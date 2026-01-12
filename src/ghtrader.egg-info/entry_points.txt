@@ -1,0 +1,2 @@
+[console_scripts]
+ghtrader = ghtrader.cli:main
