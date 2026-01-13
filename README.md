@@ -57,7 +57,7 @@ source .venv/bin/activate
 # Install in editable mode (includes vendored tqsdk-python)
 pip install -e ./tqsdk-python
 pip install -e ./akshare
-pip install -e .
+pip install -e .[dev,control]
 
 # Configure TqSdk credentials (Pro account with tq_dl required)
 # Option 1: Create .env file (recommended)
@@ -68,11 +68,15 @@ cp env.example .env
 export TQSDK_USER="your_username"
 export TQSDK_PASSWORD="your_password"
 
+# Recommended: use the trading-day partitioned lake (lake_v2) by default
+# (alternative: pass --lake-version v2 on relevant commands)
+export GHTRADER_LAKE_VERSION=v2
+
 # Download historical L5 ticks for a symbol and date range
-ghtrader download --symbol SHFE.cu2502 --start 2024-01-01 --end 2024-01-31
+ghtrader download --symbol SHFE.cu2502 --start 2024-01-01 --end 2024-01-31 --lake-version v2
 
 # Build features and labels
-ghtrader build --symbol SHFE.cu2502
+ghtrader build --symbol SHFE.cu2502 --lake-version v2
 
 # Train baseline model
 ghtrader train --model xgboost --symbol SHFE.cu2502
@@ -84,6 +88,34 @@ torchrun --nproc_per_node=4 -m ghtrader.cli train --model deeplob --symbol SHFE.
 # Run backtest
 ghtrader backtest --model xgboost --symbol SHFE.cu2502
 ```
+
+---
+
+## SSH-only web dashboard (control plane)
+
+The server is headless (no GUI OS). ghTrader includes an **SSH-only web dashboard** to manage long-running jobs and view logs/data coverage without manually running every CLI command.
+
+Start the dashboard on the server (binds to `127.0.0.1` by default):
+
+```bash
+ghtrader dashboard --host 127.0.0.1 --port 8000
+```
+
+From your local machine, open an SSH tunnel and access it in your browser:
+
+```bash
+ssh -L 8000:127.0.0.1:8000 ops@<server>
+```
+
+Then open `http://127.0.0.1:8000` locally.
+
+Explorer:
+- SQL Explorer page: `http://127.0.0.1:8000/explorer`
+
+Operational notes:
+- Job metadata: `runs/control/jobs.db`
+- Logs: `runs/control/logs/job-<id>.log`
+- Optional token (defense-in-depth): `ghtrader dashboard --token <TOKEN>` and access with `?token=<TOKEN>`
 
 ---
 
@@ -100,6 +132,9 @@ ghTrader/
     cli.py               # CLI entrypoint (download, record, build, train, backtest, paper)
     tq_ingest.py         # TqSdk integration: historical download + live recorder
     lake.py              # Parquet schema, partitioning, manifest writing/reading
+    db.py                # DuckDB lakehouse query layer (Parquet views + metrics index)
+    db_bench.py          # QuestDB/ClickHouse benchmark harness (optional)
+    serving_db.py        # Optional serving DB sync (backfill + incremental)
     features.py          # FactorEngine + registry
     labels.py            # Event-time labels, horizons
     models.py            # DeepLOB, Transformer, tabular wrappers
@@ -114,7 +149,14 @@ ghTrader/
 
 ## Data lake schema (L5 ticks)
 
-Partitioning: `data/lake/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet`
+Partitioning (two lake roots are supported):
+- **lake_v1 (legacy)**: `data/lake/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet`
+- **lake_v2 (trading-day)**: `data/lake_v2/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet`
+  - For **lake_v2**, `date=YYYY-MM-DD` is the **trading day** (night session after ~18:00 local maps to the next trading day).
+
+Derived main-with-depth ticks (optional, for continuous series + L5 depth):
+- `data/lake{,_v2}/main_l5/ticks/symbol=KQ.m@SHFE.cu/date=YYYY-MM-DD/part-....parquet`
+  - `lake_v2` main_l5 includes `underlying_contract` and `segment_id` to prevent cross-roll leakage in sequence models.
 
 Columns:
 - `symbol` (string): instrument code (e.g., `SHFE.cu2502`)
@@ -125,6 +167,31 @@ Columns:
 - `ask_price1..5`, `ask_volume1..5` (float64)
 
 ---
+
+## DuckDB SQL layer (optional)
+
+DuckDB provides fast **read-only SQL** over the Parquet lake and powers the dashboard Explorer.
+
+Install:
+- If you installed `pip install -e ".[dev,control]"`, DuckDB is included.
+- Otherwise install it with: `pip install -e ".[db]"`
+
+Initialize/refresh Parquet-backed views (writes `data/ghtrader.duckdb` by default):
+
+```bash
+ghtrader db init
+```
+
+Run SQL (SELECT/WITH only) and export:
+
+```bash
+ghtrader sql --query "SELECT COUNT(*) AS n FROM ticks_raw_v2"
+ghtrader sql --query "SELECT * FROM run_metrics ORDER BY created_at DESC" --out runs_metrics.csv
+```
+
+Optional serving DB hooks (require external daemons):
+- `ghtrader db benchmark ...` (QuestDB/ClickHouse ingest/query benchmark)
+- `ghtrader db serve-sync ...` (best-effort backfill/incremental sync from Parquet partitions)
 
 ## Labels (event-time, multi-horizon)
 

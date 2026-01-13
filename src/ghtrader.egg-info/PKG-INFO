@@ -17,6 +17,16 @@ Requires-Dist: torch>=2.2
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0; extra == "dev"
 Requires-Dist: pytest-cov>=5.0; extra == "dev"
+Requires-Dist: httpx>=0.27; extra == "dev"
+Requires-Dist: duckdb>=1.1.0; extra == "dev"
+Provides-Extra: control
+Requires-Dist: fastapi>=0.110; extra == "control"
+Requires-Dist: uvicorn[standard]>=0.24; extra == "control"
+Requires-Dist: jinja2>=3.1; extra == "control"
+Requires-Dist: python-multipart>=0.0.9; extra == "control"
+Requires-Dist: psutil>=5.9; extra == "control"
+Provides-Extra: db
+Requires-Dist: duckdb>=1.1.0; extra == "db"
 Provides-Extra: tabular
 Requires-Dist: xgboost>=2.0; extra == "tabular"
 Requires-Dist: lightgbm>=4.0; extra == "tabular"
@@ -81,7 +91,8 @@ source .venv/bin/activate
 
 # Install in editable mode (includes vendored tqsdk-python)
 pip install -e ./tqsdk-python
-pip install -e .
+pip install -e ./akshare
+pip install -e .[dev,control]
 
 # Configure TqSdk credentials (Pro account with tq_dl required)
 # Option 1: Create .env file (recommended)
@@ -108,6 +119,31 @@ torchrun --nproc_per_node=4 -m ghtrader.cli train --model deeplob --symbol SHFE.
 # Run backtest
 ghtrader backtest --model xgboost --symbol SHFE.cu2502
 ```
+
+---
+
+## SSH-only web dashboard (control plane)
+
+The server is headless (no GUI OS). ghTrader includes an **SSH-only web dashboard** to manage long-running jobs and view logs/data coverage without manually running every CLI command.
+
+Start the dashboard on the server (binds to `127.0.0.1` by default):
+
+```bash
+ghtrader dashboard --host 127.0.0.1 --port 8000
+```
+
+From your local machine, open an SSH tunnel and access it in your browser:
+
+```bash
+ssh -L 8000:127.0.0.1:8000 ops@<server>
+```
+
+Then open `http://127.0.0.1:8000` locally.
+
+Operational notes:
+- Job metadata: `runs/control/jobs.db`
+- Logs: `runs/control/logs/job-<id>.log`
+- Optional token (defense-in-depth): `ghtrader dashboard --token <TOKEN>` and access with `?token=<TOKEN>`
 
 ---
 

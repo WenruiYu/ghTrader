@@ -105,6 +105,23 @@ ghTrader must explicitly support two classes of symbols (both may exist in the l
 Implementation:
 - `src/ghtrader/tq_ingest.py` (`download_historical_ticks`)
 
+#### 5.1.2 Trading calendar correctness + no-data day semantics
+
+Problem:
+- Weekday-only calendars are incorrect for China futures (SHFE holidays exist).
+- Some valid trading days may legitimately have **no ticks available** in TqSdk Pro history (e.g., data gaps, pre-listing boundary days). These must not cause infinite retries.
+
+Requirements:
+- **Trading day source**: use the **akshare futures calendar** (`akshare.futures.cons.get_calendar()`) as the authoritative list of trading days.
+  - If akshare is not available, fallback to weekday-only behavior (best-effort).
+- **No-data markers**:
+  - For each symbol, persist a set of trading dates that were attempted but returned **zero ticks**, so ingest completion is idempotent.
+  - Store at: `data/lake/ticks/symbol=<SYMBOL>/_no_data_dates.json` (ISO dates).
+  - Missing-date computation must exclude both existing partitions and no-data dates.
+- **Chunk behavior**:
+  - If a requested chunk yields no ticks, mark all dates in that chunk as no-data (unless already present on disk).
+  - If a chunk yields partial days, mark any requested dates that did not produce ticks as no-data.
+
 ### 5.2 Data ingest (live recorder)
 
 - Must subscribe to ticks and append to lake.
@@ -117,14 +134,131 @@ Implementation:
 ### 5.3 Parquet data lake (canonical raw store)
 
 - Append-only raw lake.
-- Partitioning:
-  - `data/lake/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet`
+- Partitioning (two lake roots are supported):
+  - **lake_v1 (legacy)**: `data/lake/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet`
+  - **lake_v2 (trading-day)**: `data/lake_v2/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet`
+    - For **lake_v2**, `date=YYYY-MM-DD` is the **trading day**, not necessarily the wall-clock calendar date of the tick (night session must map to the correct trading day).
 - Compression: ZSTD.
 - Schema: locked and hashable.
 - Schema includes **L5 columns** even for L1-only sources; for `KQ.m@...` deeper levels are expected to be null.
 
 Implementation:
 - `src/ghtrader/lake.py`
+
+#### 5.3.0.0 Lake versioning and selection
+
+ghTrader maintains two tick lake roots:
+
+- **lake_v1** (`data/lake/...`): legacy layout kept for backwards compatibility.
+- **lake_v2** (`data/lake_v2/...`): the preferred layout where partitions are keyed by **trading day**.
+
+Selection rules:
+
+- Default selection is controlled by env var:
+  - `GHTRADER_LAKE_VERSION={v1|v2}` (default: `v1`)
+- CLI commands must support an explicit override:
+  - `--lake-version {v1|v2}`
+- Features/labels manifests must record which lake version they were built against and must refuse to mix outputs across lake versions unless `--overwrite` is set.
+
+#### 5.3.0 Akshare daily cache policy (used for roll schedule + active range inference)
+
+Requirements:
+- Only fetch/cache daily futures data for **trading days** (do not create cached empty files for weekends/holidays).
+- Transient fetch failures must use bounded retry/backoff and be surfaced explicitly (do **not** silently cache an empty DataFrame on error).
+
+#### 5.3.0.1 Active range cache (contract -> first/last active trading day)
+
+To avoid repeated large daily scans during contract-range backfills:
+- Persist `contract -> (first_active, last_active)` for `(market,var)` at:
+  - `data/akshare/active_ranges/market=<MKT>/var=<VAR>/active_ranges.parquet`
+  - `data/akshare/active_ranges/market=<MKT>/var=<VAR>/manifest.json` (scanned start/end, created_at)
+- Contract-range download must reuse the cache if it covers the requested scan window.
+
+#### 5.3.0.2 Data integrity validation, checksums, and audit command
+
+ghTrader must provide first-class integrity tooling for the on-disk data lake.
+
+Checksums (write-time):
+- Every Parquet file written by ghTrader for **core datasets** must write a sibling checksum file at write time:
+  - `*.parquet.sha256` (hex digest; computed over the Parquet file bytes)
+- Applies to:
+  - raw ticks (`data/lake{,_v2}/ticks/...`)
+  - derived main-with-depth ticks (`data/lake{,_v2}/main_l5/ticks/...`)
+  - features (`data/features/...`)
+  - labels (`data/labels/...`)
+
+Manifests (formal, audit-friendly):
+- Raw ticks: each `(symbol,date)` partition directory must include a date manifest:
+  - `data/lake{,_v2}/ticks/symbol=<SYM>/date=<YYYY-MM-DD>/_manifest.json`
+  - includes: file list, per-file row counts, per-file sha256, rows_total.
+- Derived main_l5 ticks: each `(derived_symbol,date)` partition directory must include:
+  - `data/lake{,_v2}/main_l5/ticks/symbol=<DERIVED>/date=<YYYY-MM-DD>/_manifest.json`
+  - includes: file list, per-file row counts, per-file sha256, rows_total.
+- Features and labels: each `symbol=...` directory must include `manifest.json`:
+  - `data/features/symbol=<SYM>/manifest.json`
+  - `data/labels/symbol=<SYM>/manifest.json`
+  - includes: build parameters (factors/horizons/ticks_lake/**lake_version**), schema hash, per-date row counts, and per-file sha256.
+
+Audit command:
+- Must provide `ghtrader audit` which scans one or more datasets and produces:
+  - JSON report under `runs/audit/<run_id>.json`
+  - exit code **0** if no errors, **1** if errors
+- Required checks:
+  - checksum verification (`*.sha256` matches Parquet bytes)
+  - schema conformity (ticks vs `TICK_ARROW_SCHEMA`; features/labels vs their manifest schema hash)
+  - datetime integrity (non-decreasing; duplicate rate reporting)
+  - basic sanity rules for ticks (non-negative volume/OI; non-negative prices; `ask_price1 >= bid_price1` when present)
+  - manifest consistency (manifest row counts match Parquet metadata row counts)
+  - derived-vs-raw equivalence for `main_l5` (tick value columns must match raw underlying; `symbol` differs by design; metadata columns must match schedule provenance)
+
+#### 5.3.0.3 Database / query layer (optional; Parquet remains canonical)
+
+ghTrader’s **canonical storage** for market data and derived datasets is the Parquet lake (`data/lake` / `data/lake_v2`) and Parquet outputs (`data/features`, `data/labels`). A database framework may be introduced as a **query/index layer** but must not become the only copy of data.
+
+Goals for a DB layer:
+
+- Provide **fast ad-hoc SQL** over ticks/features/labels/metrics for research and the dashboard.
+- Avoid duplicating data unnecessarily; prefer querying Parquet directly when possible.
+- Keep the system **single-host friendly** by default; server/daemon DBs are optional.
+- Do **not** replace operational metadata/locking unless explicitly migrating:
+  - Control-plane jobs/locks remain stored in local SQLite (`runs/control/jobs.db`) by default.
+  - A DB layer may *index* jobs/metrics for richer querying, but SQLite remains the operational source of truth unless a migration is planned.
+
+Default (Stage A): embedded analytics DB (DuckDB)
+
+- DuckDB is the default embedded query engine for **SQL over Parquet** (lakehouse-style), without changing the canonical Parquet storage model.
+- Default DB path (if persisted): `data/ghtrader.duckdb` (rebuildable cache/index).
+- Views (Parquet-backed; created/refreshed by CLI init):
+  - `ticks_raw_v1`, `ticks_raw_v2` over `data/lake{,_v2}/ticks/...`
+  - `ticks_main_l5_v1`, `ticks_main_l5_v2` over `data/lake{,_v2}/main_l5/ticks/...`
+  - `features_all` over `data/features/...`
+  - `labels_all` over `data/labels/...`
+  - `run_metrics` (when metrics are indexed from `runs/`)
+- CLI entrypoints:
+  - `ghtrader db init` (create/refresh views; optionally index metrics)
+  - `ghtrader db ingest-metrics` (index JSON reports under `runs/` into `run_metrics`)
+  - `ghtrader sql` (run **SELECT/WITH-only** queries; export `.csv` or `.parquet`)
+- Dashboard Explorer:
+  - HTML: `/explorer`
+  - JSON: `POST /api/db/query`
+  - Guardrails: read-only (SELECT/WITH only + disallowed keyword blocklist), capped row limits, and intended for local-only access via SSH forwarding.
+- ghTrader should optionally index **experiment/evaluation outputs** into DuckDB tables for easy comparisons:
+  - Backtests under `runs/<symbol>/<model>/<run_id>/...`
+  - Benchmarks under `runs/benchmarks/...`
+  - Daily pipeline reports under `runs/daily_pipeline/...`
+  (Files remain canonical; DuckDB tables are rebuildable indexes.)
+
+Optional (Stage B): serving/index DB (QuestDB / ClickHouse / TimescaleDB)
+
+- If/when the workload demands a daemon DB (concurrency, very large corpora, heavy SQL), ghTrader may support an optional serving backend:
+  - QuestDB (ILP ingestion + PGWire queries) or ClickHouse (MergeTree analytics) are likely fits for tick-heavy workloads.
+  - Postgres/TimescaleDB is a fit when strong transactional semantics are needed for metadata + moderate time-series volumes.
+- Serving DB ingestion must be **derived from Parquet** and must preserve provenance:
+  - Backfill: ingest selected `(lake_version, ticks_lake, symbol, date)` partitions into DB.
+  - Incremental: ingest new partitions as they appear (or double-write from live recorder), without breaking append-only Parquet semantics.
+- Time semantics must be explicit:
+  - Parquet stores `datetime` as **epoch-nanoseconds** (int64) in Beijing time (as provided by TqSdk).
+  - Serving DB schemas must either (a) store the same `datetime_ns` int64 or (b) convert to UTC timestamps and record the conversion rule; mixing conventions is forbidden.
 
 #### 5.3.1 Derived dataset: “main-with-depth” (materialized continuity with L5)
 
@@ -137,13 +271,32 @@ Definition:
 
 - The derived symbol is named like the continuous series (e.g. `KQ.m@SHFE.cu`), but it is **materialized** from L5 ticks of the underlying contract selected by the roll schedule (§5.3.2).
 - Output is written to a separate lake to avoid mixing raw vs derived data:
-  - `data/lake/main_l5/ticks/symbol=KQ.m@SHFE.cu/date=YYYY-MM-DD/part-....parquet`
+  - `data/lake{,_v2}/main_l5/ticks/symbol=KQ.m@SHFE.cu/date=YYYY-MM-DD/part-....parquet`
 - Provenance must be recorded (schedule hash, underlying contracts used, row counts per day).
+
+Segment metadata contract (required for correctness):
+
+- The roll schedule must include a **segment id** that increments each time `main_contract` changes.
+  - `segment_id` is stable and deterministic for a given schedule.
+- Every derived `main_l5` tick row must include:
+  - `underlying_contract` (string): the specific contract used for that trading day (e.g. `SHFE.cu2602`)
+  - `segment_id` (int): schedule segment id for that trading day
+- Derived features and labels must **propagate** `underlying_contract` and `segment_id` so downstream datasets can enforce no roll-boundary leakage.
 
 Sequence semantics (critical for ML correctness):
 
 - Feature/label sequences **must not cross roll boundaries**.
-- Dataset builders must enforce that a training example comes from a **single underlying contract** (or explicitly encode a boundary token and treat it as a different task; default is to **exclude cross-boundary windows**).
+- Dataset builders must enforce that a training example comes from a **single segment** (constant `segment_id`) / underlying contract.
+  - Default behavior is to **exclude cross-boundary windows** rather than attempting price-splice or boundary token hacks.
+
+Builder semantics for derived ticks (critical):
+- When building features on `data/lake/main_l5/ticks/symbol=KQ.m@...`:
+  - rolling-window state (lookback tail) must be **reset** when the underlying contract changes between adjacent trading days.
+- When building labels on `data/lake/main_l5/ticks/symbol=KQ.m@...`:
+  - cross-day lookahead must be **disabled** when the underlying changes between adjacent trading days (end-of-day labels become NaN rather than leaking).
+- Materialization must persist schedule provenance under the derived symbol root:
+  - `schedule.parquet` (copy)
+  - schedule hash + metadata in the manifest
 
 #### 5.3.2 Main continuous roll schedule rule (SHFE-style OI rule)
 
@@ -246,6 +399,166 @@ Implementation:
 - `src/ghtrader/benchmark.py`
 - CLI commands: `benchmark`, `compare`
 
+### 5.11 Control plane (headless ops dashboard; SSH-only)
+
+Because the server is accessed remotely and has **no GUI OS**, ghTrader must provide a **web control system** that manages core operations beyond direct CLI use.
+
+Requirements:
+
+- **Access**:
+  - Dashboard must bind to `127.0.0.1` by default (no public exposure).
+  - Operator accesses via SSH port-forward: `ssh -L 8000:127.0.0.1:8000 ops@server`.
+  - Optional shared token (defense-in-depth) may be supported.
+- **Job execution model**:
+  - Long-running operations must run as **subprocess jobs** (not in-process), so they are cancellable and resilient to UI restarts.
+  - Job history must **persist across dashboard restarts**.
+  - Must support: start, view status, tail logs, cancel (SIGTERM), and record exit codes/durations.
+- **Multi-session robustness (terminal + dashboard)**:
+  - The system must be safe under **multiple concurrent terminal sessions** and/or multiple dashboard instances.
+  - All `ghtrader ...` CLI invocations must **auto-register** into the same SQLite job registry so the dashboard reflects all sessions.
+  - Job status must be **restart-safe**:
+    - the running CLI process must write its own final status/exit_code on completion
+    - the dashboard must not be the only source of truth for job completion
+  - SQLite must be configured for concurrency:
+    - `journal_mode=WAL`
+    - non-trivial `busy_timeout` to avoid flaky “database is locked” errors
+  - Strict resource locking must prevent conflicting concurrent jobs (see below).
+- **Persistence and logs**:
+  - Store job metadata in local SQLite: `runs/control/jobs.db`.
+  - Store stdout/stderr logs per job: `runs/control/logs/job-<id>.log`.
+- **Supported operations (via UI)**:
+  - The dashboard must expose **usable forms for every CLI command**:
+    - `download`, `download-contract-range`, `record`
+    - `build`, `train`, `benchmark`, `compare`, `backtest`, `paper`, `daily-train`, `sweep`
+    - `main-schedule`, `main-depth`
+    - `audit`
+- **Observability**:
+  - Must display data coverage (lake partitions by symbol/date, features/labels coverage).
+    - Coverage UI must support both tick lake roots:
+      - `lake_v1` (`data/lake/...`)
+      - `lake_v2` (`data/lake_v2/...`)
+    - The operator must be able to view coverage for `v1`, `v2`, or both (defaulting to `GHTRADER_LAKE_VERSION`).
+  - Must display **ingest progress** for running/queued ingest jobs:
+    - `download`: % complete over requested trading-day range (includes no-data markers)
+    - `download-contract-range`: per-contract and overall % complete using active-ranges cache + trading calendar + no-data markers
+  - Progress UI must work for **already-running jobs** (no restart required) by using job logs + lake state.
+  - Performance: progress computation must be safe to refresh (use caching/TTL; avoid heavy scans every few seconds).
+  - Must display basic system status (disk usage; CPU/memory; best-effort GPU info).
+  - Must surface integrity status: latest audit report(s) and how to run an audit.
+  - Must surface multi-session state:
+    - show job source (`terminal` vs `dashboard`)
+    - show active **locks** and which job holds them
+
+#### 5.11.1 Strict resource locks (no conflicting concurrent writers)
+
+Because some CLI commands overwrite shared outputs (e.g. `build` deletes and rewrites `data/features/symbol=...`), ghTrader must enforce **strict locks** across all sessions.
+
+Locking requirements:
+- Lock acquisition must happen in the **CLI process** (so it applies equally to dashboard and terminal sessions).
+- If required locks are not available, the job must remain **queued** until locks are acquired (or fail fast if configured).
+- Locks must be automatically released on normal completion and best-effort released on crashes (stale lock reaping).
+
+Canonical lock keys (minimum set):
+- `ticks:symbol=<SYM>` for `download`, `record`
+- `ticks_range:exchange=<EX>,var=<VAR>` for `download-contract-range`
+- `build:symbol=<SYM>,ticks_lake=<raw|main_l5>` for `build`
+- `train:symbol=<SYM>,model=<M>,h=<H>` for `train`
+- `main_schedule:var=<VAR>` for `main-schedule`
+- `main_depth:symbol=<DERIVED>` for `main-depth`
+- `trade:mode=<MODE>` (and later: per-account key) for `trade`
+
+Implementation:
+- `src/ghtrader/control/` (FastAPI app + job runner + SQLite store)
+- CLI command: `ghtrader dashboard`
+
+### 5.12 Account + trading (TqSdk; phased, safety-gated)
+
+ghTrader must support **account monitoring and trading execution** using TqSdk in a **phased** way:
+
+- **Phase 1 (safe)**: paper + simulated execution for research/validation.
+- **Phase 2 (gated)**: real account execution, explicitly enabled, with robust safety/risk controls.
+
+#### 5.12.1 Trading modes
+
+Trading mode defines whether orders may be sent:
+
+- **paper**: no orders are sent; compute signals + write logs/snapshots only.
+- **sim**: orders are allowed using simulated accounts:
+  - `TqSim()` (local sim) or `TqKq()` (快期模拟).
+- **live**: orders are allowed using `TqAccount(...)` (real broker account). This is **disabled by default**.
+
+#### 5.12.2 Account configuration (env + .env)
+
+TqSdk requires:
+
+- **Shinny/快期 auth** (already used for data): `TQSDK_USER`, `TQSDK_PASSWORD` → `TqAuth(...)`
+- **Broker account** (for live mode only):
+  - `TQ_BROKER_ID`
+  - `TQ_ACCOUNT_ID`
+  - `TQ_ACCOUNT_PASSWORD`
+
+#### 5.12.3 Execution styles (two executors)
+
+ghTrader must support two execution styles:
+
+- **Target position execution** (recommended): `TargetPosTask` adjusts net position to a target.
+  - Constraint: one TargetPosTask per (account, symbol); requires continued `wait_update()`.
+  - Safety rule: **must not** mix `TargetPosTask` with direct `insert_order()` for the same (account, symbol).
+- **Direct order execution**: use `insert_order()` / `cancel_order()`.
+  - Must support advanced order params (`FAK`/`FOK`, `BEST`/`FIVELEVEL`) when applicable.
+  - Must handle SHFE close-today semantics where required.
+
+#### 5.12.4 Safety gating and risk controls
+
+Safety gate for live trading:
+
+- Default is **research-only**. Live must require **two steps**:
+  - `.env`: `GHTRADER_LIVE_ENABLED=true`
+  - CLI: `--confirm-live I_UNDERSTAND`
+
+Mandatory risk controls (must work even without TqSdk “professional” local risk features):
+
+- **max position** per symbol (absolute net position)
+- **max order size** per order (volume delta)
+- **order rate limiting** (max ops per second)
+- **max daily loss / drawdown** based on account equity snapshots (kill-switch to stop trading + flatten)
+- **session-time guard**: do not send orders outside instrument trading sessions (best-effort using quote trading_time)
+
+Optional: attach TqSdk local risk rules (when available) for defense-in-depth:
+- `TqRuleOrderRateLimit`, `TqRuleOpenCountsLimit`, `TqRuleOpenVolumesLimit`
+
+#### 5.12.5 Symbol semantics (specific vs continuous aliases)
+
+Trading may target:
+
+- **Specific contract** (preferred for execution): e.g. `SHFE.cu2602`
+- **Continuous alias**: e.g. `KQ.m@SHFE.cu`
+
+If a continuous alias is provided, trading must **resolve** to the correct underlying contract for the current trading day using the persisted roll schedule (from `main-schedule`). If the underlying changes (roll), the runner must reset any online state and avoid cross-contract leakage.
+
+Schedule resolution sources (in priority order):
+
+- Preferred: the canonical roll schedule produced by `main-schedule`:
+  - `data/rolls/shfe_main_schedule/var=<var>/schedule.parquet`
+- Fallback: a `schedule.parquet` copy stored alongside the derived `main_l5` dataset (written by `main-depth`), under either lake root:
+  - `data/lake/main_l5/ticks/symbol=<KQ.m@...>/schedule.parquet`
+  - `data/lake_v2/main_l5/ticks/symbol=<KQ.m@...>/schedule.parquet`
+- If both derived schedule copies exist, the system should prefer the selected `GHTRADER_LAKE_VERSION`.
+
+#### 5.12.6 Observability + persistence
+
+Trading runners must persist:
+
+- run config + mode/account/executor parameters
+- periodic **account snapshots** (balance/margin/positions/open orders)
+- order/trade events (fills, cancels, rejects) as structured logs
+
+Write under: `runs/trading/<run_id>/...` so the dashboard can display “last known state” without attaching to the live process.
+
+Implementation:
+- new modules: `src/ghtrader/tq_runtime.py`, `src/ghtrader/execution.py`, `src/ghtrader/symbol_resolver.py`
+- new CLI command: `ghtrader trade`
+
 ---
 
 ## 6) Non-functional requirements
@@ -270,6 +583,16 @@ Implementation:
   - features
   - inference
   - decision
+
+### 6.3.1 Parquet lake scaling (ticks/features/labels)
+
+- Tick lake reads must scale for multi-year L5 history:
+  - Per-day reads must be **O(#parquet files for that day)** (no scanning thousands of `date=` partitions just to read one day).
+  - Range reads should use **Arrow Dataset scanning** (avoid manual directory walks; allow streaming-friendly execution).
+- Build outputs (features/labels) must be safe to run repeatedly:
+  - `ghtrader build` must be **incremental/resumable by default** (no destructive delete).
+  - Full rebuild of features/labels must require explicit `--overwrite`.
+  - Incremental builds must refuse to mix configurations if `manifest.json` does not match (require `--overwrite`).
 
 Implementation:
 - `src/ghtrader/pipeline.py` (`LatencyTracker`, `LatencyContext`)
@@ -298,6 +621,13 @@ Given the target hardware (multi-CPU + **4 GPUs**), ghTrader uses a **hybrid sca
 
 Current state:
 - `tests/` includes unit coverage for lake/labels/features/models/online/pipeline/cli.
+
+CI requirements:
+- ghTrader must include a **GitHub Actions** workflow that runs on push/PR.
+- CI must run:
+  - `pytest`
+  - `pytest --cov=ghtrader --cov-fail-under=50` (minimal coverage gate; value is set to current-baseline-safe)
+- CI must **skip integration tests by default** (credentials/network), unless explicitly enabled.
 
 ### 6.5 Security and secrets
 

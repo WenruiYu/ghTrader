@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block content %}
+  <h2>Data coverage</h2>
+
+  <div class="card">
+    <form class="form" method="get" action="/data{{ token_qs }}">
+      <div class="grid2">
+        <div>
+          <label>Tick lake version</label>
+          <select name="lake_version">
+            <option value="v1" {% if lake_version == "v1" %}selected{% endif %}>v1 (data/lake)</option>
+            <option value="v2" {% if lake_version == "v2" %}selected{% endif %}>v2 (data/lake_v2)</option>
+            <option value="both" {% if lake_version == "both" %}selected{% endif %}>both</option>
+          </select>
+        </div>
+        <div style="display:flex; align-items:flex-end;">
+          <button type="submit">Apply</button>
+        </div>
+      </div>
+    </form>
+  </div>
+
+  {% if show_v1 %}
+  <h3>Ticks (raw) — lake_v1</h3>
+  <table class="table">
+    <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+    <tbody>
+    {% for r in ticks_v1 %}
+      <tr>
+        <td class="mono">{{ r.symbol }}</td>
+        <td>{{ r.n_dates }}</td>
+        <td class="mono">{{ r.min_date or "" }}</td>
+        <td class="mono">{{ r.max_date or "" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if show_v2 %}
+  <h3>Ticks (raw) — lake_v2</h3>
+  <table class="table">
+    <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+    <tbody>
+    {% for r in ticks_v2 %}
+      <tr>
+        <td class="mono">{{ r.symbol }}</td>
+        <td>{{ r.n_dates }}</td>
+        <td class="mono">{{ r.min_date or "" }}</td>
+        <td class="mono">{{ r.max_date or "" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if show_v1 %}
+  <h3>Ticks (main-with-depth) — lake_v1</h3>
+  <table class="table">
+    <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+    <tbody>
+    {% for r in main_l5_v1 %}
+      <tr>
+        <td class="mono">{{ r.symbol }}</td>
+        <td>{{ r.n_dates }}</td>
+        <td class="mono">{{ r.min_date or "" }}</td>
+        <td class="mono">{{ r.max_date or "" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if show_v2 %}
+  <h3>Ticks (main-with-depth) — lake_v2</h3>
+  <table class="table">
+    <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+    <tbody>
+    {% for r in main_l5_v2 %}
+      <tr>
+        <td class="mono">{{ r.symbol }}</td>
+        <td>{{ r.n_dates }}</td>
+        <td class="mono">{{ r.min_date or "" }}</td>
+        <td class="mono">{{ r.max_date or "" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <h3>Features</h3>
+  <table class="table">
+    <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+    <tbody>
+    {% for r in features %}
+      <tr>
+        <td class="mono">{{ r.symbol }}</td>
+        <td>{{ r.n_dates }}</td>
+        <td class="mono">{{ r.min_date or "" }}</td>
+        <td class="mono">{{ r.max_date or "" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h3>Labels</h3>
+  <table class="table">
+    <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+    <tbody>
+    {% for r in labels %}
+      <tr>
+        <td class="mono">{{ r.symbol }}</td>
+        <td>{{ r.n_dates }}</td>
+        <td class="mono">{{ r.min_date or "" }}</td>
+        <td class="mono">{{ r.max_date or "" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}
+

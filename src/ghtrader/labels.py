@@ -21,7 +21,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import structlog
 
-from ghtrader.lake import list_available_dates, read_ticks_for_symbol
+from ghtrader.lake import LakeVersion, TicksLake, list_available_dates_in_lake, read_ticks_for_symbol, ticks_symbol_dir
 
 log = structlog.get_logger()
 
@@ -148,6 +148,10 @@ def build_labels_for_symbol(
     data_dir: Path,
     horizons: list[int],
     threshold_k: int = 1,
+    ticks_lake: TicksLake = "raw",
+    overwrite: bool = False,
+    *,
+    lake_version: LakeVersion = "v1",
 ) -> Path:
     """
     Build multi-horizon labels for a symbol from Parquet lake.
@@ -163,13 +167,13 @@ def build_labels_for_symbol(
     """
     log.info("labels.build_start", symbol=symbol, horizons=horizons, threshold_k=threshold_k)
 
-    dates = list_available_dates(data_dir, symbol)
+    dates = list_available_dates_in_lake(data_dir, symbol, ticks_lake=ticks_lake, lake_version=lake_version)
     if not dates:
         raise ValueError(f"No tick data found for {symbol}")
 
-    # Overwrite derived labels for idempotency
+    # Output root
     out_root = labels_dir(data_dir) / f"symbol={symbol}"
-    if out_root.exists():
+    if overwrite and out_root.exists():
         shutil.rmtree(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -179,23 +183,149 @@ def build_labels_for_symbol(
 
     max_h = max(horizons) if horizons else 0
 
+    # For derived ticks, avoid cross-day lookahead on roll boundaries.
+    underlying_by_date: dict[date, str] = {}
+    segment_id_by_date: dict[date, int] = {}
+    if ticks_lake == "main_l5":
+        try:
+            schedule_path = ticks_symbol_dir(
+                data_dir,
+                symbol,
+                ticks_lake="main_l5",
+                lake_version=lake_version,
+            ) / "schedule.parquet"
+            if schedule_path.exists():
+                sched = pd.read_parquet(schedule_path)
+                if "date" in sched.columns and "main_contract" in sched.columns:
+                    sched = sched.copy()
+                    sched["date"] = pd.to_datetime(sched["date"], errors="coerce").dt.date
+                    sched = sched.dropna(subset=["date", "main_contract"])
+                    # Ensure segment_id exists for older schedule copies.
+                    if "segment_id" not in sched.columns:
+                        seg_ids: list[int] = []
+                        seg = 0
+                        prev: str | None = None
+                        for mc in sched["main_contract"].astype(str).tolist():
+                            if prev is None:
+                                seg = 0
+                            elif mc != prev:
+                                seg += 1
+                            seg_ids.append(int(seg))
+                            prev = mc
+                        sched["segment_id"] = seg_ids
+
+                    for _, r in sched.iterrows():
+                        d = r["date"]
+                        underlying_by_date[d] = str(r["main_contract"])
+                        try:
+                            segment_id_by_date[d] = int(r.get("segment_id", 0) or 0)
+                        except Exception:
+                            segment_id_by_date[d] = 0
+        except Exception as e:
+            log.warning("labels.schedule_load_failed", symbol=symbol, error=str(e))
+
     # Canonical schema for partitions
-    schema = pa.schema(
-        [("symbol", pa.string()), ("datetime", pa.int64()), ("mid", pa.float64())]
-        + [(f"label_{n}", pa.float64()) for n in horizons]
-    )
+    schema_fields: list[pa.Field] = [pa.field("symbol", pa.string()), pa.field("datetime", pa.int64())]
+    if ticks_lake == "main_l5":
+        schema_fields += [pa.field("underlying_contract", pa.string()), pa.field("segment_id", pa.int64())]
+    schema_fields += [pa.field("mid", pa.float64())] + [pa.field(f"label_{n}", pa.float64()) for n in horizons]
+    schema = pa.schema(schema_fields)
+
+    # Manifest safety gate: do not mix outputs across config/schema changes unless overwrite is explicit.
+    if not overwrite:
+        manifest_path = out_root / "manifest.json"
+        if manifest_path.exists():
+            try:
+                import hashlib
+                import json
+
+                cols_str = ",".join(f"{f.name}:{f.type}" for f in schema)
+                expected_schema_hash = hashlib.sha256(cols_str.encode()).hexdigest()[:16]
+                existing = json.loads(manifest_path.read_text())
+                if str(existing.get("dataset")) != "labels":
+                    raise ValueError("dataset mismatch")
+                if str(existing.get("symbol")) != str(symbol):
+                    raise ValueError("symbol mismatch")
+                if str(existing.get("ticks_lake")) != str(ticks_lake):
+                    raise ValueError("ticks_lake mismatch")
+                if str(existing.get("lake_version") or "v1") != str(lake_version):
+                    raise ValueError("lake_version mismatch")
+                if list(existing.get("horizons") or []) != list(horizons):
+                    raise ValueError("horizons mismatch")
+                if int(existing.get("threshold_k") or 0) != int(threshold_k):
+                    raise ValueError("threshold_k mismatch")
+                if str(existing.get("schema_hash") or "") != expected_schema_hash:
+                    raise ValueError("schema_hash mismatch")
+            except Exception as e:
+                raise ValueError(
+                    f"Existing labels manifest does not match requested build ({e}). "
+                    f"Refusing to mix outputs. Re-run with overwrite=True to rebuild."
+                )
+
+    # Determine which dates need work (incremental default).
+    existing_dates: set[date] = set()
+    for ddir in out_root.iterdir():
+        if not ddir.is_dir() or not ddir.name.startswith("date="):
+            continue
+        try:
+            dt = date.fromisoformat(ddir.name.split("=", 1)[1])
+        except Exception:
+            continue
+        if any(ddir.glob("*.parquet")):
+            existing_dates.add(dt)
+
+    missing_dates = [d for d in dates if d not in existing_dates]
+    dates_to_process: set[date] = set()
+    if overwrite:
+        dates_to_process = set(dates)
+    else:
+        # Backfill/appends guard: if a day is missing, also recompute the previous available tick day.
+        idx_map = {d: i for i, d in enumerate(dates)}
+        for d in missing_dates:
+            dates_to_process.add(d)
+            j = idx_map.get(d)
+            if j is not None and j - 1 >= 0:
+                dates_to_process.add(dates[j - 1])
 
     total_rows = 0
     # Process each day; include up to max_h future ticks from next day for cross-boundary labels
-    for idx, dt in enumerate(dates):
-        df_day = read_ticks_for_symbol(data_dir, symbol, start_date=dt, end_date=dt)
+    for dt in sorted(dates_to_process):
+        idx = {d: i for i, d in enumerate(dates)}.get(dt, None)
+        df_day = read_ticks_for_symbol(
+            data_dir,
+            symbol,
+            start_date=dt,
+            end_date=dt,
+            ticks_lake=ticks_lake,
+            lake_version=lake_version,
+        )
         if df_day.empty:
             continue
 
         df_future = pd.DataFrame()
-        if max_h > 0 and idx + 1 < len(dates):
+        if max_h > 0 and idx is not None and idx + 1 < len(dates):
             next_dt = dates[idx + 1]
-            df_next = read_ticks_for_symbol(data_dir, symbol, start_date=next_dt, end_date=next_dt)
+            allow_cross = True
+            if ticks_lake == "main_l5":
+                seg0 = segment_id_by_date.get(dt)
+                seg1 = segment_id_by_date.get(next_dt)
+                allow_cross = bool(seg0 is not None and seg1 is not None and seg0 == seg1)
+                if not allow_cross:
+                    u0 = underlying_by_date.get(dt)
+                    u1 = underlying_by_date.get(next_dt)
+                    allow_cross = bool(u0 and u1 and u0 == u1)
+
+            if allow_cross:
+                df_next = read_ticks_for_symbol(
+                    data_dir,
+                    symbol,
+                    start_date=next_dt,
+                    end_date=next_dt,
+                    ticks_lake=ticks_lake,
+                    lake_version=lake_version,
+                )
+            else:
+                df_next = pd.DataFrame()
             if not df_next.empty:
                 df_future = df_next.head(max_h)
 
@@ -209,21 +339,81 @@ def build_labels_for_symbol(
 
         labels_day["datetime"] = df_day["datetime"].values
         labels_day["symbol"] = symbol
+        if ticks_lake == "main_l5":
+            labels_day["underlying_contract"] = underlying_by_date.get(dt) or ""
+            labels_day["segment_id"] = int(segment_id_by_date.get(dt, 0) or 0)
 
-        cols = ["symbol", "datetime", "mid"] + [f"label_{n}" for n in horizons]
+        cols = ["symbol", "datetime"]
+        if ticks_lake == "main_l5":
+            cols += ["underlying_contract", "segment_id"]
+        cols += ["mid"] + [f"label_{n}" for n in horizons]
         labels_day = labels_day[cols]
 
-        part_id = uuid.uuid4().hex[:8]
         out_dir = out_root / f"date={dt.isoformat()}"
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"part-{part_id}.parquet"
+        # Deterministic per-date output name; remove any previous parquet(s) for this date.
+        for p in out_dir.glob("*.parquet*"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
 
+        out_path = out_dir / "part.parquet"
+        tmp_path = out_dir / "part.parquet.tmp"
         table = pa.Table.from_pandas(labels_day, schema=schema, preserve_index=False)
-        pq.write_table(table, out_path, compression="zstd")
+        pq.write_table(table, tmp_path, compression="zstd")
+        tmp_path.replace(out_path)
+        try:
+            from ghtrader.integrity import write_sha256_sidecar
+
+            write_sha256_sidecar(out_path)
+        except Exception as e:
+            log.warning("labels.checksum_failed", path=str(out_path), error=str(e))
 
         total_rows += len(labels_day)
 
     log.info("labels.build_done", symbol=symbol, rows=total_rows, root=str(out_root))
+
+    # Rebuild symbol-level manifest from on-disk partitions (covers incremental runs).
+    row_counts: dict[str, int] = {}
+    files: list[dict] = []
+    try:
+        import hashlib
+
+        from ghtrader.integrity import now_utc_iso, parquet_num_rows, read_sha256_sidecar, write_json_atomic
+
+        total_rows2 = 0
+        for ddir in sorted([p for p in out_root.iterdir() if p.is_dir() and p.name.startswith("date=")], key=lambda p: p.name):
+            dt_s = ddir.name.split("=", 1)[1]
+            pq_files = sorted(ddir.glob("*.parquet"))
+            if not pq_files:
+                continue
+            p = pq_files[0]
+            rows = parquet_num_rows(p)
+            sha = read_sha256_sidecar(p) or ""
+            row_counts[dt_s] = int(rows)
+            total_rows2 += int(rows)
+            files.append({"date": dt_s, "file": f"{ddir.name}/{p.name}", "rows": int(rows), "sha256": sha})
+
+        cols_str = ",".join(f"{f.name}:{f.type}" for f in schema)
+        schema_hash = hashlib.sha256(cols_str.encode()).hexdigest()[:16]
+        manifest = {
+            "created_at": now_utc_iso(),
+            "dataset": "labels",
+            "symbol": symbol,
+            "ticks_lake": ticks_lake,
+            "lake_version": lake_version,
+            "horizons": list(horizons),
+            "threshold_k": int(threshold_k),
+            "schema_hash": schema_hash,
+            "rows_total": int(total_rows2),
+            "row_counts": row_counts,
+            "files": files,
+        }
+        write_json_atomic(out_root / "manifest.json", manifest)
+    except Exception as e:
+        log.warning("labels.manifest_failed", symbol=symbol, error=str(e))
+
     return out_root
 
 

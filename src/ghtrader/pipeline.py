@@ -329,7 +329,7 @@ def run_hyperparam_sweep(
         log.error("sweep.ray_not_installed")
         raise RuntimeError("Ray is required for sweeps. Install with: pip install ray[tune]")
     
-    from ghtrader.features import read_features_for_symbol
+    from ghtrader.features import read_features_for_symbol, read_features_manifest
     from ghtrader.labels import read_labels_for_symbol
     from ghtrader.models import create_model
     
@@ -340,7 +340,22 @@ def run_hyperparam_sweep(
     labels_df = read_labels_for_symbol(data_dir, symbol)
     df = features_df.merge(labels_df[["datetime", f"label_{horizon}"]], on="datetime")
     
-    feature_cols = [c for c in features_df.columns if c not in ["symbol", "datetime"]]
+    manifest = read_features_manifest(data_dir, symbol)
+    feature_cols = list(manifest.get("enabled_factors") or [])
+    if feature_cols:
+        feature_cols = [c for c in feature_cols if c in features_df.columns]
+    else:
+        exclude = {"symbol", "datetime", "underlying_contract", "segment_id"}
+        feature_cols = [c for c in features_df.columns if c not in exclude]
+
+    seg_all: np.ndarray | None = None
+    if "segment_id" in df.columns:
+        try:
+            seg_all = pd.to_numeric(df["segment_id"], errors="coerce").fillna(-1).astype("int64").values
+            if len(seg_all) > 0 and int(seg_all.min()) == int(seg_all.max()):
+                seg_all = None
+        except Exception:
+            seg_all = None
     X = df[feature_cols].values
     y = df[f"label_{horizon}"].values
     
@@ -379,17 +394,19 @@ def run_hyperparam_sweep(
         
         X_train, y_train = X[:train_end], y[:train_end]
         X_val, y_val = X[train_end:val_end], y[train_end:val_end]
+        seg_train = seg_all[:train_end] if seg_all is not None else None
+        seg_val = seg_all[train_end:val_end] if seg_all is not None else None
         
         # Create and train model
         model = create_model(model_type, n_features=X.shape[1], **config)
         
         if model_type in ["deeplob", "transformer"]:
-            model.fit(X_train, y_train, epochs=config.get("epochs", 50))
+            model.fit(X_train, y_train, epochs=config.get("epochs", 50), segment_id=seg_train)
         else:
-            model.fit(X_train, y_train)
+            model.fit(X_train, y_train, segment_id=seg_train)
         
         # Evaluate
-        probs = model.predict_proba(X_val)
+        probs = model.predict_proba(X_val, segment_id=seg_val)
         if len(probs.shape) == 2:
             preds = probs.argmax(axis=1)
         else:
@@ -397,6 +414,8 @@ def run_hyperparam_sweep(
         
         # Filter valid
         valid_mask = ~np.isnan(y_val)
+        if len(probs.shape) == 2:
+            valid_mask = valid_mask & (~np.isnan(probs).any(axis=1))
         accuracy = (preds[valid_mask] == y_val[valid_mask]).mean()
         
         return {"accuracy": accuracy}

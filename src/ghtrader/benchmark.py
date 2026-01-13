@@ -299,12 +299,29 @@ def run_benchmark(
     log.info("benchmark.start", run_id=run_id, model_type=model_type, symbol=symbol)
     
     # Load data
+    from ghtrader.features import read_features_manifest
+
     features_df = read_features_for_symbol(data_dir, symbol)
     labels_df = read_labels_for_symbol(data_dir, symbol)
     
     df = features_df.merge(labels_df[["datetime", f"label_{horizon}"]], on="datetime")
     
-    feature_cols = [c for c in features_df.columns if c not in ["symbol", "datetime"]]
+    manifest = read_features_manifest(data_dir, symbol)
+    feature_cols = list(manifest.get("enabled_factors") or [])
+    if feature_cols:
+        feature_cols = [c for c in feature_cols if c in features_df.columns]
+    else:
+        exclude = {"symbol", "datetime", "underlying_contract", "segment_id"}
+        feature_cols = [c for c in features_df.columns if c not in exclude]
+
+    seg_all: np.ndarray | None = None
+    if "segment_id" in df.columns:
+        try:
+            seg_all = pd.to_numeric(df["segment_id"], errors="coerce").fillna(-1).astype("int64").values
+            if len(seg_all) > 0 and int(seg_all.min()) == int(seg_all.max()):
+                seg_all = None
+        except Exception:
+            seg_all = None
     X = df[feature_cols].values
     y = df[f"label_{horizon}"].values
     
@@ -327,6 +344,8 @@ def run_benchmark(
         y_train = y[split.train_start_idx:split.train_end_idx]
         X_test = X[split.test_start_idx:split.test_end_idx]
         y_test = y[split.test_start_idx:split.test_end_idx]
+        seg_train = seg_all[split.train_start_idx:split.train_end_idx] if seg_all is not None else None
+        seg_test = seg_all[split.test_start_idx:split.test_end_idx] if seg_all is not None else None
 
         log.info(
             "benchmark.split",
@@ -339,13 +358,13 @@ def run_benchmark(
 
         t0 = time.time()
         if model_type in ["deeplob", "transformer", "tcn", "tlob", "ssm"]:
-            model.fit(X_train, y_train, epochs=30, batch_size=256)
+            model.fit(X_train, y_train, epochs=30, batch_size=256, segment_id=seg_train)
         else:
-            model.fit(X_train, y_train)
+            model.fit(X_train, y_train, segment_id=seg_train)
         train_time = time.time() - t0
 
         # Predict on test set
-        y_probs = model.predict_proba(X_test)
+        y_probs = model.predict_proba(X_test, segment_id=seg_test)
 
         # Align outputs for sequence models (pad/trim)
         if y_probs.shape[0] < X_test.shape[0]:

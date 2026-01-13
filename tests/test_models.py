@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 import ghtrader.distributed as distu
-from ghtrader.models import DeepLOBModel, TCNModel, TLOBModel, SSMModel, create_model
+from ghtrader.models import DeepLOBModel, TCNModel, TLOBModel, SSMModel, TickSequenceDataset, create_model
 
 
 class TestModelFactory:
@@ -33,6 +33,27 @@ def test_fit_predict_smoke(model_cls):
 
     probs = m.predict_proba(X)
     assert probs.shape[0] == n
+
+
+def test_tick_sequence_dataset_excludes_cross_segment_windows():
+    n = 50
+    seq_len = 10
+    n_features = 3
+
+    X = np.random.randn(n, n_features).astype("float32")
+    y = np.random.randint(0, 3, size=n).astype("float32")
+
+    seg = np.zeros(n, dtype="int64")
+    seg[25:] = 1  # segment boundary at index 25
+
+    ds_no_seg = TickSequenceDataset(X, y, seq_len=seq_len)
+    assert len(ds_no_seg) == (n - seq_len)
+
+    ds_seg = TickSequenceDataset(X, y, seq_len=seq_len, segment_id=seg)
+    # Valid indices are:
+    # - segment 0: i in [seq_len, 24]
+    # - segment 1: i in [25+seq_len, n-1]
+    assert len(ds_seg) == 30
 
 
 class TestDeepLOBModel:

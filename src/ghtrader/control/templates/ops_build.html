@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block content %}
+  <h2>Build</h2>
+
+  <div class="card">
+    <h3>build (labels + features)</h3>
+    <form class="form" method="post" action="/ops/build/build{{ token_qs }}">
+      <div class="grid3">
+        <div><label>Symbol</label><input name="symbol" placeholder="SHFE.cu2602"/></div>
+        <div><label>Horizons (comma)</label><input name="horizons" value="10,50,200"/></div>
+        <div><label>Threshold k</label><input name="threshold_k" value="1"/></div>
+      </div>
+      <div class="grid3">
+        <div><label>Ticks lake</label>
+          <select name="ticks_lake"><option value="raw" selected>raw</option><option value="main_l5">main_l5</option></select>
+        </div>
+        <div><label>Overwrite</label>
+          <select name="overwrite"><option value="false" selected>false</option><option value="true">true</option></select>
+        </div>
+        <div><label>Lake version</label>
+          <select name="lake_version"><option value="v1" selected>v1</option><option value="v2">v2</option></select>
+        </div>
+      </div>
+      <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+      <button type="submit">Start build</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>main-schedule</h3>
+    <form class="form" method="post" action="/ops/build/main_schedule{{ token_qs }}">
+      <div class="grid3">
+        <div><label>Var</label><input name="variety" value="cu"/></div>
+        <div><label>Start (YYYY-MM-DD)</label><input name="start_date"/></div>
+        <div><label>End (YYYY-MM-DD)</label><input name="end_date"/></div>
+      </div>
+      <div class="grid3">
+        <div><label>Threshold</label><input name="threshold" value="1.1"/></div>
+        <div><label>Refresh akshare</label>
+          <select name="refresh_akshare"><option value="false" selected>false</option><option value="true">true</option></select>
+        </div>
+        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+      </div>
+      <button type="submit">Build schedule</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>main-depth</h3>
+    <form class="form" method="post" action="/ops/build/main_depth{{ token_qs }}">
+      <div class="grid2">
+        <div><label>Derived symbol</label><input name="derived_symbol" value="KQ.m@SHFE.cu"/></div>
+        <div><label>Schedule path</label><input name="schedule_path" placeholder="data/rolls/shfe_main_schedule/var=cu/schedule.parquet"/></div>
+      </div>
+      <div class="grid3">
+        <div><label>Overwrite</label>
+          <select name="overwrite"><option value="false" selected>false</option><option value="true">true</option></select>
+        </div>
+        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+        <div><label>Lake version</label>
+          <select name="lake_version"><option value="v1" selected>v1</option><option value="v2">v2</option></select>
+        </div>
+      </div>
+      <button type="submit">Materialize main-with-depth</button>
+    </form>
+  </div>
+{% endblock %}
+

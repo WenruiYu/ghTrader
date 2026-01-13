@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% block content %}
+  <h2>Jobs</h2>
+
+  <div class="card">
+    <h3>Start a job</h3>
+    <p class="muted">Jobs run as subprocesses and stream logs to <span class="mono">runs/control/logs/</span>.</p>
+
+    <form class="form" method="post" action="/jobs/start{{ token_qs }}">
+      <label>Job type</label>
+      <select name="job_type">
+        <option value="download_contract_range">download-contract-range</option>
+        <option value="build">build (labels+features)</option>
+        <option value="train">train</option>
+        <option value="benchmark">benchmark</option>
+        <option value="main_schedule">main-schedule (roll schedule)</option>
+        <option value="main_depth">main-depth (materialize)</option>
+      </select>
+
+      <div class="grid2">
+        <div>
+          <label>Symbol / Variety</label>
+          <input name="symbol_or_var" placeholder="e.g. SHFE.cu2602 or cu"/>
+        </div>
+        <div>
+          <label>Data dir</label>
+          <input name="data_dir" value="data"/>
+        </div>
+      </div>
+
+      <div class="grid3">
+        <div>
+          <label>Start contract (YYMM)</label>
+          <input name="start_contract" value="1601"/>
+        </div>
+        <div>
+          <label>End contract</label>
+          <input name="end_contract" value="auto"/>
+        </div>
+        <div>
+          <label>Chunk days</label>
+          <input name="chunk_days" value="5"/>
+        </div>
+      </div>
+
+      <div class="grid3">
+        <div>
+          <label>Model</label>
+          <input name="model" value="xgboost"/>
+        </div>
+        <div>
+          <label>Horizon</label>
+          <input name="horizon" value="50"/>
+        </div>
+        <div>
+          <label>Artifacts dir</label>
+          <input name="artifacts_dir" value="artifacts"/>
+        </div>
+      </div>
+
+      <div class="grid3">
+        <div>
+          <label>Start date</label>
+          <input name="start_date" placeholder="YYYY-MM-DD"/>
+        </div>
+        <div>
+          <label>End date</label>
+          <input name="end_date" placeholder="YYYY-MM-DD"/>
+        </div>
+        <div>
+          <label>Threshold</label>
+          <input name="threshold" value="1.1"/>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div>
+          <label>Derived symbol</label>
+          <input name="derived_symbol" value="KQ.m@SHFE.cu"/>
+        </div>
+        <div>
+          <label>Schedule path</label>
+          <input name="schedule_path" placeholder="data/rolls/shfe_main_schedule/var=cu/schedule.parquet"/>
+        </div>
+      </div>
+
+      <button type="submit">Start</button>
+    </form>
+  </div>
+
+  <h3>Recent jobs</h3>
+  <table class="table">
+    <thead>
+      <tr>
+        <th>ID</th><th>Status</th><th>Source</th><th>Title</th><th>Locks</th><th>PID</th><th>Exit</th><th>Created</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for j in jobs %}
+      <tr>
+        <td class="mono">{{ j.id }}</td>
+        <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
+        <td class="mono">{{ j.source or "" }}</td>
+        <td>{{ j.title }}</td>
+        <td class="mono">
+          {% if j.held_locks %}
+            held: {{ j.held_locks | join(",") }}
+          {% elif j.waiting_locks %}
+            waiting: {{ j.waiting_locks | join(",") }}
+          {% else %}
+          {% endif %}
+        </td>
+        <td class="mono">{{ j.pid or "" }}</td>
+        <td class="mono">{{ j.exit_code if j.exit_code is not none else "" }}</td>
+        <td class="mono">{{ j.created_at }}</td>
+        <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}
+

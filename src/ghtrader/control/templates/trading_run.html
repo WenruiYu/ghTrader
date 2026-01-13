@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+  <h2>Trading run {{ run_id }}</h2>
+
+  <div class="card">
+    <div><b>Root:</b> <span class="mono">{{ root }}</span></div>
+    <div><b>Config:</b> <span class="mono">{{ config_path }}</span></div>
+    <div><b>Snapshots:</b> <span class="mono">{{ snapshots_path }}</span></div>
+    <div><b>Events:</b> <span class="mono">{{ events_path }}</span></div>
+  </div>
+
+  <h3>Last snapshot</h3>
+  <pre class="log">{{ last_snapshot }}</pre>
+{% endblock %}
+

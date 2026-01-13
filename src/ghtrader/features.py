@@ -23,7 +23,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import structlog
 
-from ghtrader.lake import list_available_dates, read_ticks_for_symbol
+from ghtrader.lake import LakeVersion, TicksLake, list_available_dates, list_available_dates_in_lake, read_ticks_for_symbol, ticks_symbol_dir
 
 log = structlog.get_logger()
 
@@ -405,7 +405,15 @@ class FactorEngine:
         for name in self._instances:
             self._states[name] = self._instances[name].init_state()
     
-    def build_features_for_symbol(self, symbol: str, data_dir: Path) -> Path:
+    def build_features_for_symbol(
+        self,
+        symbol: str,
+        data_dir: Path,
+        *,
+        ticks_lake: TicksLake = "raw",
+        overwrite: bool = False,
+        lake_version: LakeVersion = "v1",
+    ) -> Path:
         """
         Build features for a symbol from Parquet lake.
         
@@ -419,13 +427,13 @@ class FactorEngine:
         log.info("features.build_start", symbol=symbol, factors=self.enabled_factors)
 
         # Discover available tick partitions
-        dates = list_available_dates(data_dir, symbol)
+        dates = list_available_dates_in_lake(data_dir, symbol, ticks_lake=ticks_lake, lake_version=lake_version)
         if not dates:
             raise ValueError(f"No tick data found for {symbol}")
 
-        # Overwrite derived features for idempotency
+        # Output root
         out_root = data_dir / "features" / f"symbol={symbol}"
-        if out_root.exists():
+        if overwrite and out_root.exists():
             shutil.rmtree(out_root)
         out_root.mkdir(parents=True, exist_ok=True)
 
@@ -436,18 +444,162 @@ class FactorEngine:
             lookback = max(lookback, int(getattr(f, "window_size", 0) or 0))
 
         # Canonical schema for partitions
-        schema = pa.schema(
-            [("symbol", pa.string()), ("datetime", pa.int64())]
-            + [(name, pa.float64()) for name in self.enabled_factors]
-        )
+        schema_fields: list[pa.Field] = [pa.field("symbol", pa.string()), pa.field("datetime", pa.int64())]
+        if ticks_lake == "main_l5":
+            schema_fields += [pa.field("underlying_contract", pa.string()), pa.field("segment_id", pa.int64())]
+        schema_fields += [pa.field(name, pa.float64()) for name in self.enabled_factors]
+        schema = pa.schema(schema_fields)
 
-        tail_ticks: pd.DataFrame | None = None
-        total_rows = 0
+        # Manifest safety gate: do not mix outputs across config/schema changes unless overwrite is explicit.
+        if not overwrite:
+            manifest_path = out_root / "manifest.json"
+            if manifest_path.exists():
+                try:
+                    import hashlib
+                    import json
 
-        for dt in dates:
-            df_day = read_ticks_for_symbol(data_dir, symbol, start_date=dt, end_date=dt)
+                    cols_str = ",".join(f"{f.name}:{f.type}" for f in schema)
+                    expected_schema_hash = hashlib.sha256(cols_str.encode()).hexdigest()[:16]
+                    existing = json.loads(manifest_path.read_text())
+                    if str(existing.get("dataset")) != "features":
+                        raise ValueError("dataset mismatch")
+                    if str(existing.get("symbol")) != str(symbol):
+                        raise ValueError("symbol mismatch")
+                    if str(existing.get("ticks_lake")) != str(ticks_lake):
+                        raise ValueError("ticks_lake mismatch")
+                    if str(existing.get("lake_version") or "v1") != str(lake_version):
+                        raise ValueError("lake_version mismatch")
+                    if list(existing.get("enabled_factors") or []) != list(self.enabled_factors):
+                        raise ValueError("enabled_factors mismatch")
+                    if str(existing.get("schema_hash") or "") != expected_schema_hash:
+                        raise ValueError("schema_hash mismatch")
+                except Exception as e:
+                    raise ValueError(
+                        f"Existing features manifest does not match requested build ({e}). "
+                        f"Refusing to mix outputs. Re-run with overwrite=True to rebuild."
+                    )
+
+        # Determine which dates need work (incremental default).
+        existing_dates: set[date] = set()
+        for ddir in out_root.iterdir():
+            if not ddir.is_dir() or not ddir.name.startswith("date="):
+                continue
+            try:
+                dt = date.fromisoformat(ddir.name.split("=", 1)[1])
+            except Exception:
+                continue
+            # consider built if any parquet exists
+            if any(ddir.glob("*.parquet")):
+                existing_dates.add(dt)
+
+        missing_dates = [d for d in dates if d not in existing_dates]
+
+        dates_to_process: set[date] = set()
+        if overwrite:
+            dates_to_process = set(dates)
+        else:
+            # Backfill guard: if a day is missing, also recompute the next available tick day.
+            idx = {d: i for i, d in enumerate(dates)}
+            for d in missing_dates:
+                dates_to_process.add(d)
+                j = idx.get(d)
+                if j is not None and j + 1 < len(dates):
+                    dates_to_process.add(dates[j + 1])
+
+        # For derived ticks, reset rolling continuity on roll boundaries.
+
+        # For derived ticks, reset rolling continuity on roll boundaries.
+        underlying_by_date: dict[date, str] = {}
+        segment_id_by_date: dict[date, int] = {}
+        if ticks_lake == "main_l5":
+            try:
+                schedule_path = ticks_symbol_dir(
+                    data_dir,
+                    symbol,
+                    ticks_lake="main_l5",
+                    lake_version=lake_version,
+                ) / "schedule.parquet"
+                if schedule_path.exists():
+                    sched = pd.read_parquet(schedule_path)
+                    if "date" in sched.columns and "main_contract" in sched.columns:
+                        sched = sched.copy()
+                        sched["date"] = pd.to_datetime(sched["date"], errors="coerce").dt.date
+                        sched = sched.dropna(subset=["date", "main_contract"])
+                        # Ensure segment_id exists for schedule copy (older versions may not include it).
+                        if "segment_id" not in sched.columns:
+                            seg_ids: list[int] = []
+                            seg = 0
+                            prev: str | None = None
+                            for mc in sched["main_contract"].astype(str).tolist():
+                                if prev is None:
+                                    seg = 0
+                                elif mc != prev:
+                                    seg += 1
+                                seg_ids.append(int(seg))
+                                prev = mc
+                            sched["segment_id"] = seg_ids
+
+                        for _, r in sched.iterrows():
+                            d = r["date"]
+                            underlying_by_date[d] = str(r["main_contract"])
+                            try:
+                                segment_id_by_date[d] = int(r.get("segment_id", 0) or 0)
+                            except Exception:
+                                segment_id_by_date[d] = 0
+            except Exception as e:
+                log.warning("features.schedule_load_failed", symbol=symbol, error=str(e))
+
+        # Process only dates that require work.
+        idx = {d: i for i, d in enumerate(dates)}
+        for dt in sorted(dates_to_process):
+            df_day = read_ticks_for_symbol(
+                data_dir,
+                symbol,
+                start_date=dt,
+                end_date=dt,
+                ticks_lake=ticks_lake,
+                lake_version=lake_version,
+            )
             if df_day.empty:
                 continue
+
+            # Build tail from previous available tick day (lookback only).
+            tail_ticks: pd.DataFrame | None = None
+            if lookback > 0:
+                i = idx.get(dt)
+                if i is not None and i - 1 >= 0:
+                    prev_dt = dates[i - 1]
+                    if ticks_lake == "main_l5":
+                        seg_prev = segment_id_by_date.get(prev_dt)
+                        seg_cur = segment_id_by_date.get(dt)
+                        allow = (seg_prev is not None and seg_cur is not None and seg_prev == seg_cur)
+                        if not allow:
+                            u_prev = underlying_by_date.get(prev_dt)
+                            u_cur = underlying_by_date.get(dt)
+                            allow = bool(u_prev and u_cur and u_prev == u_cur)
+
+                        if allow:
+                            df_prev = read_ticks_for_symbol(
+                                data_dir,
+                                symbol,
+                                start_date=prev_dt,
+                                end_date=prev_dt,
+                                ticks_lake=ticks_lake,
+                                lake_version=lake_version,
+                            )
+                            if not df_prev.empty:
+                                tail_ticks = df_prev.tail(lookback).copy()
+                    else:
+                        df_prev = read_ticks_for_symbol(
+                            data_dir,
+                            symbol,
+                            start_date=prev_dt,
+                            end_date=prev_dt,
+                            ticks_lake=ticks_lake,
+                            lake_version=lake_version,
+                        )
+                        if not df_prev.empty:
+                            tail_ticks = df_prev.tail(lookback).copy()
 
             if tail_ticks is not None and not tail_ticks.empty:
                 df_in = pd.concat([tail_ticks, df_day], ignore_index=True)
@@ -459,29 +611,80 @@ class FactorEngine:
             features_in = self.compute_batch(df_in)
             features_day = features_in.iloc[tail_len:].reset_index(drop=True)
 
-            # Add datetime and symbol for current day rows
             features_day["datetime"] = df_day["datetime"].values
             features_day["symbol"] = symbol
+            if ticks_lake == "main_l5":
+                u = underlying_by_date.get(dt) or ""
+                seg_id = int(segment_id_by_date.get(dt, 0) or 0)
+                features_day["underlying_contract"] = u
+                features_day["segment_id"] = int(seg_id)
 
-            cols = ["symbol", "datetime"] + self.enabled_factors
+            cols = ["symbol", "datetime"]
+            if ticks_lake == "main_l5":
+                cols += ["underlying_contract", "segment_id"]
+            cols += self.enabled_factors
             features_day = features_day[cols]
 
-            # Write one partition file per date
-            part_id = uuid.uuid4().hex[:8]
             out_dir = out_root / f"date={dt.isoformat()}"
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"part-{part_id}.parquet"
 
+            # Deterministic per-date output name; remove any previous parquet(s) for this date.
+            for p in out_dir.glob("*.parquet*"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+
+            out_path = out_dir / "part.parquet"
+            tmp_path = out_dir / "part.parquet.tmp"
             table = pa.Table.from_pandas(features_day, schema=schema, preserve_index=False)
-            pq.write_table(table, out_path, compression="zstd")
+            pq.write_table(table, tmp_path, compression="zstd")
+            tmp_path.replace(out_path)
+            try:
+                from ghtrader.integrity import write_sha256_sidecar
 
-            total_rows += len(features_day)
+                write_sha256_sidecar(out_path)
+            except Exception as e:
+                log.warning("features.checksum_failed", path=str(out_path), error=str(e))
 
-            # Update tail buffer for next day
-            if lookback > 0:
-                tail_ticks = df_in.tail(lookback).copy()
-            else:
-                tail_ticks = None
+        # Rebuild symbol-level manifest from on-disk partitions (covers incremental runs).
+        total_rows = 0
+        row_counts: dict[str, int] = {}
+        files: list[dict[str, Any]] = []
+        try:
+            import hashlib
+
+            from ghtrader.integrity import now_utc_iso, parquet_num_rows, read_sha256_sidecar, write_json_atomic
+
+            for ddir in sorted([p for p in out_root.iterdir() if p.is_dir() and p.name.startswith("date=")], key=lambda p: p.name):
+                dt_s = ddir.name.split("=", 1)[1]
+                pq_files = sorted(ddir.glob("*.parquet"))
+                if not pq_files:
+                    continue
+                p = pq_files[0]  # should be part.parquet
+                rows = parquet_num_rows(p)
+                sha = read_sha256_sidecar(p) or ""
+                row_counts[dt_s] = int(rows)
+                total_rows += int(rows)
+                files.append({"date": dt_s, "file": f"{ddir.name}/{p.name}", "rows": int(rows), "sha256": sha})
+
+            cols_str = ",".join(f"{f.name}:{f.type}" for f in schema)
+            schema_hash = hashlib.sha256(cols_str.encode()).hexdigest()[:16]
+            manifest = {
+                "created_at": now_utc_iso(),
+                "dataset": "features",
+                "symbol": symbol,
+                "ticks_lake": ticks_lake,
+                "lake_version": lake_version,
+                "enabled_factors": list(self.enabled_factors),
+                "schema_hash": schema_hash,
+                "rows_total": int(total_rows),
+                "row_counts": row_counts,
+                "files": files,
+            }
+            write_json_atomic(out_root / "manifest.json", manifest)
+        except Exception as e:
+            log.warning("features.manifest_failed", symbol=symbol, error=str(e))
 
         log.info("features.build_done", symbol=symbol, rows=total_rows, root=str(out_root))
         return out_root
@@ -519,3 +722,21 @@ def read_features_for_symbol(data_dir: Path, symbol: str) -> pd.DataFrame:
     combined = pa.concat_tables(tables)
     df = combined.to_pandas()
     return df.sort_values("datetime").reset_index(drop=True)
+
+
+def read_features_manifest(data_dir: Path, symbol: str) -> dict[str, Any]:
+    """
+    Read the features manifest for a symbol (if present).
+
+    This is the canonical source of truth for which factor columns are model inputs
+    (see `enabled_factors`).
+    """
+    p = data_dir / "features" / f"symbol={symbol}" / "manifest.json"
+    if not p.exists():
+        return {}
+    try:
+        import json
+
+        return dict(json.loads(p.read_text()))
+    except Exception:
+        return {}

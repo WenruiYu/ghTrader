@@ -126,3 +126,49 @@ def synthetic_lake(synthetic_data_dir: Path, small_synthetic_tick_df: pd.DataFra
 
     return data_dir, symbol, [d0, d1]
 
+
+@pytest.fixture()
+def synthetic_lake_two_symbols(
+    synthetic_data_dir: Path, small_synthetic_tick_df: pd.DataFrame
+) -> tuple[Path, tuple[str, str], list[date]]:
+    """
+    Create a tiny Parquet lake with 2 day partitions for two different symbols,
+    so we can test roll-boundary behavior.
+    """
+    sym_a = "SHFE.cu2501"
+    sym_b = "SHFE.cu2502"
+    d0 = date(2025, 1, 1)
+    d1 = date(2025, 1, 2)
+    data_dir = synthetic_data_dir
+
+    # Day 1 for symbol A
+    df0a = small_synthetic_tick_df.copy()
+    df0a["symbol"] = sym_a
+    write_ticks_partition(df0a, data_dir=data_dir, symbol=sym_a, dt=d0, part_id="a-d0")
+
+    # Day 2 for symbol A (so we can test a no-roll schedule A->A)
+    df1a = small_synthetic_tick_df.copy()
+    df1a["symbol"] = sym_a
+    df1a["datetime"] = df1a["datetime"].astype("int64") + 10_000_000_000  # shift 10s
+    offset_a = np.sin(np.linspace(0, 4 * np.pi, len(df1a))) * 20.0
+    for lvl in range(1, 6):
+        df1a[f"bid_price{lvl}"] = df1a[f"bid_price{lvl}"] + offset_a
+        df1a[f"ask_price{lvl}"] = df1a[f"ask_price{lvl}"] + offset_a
+    for col in ["last_price", "average", "highest", "lowest"]:
+        df1a[col] = df1a[col] + offset_a
+    write_ticks_partition(df1a, data_dir=data_dir, symbol=sym_a, dt=d1, part_id="a-d1")
+
+    # Day 2 for symbol B (different underlying) so we can test a roll A->B
+    df1b = small_synthetic_tick_df.copy()
+    df1b["symbol"] = sym_b
+    df1b["datetime"] = df1b["datetime"].astype("int64") + 10_000_000_000  # shift 10s
+    offset = np.sin(np.linspace(0, 4 * np.pi, len(df1b))) * 20.0
+    for lvl in range(1, 6):
+        df1b[f"bid_price{lvl}"] = df1b[f"bid_price{lvl}"] + offset
+        df1b[f"ask_price{lvl}"] = df1b[f"ask_price{lvl}"] + offset
+    for col in ["last_price", "average", "highest", "lowest"]:
+        df1b[col] = df1b[col] + offset
+    write_ticks_partition(df1b, data_dir=data_dir, symbol=sym_b, dt=d1, part_id="b-d1")
+
+    return data_dir, (sym_a, sym_b), [d0, d1]
+

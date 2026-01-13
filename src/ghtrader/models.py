@@ -45,7 +45,7 @@ class BaseModel(ABC):
         pass
     
     @abstractmethod
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         """Predict class probabilities. Shape: (n_samples, n_classes)."""
         pass
     
@@ -91,7 +91,7 @@ class LogisticModel(BaseModel):
         self.model.fit(X_scaled, y_clean)
         log.info("logistic.fit_done", n_samples=len(y_clean))
     
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         X_scaled = self.scaler.transform(X)
         return self.model.predict_proba(X_scaled)
     
@@ -149,7 +149,7 @@ class LightGBMModel(BaseModel):
         )
         log.info("lightgbm.fit_done", n_samples=len(y_clean), n_rounds=n_rounds)
     
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("Model not fitted")
         return self.model.predict(X)
@@ -200,7 +200,7 @@ class XGBoostModel(BaseModel):
         self.model = xgb.train(self.params, dtrain, num_boost_round=n_rounds)
         log.info("xgboost.fit_done", n_samples=len(y_clean), n_rounds=n_rounds)
     
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         import xgboost as xgb
         if self.model is None:
             raise RuntimeError("Model not fitted")
@@ -231,6 +231,8 @@ class TickSequenceDataset(Dataset):
         features: np.ndarray,
         labels: np.ndarray,
         seq_len: int = 100,
+        *,
+        segment_id: np.ndarray | None = None,
     ) -> None:
         """
         Args:
@@ -241,11 +243,19 @@ class TickSequenceDataset(Dataset):
         self.features = features
         self.labels = labels
         self.seq_len = seq_len
+        self.segment_id = segment_id
         
         # Valid indices: need seq_len history and valid label
         self.valid_indices = []
         for i in range(seq_len, len(features)):
             if not np.isnan(labels[i]).any():
+                if self.segment_id is not None:
+                    # Enforce "no cross-segment" windows: the whole history window and the
+                    # label index must share the same segment id.
+                    s = self.segment_id[i]
+                    window = self.segment_id[i - seq_len : i + 1]
+                    if not np.all(window == s):
+                        continue
                 self.valid_indices.append(i)
     
     def __len__(self) -> int:
@@ -398,7 +408,8 @@ class DeepLOBModel(BaseModel):
         X_scaled = self.scaler.fit_transform(X)
 
         # Create dataset + sampler
-        dataset = TickSequenceDataset(X_scaled, y, self.seq_len)
+        seg = kwargs.pop("segment_id", None)
+        dataset = TickSequenceDataset(X_scaled, y, self.seq_len, segment_id=seg)
         sampler = None
         if ddp_active:
             from torch.utils.data.distributed import DistributedSampler
@@ -486,27 +497,42 @@ class DeepLOBModel(BaseModel):
         if ddp_active:
             distu.barrier()
     
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("Model not fitted")
         
         X_scaled = self.scaler.transform(X)
-        
-        # Create sequences
-        results = []
+
+        seg = kwargs.get("segment_id", None)
+        seg_arr: np.ndarray | None = None
+        if seg is not None:
+            try:
+                seg_arr = np.asarray(seg)
+                if len(seg_arr) != len(X_scaled):
+                    seg_arr = None
+            except Exception:
+                seg_arr = None
+
+        out = np.full((len(X_scaled), self.n_classes), np.nan, dtype=float)
         self.model.eval()
         with torch.no_grad():
             for i in range(self.seq_len, len(X_scaled)):
+                if seg_arr is not None:
+                    s = seg_arr[i]
+                    if not np.all(seg_arr[i - self.seq_len : i + 1] == s):
+                        continue
+
                 seq = X_scaled[i - self.seq_len : i]
                 seq = np.nan_to_num(seq, nan=0.0)
                 seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
                 outputs = self.model(seq_tensor)
                 probs = F.softmax(outputs, dim=-1).cpu().numpy()
-                results.append(probs[0])
-        
-        # Pad beginning with NaN
-        pad = np.full((self.seq_len, self.n_classes), np.nan)
-        return np.vstack([pad, np.array(results)])
+                p0 = probs[0]
+                if getattr(p0, "ndim", 1) == 2:
+                    p0 = p0[0]
+                out[i] = p0
+
+        return out
     
     def save(self, path: Path) -> None:
         if self.model is None:
@@ -667,7 +693,8 @@ class TransformerModel(BaseModel):
         # Scale features
         X_scaled = self.scaler.fit_transform(X)
 
-        dataset = TickSequenceDataset(X_scaled, y, self.seq_len)
+        seg = kwargs.pop("segment_id", None)
+        dataset = TickSequenceDataset(X_scaled, y, self.seq_len, segment_id=seg)
         sampler = None
         if ddp_active:
             from torch.utils.data.distributed import DistributedSampler
@@ -754,25 +781,42 @@ class TransformerModel(BaseModel):
         if ddp_active:
             distu.barrier()
     
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("Model not fitted")
         
         X_scaled = self.scaler.transform(X)
-        
-        results = []
+
+        seg = kwargs.get("segment_id", None)
+        seg_arr: np.ndarray | None = None
+        if seg is not None:
+            try:
+                seg_arr = np.asarray(seg)
+                if len(seg_arr) != len(X_scaled):
+                    seg_arr = None
+            except Exception:
+                seg_arr = None
+
+        out = np.full((len(X_scaled), self.n_classes), np.nan, dtype=float)
         self.model.eval()
         with torch.no_grad():
             for i in range(self.seq_len, len(X_scaled)):
+                if seg_arr is not None:
+                    s = seg_arr[i]
+                    if not np.all(seg_arr[i - self.seq_len : i + 1] == s):
+                        continue
+
                 seq = X_scaled[i - self.seq_len : i]
                 seq = np.nan_to_num(seq, nan=0.0)
                 seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
                 outputs = self.model(seq_tensor)
                 probs = F.softmax(outputs, dim=-1).cpu().numpy()
-                results.append(probs[0])
-        
-        pad = np.full((self.seq_len, self.n_classes), np.nan)
-        return np.vstack([pad, np.array(results)])
+                p0 = probs[0]
+                if getattr(p0, "ndim", 1) == 2:
+                    p0 = p0[0]
+                out[i] = p0
+
+        return out
     
     def save(self, path: Path) -> None:
         if self.model is None:
@@ -979,7 +1023,8 @@ class TCNModel(BaseModel):
 
         X_scaled = self.scaler.fit_transform(X)
 
-        dataset = TickSequenceDataset(X_scaled, y, self.seq_len)
+        seg = kwargs.pop("segment_id", None)
+        dataset = TickSequenceDataset(X_scaled, y, self.seq_len, segment_id=seg)
         sampler = None
         if ddp_active:
             from torch.utils.data.distributed import DistributedSampler
@@ -1065,25 +1110,42 @@ class TCNModel(BaseModel):
         if ddp_active:
             distu.barrier()
     
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("Model not fitted")
         
         X_scaled = self.scaler.transform(X)
-        
-        results = []
+
+        seg = kwargs.get("segment_id", None)
+        seg_arr: np.ndarray | None = None
+        if seg is not None:
+            try:
+                seg_arr = np.asarray(seg)
+                if len(seg_arr) != len(X_scaled):
+                    seg_arr = None
+            except Exception:
+                seg_arr = None
+
+        out = np.full((len(X_scaled), self.n_classes), np.nan, dtype=float)
         self.model.eval()
         with torch.no_grad():
             for i in range(self.seq_len, len(X_scaled)):
+                if seg_arr is not None:
+                    s = seg_arr[i]
+                    if not np.all(seg_arr[i - self.seq_len : i + 1] == s):
+                        continue
+
                 seq = X_scaled[i - self.seq_len : i]
                 seq = np.nan_to_num(seq, nan=0.0)
                 seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
                 outputs = self.model(seq_tensor)
                 probs = F.softmax(outputs, dim=-1).cpu().numpy()
-                results.append(probs[0])
-        
-        pad = np.full((self.seq_len, self.n_classes), np.nan)
-        return np.vstack([pad, np.array(results)])
+                p0 = probs[0]
+                if getattr(p0, "ndim", 1) == 2:
+                    p0 = p0[0]
+                out[i] = p0
+
+        return out
     
     def save(self, path: Path) -> None:
         if self.model is None:
@@ -1295,7 +1357,8 @@ class TLOBModel(BaseModel):
 
         X_scaled = self.scaler.fit_transform(X)
 
-        dataset = TickSequenceDataset(X_scaled, y, self.seq_len)
+        seg = kwargs.pop("segment_id", None)
+        dataset = TickSequenceDataset(X_scaled, y, self.seq_len, segment_id=seg)
         sampler = None
         if ddp_active:
             from torch.utils.data.distributed import DistributedSampler
@@ -1382,25 +1445,42 @@ class TLOBModel(BaseModel):
         if ddp_active:
             distu.barrier()
     
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("Model not fitted")
         
         X_scaled = self.scaler.transform(X)
-        
-        results = []
+
+        seg = kwargs.get("segment_id", None)
+        seg_arr: np.ndarray | None = None
+        if seg is not None:
+            try:
+                seg_arr = np.asarray(seg)
+                if len(seg_arr) != len(X_scaled):
+                    seg_arr = None
+            except Exception:
+                seg_arr = None
+
+        out = np.full((len(X_scaled), self.n_classes), np.nan, dtype=float)
         self.model.eval()
         with torch.no_grad():
             for i in range(self.seq_len, len(X_scaled)):
+                if seg_arr is not None:
+                    s = seg_arr[i]
+                    if not np.all(seg_arr[i - self.seq_len : i + 1] == s):
+                        continue
+
                 seq = X_scaled[i - self.seq_len : i]
                 seq = np.nan_to_num(seq, nan=0.0)
                 seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
                 outputs = self.model(seq_tensor)
                 probs = F.softmax(outputs, dim=-1).cpu().numpy()
-                results.append(probs[0])
-        
-        pad = np.full((self.seq_len, self.n_classes), np.nan)
-        return np.vstack([pad, np.array(results)])
+                p0 = probs[0]
+                if getattr(p0, "ndim", 1) == 2:
+                    p0 = p0[0]
+                out[i] = p0
+
+        return out
     
     def save(self, path: Path) -> None:
         if self.model is None:
@@ -1608,7 +1688,8 @@ class SSMModel(BaseModel):
 
         X_scaled = self.scaler.fit_transform(X)
 
-        dataset = TickSequenceDataset(X_scaled, y, self.seq_len)
+        seg = kwargs.pop("segment_id", None)
+        dataset = TickSequenceDataset(X_scaled, y, self.seq_len, segment_id=seg)
         sampler = None
         if ddp_active:
             from torch.utils.data.distributed import DistributedSampler
@@ -1695,25 +1776,42 @@ class SSMModel(BaseModel):
         if ddp_active:
             distu.barrier()
     
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("Model not fitted")
         
         X_scaled = self.scaler.transform(X)
-        
-        results = []
+
+        seg = kwargs.get("segment_id", None)
+        seg_arr: np.ndarray | None = None
+        if seg is not None:
+            try:
+                seg_arr = np.asarray(seg)
+                if len(seg_arr) != len(X_scaled):
+                    seg_arr = None
+            except Exception:
+                seg_arr = None
+
+        out = np.full((len(X_scaled), self.n_classes), np.nan, dtype=float)
         self.model.eval()
         with torch.no_grad():
             for i in range(self.seq_len, len(X_scaled)):
+                if seg_arr is not None:
+                    s = seg_arr[i]
+                    if not np.all(seg_arr[i - self.seq_len : i + 1] == s):
+                        continue
+
                 seq = X_scaled[i - self.seq_len : i]
                 seq = np.nan_to_num(seq, nan=0.0)
                 seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
                 outputs = self.model(seq_tensor)
                 probs = F.softmax(outputs, dim=-1).cpu().numpy()
-                results.append(probs[0])
-        
-        pad = np.full((self.seq_len, self.n_classes), np.nan)
-        return np.vstack([pad, np.array(results)])
+                p0 = probs[0]
+                if getattr(p0, "ndim", 1) == 2:
+                    p0 = p0[0]
+                out[i] = p0
+
+        return out
     
     def save(self, path: Path) -> None:
         if self.model is None:
@@ -1834,7 +1932,7 @@ def train_model(
     Returns:
         Path to saved model
     """
-    from ghtrader.features import read_features_for_symbol
+    from ghtrader.features import read_features_for_symbol, read_features_manifest
     from ghtrader.labels import read_labels_for_symbol
     
     log.info("train.start", model_type=model_type, symbol=symbol, horizon=horizon)
@@ -1853,7 +1951,24 @@ def train_model(
     df = features_df.merge(labels_df[["datetime", f"label_{horizon}"]], on="datetime")
     
     # Prepare X and y
-    feature_cols = [c for c in features_df.columns if c not in ["symbol", "datetime"]]
+    manifest = read_features_manifest(data_dir, symbol)
+    feature_cols = list(manifest.get("enabled_factors") or [])
+    if feature_cols:
+        # Keep only factors that actually exist on disk (defensive for older caches).
+        feature_cols = [c for c in feature_cols if c in features_df.columns]
+    else:
+        # Legacy fallback: infer from columns, but never treat metadata as features.
+        exclude = {"symbol", "datetime", "underlying_contract", "segment_id"}
+        feature_cols = [c for c in features_df.columns if c not in exclude]
+
+    segment_id: np.ndarray | None = None
+    if "segment_id" in df.columns:
+        try:
+            seg = pd.to_numeric(df["segment_id"], errors="coerce").fillna(-1).astype("int64").values
+            if len(seg) > 0 and int(seg.min()) != int(seg.max()):
+                segment_id = seg
+        except Exception:
+            segment_id = None
     X = df[feature_cols].values
     y = df[f"label_{horizon}"].values
     
@@ -1879,6 +1994,8 @@ def train_model(
         fit_kwargs["batch_size"] = batch_size
     if lr is not None:
         fit_kwargs["lr"] = lr
+    if segment_id is not None:
+        fit_kwargs["segment_id"] = segment_id
 
     model.fit(X, y, **fit_kwargs)
     

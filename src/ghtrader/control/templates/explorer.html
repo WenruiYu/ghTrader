@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block content %}
+  <h2>SQL Explorer (DuckDB)</h2>
+
+  <div class="card">
+    <p class="muted">
+      Read-only SQL over the Parquet lake via DuckDB. Only <span class="mono">SELECT</span>/<span class="mono">WITH</span> is allowed.
+      For best performance, run <span class="mono">ghtrader db init</span> once to materialize views into <span class="mono">data/ghtrader.duckdb</span>.
+    </p>
+
+    {% if error %}
+      <pre class="mono" style="white-space:pre-wrap; color:#b00020;">{{ error }}</pre>
+    {% endif %}
+
+    <form class="form" method="post" action="/explorer{{ token_qs }}">
+      <div>
+        <label>Query</label>
+        <textarea name="query" rows="10" class="mono" style="width:100%;">{{ query or "" }}</textarea>
+      </div>
+      <div class="grid3">
+        <div>
+          <label>Max rows</label>
+          <input name="limit" value="{{ limit or 200 }}"/>
+        </div>
+        <div>
+          <label>Include metrics index (slow)</label>
+          <select name="include_metrics">
+            <option value="false" {% if not include_metrics %}selected{% endif %}>false</option>
+            <option value="true" {% if include_metrics %}selected{% endif %}>true</option>
+          </select>
+        </div>
+        <div style="display:flex; align-items:flex-end;">
+          <button type="submit">Run query</button>
+        </div>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>Available views (if initialized)</h3>
+    <ul>
+      <li><span class="mono">ticks_raw_v1</span>, <span class="mono">ticks_raw_v2</span></li>
+      <li><span class="mono">ticks_main_l5_v1</span>, <span class="mono">ticks_main_l5_v2</span></li>
+      <li><span class="mono">features_all</span>, <span class="mono">labels_all</span></li>
+      <li><span class="mono">run_metrics</span> (if indexed via <span class="mono">ghtrader db ingest-metrics</span>)</li>
+    </ul>
+    <p class="muted">Tip: most views include <span class="mono">hive_symbol</span> and <span class="mono">hive_date</span> extracted from Parquet paths.</p>
+  </div>
+
+  {% if columns and rows %}
+    <div class="card">
+      <h3>Results ({{ rows|length }} rows)</h3>
+      <table class="table">
+        <thead>
+          <tr>
+            {% for c in columns %}
+              <th class="mono">{{ c }}</th>
+            {% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+            <tr>
+              {% for c in columns %}
+                <td class="mono">{{ r.get(c, "") }}</td>
+              {% endfor %}
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+{% endblock %}
+

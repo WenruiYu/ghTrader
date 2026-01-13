@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+  <h2>Overview</h2>
+
+  <div class="grid">
+    <div class="card">
+      <div class="kpiLabel">Running jobs</div>
+      <div class="kpiValue">{{ running_count }}</div>
+    </div>
+    <div class="card">
+      <div class="kpiLabel">Recent jobs</div>
+      <div class="kpiValue">{{ recent_count }}</div>
+    </div>
+  </div>
+
+  <h3>Recent</h3>
+  <table class="table">
+    <thead>
+      <tr>
+        <th>ID</th><th>Status</th><th>Title</th><th>Created</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for j in jobs %}
+      <tr>
+        <td class="mono">{{ j.id }}</td>
+        <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
+        <td>{{ j.title }}</td>
+        <td class="mono">{{ j.created_at }}</td>
+        <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}
+

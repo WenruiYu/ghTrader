@@ -40,3 +40,24 @@ def test_read_with_date_range(synthetic_lake):
     got_dates = list_available_dates(data_dir, symbol)
     assert got_dates == dates
 
+
+def test_read_range_uses_arrow_dataset_path(synthetic_lake):
+    """
+    Ensure the Arrow-first range scan helper returns the same rows as the pandas reader.
+
+    This locks in the new scalable code path used for large ranges.
+    """
+    import pandas as pd
+
+    from ghtrader.lake import read_ticks_for_symbol, read_ticks_for_symbol_arrow
+
+    data_dir, symbol, dates = synthetic_lake
+
+    df = read_ticks_for_symbol(data_dir, symbol, start_date=dates[0], end_date=dates[-1])
+    table = read_ticks_for_symbol_arrow(data_dir, symbol, start_date=dates[0], end_date=dates[-1])
+    df2 = table.to_pandas()
+
+    assert isinstance(df, pd.DataFrame)
+    assert len(df) == len(df2)
+    assert df.sort_values("datetime").reset_index(drop=True)["datetime"].tolist() == df2.sort_values("datetime").reset_index(drop=True)["datetime"].tolist()
+

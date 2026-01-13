@@ -17,6 +17,7 @@ import importlib
 import os
 import re
 import sys
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -126,6 +127,7 @@ def fetch_futures_daily_for_date(
     market: str,
     day: date,
     refresh: bool = False,
+    max_retries: int = 3,
 ) -> pd.DataFrame:
     """
     Fetch exchange daily futures data for a single trading day, with local caching.
@@ -133,6 +135,12 @@ def fetch_futures_daily_for_date(
     Returns a DataFrame with (at least) columns:
       ['symbol','date','open','high','low','close','volume','open_interest','turnover','settle','pre_settle','variety']
     """
+    # Avoid caching non-trading day empties: consult the trading calendar first.
+    from ghtrader.trading_calendar import is_trading_day
+
+    if not is_trading_day(day=day, data_dir=data_dir):
+        return pd.DataFrame(columns=EXPECTED_FUTURES_DAILY_COLUMNS)
+
     cache_path = _cache_path(data_dir, market, day)
     if cache_path.exists() and not refresh:
         return pd.read_parquet(cache_path)
@@ -140,18 +148,37 @@ def fetch_futures_daily_for_date(
     _ensure_akshare_importable()
     from akshare.futures.futures_daily_bar import get_futures_daily  # type: ignore
 
-    try:
-        df = get_futures_daily(
-            start_date=day.strftime("%Y%m%d"),
-            end_date=day.strftime("%Y%m%d"),
-            market=market.upper(),
-        )
-    except Exception as e:
-        # Akshare fetch can occasionally fail due to upstream instability
-        # (e.g. HTML/empty responses causing JSONDecodeError). Treat as empty
-        # for caching purposes so the range scan can continue.
-        log.warning("akshare.daily_fetch_failed", market=market.upper(), day=day.isoformat(), error=str(e))
-        df = pd.DataFrame(columns=EXPECTED_FUTURES_DAILY_COLUMNS)
+    last_err: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            df = get_futures_daily(
+                start_date=day.strftime("%Y%m%d"),
+                end_date=day.strftime("%Y%m%d"),
+                market=market.upper(),
+            )
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            if attempt >= max_retries:
+                break
+            sleep_s = 0.5 * (2**attempt)
+            log.warning(
+                "akshare.daily_fetch_retry",
+                market=market.upper(),
+                day=day.isoformat(),
+                attempt=attempt + 1,
+                max_retries=max_retries,
+                sleep_s=sleep_s,
+                error=str(e),
+            )
+            time.sleep(sleep_s)
+
+    if last_err is not None:
+        # Do not cache failures as empty; surface failure to caller.
+        raise RuntimeError(
+            f"akshare daily fetch failed after retries: market={market.upper()} day={day.isoformat()} err={last_err}"
+        ) from last_err
     if df is None or df.empty:
         # Persist an empty file as a negative cache to avoid repeated calls.
         # Important: Parquet writers require a schema; keep a stable empty schema.
@@ -188,6 +215,45 @@ def fetch_futures_daily_for_date(
     return df
 
 
+def iter_futures_daily_range(
+    *,
+    data_dir: Path,
+    market: str,
+    start: date,
+    end: date,
+    refresh: bool = False,
+    skip_errors: bool = True,
+) -> "object":
+    """
+    Yield per-day futures daily data for trading days only.
+
+    This is used by long-running backfills so we can stream-process and avoid
+    building a huge in-memory DataFrame.
+    """
+    from ghtrader.trading_calendar import get_trading_days
+
+    if end < start:
+        return iter(())
+
+    days = get_trading_days(market=market.upper(), start=start, end=end, data_dir=data_dir, refresh=refresh)
+
+    def _gen():
+        for d in days:
+            try:
+                df_day = fetch_futures_daily_for_date(
+                    data_dir=data_dir, market=market, day=d, refresh=refresh, max_retries=3
+                )
+            except Exception as e:
+                log.warning("akshare.daily_range_failed", market=market.upper(), day=d.isoformat(), error=str(e))
+                if skip_errors:
+                    continue
+                raise
+            if df_day is not None and not df_day.empty:
+                yield df_day
+
+    return _gen()
+
+
 def fetch_futures_daily_range(
     *,
     data_dir: Path,
@@ -205,13 +271,16 @@ def fetch_futures_daily_range(
     if end < start:
         raise ValueError("end must be >= start")
 
-    out: list[pd.DataFrame] = []
-    cur = start
-    while cur <= end:
-        df_day = fetch_futures_daily_for_date(data_dir=data_dir, market=market, day=cur, refresh=refresh)
-        if df_day is not None and not df_day.empty:
-            out.append(df_day)
-        cur = date.fromordinal(cur.toordinal() + 1)
+    out: list[pd.DataFrame] = list(
+        iter_futures_daily_range(
+            data_dir=data_dir,
+            market=market,
+            start=start,
+            end=end,
+            refresh=refresh,
+            skip_errors=True,
+        )
+    )
 
     if not out:
         return pd.DataFrame()

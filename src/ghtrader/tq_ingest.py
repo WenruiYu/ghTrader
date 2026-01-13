@@ -6,22 +6,19 @@ Uses TqSdk Pro (tq_dl) for bulk historical download and get_tick_serial for live
 
 from __future__ import annotations
 
-import sys
+import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 import structlog
 
-# Add vendored tqsdk to path if not installed
-_TQSDK_PATH = Path(__file__).parent.parent.parent.parent / "tqsdk-python"
-if _TQSDK_PATH.exists() and str(_TQSDK_PATH) not in sys.path:
-    sys.path.insert(0, str(_TQSDK_PATH))
-
-from tqsdk import TqApi, BacktestFinished  # noqa: E402
+# tqsdk is optional in unit tests; import only when needed.
+import sys
 
 from ghtrader.config import get_tqsdk_auth  # noqa: E402
 from ghtrader.lake import (  # noqa: E402
+    LakeVersion,
     TICK_COLUMN_NAMES,
     list_available_dates,
     write_manifest,
@@ -35,16 +32,71 @@ log = structlog.get_logger()
 # Historical download
 # ---------------------------------------------------------------------------
 
-def _trading_days_between(start: date, end: date) -> list[date]:
-    """Generate list of dates between start and end (inclusive), skipping weekends."""
-    days: list[date] = []
-    current = start
-    while current <= end:
-        # Skip weekends (Saturday=5, Sunday=6)
-        if current.weekday() < 5:
-            days.append(current)
-        current += timedelta(days=1)
-    return days
+def _infer_market_from_symbol(symbol: str) -> str | None:
+    """
+    Best-effort market inference.
+
+    Examples:
+    - SHFE.cu2602 -> SHFE
+    - KQ.m@SHFE.cu -> SHFE
+    """
+    s = str(symbol).strip()
+    if "@" in s:
+        s = s.split("@", 1)[1]
+    if "." in s:
+        return s.split(".", 1)[0].upper()
+    return None
+
+
+def _no_data_dates_path(data_dir: Path, symbol: str) -> Path:
+    # Backwards compatible default is lake_v1; callers may override via helpers below.
+    return data_dir / "lake" / "ticks" / f"symbol={symbol}" / "_no_data_dates.json"
+
+
+def _no_data_dates_path_in_lake(data_dir: Path, symbol: str, *, lake_version: LakeVersion) -> Path:
+    from ghtrader.lake import ticks_symbol_dir
+
+    return ticks_symbol_dir(data_dir, symbol, ticks_lake="raw", lake_version=lake_version) / "_no_data_dates.json"
+
+
+def _load_no_data_dates(data_dir: Path, symbol: str, *, lake_version: LakeVersion = "v1") -> set[date]:
+    p = _no_data_dates_path_in_lake(data_dir, symbol, lake_version=lake_version)
+    if not p.exists():
+        return set()
+    try:
+        with open(p, "r") as f:
+            raw = json.load(f)
+        if not isinstance(raw, list):
+            return set()
+        out: set[date] = set()
+        for s in raw:
+            try:
+                out.add(date.fromisoformat(str(s)))
+            except Exception:
+                continue
+        return out
+    except Exception as e:
+        log.warning("tq_ingest.no_data_read_failed", symbol=symbol, path=str(p), error=str(e))
+        return set()
+
+
+def _write_no_data_dates(data_dir: Path, symbol: str, dates_set: set[date], *, lake_version: LakeVersion = "v1") -> None:
+    p = _no_data_dates_path_in_lake(data_dir, symbol, lake_version=lake_version)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = sorted({d.isoformat() for d in dates_set})
+    with open(p, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _mark_no_data_dates(data_dir: Path, symbol: str, dates_to_add: set[date], *, lake_version: LakeVersion = "v1") -> None:
+    if not dates_to_add:
+        return
+    cur = _load_no_data_dates(data_dir, symbol, lake_version=lake_version)
+    before = len(cur)
+    cur |= dates_to_add
+    if len(cur) != before:
+        _write_no_data_dates(data_dir, symbol, cur, lake_version=lake_version)
+        log.info("tq_ingest.no_data_updated", symbol=symbol, added=len(dates_to_add), total=len(cur))
 
 
 def download_historical_ticks(
@@ -53,6 +105,8 @@ def download_historical_ticks(
     end_date: date,
     data_dir: Path,
     chunk_days: int = 5,
+    *,
+    lake_version: LakeVersion = "v1",
 ) -> None:
     """
     Download historical L5 ticks for a symbol and write to Parquet lake.
@@ -71,10 +125,14 @@ def download_historical_ticks(
     """
     log.info("tq_ingest.download_start", symbol=symbol, start=str(start_date), end=str(end_date))
     
-    # Check which dates already exist
-    existing_dates = set(list_available_dates(data_dir, symbol))
-    all_dates = _trading_days_between(start_date, end_date)
-    missing_dates = [d for d in all_dates if d not in existing_dates]
+    # Check which dates already exist in the selected lake version
+    existing_dates = set(list_available_dates(data_dir, symbol, lake_version=lake_version))
+    from ghtrader.trading_calendar import get_trading_days
+
+    market = _infer_market_from_symbol(symbol)
+    all_dates = get_trading_days(market=market, start=start_date, end=end_date, data_dir=data_dir)
+    no_data_dates = _load_no_data_dates(data_dir, symbol, lake_version=lake_version)
+    missing_dates = [d for d in all_dates if d not in existing_dates and d not in no_data_dates]
     
     if not missing_dates:
         log.info("tq_ingest.already_complete", symbol=symbol)
@@ -89,6 +147,13 @@ def download_historical_ticks(
     )
     
     # Create TqApi (outside backtest mode, not in coroutine)
+    # Add vendored tqsdk to path if present (repo-local install pattern).
+    _TQSDK_PATH = Path(__file__).parent.parent.parent.parent / "tqsdk-python"
+    if _TQSDK_PATH.exists() and str(_TQSDK_PATH) not in sys.path:
+        sys.path.insert(0, str(_TQSDK_PATH))
+
+    from tqsdk import TqApi  # type: ignore
+
     auth = get_tqsdk_auth()
     api = TqApi(auth=auth)
     
@@ -113,14 +178,19 @@ def download_historical_ticks(
             # Download using TqSdk Pro API
             # Note: get_tick_data_series returns a static DataFrame
             # Date params are trading days (date) or datetime for exact time
-            df = api.get_tick_data_series(
-                symbol=symbol,
-                start_dt=chunk_start,
-                end_dt=chunk_end + timedelta(days=1),  # end is exclusive
-            )
+            try:
+                df = api.get_tick_data_series(
+                    symbol=symbol,
+                    start_dt=chunk_start,
+                    end_dt=chunk_end + timedelta(days=1),  # end is exclusive
+                )
+            except Exception as e:
+                log.warning("tq_ingest.chunk_failed", symbol=symbol, chunk_start=str(chunk_start), error=str(e))
+                continue
             
             if df.empty:
                 log.warning("tq_ingest.empty_chunk", symbol=symbol, chunk_start=str(chunk_start))
+                _mark_no_data_dates(data_dir, symbol, set(chunk) - existing_dates, lake_version=lake_version)
                 continue
             
             # Rename columns to match our schema
@@ -135,9 +205,39 @@ def download_historical_ticks(
                 if col not in df.columns:
                     df[col] = float("nan")
             
-            # Group by date and write partitions
-            df["_date"] = pd.to_datetime(df["datetime"], unit="ns").dt.date
+            # Group by date and write partitions.
+            # - v1: calendar date (legacy behavior)
+            # - v2: trading day (night-session aware)
+            dt_series = pd.to_datetime(df["datetime"], unit="ns")
+            cal_dates = dt_series.dt.date
+            if lake_version == "v2":
+                from bisect import bisect_right
+                from ghtrader.trading_calendar import get_trading_calendar
+
+                cal = get_trading_calendar(data_dir=data_dir, refresh=False)
+                cal_list = cal if cal else []
+
+                def _next_trading_day(d: date) -> date:
+                    if cal_list:
+                        j = bisect_right(cal_list, d)
+                        if j < len(cal_list):
+                            return cal_list[j]
+                    return d + timedelta(days=1)
+
+                mask = dt_series.dt.hour >= 18
+                if mask.any():
+                    # Map only the (small) set of unique calendar dates needing +1 trading-day shift.
+                    uniq = sorted({d for d in cal_dates[mask].tolist() if isinstance(d, date)})
+                    next_map = {d: _next_trading_day(d) for d in uniq}
+                    trading_dates = cal_dates.copy()
+                    trading_dates.loc[mask] = cal_dates.loc[mask].map(next_map)  # type: ignore[assignment]
+                    df["_date"] = trading_dates
+                else:
+                    df["_date"] = cal_dates
+            else:
+                df["_date"] = cal_dates
             
+            written_dates: set[date] = set()
             for dt, group_df in df.groupby("_date"):
                 if dt in existing_dates:
                     continue
@@ -146,12 +246,17 @@ def download_historical_ticks(
                 partition_df = group_df.drop(columns=["_date", "_tq_id"], errors="ignore")
                 
                 # Write partition
-                write_ticks_partition(partition_df, data_dir, symbol, dt)
+                write_ticks_partition(partition_df, data_dir, symbol, dt, lake_version=lake_version)
                 
                 row_counts[str(dt)] = len(partition_df)
                 total_rows += len(partition_df)
+                written_dates.add(dt)
                 
                 log.debug("tq_ingest.partition_written", symbol=symbol, date=str(dt), rows=len(partition_df))
+
+            # Mark any requested trading dates in this chunk that produced no ticks.
+            missing_in_chunk = set(chunk) - written_dates - existing_dates
+            _mark_no_data_dates(data_dir, symbol, missing_in_chunk, lake_version=lake_version)
     
     finally:
         api.close()
@@ -230,6 +335,106 @@ def _infer_active_ranges_from_daily(
     return {sym: (v["min"], v["max"]) for sym, v in ranges.items()}
 
 
+def _update_active_ranges_from_daily_frame(
+    ranges: dict[str, tuple[date, date]],
+    daily_df: pd.DataFrame,
+    *,
+    var_upper: str,
+) -> None:
+    """
+    Streaming active-range updater (in-place).
+
+    This matches `_infer_active_ranges_from_daily` semantics:
+    active day := (open_interest > 0) OR (volume > 0)
+    """
+    if daily_df is None or daily_df.empty:
+        return
+
+    df = daily_df.copy()
+    df["date"] = pd.to_datetime(df.get("date"), errors="coerce").dt.date
+    df["open_interest"] = pd.to_numeric(df.get("open_interest"), errors="coerce")
+    df["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
+
+    if "variety" in df.columns:
+        df = df[df["variety"].astype(str).str.upper() == var_upper]
+    else:
+        df = df[df["symbol"].astype(str).str.upper().str.startswith(var_upper)]
+
+    df = df.dropna(subset=["date", "symbol"])
+    active = df[(df["open_interest"].fillna(0) > 0) | (df["volume"].fillna(0) > 0)]
+    if active.empty:
+        return
+
+    for _, row in active.iterrows():
+        sym = str(row["symbol"])
+        d = row["date"]
+        if not isinstance(d, date):
+            continue
+        if sym not in ranges:
+            ranges[sym] = (d, d)
+        else:
+            s, e = ranges[sym]
+            if d < s:
+                s = d
+            if d > e:
+                e = d
+            ranges[sym] = (s, e)
+
+
+def _active_ranges_cache_dir(data_dir: Path, exchange: str, var: str) -> Path:
+    return data_dir / "akshare" / "active_ranges" / f"market={exchange.upper()}" / f"var={var.lower()}"
+
+
+def _read_active_ranges_cache(data_dir: Path, exchange: str, var: str) -> tuple[pd.DataFrame | None, dict | None]:
+    root = _active_ranges_cache_dir(data_dir, exchange, var)
+    p_ranges = root / "active_ranges.parquet"
+    p_manifest = root / "manifest.json"
+    if not p_ranges.exists() or not p_manifest.exists():
+        return None, None
+    try:
+        df = pd.read_parquet(p_ranges)
+        with open(p_manifest, "r") as f:
+            manifest = json.load(f)
+        return df, manifest
+    except Exception as e:
+        log.warning("tq_ingest.active_ranges_cache_read_failed", root=str(root), error=str(e))
+        return None, None
+
+
+def _write_active_ranges_cache(
+    *,
+    data_dir: Path,
+    exchange: str,
+    var: str,
+    ranges: dict[str, tuple[date, date]],
+    scanned_start: date,
+    scanned_end: date,
+) -> Path:
+    root = _active_ranges_cache_dir(data_dir, exchange, var)
+    root.mkdir(parents=True, exist_ok=True)
+
+    rows = [
+        {"symbol": sym, "first_active": s.isoformat(), "last_active": e.isoformat()}
+        for sym, (s, e) in sorted(ranges.items())
+    ]
+    df = pd.DataFrame(rows)
+    out_path = root / "active_ranges.parquet"
+    df.to_parquet(out_path, index=False)
+
+    manifest = {
+        "exchange": exchange.upper(),
+        "var": var.lower(),
+        "scanned_start": scanned_start.isoformat(),
+        "scanned_end": scanned_end.isoformat(),
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "n_symbols": len(df),
+    }
+    with open(root / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    return out_path
+
+
 def _detect_latest_contract_yymm_from_daily(daily: pd.DataFrame, *, var_upper: str) -> str:
     """
     Detect the latest listed contract YYMM from akshare daily data.
@@ -278,6 +483,7 @@ def download_contract_range(
     data_dir: Path,
     chunk_days: int = 5,
     refresh_akshare: bool = False,
+    lake_version: LakeVersion = "v1",
 ) -> None:
     """
     Exhaustively backfill L5 ticks for a full contract YYMM range.
@@ -288,7 +494,7 @@ def download_contract_range(
     We infer each contract's active trading date range using akshare daily data,
     then call `download_historical_ticks()` for only that inferred window.
     """
-    from ghtrader.akshare_daily import fetch_futures_daily_range
+    from ghtrader.akshare_daily import fetch_futures_daily_range, iter_futures_daily_range
 
     ex = exchange.upper().strip()
     var_l = var.lower().strip()
@@ -329,14 +535,50 @@ def download_contract_range(
         daily_end=str(fetch_end),
     )
 
-    daily = fetch_futures_daily_range(
-        data_dir=data_dir,
-        market=ex,
-        start=fetch_start,
-        end=fetch_end,
-        refresh=refresh_akshare,
-    )
-    ranges = _infer_active_ranges_from_daily(daily, var_upper=var_u)
+    # Active ranges cache: reuse if it covers the scan window.
+    cached_df, cached_manifest = _read_active_ranges_cache(data_dir, ex, var_l)
+    ranges: dict[str, tuple[date, date]] = {}
+    reused_cache = False
+    if (
+        cached_df is not None
+        and cached_manifest is not None
+        and not refresh_akshare
+        and str(cached_manifest.get("scanned_start")) <= fetch_start.isoformat()
+        and str(cached_manifest.get("scanned_end")) >= fetch_end.isoformat()
+    ):
+        try:
+            for _, r in cached_df.iterrows():
+                ranges[str(r["symbol"])] = (
+                    date.fromisoformat(str(r["first_active"])),
+                    date.fromisoformat(str(r["last_active"])),
+                )
+            reused_cache = True
+            log.info("tq_ingest.active_ranges_cache_reused", exchange=ex, var=var_l, n=len(ranges))
+        except Exception as e:
+            log.warning("tq_ingest.active_ranges_cache_bad", error=str(e))
+            ranges = {}
+
+    if not reused_cache:
+        # Stream daily frames (trading days only) to build ranges without huge in-memory DataFrames.
+        for df_day in iter_futures_daily_range(
+            data_dir=data_dir,
+            market=ex,
+            start=fetch_start,
+            end=fetch_end,
+            refresh=refresh_akshare,
+            skip_errors=True,
+        ):
+            _update_active_ranges_from_daily_frame(ranges, df_day, var_upper=var_u)
+
+        _write_active_ranges_cache(
+            data_dir=data_dir,
+            exchange=ex,
+            var=var_l,
+            ranges=ranges,
+            scanned_start=fetch_start,
+            scanned_end=fetch_end,
+        )
+        log.info("tq_ingest.active_ranges_cache_written", exchange=ex, var=var_l, n=len(ranges))
 
     n_skipped = 0
     for raw in raw_contracts:
@@ -354,6 +596,7 @@ def download_contract_range(
                 end_date=c_end,
                 data_dir=data_dir,
                 chunk_days=chunk_days,
+                lake_version=lake_version,
             )
         except Exception as e:
             # Keep the long-running backfill resilient: one bad contract should not
@@ -372,6 +615,8 @@ def run_live_recorder(
     symbols: list[str],
     data_dir: Path,
     flush_interval_seconds: int = 60,
+    *,
+    lake_version: LakeVersion = "v1",
 ) -> None:
     """
     Run live tick recorder that subscribes to symbols and appends to Parquet lake.
@@ -388,6 +633,13 @@ def run_live_recorder(
     
     log.info("tq_ingest.live_recorder_start", symbols=symbols)
     
+    # Add vendored tqsdk to path if present (repo-local install pattern).
+    _TQSDK_PATH = Path(__file__).parent.parent.parent.parent / "tqsdk-python"
+    if _TQSDK_PATH.exists() and str(_TQSDK_PATH) not in sys.path:
+        sys.path.insert(0, str(_TQSDK_PATH))
+
+    from tqsdk import TqApi  # type: ignore
+
     auth = get_tqsdk_auth()
     api = TqApi(auth=auth)
     
@@ -444,19 +696,19 @@ def run_live_recorder(
             # Flush periodically
             now = time.time()
             if now - last_flush >= flush_interval_seconds:
-                _flush_buffers(buffers, data_dir)
+                _flush_buffers(buffers, data_dir, lake_version=lake_version)
                 last_flush = now
     
     except KeyboardInterrupt:
         log.info("tq_ingest.live_recorder_interrupted")
     finally:
         # Final flush
-        _flush_buffers(buffers, data_dir)
+        _flush_buffers(buffers, data_dir, lake_version=lake_version)
         api.close()
         log.info("tq_ingest.live_recorder_stopped")
 
 
-def _flush_buffers(buffers: dict[str, list[dict]], data_dir: Path) -> None:
+def _flush_buffers(buffers: dict[str, list[dict]], data_dir: Path, *, lake_version: LakeVersion = "v1") -> None:
     """Flush accumulated tick buffers to Parquet partitions."""
     for symbol, records in buffers.items():
         if not records:
@@ -465,11 +717,37 @@ def _flush_buffers(buffers: dict[str, list[dict]], data_dir: Path) -> None:
         df = pd.DataFrame(records)
         
         # Group by date
-        df["_date"] = pd.to_datetime(df["datetime"], unit="ns").dt.date
+        dt_series = pd.to_datetime(df["datetime"], unit="ns")
+        cal_dates = dt_series.dt.date
+        if lake_version == "v2":
+            from bisect import bisect_right
+            from ghtrader.trading_calendar import get_trading_calendar
+
+            cal = get_trading_calendar(data_dir=data_dir, refresh=False)
+            cal_list = cal if cal else []
+
+            def _next_trading_day(d: date) -> date:
+                if cal_list:
+                    j = bisect_right(cal_list, d)
+                    if j < len(cal_list):
+                        return cal_list[j]
+                return d + timedelta(days=1)
+
+            mask = dt_series.dt.hour >= 18
+            if mask.any():
+                uniq = sorted({d for d in cal_dates[mask].tolist() if isinstance(d, date)})
+                next_map = {d: _next_trading_day(d) for d in uniq}
+                trading_dates = cal_dates.copy()
+                trading_dates.loc[mask] = cal_dates.loc[mask].map(next_map)  # type: ignore[assignment]
+                df["_date"] = trading_dates
+            else:
+                df["_date"] = cal_dates
+        else:
+            df["_date"] = cal_dates
         
         for dt, group_df in df.groupby("_date"):
             partition_df = group_df.drop(columns=["_date"])
-            write_ticks_partition(partition_df, data_dir, symbol, dt)
+            write_ticks_partition(partition_df, data_dir, symbol, dt, lake_version=lake_version)
             log.debug("tq_ingest.flush", symbol=symbol, date=str(dt), rows=len(partition_df))
         
         # Clear buffer

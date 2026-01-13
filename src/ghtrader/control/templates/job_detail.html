@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block content %}
+  <h2>Job {{ job.id }}</h2>
+
+  <div class="card">
+    <div><b>Status:</b> <span class="pill pill-{{ job.status }}">{{ job.status }}</span></div>
+    <div><b>Title:</b> {{ job.title }}</div>
+    <div><b>Source:</b> <span class="mono">{{ job.source or "" }}</span></div>
+    <div><b>PID:</b> <span class="mono">{{ job.pid or "" }}</span></div>
+    <div><b>Exit:</b> <span class="mono">{{ job.exit_code if job.exit_code is not none else "" }}</span></div>
+    <div><b>Created:</b> <span class="mono">{{ job.created_at }}</span></div>
+    <div><b>Started:</b> <span class="mono">{{ job.started_at or "" }}</span></div>
+    <div><b>Finished:</b> <span class="mono">{{ job.finished_at or "" }}</span></div>
+    <div><b>Command:</b> <span class="mono">{{ job.command | join(" ") }}</span></div>
+    <div><b>Log:</b> <span class="mono">{{ job.log_path or "" }}</span></div>
+    <div><b>Waiting locks:</b> <span class="mono">{{ (job.waiting_locks or []) | join(",") }}</span></div>
+    <div><b>Held locks:</b> <span class="mono">{{ (job.held_locks or []) | join(",") }}</span></div>
+
+    {% if job.status == "running" %}
+      <form method="post" action="/jobs/{{ job.id }}/cancel{{ token_qs }}">
+        <button class="danger" type="submit">Cancel (SIGTERM)</button>
+      </form>
+    {% endif %}
+  </div>
+
+  <h3>Ingest status</h3>
+  <div class="card" id="ingestCard" style="display:none;">
+    <div><b>Kind:</b> <span class="mono" id="ingestKind"></span></div>
+    <div><b>Current:</b> <span class="mono" id="ingestCurrent"></span></div>
+    <div><b>Progress:</b> <span class="mono" id="ingestProgress"></span></div>
+    <div class="muted">For full details, see <a href="/ops/ingest{{ token_qs }}">Ingest</a>.</div>
+  </div>
+
+  <h3>Log tail</h3>
+  <pre class="log" id="logBox">{{ log_text }}</pre>
+
+  <script>
+    (function() {
+      const logUrl = "/api/jobs/{{ job.id }}/log{{ token_qs }}";
+      const ingestUrl = "/api/jobs/{{ job.id }}/ingest_status{{ token_qs }}";
+      const box = document.getElementById("logBox");
+      const ingestCard = document.getElementById("ingestCard");
+      const ingestKind = document.getElementById("ingestKind");
+      const ingestCurrent = document.getElementById("ingestCurrent");
+      const ingestProgress = document.getElementById("ingestProgress");
+
+      function fmtPct(x) {
+        if (x === null || x === undefined) return "-";
+        return (Math.round(x * 1000) / 10).toFixed(1) + "%";
+      }
+
+      async function tick() {
+        try {
+          const resp = await fetch(logUrl);
+          if (!resp.ok) return;
+          const txt = await resp.text();
+          box.textContent = txt;
+          box.scrollTop = box.scrollHeight;
+        } catch (e) {}
+      }
+
+      async function tickIngest() {
+        try {
+          const resp = await fetch(ingestUrl);
+          if (!resp.ok) return;
+          const s = await resp.json();
+          if (!s || !s.kind || s.kind === "unknown") {
+            ingestCard.style.display = "none";
+            return;
+          }
+          ingestCard.style.display = "block";
+          ingestKind.textContent = s.kind || "";
+
+          if (s.kind === "download_contract_range") {
+            ingestCurrent.textContent = s.current_symbol || "";
+            const sum = s.summary || {};
+            ingestProgress.textContent =
+              fmtPct(sum.pct) +
+              " days " + (sum.days_done_total ?? "") + "/" + (sum.days_expected_total ?? "") +
+              " contracts " + (sum.contracts_done ?? "") + "/" + (sum.contracts_total ?? "");
+          } else if (s.kind === "download") {
+            ingestCurrent.textContent = s.symbol || "";
+            const sum = s.summary || {};
+            ingestProgress.textContent =
+              fmtPct(sum.pct) +
+              " days " + (sum.days_done ?? "") + "/" + (sum.days_expected ?? "") +
+              (s.chunk_idx ? (" chunk_idx=" + s.chunk_idx) : "");
+          } else {
+            ingestCurrent.textContent = s.current_symbol || "";
+            ingestProgress.textContent = "-";
+          }
+        } catch (e) {}
+      }
+
+      setInterval(tick, 2000);
+      setInterval(tickIngest, 10000);
+      tickIngest();
+    })();
+  </script>
+{% endblock %}
+

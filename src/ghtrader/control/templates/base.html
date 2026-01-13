@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>{{ title or "ghTrader Control" }}</title>
+    <link rel="stylesheet" href="/static/app.css"/>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">ghTrader Control</div>
+      <nav class="nav">
+        <a href="/{{ token_qs }}">Home</a>
+        <a href="/jobs{{ token_qs }}">Jobs</a>
+        <a href="/ops/ingest{{ token_qs }}">Ingest</a>
+        <a href="/ops/build{{ token_qs }}">Build</a>
+        <a href="/ops/model{{ token_qs }}">Model</a>
+        <a href="/ops/eval{{ token_qs }}">Eval</a>
+        <a href="/ops/trading{{ token_qs }}">Trading</a>
+        <a href="/ops/locks{{ token_qs }}">Locks</a>
+        <a href="/ops/integrity{{ token_qs }}">Integrity</a>
+        <a href="/data{{ token_qs }}">Data</a>
+        <a href="/explorer{{ token_qs }}">Explorer</a>
+        <a href="/system{{ token_qs }}">System</a>
+      </nav>
+    </header>
+
+    <main class="container">
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>
+

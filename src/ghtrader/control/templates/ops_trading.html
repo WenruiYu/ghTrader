@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block content %}
+  <h2>Trading</h2>
+
+  <div class="card">
+    <h3>trade</h3>
+    <form class="form" method="post" action="/ops/trading/trade{{ token_qs }}">
+      <div class="grid3">
+        <div>
+          <label>Mode</label>
+          <select name="mode">
+            <option value="paper" selected>paper</option>
+            <option value="sim">sim</option>
+            <option value="live">live</option>
+          </select>
+        </div>
+        <div>
+          <label>Sim account</label>
+          <select name="sim_account">
+            <option value="tqsim" selected>tqsim</option>
+            <option value="tqkq">tqkq</option>
+          </select>
+        </div>
+        <div>
+          <label>Executor</label>
+          <select name="executor">
+            <option value="targetpos" selected>targetpos</option>
+            <option value="direct">direct</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid3">
+        <div><label>Model</label><input name="model" value="xgboost"/></div>
+        <div><label>Horizon</label><input name="horizon" value="50"/></div>
+        <div><label>Position size</label><input name="position_size" value="1"/></div>
+      </div>
+
+      <div class="grid3">
+        <div><label>Threshold up</label><input name="threshold_up" value="0.6"/></div>
+        <div><label>Threshold down</label><input name="threshold_down" value="0.6"/></div>
+        <div><label>Snapshot interval (sec)</label><input name="snapshot_interval_sec" value="10"/></div>
+      </div>
+
+      <div>
+        <label>Symbols (comma-separated)</label>
+        <input name="symbols" placeholder="SHFE.cu2602,KQ.m@SHFE.cu"/>
+      </div>
+
+      <h4>Risk</h4>
+      <div class="grid3">
+        <div><label>Max position</label><input name="max_position" value="1"/></div>
+        <div><label>Max order size</label><input name="max_order_size" value="1"/></div>
+        <div><label>Max ops/sec</label><input name="max_ops_per_sec" value="10"/></div>
+      </div>
+      <div class="grid3">
+        <div><label>Max daily loss</label><input name="max_daily_loss" placeholder="(optional)"/></div>
+        <div>
+          <label>Enforce trading time</label>
+          <select name="enforce_trading_time"><option value="true" selected>true</option><option value="false">false</option></select>
+        </div>
+        <div><label>Confirm live</label><input name="confirm_live" placeholder="I_UNDERSTAND"/></div>
+      </div>
+
+      <h4>TargetPosTask</h4>
+      <div class="grid2">
+        <div>
+          <label>tp price</label>
+          <select name="tp_price"><option value="ACTIVE" selected>ACTIVE</option><option value="PASSIVE">PASSIVE</option></select>
+        </div>
+        <div><label>tp offset priority</label><input name="tp_offset_priority" value="今昨,开"/></div>
+      </div>
+
+      <h4>Direct orders</h4>
+      <div class="grid2">
+        <div>
+          <label>direct price mode</label>
+          <select name="direct_price_mode"><option value="ACTIVE" selected>ACTIVE</option><option value="PASSIVE">PASSIVE</option></select>
+        </div>
+        <div>
+          <label>direct advanced</label>
+          <select name="direct_advanced"><option value="" selected>(none)</option><option value="FAK">FAK</option><option value="FOK">FOK</option></select>
+        </div>
+      </div>
+
+      <div class="grid3">
+        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+        <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
+        <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
+      </div>
+
+      <button type="submit">Start trade job</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>Recent trading runs</h3>
+    {% if runs and runs|length > 0 %}
+      <table class="table">
+        <thead><tr><th>run_id</th><th>last_ts</th><th>balance</th><th></th></tr></thead>
+        <tbody>
+        {% for r in runs %}
+          <tr>
+            <td class="mono">{{ r.run_id }}</td>
+            <td class="mono">{{ r.last_ts }}</td>
+            <td class="mono">{{ r.balance }}</td>
+            <td><a href="/ops/trading/run/{{ r.run_id }}{{ token_qs }}">view</a></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">No runs found under runs/trading/</p>
+    {% endif %}
+  </div>
+{% endblock %}
+

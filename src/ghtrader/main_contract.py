@@ -176,6 +176,21 @@ def compute_shfe_main_schedule_from_daily(
     schedule = pd.DataFrame(rows)
     if schedule.empty:
         raise ValueError("Computed empty schedule")
+
+    # Segment id: increments whenever the underlying main_contract changes.
+    # This is used downstream to prevent cross-roll leakage in sequence modeling.
+    schedule = schedule.sort_values("date").reset_index(drop=True)
+    seg_ids: list[int] = []
+    seg = 0
+    prev: str | None = None
+    for mc in schedule["main_contract"].astype(str).tolist():
+        if prev is None:
+            seg = 0
+        elif mc != prev:
+            seg += 1
+        seg_ids.append(int(seg))
+        prev = mc
+    schedule["segment_id"] = seg_ids
     return schedule
 
 
