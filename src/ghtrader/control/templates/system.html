@@ -2,33 +2,204 @@
 {% block content %}
   <h2>System</h2>
 
-  <div class="grid">
+  <div class="card">
+    <div class="inlineControls">
+      <button class="btn-secondary" type="button" id="refreshFastBtn">Refresh now</button>
+      <button class="btn-secondary" type="button" id="refreshDirBtn">Refresh directory sizes</button>
+      <span class="muted mono" id="updatedAt">last updated: …</span>
+      <span class="pill" id="gpuStatusPill">GPU: …</span>
+      <span class="pill" id="dirStatusPill">Dir sizes: …</span>
+    </div>
+    <div class="muted" style="margin-top:8px;">
+      Note: filesystem totals show overall disk capacity; directory sizes are computed lazily and cached.
+    </div>
+  </div>
+
+  <div class="grid3">
     <div class="card">
       <div class="kpiLabel">CPU %</div>
-      <div class="kpiValue">{{ cpu_mem.cpu_percent if cpu_mem.cpu_percent is not none else "n/a" }}</div>
+      <div class="kpiValue" id="cpuPct">…</div>
     </div>
     <div class="card">
       <div class="kpiLabel">Mem %</div>
-      <div class="kpiValue">{{ cpu_mem.mem_percent if cpu_mem.mem_percent is not none else "n/a" }}</div>
+      <div class="kpiValue" id="memPct">…</div>
+    </div>
+    <div class="card">
+      <div class="kpiLabel">Load avg (1/5/15)</div>
+      <div class="kpiValue mono" style="font-size:20px; font-weight:800;" id="loadAvg">…</div>
     </div>
   </div>
 
   <h3>Disk</h3>
-  <table class="table">
-    <thead><tr><th>Path</th><th>Total(GB)</th><th>Used(GB)</th><th>Free(GB)</th></tr></thead>
-    <tbody>
-      {% for p, du in disks %}
-      <tr>
-        <td class="mono">{{ p }}</td>
-        <td>{{ "%.1f"|format(du.total_gb) }}</td>
-        <td>{{ "%.1f"|format(du.used_gb) }}</td>
-        <td>{{ "%.1f"|format(du.free_gb) }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="tableWrap">
+    <table class="table" id="diskTable">
+      <thead>
+        <tr>
+          <th>Path</th>
+          <th>FS Used %</th>
+          <th>Total(GB)</th>
+          <th>Used(GB)</th>
+          <th>Free(GB)</th>
+          <th>Dir size</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in paths %}
+        <tr data-key="{{ p.key }}">
+          <td class="mono">{{ p.path }}{% if not p.exists %} (missing){% endif %}</td>
+          <td>
+            <div class="progressBar"><div data-field="usedPctBar"></div></div>
+            <div class="mono muted" data-field="usedPctText">…</div>
+          </td>
+          <td class="mono" data-field="totalGb">…</td>
+          <td class="mono" data-field="usedGb">…</td>
+          <td class="mono" data-field="freeGb">…</td>
+          <td class="mono" data-field="dirSize">not loaded</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 
   <h3>GPU (best-effort)</h3>
-  <pre class="log">{{ gpu_info or "nvidia-smi not available" }}</pre>
+  <pre class="log" id="gpuInfo">Loading…</pre>
+
+  <script>
+    (function() {
+      const $ = (sel) => document.querySelector(sel);
+      const qs = new URLSearchParams(window.location.search);
+      const token = qs.get("token");
+
+      function apiUrl(params) {
+        const u = new URL("/api/system", window.location.origin);
+        if (token) u.searchParams.set("token", token);
+        for (const [k, v] of Object.entries(params || {})) {
+          if (v === undefined || v === null) continue;
+          u.searchParams.set(k, String(v));
+        }
+        return u.toString();
+      }
+
+      function fmt1(x) {
+        const n = Number(x);
+        if (!Number.isFinite(n)) return "n/a";
+        return n.toFixed(1);
+      }
+
+      function fmtPct(x) {
+        const n = Number(x);
+        if (!Number.isFinite(n)) return "n/a";
+        return n.toFixed(1) + "%";
+      }
+
+      function setText(id, txt) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = txt;
+      }
+
+      function updateFromSnapshot(snap) {
+        if (!snap) return;
+        setText("updatedAt", "last updated: " + (snap.fast_updated_at || snap.ts || ""));
+
+        const cpu = (snap.cpu_mem || {}).cpu_percent;
+        const mem = (snap.cpu_mem || {}).mem_percent;
+        setText("cpuPct", Number.isFinite(Number(cpu)) ? fmt1(cpu) : "n/a");
+        setText("memPct", Number.isFinite(Number(mem)) ? fmt1(mem) : "n/a");
+
+        const load = snap.load || {};
+        const l1 = load.load1, l5 = load.load5, l15 = load.load15;
+        setText("loadAvg", [l1, l5, l15].map((x) => (Number.isFinite(Number(x)) ? Number(x).toFixed(2) : "n/a")).join(" / "));
+
+        // GPU
+        const gpu = snap.gpu || {};
+        setText("gpuInfo", gpu.info || "n/a");
+        setText("gpuStatusPill", "GPU: " + (gpu.status || "n/a"));
+
+        // Dir sizes status
+        const ds = snap.dir_sizes || {};
+        setText("dirStatusPill", "Dir sizes: " + (ds.status || "n/a"));
+
+        // Disks
+        const disks = snap.disks || [];
+        for (const d of disks) {
+          const key = d.key;
+          const row = document.querySelector(`tr[data-key=\"${key}\"]`);
+          if (!row) continue;
+          const fs = d.fs || {};
+
+          const totalGb = fs.total_gb, usedGb = fs.used_gb, freeGb = fs.free_gb, usedPct = fs.used_pct;
+          const totalEl = row.querySelector('[data-field=\"totalGb\"]');
+          const usedEl = row.querySelector('[data-field=\"usedGb\"]');
+          const freeEl = row.querySelector('[data-field=\"freeGb\"]');
+          const pctText = row.querySelector('[data-field=\"usedPctText\"]');
+          const pctBar = row.querySelector('[data-field=\"usedPctBar\"]');
+
+          if (totalEl) totalEl.textContent = fmt1(totalGb);
+          if (usedEl) usedEl.textContent = fmt1(usedGb);
+          if (freeEl) freeEl.textContent = fmt1(freeGb);
+          if (pctText) pctText.textContent = fmtPct(usedPct);
+          if (pctBar) pctBar.style.width = (Number.isFinite(Number(usedPct)) ? Math.max(0, Math.min(100, Number(usedPct))) : 0) + "%";
+
+          const dirEl = row.querySelector('[data-field=\"dirSize\"]');
+          const dir = d.dir;
+          if (dirEl) {
+            if (dir && dir.human) {
+              dirEl.textContent = dir.human + (dir.error ? " (" + dir.error + ")" : "");
+            } else {
+              dirEl.textContent = "not loaded";
+            }
+          }
+        }
+      }
+
+      async function fetchSnapshot(params) {
+        const u = apiUrl(params);
+        const res = await fetch(u, { headers: token ? {"x-auth-token": token} : {} });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return await res.json();
+      }
+
+      async function refreshFast(force) {
+        try {
+          const snap = await fetchSnapshot({ include_dir_sizes: "true", refresh: force ? "fast" : "none" });
+          updateFromSnapshot(snap);
+        } catch (e) {
+          setText("gpuInfo", "Failed to load system snapshot: " + (e && e.message ? e.message : String(e)));
+        }
+      }
+
+      async function refreshDirSizes() {
+        try {
+          const snap = await fetchSnapshot({ include_dir_sizes: "true", refresh: "dir" });
+          updateFromSnapshot(snap);
+          // Poll until ready (or a few attempts).
+          let tries = 0;
+          const t = setInterval(async () => {
+            tries += 1;
+            try {
+              const s2 = await fetchSnapshot({ include_dir_sizes: "true", refresh: "none" });
+              updateFromSnapshot(s2);
+              if ((s2.dir_sizes || {}).status === "ready" || tries >= 10) {
+                clearInterval(t);
+              }
+            } catch (e) {
+              clearInterval(t);
+            }
+          }, 800);
+        } catch (e) {
+          setText("gpuInfo", "Failed to refresh directory sizes: " + (e && e.message ? e.message : String(e)));
+        }
+      }
+
+      const fastBtn = $("#refreshFastBtn");
+      const dirBtn = $("#refreshDirBtn");
+      if (fastBtn) fastBtn.addEventListener("click", () => refreshFast(true));
+      if (dirBtn) dirBtn.addEventListener("click", () => refreshDirSizes());
+
+      // Initial fetch + auto-refresh
+      refreshFast(false);
+      setInterval(() => refreshFast(false), 5000);
+    })();
+  </script>
 {% endblock %}
 

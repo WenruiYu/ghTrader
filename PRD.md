@@ -443,7 +443,12 @@ Requirements:
     - `download-contract-range`: per-contract and overall % complete using active-ranges cache + trading calendar + no-data markers
   - Progress UI must work for **already-running jobs** (no restart required) by using job logs + lake state.
   - Performance: progress computation must be safe to refresh (use caching/TTL; avoid heavy scans every few seconds).
-  - Must display basic system status (disk usage; CPU/memory; best-effort GPU info).
+  - Must display basic system status (fast to load; safe to refresh):
+    - CPU/memory (and optional load average / uptime).
+    - Disk:
+      - Filesystem totals for key roots (total/used/free + % used).
+      - Optional per-directory sizes for `data/`, `runs/`, `artifacts/` (must be lazy/cached and must not block page load).
+    - GPU: best-effort `nvidia-smi` summary or a helpful diagnostic string (must be cached/non-blocking for the HTML page).
   - Must surface integrity status: latest audit report(s) and how to run an audit.
   - Must surface multi-session state:
     - show job source (`terminal` vs `dashboard`)

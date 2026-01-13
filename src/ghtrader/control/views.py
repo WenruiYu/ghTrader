@@ -1072,20 +1072,19 @@ def build_router() -> Any:
         data_dir = get_data_dir()
         runs_dir = get_runs_dir()
         artifacts_dir = get_artifacts_dir()
-        disks = [
-            (str(data_dir), disk_usage(data_dir)),
-            (str(runs_dir), disk_usage(runs_dir)),
-            (str(artifacts_dir), disk_usage(artifacts_dir)),
-        ]
+
         return templates.TemplateResponse(
             "system.html",
             {
                 "request": request,
                 "title": "System",
                 "token_qs": _token_qs(request),
-                "cpu_mem": cpu_mem_info(),
-                "disks": disks,
-                "gpu_info": gpu_info(),
+                # Render fast and fetch live metrics via /api/system (JS).
+                "paths": [
+                    {"key": "data", "path": str(data_dir), "exists": bool(data_dir.exists())},
+                    {"key": "runs", "path": str(runs_dir), "exists": bool(runs_dir.exists())},
+                    {"key": "artifacts", "path": str(artifacts_dir), "exists": bool(artifacts_dir.exists())},
+                ],
             },
         )
 
