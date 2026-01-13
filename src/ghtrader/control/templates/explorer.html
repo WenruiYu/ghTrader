@@ -13,14 +13,29 @@
     {% endif %}
 
     <form class="form" method="post" action="/explorer{{ token_qs }}">
+      <div class="grid2">
+        <div>
+          <label>Sample queries</label>
+          <select id="sampleQuery">
+            <option value="" selected>(select)</option>
+            <option value="SELECT COUNT(*) AS n_ticks FROM ticks_raw_v2">Count ticks_raw_v2 rows</option>
+            <option value="SELECT hive_symbol, COUNT(*) AS n_rows FROM ticks_raw_v2 GROUP BY hive_symbol ORDER BY n_rows DESC LIMIT 20">Top symbols by rows (ticks_raw_v2)</option>
+            <option value="SELECT kind, COUNT(*) AS n FROM run_metrics GROUP BY kind ORDER BY n DESC">Run metrics counts by kind</option>
+            <option value="SELECT run_id, kind, symbol, model, created_at FROM run_metrics ORDER BY created_at DESC LIMIT 50">Latest run metrics</option>
+          </select>
+        </div>
+        <div class="muted" style="display:flex; align-items:flex-end;">
+          Paste your own SELECT/WITH queries below.
+        </div>
+      </div>
       <div>
         <label>Query</label>
-        <textarea name="query" rows="10" class="mono" style="width:100%;">{{ query or "" }}</textarea>
+        <textarea name="query" rows="10" class="mono" style="width:100%;" id="queryBox">{{ query or "" }}</textarea>
       </div>
       <div class="grid3">
         <div>
           <label>Max rows</label>
-          <input name="limit" value="{{ limit or 200 }}"/>
+          <input name="limit" type="number" min="1" step="1" value="{{ limit or 200 }}"/>
         </div>
         <div>
           <label>Include metrics index (slow)</label>
@@ -50,25 +65,44 @@
   {% if columns and rows %}
     <div class="card">
       <h3>Results ({{ rows|length }} rows)</h3>
-      <table class="table">
-        <thead>
-          <tr>
-            {% for c in columns %}
-              <th class="mono">{{ c }}</th>
-            {% endfor %}
-          </tr>
-        </thead>
-        <tbody>
-          {% for r in rows %}
+      <div class="tableWrap">
+        <table class="table">
+          <thead>
             <tr>
               {% for c in columns %}
-                <td class="mono">{{ r.get(c, "") }}</td>
+                <th class="mono">{{ c }}</th>
               {% endfor %}
             </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {% for r in rows %}
+              <tr>
+                {% for c in columns %}
+                  <td class="mono">{{ r.get(c, "") }}</td>
+                {% endfor %}
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% elif not error %}
+    <div class="card">
+      <p class="muted">No results yet. Pick a sample query or run your own SQL.</p>
     </div>
   {% endif %}
+
+  <script>
+    (function() {
+      const sample = document.getElementById("sampleQuery");
+      const box = document.getElementById("queryBox");
+      if (!sample || !box) return;
+      sample.addEventListener("change", () => {
+        if (!sample.value) return;
+        box.value = sample.value;
+        box.focus();
+      });
+    })();
+  </script>
 {% endblock %}
 

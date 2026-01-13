@@ -3,12 +3,15 @@
   <h2>Jobs</h2>
 
   <div class="card">
-    <h3>Start a job</h3>
-    <p class="muted">Jobs run as subprocesses and stream logs to <span class="mono">runs/control/logs/</span>.</p>
+    <h3>Start a job (quick)</h3>
+    <p class="muted">
+      Jobs run as subprocesses and stream logs to <span class="mono">runs/control/logs/</span>.
+      For full parameter control, prefer the Ops pages (Ingest/Build/Model/Eval/Trading).
+    </p>
 
-    <form class="form" method="post" action="/jobs/start{{ token_qs }}">
+    <form class="form" method="post" action="/jobs/start{{ token_qs }}" id="startJobForm">
       <label>Job type</label>
-      <select name="job_type">
+      <select name="job_type" id="jobType">
         <option value="download_contract_range">download-contract-range</option>
         <option value="build">build (labels+features)</option>
         <option value="train">train</option>
@@ -20,7 +23,7 @@
       <div class="grid2">
         <div>
           <label>Symbol / Variety</label>
-          <input name="symbol_or_var" placeholder="e.g. SHFE.cu2602 or cu"/>
+          <input name="symbol_or_var" id="symbolOrVar" placeholder="e.g. SHFE.cu2602 or cu"/>
         </div>
         <div>
           <label>Data dir</label>
@@ -30,93 +33,199 @@
 
       <div class="grid3">
         <div>
-          <label>Start contract (YYMM)</label>
-          <input name="start_contract" value="1601"/>
+          <label>Lake version</label>
+          <select name="lake_version">
+            <option value="v1" selected>v1</option>
+            <option value="v2">v2</option>
+          </select>
         </div>
-        <div>
-          <label>End contract</label>
-          <input name="end_contract" value="auto"/>
-        </div>
-        <div>
-          <label>Chunk days</label>
-          <input name="chunk_days" value="5"/>
-        </div>
+        <div></div>
+        <div></div>
       </div>
 
-      <div class="grid3">
-        <div>
-          <label>Model</label>
-          <input name="model" value="xgboost"/>
+      <details id="groupContractRange">
+        <summary>download-contract-range options</summary>
+        <div class="grid3">
+          <div>
+            <label>Start contract (YYMM)</label>
+            <input name="start_contract" value="1601"/>
+          </div>
+          <div>
+            <label>End contract</label>
+            <input name="end_contract" value="auto"/>
+          </div>
+          <div>
+            <label>Chunk days</label>
+            <input name="chunk_days" value="5"/>
+          </div>
         </div>
-        <div>
-          <label>Horizon</label>
-          <input name="horizon" value="50"/>
-        </div>
-        <div>
-          <label>Artifacts dir</label>
-          <input name="artifacts_dir" value="artifacts"/>
-        </div>
-      </div>
+      </details>
 
-      <div class="grid3">
-        <div>
-          <label>Start date</label>
-          <input name="start_date" placeholder="YYYY-MM-DD"/>
+      <details id="groupModel">
+        <summary>train / benchmark options</summary>
+        <div class="grid3">
+          <div>
+            <label>Model</label>
+            <input name="model" value="xgboost"/>
+          </div>
+          <div>
+            <label>Horizon</label>
+            <input name="horizon" value="50"/>
+          </div>
+          <div>
+            <label>Artifacts dir</label>
+            <input name="artifacts_dir" value="artifacts"/>
+          </div>
         </div>
-        <div>
-          <label>End date</label>
-          <input name="end_date" placeholder="YYYY-MM-DD"/>
-        </div>
-        <div>
-          <label>Threshold</label>
-          <input name="threshold" value="1.1"/>
-        </div>
-      </div>
+      </details>
 
-      <div class="grid2">
-        <div>
-          <label>Derived symbol</label>
-          <input name="derived_symbol" value="KQ.m@SHFE.cu"/>
+      <details id="groupMainSchedule">
+        <summary>main-schedule options</summary>
+        <div class="grid3">
+          <div>
+            <label>Start date</label>
+            <input name="start_date" placeholder="YYYY-MM-DD"/>
+          </div>
+          <div>
+            <label>End date</label>
+            <input name="end_date" placeholder="YYYY-MM-DD"/>
+          </div>
+          <div>
+            <label>Threshold</label>
+            <input name="threshold" value="1.1"/>
+          </div>
         </div>
-        <div>
-          <label>Schedule path</label>
-          <input name="schedule_path" placeholder="data/rolls/shfe_main_schedule/var=cu/schedule.parquet"/>
+      </details>
+
+      <details id="groupMainDepth">
+        <summary>main-depth options</summary>
+        <div class="grid2">
+          <div>
+            <label>Derived symbol</label>
+            <input name="derived_symbol" value="KQ.m@SHFE.cu"/>
+          </div>
+          <div>
+            <label>Schedule path</label>
+            <input name="schedule_path" placeholder="data/rolls/shfe_main_schedule/var=cu/schedule.parquet"/>
+          </div>
         </div>
-      </div>
+      </details>
 
       <button type="submit">Start</button>
     </form>
   </div>
 
   <h3>Recent jobs</h3>
-  <table class="table">
-    <thead>
-      <tr>
-        <th>ID</th><th>Status</th><th>Source</th><th>Title</th><th>Locks</th><th>PID</th><th>Exit</th><th>Created</th><th></th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for j in jobs %}
-      <tr>
-        <td class="mono">{{ j.id }}</td>
-        <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
-        <td class="mono">{{ j.source or "" }}</td>
-        <td>{{ j.title }}</td>
-        <td class="mono">
-          {% if j.held_locks %}
-            held: {{ j.held_locks | join(",") }}
-          {% elif j.waiting_locks %}
-            waiting: {{ j.waiting_locks | join(",") }}
-          {% else %}
-          {% endif %}
-        </td>
-        <td class="mono">{{ j.pid or "" }}</td>
-        <td class="mono">{{ j.exit_code if j.exit_code is not none else "" }}</td>
-        <td class="mono">{{ j.created_at }}</td>
-        <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="card">
+    <div class="inlineControls">
+      <label for="jobsFilter">Filter</label>
+      <input id="jobsFilter" placeholder="Search id/title/source..."/>
+      <label for="statusFilter">Status</label>
+      <select id="statusFilter">
+        <option value="" selected>(any)</option>
+        <option value="running">running</option>
+        <option value="queued">queued</option>
+        <option value="succeeded">succeeded</option>
+        <option value="failed">failed</option>
+        <option value="cancelled">cancelled</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="tableWrap">
+    <table class="table" id="jobsTable">
+      <thead>
+        <tr>
+          <th>ID</th><th>Status</th><th>Source</th><th>Title</th><th>Locks</th><th>PID</th><th>Exit</th><th>Created</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for j in jobs %}
+        <tr data-status="{{ j.status }}">
+          <td class="mono">{{ j.id }}</td>
+          <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
+          <td class="mono">{{ j.source or "" }}</td>
+          <td>{{ j.title }}</td>
+          <td class="mono">
+            {% if j.held_locks %}
+              <div class="muted">held</div>
+              {% for k in j.held_locks %}<div>{{ k }}</div>{% endfor %}
+            {% endif %}
+            {% if j.waiting_locks %}
+              <div class="muted" style="margin-top:6px;">waiting</div>
+              {% for k in j.waiting_locks %}<div>{{ k }}</div>{% endfor %}
+            {% endif %}
+          </td>
+          <td class="mono">{{ j.pid or "" }}</td>
+          <td class="mono">{{ j.exit_code if j.exit_code is not none else "" }}</td>
+          <td class="mono">{{ j.created_at }}</td>
+          <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    (function() {
+      const jobType = document.getElementById("jobType");
+      const symbolOrVar = document.getElementById("symbolOrVar");
+
+      const groups = {
+        contract: document.getElementById("groupContractRange"),
+        model: document.getElementById("groupModel"),
+        mainSchedule: document.getElementById("groupMainSchedule"),
+        mainDepth: document.getElementById("groupMainDepth"),
+      };
+
+      function setGroupVisible(el, on) {
+        if (!el) return;
+        el.style.display = on ? "block" : "none";
+      }
+
+      function syncFormByType() {
+        const t = (jobType && jobType.value) ? jobType.value : "";
+        setGroupVisible(groups.contract, t === "download_contract_range");
+        setGroupVisible(groups.model, t === "train" || t === "benchmark");
+        setGroupVisible(groups.mainSchedule, t === "main_schedule");
+        setGroupVisible(groups.mainDepth, t === "main_depth");
+
+        // Open the relevant section by default to reduce missed-required-fields.
+        if (groups.contract) groups.contract.open = (t === "download_contract_range");
+        if (groups.model) groups.model.open = (t === "train" || t === "benchmark");
+        if (groups.mainSchedule) groups.mainSchedule.open = (t === "main_schedule");
+        if (groups.mainDepth) groups.mainDepth.open = (t === "main_depth");
+
+        if (!symbolOrVar) return;
+        if (t === "download_contract_range" || t === "main_schedule") {
+          symbolOrVar.placeholder = "e.g. cu";
+        } else {
+          symbolOrVar.placeholder = "e.g. SHFE.cu2602";
+        }
+      }
+      if (jobType) jobType.addEventListener("change", syncFormByType);
+      syncFormByType();
+
+      const filter = document.getElementById("jobsFilter");
+      const status = document.getElementById("statusFilter");
+      const table = document.getElementById("jobsTable");
+
+      function applyFilter() {
+        if (!table) return;
+        const q = (filter && filter.value ? filter.value : "").trim().toLowerCase();
+        const s = (status && status.value ? status.value : "").trim().toLowerCase();
+        const rows = table.querySelectorAll("tbody tr");
+        for (const tr of rows) {
+          const t = (tr.textContent || "").toLowerCase();
+          const st = (tr.getAttribute("data-status") || "").toLowerCase();
+          const okQ = !q || t.includes(q);
+          const okS = !s || st === s;
+          tr.style.display = (okQ && okS) ? "" : "none";
+        }
+      }
+      if (filter) filter.addEventListener("input", applyFilter);
+      if (status) status.addEventListener("change", applyFilter);
+    })();
+  </script>
 {% endblock %}
 

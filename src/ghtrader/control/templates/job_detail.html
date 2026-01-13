@@ -3,7 +3,7 @@
   <h2>Job {{ job.id }}</h2>
 
   <div class="card">
-    <div><b>Status:</b> <span class="pill pill-{{ job.status }}">{{ job.status }}</span></div>
+    <div><b>Status:</b> <span class="pill pill-{{ job.status }}" id="jobStatusPill">{{ job.status }}</span></div>
     <div><b>Title:</b> {{ job.title }}</div>
     <div><b>Source:</b> <span class="mono">{{ job.source or "" }}</span></div>
     <div><b>PID:</b> <span class="mono">{{ job.pid or "" }}</span></div>
@@ -11,8 +11,8 @@
     <div><b>Created:</b> <span class="mono">{{ job.created_at }}</span></div>
     <div><b>Started:</b> <span class="mono">{{ job.started_at or "" }}</span></div>
     <div><b>Finished:</b> <span class="mono">{{ job.finished_at or "" }}</span></div>
-    <div><b>Command:</b> <span class="mono">{{ job.command | join(" ") }}</span></div>
-    <div><b>Log:</b> <span class="mono">{{ job.log_path or "" }}</span></div>
+    <div><b>Command:</b> <span class="mono" id="jobCommand">{{ job.command | join(" ") }}</span></div>
+    <div><b>Log:</b> <span class="mono" id="jobLogPath">{{ job.log_path or "" }}</span></div>
     <div><b>Waiting locks:</b> <span class="mono">{{ (job.waiting_locks or []) | join(",") }}</span></div>
     <div><b>Held locks:</b> <span class="mono">{{ (job.held_locks or []) | join(",") }}</span></div>
 
@@ -32,21 +32,68 @@
   </div>
 
   <h3>Log tail</h3>
+  <div class="card">
+    <div class="inlineControls">
+      <label><input type="checkbox" id="autoScroll" checked/> autoscroll</label>
+      <label><input type="checkbox" id="pausePolling"/> pause polling</label>
+      <label for="pollMs">poll</label>
+      <select id="pollMs">
+        <option value="1000">1s</option>
+        <option value="2000" selected>2s</option>
+        <option value="5000">5s</option>
+        <option value="10000">10s</option>
+      </select>
+      <button type="button" class="btn btn-secondary" id="copyJobId">Copy job id</button>
+      <button type="button" class="btn btn-secondary" id="copyCmd">Copy command</button>
+      <button type="button" class="btn btn-secondary" id="copyLogPath">Copy log path</button>
+      <a class="btn btn-secondary" href="/api/jobs/{{ job.id }}/log/download{{ token_qs }}">Download full log</a>
+    </div>
+    <p class="muted" style="margin:10px 0 0;">
+      Tip: polling pauses when the tab is hidden and stops when the job finishes.
+    </p>
+  </div>
+
   <pre class="log" id="logBox">{{ log_text }}</pre>
 
   <script>
     (function() {
       const logUrl = "/api/jobs/{{ job.id }}/log{{ token_qs }}";
       const ingestUrl = "/api/jobs/{{ job.id }}/ingest_status{{ token_qs }}";
+      const statusUrl = "/api/jobs{{ token_qs }}";
       const box = document.getElementById("logBox");
       const ingestCard = document.getElementById("ingestCard");
       const ingestKind = document.getElementById("ingestKind");
       const ingestCurrent = document.getElementById("ingestCurrent");
       const ingestProgress = document.getElementById("ingestProgress");
+      const pill = document.getElementById("jobStatusPill");
+      const autoScroll = document.getElementById("autoScroll");
+      const pausePolling = document.getElementById("pausePolling");
+      const pollMs = document.getElementById("pollMs");
+
+      const jobId = "{{ job.id }}";
+      let isRunning = ("{{ job.status }}" === "running");
+      let logTimer = null;
+      let statusTimer = null;
+      let ingestTimer = null;
 
       function fmtPct(x) {
         if (x === null || x === undefined) return "-";
         return (Math.round(x * 1000) / 10).toFixed(1) + "%";
+      }
+
+      async function copyText(s) {
+        const txt = String(s || "");
+        try {
+          await navigator.clipboard.writeText(txt);
+        } catch (e) {
+          window.prompt("Copy to clipboard:", txt);
+        }
+      }
+
+      function setPill(status) {
+        if (!pill) return;
+        pill.textContent = status || "";
+        pill.className = "pill pill-" + (status || "queued");
       }
 
       async function tick() {
@@ -55,7 +102,9 @@
           if (!resp.ok) return;
           const txt = await resp.text();
           box.textContent = txt;
-          box.scrollTop = box.scrollHeight;
+          if (autoScroll && autoScroll.checked) {
+            box.scrollTop = box.scrollHeight;
+          }
         } catch (e) {}
       }
 
@@ -92,9 +141,79 @@
         } catch (e) {}
       }
 
-      setInterval(tick, 2000);
-      setInterval(tickIngest, 10000);
-      tickIngest();
+      async function tickStatus() {
+        try {
+          const resp = await fetch(statusUrl);
+          if (!resp.ok) return;
+          const data = await resp.json();
+          const jobs = data.jobs || [];
+          const j = jobs.find(x => x && x.id === jobId);
+          if (!j) return;
+          const st = j.status || "";
+          setPill(st);
+          if (st !== "running") {
+            isRunning = false;
+            stopPolling();
+          } else {
+            isRunning = true;
+          }
+        } catch (e) {}
+      }
+
+      function stopPolling() {
+        if (logTimer) { clearInterval(logTimer); logTimer = null; }
+        if (ingestTimer) { clearInterval(ingestTimer); ingestTimer = null; }
+        if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+      }
+
+      function startPolling() {
+        stopPolling();
+        const ms = pollMs ? parseInt(pollMs.value, 10) : 2000;
+        if (!pausePolling || !pausePolling.checked) {
+          logTimer = setInterval(tick, ms);
+          statusTimer = setInterval(tickStatus, Math.max(2000, ms));
+          ingestTimer = setInterval(tickIngest, 10000);
+          tick();
+          tickStatus();
+          tickIngest();
+        }
+      }
+
+      function maybePauseForVisibility() {
+        if (document.hidden) {
+          stopPolling();
+          return;
+        }
+        if (!isRunning) return;
+        startPolling();
+      }
+
+      if (pausePolling) {
+        pausePolling.addEventListener("change", () => {
+          if (pausePolling.checked) {
+            stopPolling();
+          } else {
+            if (isRunning) startPolling();
+          }
+        });
+      }
+      if (pollMs) pollMs.addEventListener("change", () => { if (isRunning) startPolling(); });
+      document.addEventListener("visibilitychange", maybePauseForVisibility);
+
+      const btnCopyId = document.getElementById("copyJobId");
+      const btnCopyCmd = document.getElementById("copyCmd");
+      const btnCopyLog = document.getElementById("copyLogPath");
+      if (btnCopyId) btnCopyId.addEventListener("click", () => copyText(jobId));
+      if (btnCopyCmd) btnCopyCmd.addEventListener("click", () => copyText(document.getElementById("jobCommand").textContent));
+      if (btnCopyLog) btnCopyLog.addEventListener("click", () => copyText(document.getElementById("jobLogPath").textContent));
+
+      // Start polling if running; otherwise do one-time fetch.
+      if (isRunning) {
+        startPolling();
+      } else {
+        tick();
+        tickIngest();
+      }
     })();
   </script>
 {% endblock %}

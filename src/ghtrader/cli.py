@@ -489,6 +489,26 @@ def paper(ctx: click.Context, model: str, symbols: tuple[str, ...],
     type=click.Choice(["", "FAK", "FOK"]),
     help='Direct executor advanced order type ("FAK"/"FOK"; empty means none)',
 )
+@click.option(
+    "--monitor-only/--no-monitor-only",
+    default=False,
+    show_default=True,
+    help="Connect and record snapshots/events but never send orders (safe for real-account validation).",
+)
+@click.option(
+    "--require-no-alive-orders",
+    default="auto",
+    show_default=True,
+    type=click.Choice(["auto", "true", "false"]),
+    help="Preflight: refuse to start if there are any ALIVE orders (auto=true for live order routing).",
+)
+@click.option(
+    "--require-flat-start",
+    default="auto",
+    show_default=True,
+    type=click.Choice(["auto", "true", "false"]),
+    help="Preflight: require net position == 0 at startup (auto=true for live order routing).",
+)
 @click.option("--confirm-live", default="", type=str, help="Required for live: set to I_UNDERSTAND")
 @click.option(
     "--snapshot-interval-sec",
@@ -521,6 +541,9 @@ def trade(
     tp_offset_priority: str,
     direct_price_mode: str,
     direct_advanced: str,
+    monitor_only: bool,
+    require_no_alive_orders: str,
+    require_flat_start: str,
     confirm_live: str,
     snapshot_interval_sec: float,
 ) -> None:
@@ -538,8 +561,20 @@ def trade(
         max_daily_loss=max_daily_loss,
         enforce_trading_time=bool(enforce_trading_time),
     )
+
+    def _tri(x: str) -> bool | None:
+        x = str(x or "auto").strip().lower()
+        if x == "auto":
+            return None
+        if x == "true":
+            return True
+        if x == "false":
+            return False
+        return None
+
     cfg = TradeConfig(
         mode=mode,  # type: ignore[arg-type]
+        monitor_only=bool(monitor_only),
         sim_account=sim_account,  # type: ignore[arg-type]
         executor=executor,  # type: ignore[arg-type]
         model_name=model,
@@ -551,6 +586,8 @@ def trade(
         data_dir=Path(data_dir),
         artifacts_dir=Path(artifacts_dir),
         runs_dir=Path(runs_dir),
+        require_no_alive_orders=_tri(require_no_alive_orders),
+        require_flat_start=_tri(require_flat_start),
         limits=limits,
         targetpos_price=tp_price,
         targetpos_offset_priority=tp_offset_priority,

@@ -106,7 +106,7 @@ def load_trade_account_config_from_env() -> TradeAccountConfig:
     return TradeAccountConfig(broker_id=broker, account_id=acc, password=pwd)
 
 
-def create_tq_account(*, mode: TradingMode, sim_account: SimAccount = "tqsim") -> Any:
+def create_tq_account(*, mode: TradingMode, sim_account: SimAccount = "tqsim", monitor_only: bool = False) -> Any:
     _ensure_tqsdk_on_path()
     from tqsdk import TqAccount, TqKq, TqSim
 
@@ -116,7 +116,7 @@ def create_tq_account(*, mode: TradingMode, sim_account: SimAccount = "tqsim") -
         return TqSim()
 
     # live
-    if not is_live_enabled():
+    if (not monitor_only) and (not is_live_enabled()):
         raise RuntimeError("Live trading is disabled. Set GHTRADER_LIVE_ENABLED=true in .env to enable (dangerous).")
     cfg = load_trade_account_config_from_env()
     return TqAccount(cfg.broker_id, cfg.account_id, cfg.password)

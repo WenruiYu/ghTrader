@@ -6,7 +6,7 @@ from typing import Any
 
 import structlog
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from ghtrader.config import get_data_dir, get_runs_dir
@@ -86,6 +86,26 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         return jm.read_log_tail(job_id, max_bytes=int(max_bytes))
+
+    @app.get("/api/jobs/{job_id}/log/download")
+    def api_job_log_download(request: Request, job_id: str) -> Any:
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if not job.log_path:
+            raise HTTPException(status_code=404, detail="No log path for job")
+
+        p = Path(str(job.log_path)).resolve()
+        if not p.exists():
+            raise HTTPException(status_code=404, detail="Log file not found")
+
+        logs_root = _logs_dir(get_runs_dir()).resolve()
+        if logs_root not in p.parents:
+            raise HTTPException(status_code=400, detail="Invalid log path")
+
+        return FileResponse(path=str(p), filename=p.name, media_type="text/plain")
 
     @app.get("/api/jobs/{job_id}/ingest_status", response_class=JSONResponse)
     def api_job_ingest_status(request: Request, job_id: str) -> dict[str, Any]:

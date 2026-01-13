@@ -22,100 +22,112 @@
 
   {% if show_v1 %}
   <h3>Ticks (raw) — lake_v1</h3>
-  <table class="table">
-    <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-    <tbody>
-    {% for r in ticks_v1 %}
-      <tr>
-        <td class="mono">{{ r.symbol }}</td>
-        <td>{{ r.n_dates }}</td>
-        <td class="mono">{{ r.min_date or "" }}</td>
-        <td class="mono">{{ r.max_date or "" }}</td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
+  <div class="tableWrap">
+    <table class="table">
+      <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+      <tbody>
+      {% for r in ticks_v1 %}
+        <tr>
+          <td class="mono">{{ r.symbol }}</td>
+          <td>{{ r.n_dates }}</td>
+          <td class="mono">{{ r.min_date or "" }}</td>
+          <td class="mono">{{ r.max_date or "" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
   {% endif %}
 
   {% if show_v2 %}
   <h3>Ticks (raw) — lake_v2</h3>
-  <table class="table">
-    <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-    <tbody>
-    {% for r in ticks_v2 %}
-      <tr>
-        <td class="mono">{{ r.symbol }}</td>
-        <td>{{ r.n_dates }}</td>
-        <td class="mono">{{ r.min_date or "" }}</td>
-        <td class="mono">{{ r.max_date or "" }}</td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
+  <div class="tableWrap">
+    <table class="table">
+      <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+      <tbody>
+      {% for r in ticks_v2 %}
+        <tr>
+          <td class="mono">{{ r.symbol }}</td>
+          <td>{{ r.n_dates }}</td>
+          <td class="mono">{{ r.min_date or "" }}</td>
+          <td class="mono">{{ r.max_date or "" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
   {% endif %}
 
   {% if show_v1 %}
   <h3>Ticks (main-with-depth) — lake_v1</h3>
-  <table class="table">
-    <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-    <tbody>
-    {% for r in main_l5_v1 %}
-      <tr>
-        <td class="mono">{{ r.symbol }}</td>
-        <td>{{ r.n_dates }}</td>
-        <td class="mono">{{ r.min_date or "" }}</td>
-        <td class="mono">{{ r.max_date or "" }}</td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
+  <div class="tableWrap">
+    <table class="table">
+      <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+      <tbody>
+      {% for r in main_l5_v1 %}
+        <tr>
+          <td class="mono">{{ r.symbol }}</td>
+          <td>{{ r.n_dates }}</td>
+          <td class="mono">{{ r.min_date or "" }}</td>
+          <td class="mono">{{ r.max_date or "" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
   {% endif %}
 
   {% if show_v2 %}
   <h3>Ticks (main-with-depth) — lake_v2</h3>
-  <table class="table">
-    <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-    <tbody>
-    {% for r in main_l5_v2 %}
-      <tr>
-        <td class="mono">{{ r.symbol }}</td>
-        <td>{{ r.n_dates }}</td>
-        <td class="mono">{{ r.min_date or "" }}</td>
-        <td class="mono">{{ r.max_date or "" }}</td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
+  <div class="tableWrap">
+    <table class="table">
+      <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+      <tbody>
+      {% for r in main_l5_v2 %}
+        <tr>
+          <td class="mono">{{ r.symbol }}</td>
+          <td>{{ r.n_dates }}</td>
+          <td class="mono">{{ r.min_date or "" }}</td>
+          <td class="mono">{{ r.max_date or "" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
   {% endif %}
 
   <h3>Features</h3>
-  <table class="table">
-    <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-    <tbody>
-    {% for r in features %}
-      <tr>
-        <td class="mono">{{ r.symbol }}</td>
-        <td>{{ r.n_dates }}</td>
-        <td class="mono">{{ r.min_date or "" }}</td>
-        <td class="mono">{{ r.max_date or "" }}</td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
+  <div class="tableWrap">
+    <table class="table">
+      <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+      <tbody>
+      {% for r in features %}
+        <tr>
+          <td class="mono">{{ r.symbol }}</td>
+          <td>{{ r.n_dates }}</td>
+          <td class="mono">{{ r.min_date or "" }}</td>
+          <td class="mono">{{ r.max_date or "" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
 
   <h3>Labels</h3>
-  <table class="table">
-    <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-    <tbody>
-    {% for r in labels %}
-      <tr>
-        <td class="mono">{{ r.symbol }}</td>
-        <td>{{ r.n_dates }}</td>
-        <td class="mono">{{ r.min_date or "" }}</td>
-        <td class="mono">{{ r.max_date or "" }}</td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
+  <div class="tableWrap">
+    <table class="table">
+      <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+      <tbody>
+      {% for r in labels %}
+        <tr>
+          <td class="mono">{{ r.symbol }}</td>
+          <td>{{ r.n_dates }}</td>
+          <td class="mono">{{ r.min_date or "" }}</td>
+          <td class="mono">{{ r.max_date or "" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
 {% endblock %}
 

@@ -13,24 +13,51 @@
     </div>
   </div>
 
+  {% set running_jobs = jobs | selectattr("status", "equalto", "running") | list %}
+  {% if running_jobs and running_jobs|length > 0 %}
+    <h3>Running</h3>
+    <div class="tableWrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>ID</th><th>Status</th><th>Title</th><th>Started</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for j in running_jobs %}
+          <tr>
+            <td class="mono">{{ j.id }}</td>
+            <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
+            <td>{{ j.title }}</td>
+            <td class="mono">{{ j.started_at or "" }}</td>
+            <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+
   <h3>Recent</h3>
-  <table class="table">
-    <thead>
-      <tr>
-        <th>ID</th><th>Status</th><th>Title</th><th>Created</th><th></th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for j in jobs %}
-      <tr>
-        <td class="mono">{{ j.id }}</td>
-        <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
-        <td>{{ j.title }}</td>
-        <td class="mono">{{ j.created_at }}</td>
-        <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="tableWrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>ID</th><th>Status</th><th>Title</th><th>Created</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for j in jobs %}
+        <tr>
+          <td class="mono">{{ j.id }}</td>
+          <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
+          <td>{{ j.title }}</td>
+          <td class="mono">{{ j.created_at }}</td>
+          <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 {% endblock %}
 

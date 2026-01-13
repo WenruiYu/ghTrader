@@ -8,7 +8,7 @@
       <div class="grid3">
         <div>
           <label>Mode</label>
-          <select name="mode">
+          <select name="mode" id="tradeMode">
             <option value="paper" selected>paper</option>
             <option value="sim">sim</option>
             <option value="live">live</option>
@@ -27,6 +27,13 @@
             <option value="targetpos" selected>targetpos</option>
             <option value="direct">direct</option>
           </select>
+        </div>
+      </div>
+
+      <div class="card" style="margin:12px 0;">
+        <div class="inlineControls">
+          <label><input type="checkbox" id="monitorOnly" name="monitor_only" checked/> monitor-only (no orders)</label>
+          <span class="muted">Recommended for first real-account testing.</span>
         </div>
       </div>
 
@@ -59,7 +66,7 @@
           <label>Enforce trading time</label>
           <select name="enforce_trading_time"><option value="true" selected>true</option><option value="false">false</option></select>
         </div>
-        <div><label>Confirm live</label><input name="confirm_live" placeholder="I_UNDERSTAND"/></div>
+        <div id="confirmLiveWrap"><label>Confirm live</label><input name="confirm_live" placeholder="I_UNDERSTAND"/></div>
       </div>
 
       <h4>TargetPosTask</h4>
@@ -93,22 +100,52 @@
     </form>
   </div>
 
+  <script>
+    (function() {
+      const mode = document.getElementById("tradeMode");
+      const mo = document.getElementById("monitorOnly");
+      const confirmWrap = document.getElementById("confirmLiveWrap");
+
+      function sync() {
+        const m = (mode && mode.value) ? mode.value : "paper";
+        const monitor = !!(mo && mo.checked);
+        // Only show confirm-live when doing real order routing.
+        if (confirmWrap) {
+          confirmWrap.style.display = (m === "live" && !monitor) ? "block" : "none";
+        }
+        // Auto-enable monitor-only when switching to live (safety-first).
+        if (m === "live" && mo && !mo.checked) {
+          mo.checked = true;
+        }
+        // Disable sim_account control unless sim
+        const simSelect = document.querySelector('select[name="sim_account"]');
+        if (simSelect) simSelect.disabled = (m !== "sim");
+      }
+
+      if (mode) mode.addEventListener("change", sync);
+      if (mo) mo.addEventListener("change", sync);
+      sync();
+    })();
+  </script>
+
   <div class="card">
     <h3>Recent trading runs</h3>
     {% if runs and runs|length > 0 %}
-      <table class="table">
-        <thead><tr><th>run_id</th><th>last_ts</th><th>balance</th><th></th></tr></thead>
-        <tbody>
-        {% for r in runs %}
-          <tr>
-            <td class="mono">{{ r.run_id }}</td>
-            <td class="mono">{{ r.last_ts }}</td>
-            <td class="mono">{{ r.balance }}</td>
-            <td><a href="/ops/trading/run/{{ r.run_id }}{{ token_qs }}">view</a></td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
+      <div class="tableWrap">
+        <table class="table">
+          <thead><tr><th>run_id</th><th>last_ts</th><th>balance</th><th></th></tr></thead>
+          <tbody>
+          {% for r in runs %}
+            <tr>
+              <td class="mono">{{ r.run_id }}</td>
+              <td class="mono">{{ r.last_ts }}</td>
+              <td class="mono">{{ r.balance }}</td>
+              <td><a href="/ops/trading/run/{{ r.run_id }}{{ token_qs }}">view</a></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
     {% else %}
       <p class="muted">No runs found under runs/trading/</p>
     {% endif %}

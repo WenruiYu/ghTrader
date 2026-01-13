@@ -654,6 +654,7 @@ def build_router() -> Any:
         _require_auth(request)
         form = await request.form()
         mode = str(form.get("mode") or "paper").strip()
+        monitor_only = str(form.get("monitor_only") or "").strip().lower() in {"true", "1", "yes", "on"}
         sim_account = str(form.get("sim_account") or "tqsim").strip()
         executor = str(form.get("executor") or "targetpos").strip()
         model = str(form.get("model") or "").strip()
@@ -685,6 +686,7 @@ def build_router() -> Any:
             "trade",
             "--mode",
             mode,
+            "--monitor-only" if monitor_only else "--no-monitor-only",
             "--sim-account",
             sim_account,
             "--executor",

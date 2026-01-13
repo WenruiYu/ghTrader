@@ -203,21 +203,33 @@ class TargetPosExecutor:
 
         self.api = api
         self.account = account
+        self.price = price
+        self.offset_priority = offset_priority
+        self.min_volume = min_volume
+        self.max_volume = max_volume
         self.symbols = list(symbols)
-        self.tasks = {
-            s: TargetPosTask(
-                api,
-                s,
-                price=price,
-                offset_priority=offset_priority,
-                min_volume=min_volume,
-                max_volume=max_volume,
-                account=account,
-            )
-            for s in self.symbols
-        }
+        self._TargetPosTask = TargetPosTask
+        self.tasks = {s: self._new_task(s) for s in self.symbols}
+
+    def _new_task(self, symbol: str):
+        return self._TargetPosTask(
+            self.api,
+            symbol,
+            price=self.price,
+            offset_priority=self.offset_priority,
+            min_volume=self.min_volume,
+            max_volume=self.max_volume,
+            account=self.account,
+        )
+
+    def _ensure_task(self, symbol: str) -> None:
+        if symbol in self.tasks:
+            return
+        self.symbols.append(symbol)
+        self.tasks[symbol] = self._new_task(symbol)
 
     def set_target(self, symbol: str, target_net: int) -> None:
+        self._ensure_task(symbol)
         self.tasks[symbol].set_target_volume(int(target_net))
 
     def cancel_all(self) -> None:

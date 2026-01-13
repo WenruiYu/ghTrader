@@ -9,59 +9,71 @@
       “current” symbol/chunk hints are parsed from job logs.
     </p>
 
-    <table class="table" id="ingestJobsTable">
-      <thead>
-        <tr>
-          <th>ID</th><th>Status</th><th>Kind</th><th>Source</th><th>Current</th><th>Progress</th><th>Title</th><th></th>
-        </tr>
-      </thead>
-      <tbody id="ingestJobsBody">
-        {% for s in ingest_statuses %}
+    <div class="tableWrap">
+      <table class="table" id="ingestJobsTable">
+        <thead>
           <tr>
-            <td class="mono">{{ s.job_id }}</td>
-            <td><span class="pill pill-{{ s.job_status }}">{{ s.job_status }}</span></td>
-            <td class="mono">{{ s.kind }}</td>
-            <td class="mono">{{ s.source or "" }}</td>
-            <td class="mono">
-              {% if s.kind == "download_contract_range" %}
-                {{ s.current_symbol or "" }}
-              {% elif s.kind == "download" %}
-                {{ s.symbol or "" }}
-              {% else %}
-                {{ s.current_symbol or "" }}
-              {% endif %}
-            </td>
-            <td class="mono">
-              {% if s.kind == "download_contract_range" and s.summary %}
-                {{ (s.summary.pct * 100) | round(1) }}%
-                ({{ s.summary.days_done_total }}/{{ s.summary.days_expected_total }})
-                contracts {{ s.summary.contracts_done }}/{{ s.summary.contracts_total }}
-              {% elif s.kind == "download" and s.summary %}
-                {{ (s.summary.pct * 100) | round(1) }}%
-                ({{ s.summary.days_done }}/{{ s.summary.days_expected }})
-              {% else %}
-                -
-              {% endif %}
-            </td>
-            <td>{{ s.title or "" }}</td>
-            <td><a href="/jobs/{{ s.job_id }}{{ token_qs }}">View</a></td>
+            <th>ID</th><th>Status</th><th>Kind</th><th>Lake</th><th>Source</th><th>Current</th><th>Progress</th><th>Title</th><th></th>
           </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+        </thead>
+        <tbody id="ingestJobsBody">
+          {% for s in ingest_statuses %}
+            <tr>
+              <td class="mono">{{ s.job_id }}</td>
+              <td><span class="pill pill-{{ s.job_status }}">{{ s.job_status }}</span></td>
+              <td class="mono">{{ s.kind }}</td>
+              <td class="mono">{{ s.lake_version or "" }}</td>
+              <td class="mono">{{ s.source or "" }}</td>
+              <td class="mono">
+                {% if s.kind == "download_contract_range" %}
+                  {{ s.current_symbol or "" }}
+                {% elif s.kind == "download" %}
+                  {{ s.symbol or "" }}
+                {% else %}
+                  {{ s.current_symbol or "" }}
+                {% endif %}
+              </td>
+              <td>
+                {% if s.summary and s.summary.pct is not none %}
+                  <div class="progressBar"><div style="width: {{ (s.summary.pct * 100) | round(1) }}%;"></div></div>
+                  <div class="mono" style="margin-top:6px;">
+                    {% if s.kind == "download_contract_range" %}
+                      {{ (s.summary.pct * 100) | round(1) }}%
+                      ({{ s.summary.days_done_total }}/{{ s.summary.days_expected_total }})
+                      contracts {{ s.summary.contracts_done }}/{{ s.summary.contracts_total }}
+                    {% elif s.kind == "download" %}
+                      {{ (s.summary.pct * 100) | round(1) }}%
+                      ({{ s.summary.days_done }}/{{ s.summary.days_expected }})
+                    {% else %}
+                      {{ (s.summary.pct * 100) | round(1) }}%
+                    {% endif %}
+                  </div>
+                {% else %}
+                  <span class="mono">-</span>
+                {% endif %}
+              </td>
+              <td>{{ s.title or "" }}</td>
+              <td><a href="/jobs/{{ s.job_id }}{{ token_qs }}">View</a></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   </div>
 
   <div class="card" id="rangeDetailsCard" style="display:none;">
     <h3>Range details</h3>
     <div id="rangeDetailsMeta" class="muted"></div>
-    <table class="table">
-      <thead>
-        <tr>
-          <th>Contract</th><th>Status</th><th>Current</th><th>Expected</th><th>Done</th><th>%</th><th>min</th><th>max</th>
-        </tr>
-      </thead>
-      <tbody id="rangeDetailsBody"></tbody>
-    </table>
+    <div class="tableWrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Contract</th><th>Status</th><th>Current</th><th>Expected</th><th>Done</th><th>%</th><th>min</th><th>max</th>
+          </tr>
+        </thead>
+        <tbody id="rangeDetailsBody"></tbody>
+      </table>
+    </div>
   </div>
 
   <div class="card">
@@ -69,12 +81,12 @@
     <form class="form" method="post" action="/ops/ingest/download{{ token_qs }}">
       <div class="grid3">
         <div><label>Symbol</label><input name="symbol" placeholder="SHFE.cu2602"/></div>
-        <div><label>Start (YYYY-MM-DD)</label><input name="start_date"/></div>
-        <div><label>End (YYYY-MM-DD)</label><input name="end_date"/></div>
+        <div><label>Start (YYYY-MM-DD)</label><input name="start_date" type="date"/></div>
+        <div><label>End (YYYY-MM-DD)</label><input name="end_date" type="date"/></div>
       </div>
       <div class="grid3">
         <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Chunk days</label><input name="chunk_days" value="5"/></div>
+        <div><label>Chunk days</label><input name="chunk_days" type="number" min="1" step="1" value="5"/></div>
         <div><label>Lake version</label>
           <select name="lake_version"><option value="v1" selected>v1</option><option value="v2">v2</option></select>
         </div>
@@ -89,7 +101,7 @@
       <div class="grid3">
         <div><label>Exchange</label><input name="exchange" value="SHFE"/></div>
         <div><label>Var (cu/au/ag)</label><input name="variety" value="cu"/></div>
-        <div><label>Chunk days</label><input name="chunk_days" value="5"/></div>
+        <div><label>Chunk days</label><input name="chunk_days" type="number" min="1" step="1" value="5"/></div>
       </div>
       <div class="grid3">
         <div><label>Start contract (YYMM)</label><input name="start_contract" value="1601"/></div>
@@ -146,22 +158,30 @@
                           (s.kind === "download") ? (s.symbol || "") :
                           (s.current_symbol || "");
 
+          let pct = null;
           let progress = "-";
           if (s.kind === "download_contract_range" && s.summary) {
+            pct = s.summary.pct;
             progress = fmtPct(s.summary.pct) +
               " (" + s.summary.days_done_total + "/" + s.summary.days_expected_total + ")" +
               " contracts " + s.summary.contracts_done + "/" + s.summary.contracts_total;
           } else if (s.kind === "download" && s.summary) {
+            pct = s.summary.pct;
             progress = fmtPct(s.summary.pct) + " (" + s.summary.days_done + "/" + s.summary.days_expected + ")";
           }
+
+          const bar = (pct !== null && pct !== undefined) ?
+            ('<div class=\"progressBar\"><div style=\"width:' + (Math.max(0, Math.min(1, pct)) * 100).toFixed(1) + '%\"></div></div>') :
+            '';
 
           tr.innerHTML =
             '<td class="mono">' + (s.job_id || "") + '</td>' +
             '<td><span class="' + pillClass(s.job_status) + '">' + (s.job_status || "") + '</span></td>' +
             '<td class="mono">' + (s.kind || "") + '</td>' +
+            '<td class="mono">' + (s.lake_version || "") + '</td>' +
             '<td class="mono">' + (s.source || "") + '</td>' +
             '<td class="mono">' + current + '</td>' +
-            '<td class="mono">' + progress + '</td>' +
+            '<td>' + bar + '<div class="mono" style="margin-top:6px;">' + progress + '</div></td>' +
             '<td>' + (s.title || "") + '</td>' +
             '<td><a href="/jobs/' + (s.job_id || "") + tokenQs + '">View</a></td>';
 
@@ -184,6 +204,7 @@
         meta.textContent =
           "Job " + (s.job_id || "") + " / " + (s.var || "") + " " +
           (s.start_contract || "") + " -> " + (s.resolved_end_contract || s.end_contract || "") +
+          (s.lake_version ? (" | lake: " + s.lake_version) : "") +
           (s.current_symbol ? (" | current: " + s.current_symbol) : "");
 
         body.innerHTML = "";
@@ -200,7 +221,7 @@
             '<td class="mono">' + (c.min_downloaded || "") + '</td>' +
             '<td class="mono">' + (c.max_downloaded || "") + '</td>';
           if (c.is_current) {
-            tr.style.background = "#fff3cd";
+            tr.classList.add("rowCurrent");
           }
           body.appendChild(tr);
         }

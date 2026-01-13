@@ -486,6 +486,8 @@ Trading mode defines whether orders may be sent:
 - **sim**: orders are allowed using simulated accounts:
   - `TqSim()` (local sim) or `TqKq()` (快期模拟).
 - **live**: orders are allowed using `TqAccount(...)` (real broker account). This is **disabled by default**.
+- **live (monitor-only)**: connect to the real broker account and record snapshots/events, but **never send orders**.
+  This is the required first step before any live order routing.
 
 #### 5.12.2 Account configuration (env + .env)
 
@@ -516,6 +518,10 @@ Safety gate for live trading:
   - `.env`: `GHTRADER_LIVE_ENABLED=true`
   - CLI: `--confirm-live I_UNDERSTAND`
 
+Monitor-only live mode gate:
+- `--mode live --monitor-only` must **not** require `--confirm-live`.
+  It must still require broker credentials and must still log all snapshots/events to `runs/trading/...`.
+
 Mandatory risk controls (must work even without TqSdk “professional” local risk features):
 
 - **max position** per symbol (absolute net position)
@@ -536,6 +542,15 @@ Trading may target:
 
 If a continuous alias is provided, trading must **resolve** to the correct underlying contract for the current trading day using the persisted roll schedule (from `main-schedule`). If the underlying changes (roll), the runner must reset any online state and avoid cross-contract leakage.
 
+Continuous alias roll behavior (required):
+- The runner must treat the user-supplied symbol as a **strategy symbol** and maintain a binding:
+  `requested_symbol -> execution_symbol`.
+- The runner must detect trading-day transitions (night session boundary included) and **re-resolve** `execution_symbol` for each continuous alias.
+- On roll (execution symbol changes):
+  - Reset any online feature/model state (FactorEngine states, deep model buffers)
+  - Refresh subscriptions (quotes/ticks/positions) to the new underlying contract
+  - In order-enabled modes: flatten/cancel the old underlying contract before switching
+
 Schedule resolution sources (in priority order):
 
 - Preferred: the canonical roll schedule produced by `main-schedule`:
@@ -552,6 +567,11 @@ Trading runners must persist:
 - run config + mode/account/executor parameters
 - periodic **account snapshots** (balance/margin/positions/open orders)
 - order/trade events (fills, cancels, rejects) as structured logs
+
+Feature-spec correctness (required for live safety):
+- Online trading must enforce that the factor set/order used for inference matches the trained model’s expected feature shape.
+  - Default source of truth: `data/features/symbol=<strategy_symbol>/manifest.json` (`enabled_factors`).
+  - If a feature spec cannot be determined, the runner must fail fast in live order-enabled mode.
 
 Write under: `runs/trading/<run_id>/...` so the dashboard can display “last known state” without attaching to the live process.
 
