@@ -4,28 +4,6 @@ import json
 from datetime import date
 from pathlib import Path
 
-import pandas as pd
-
-
-def _write_calendar_cache(data_dir: Path, days: list[date]) -> None:
-    p = data_dir / "akshare" / "calendar" / "calendar.parquet"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame({"date": pd.to_datetime([d.isoformat() for d in days])})
-    df.to_parquet(p, index=False)
-
-
-def _write_active_ranges_cache(data_dir: Path, *, exchange: str, var: str, rows: list[dict]) -> None:
-    root = data_dir / "akshare" / "active_ranges" / f"market={exchange.upper()}" / f"var={var.lower()}"
-    root.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(rows)
-    df.to_parquet(root / "active_ranges.parquet", index=False)
-    (root / "manifest.json").write_text(
-        json.dumps(
-            {"exchange": exchange.upper(), "var": var.lower(), "scanned_start": "2000-01-01", "scanned_end": "2100-01-01"},
-            indent=2,
-        )
-    )
-
 
 def _touch_tick_day(data_dir: Path, symbol: str, day: date) -> None:
     d = data_dir / "lake" / "ticks" / f"symbol={symbol}" / f"date={day.isoformat()}"
@@ -113,11 +91,14 @@ def test_parse_ingest_command_download_contract_range(tmp_path: Path) -> None:
         "1601",
         "--end-contract",
         "auto",
+        "--start-date",
+        "2015-01-01",
+        "--end-date",
+        "2015-01-08",
         "--data-dir",
         str(tmp_path / "data"),
         "--chunk-days",
         "5",
-        "--no-refresh-akshare",
     ]
     out = parse_ingest_command(cmd)
     assert out["kind"] == "download_contract_range"
@@ -125,6 +106,8 @@ def test_parse_ingest_command_download_contract_range(tmp_path: Path) -> None:
     assert out["args"]["var"] == "cu"
     assert out["args"]["start_contract"] == "1601"
     assert out["args"]["end_contract"] == "auto"
+    assert out["args"]["start_date"] == "2015-01-01"
+    assert out["args"]["end_date"] == "2015-01-08"
 
     cmd2 = cmd + ["--lake-version", "v2"]
     out2 = parse_ingest_command(cmd2)
@@ -153,85 +136,47 @@ def test_compute_range_progress_from_lake_and_no_data(tmp_path: Path) -> None:
     from ghtrader.control.ingest_status import compute_download_contract_range_status
 
     data_dir = tmp_path / "data"
-    _write_calendar_cache(
-        data_dir,
-        days=[
-            # 2025-01 range
-            date(2025, 1, 2),
-            date(2025, 1, 3),
-            date(2025, 1, 6),
-            date(2025, 1, 7),
-            # 2025-02 range
-            date(2025, 2, 3),
-            date(2025, 2, 4),
-            date(2025, 2, 5),
-        ],
-    )
 
-    _write_active_ranges_cache(
-        data_dir,
-        exchange="SHFE",
-        var="cu",
-        rows=[
-            {"symbol": "CU2501", "first_active": "2025-01-02", "last_active": "2025-01-07"},
-            {"symbol": "CU2502", "first_active": "2025-02-03", "last_active": "2025-02-05"},
-        ],
-    )
+    # Window: 2025-01-02..2025-01-07 (weekday fallback calendar => 4 trading days)
+    d0 = date(2025, 1, 2)
+    d1 = date(2025, 1, 7)
 
-    # CU2501 expected trading days: 4 (02,03,06,07)
-    # downloaded: 2, no-data: 1 => done 3/4
+    # CU2501: downloaded 2, no-data 1 => done 3/4
     sym1 = "SHFE.cu2501"
     _touch_tick_day(data_dir, sym1, date(2025, 1, 2))
     _touch_tick_day(data_dir, sym1, date(2025, 1, 3))
     _write_no_data_dates(data_dir, sym1, [date(2025, 1, 6)])
 
-    # CU2502 expected: 3 (03,04,05)
-    # downloaded: 3 => done 3/3
+    # CU2502: downloaded 4 => done 4/4
     sym2 = "SHFE.cu2502"
-    _touch_tick_day(data_dir, sym2, date(2025, 2, 3))
-    _touch_tick_day(data_dir, sym2, date(2025, 2, 4))
-    _touch_tick_day(data_dir, sym2, date(2025, 2, 5))
+    _touch_tick_day(data_dir, sym2, date(2025, 1, 2))
+    _touch_tick_day(data_dir, sym2, date(2025, 1, 3))
+    _touch_tick_day(data_dir, sym2, date(2025, 1, 6))
+    _touch_tick_day(data_dir, sym2, date(2025, 1, 7))
 
     status = compute_download_contract_range_status(
         exchange="SHFE",
         var="cu",
         start_contract="2501",
         end_contract="2502",
+        start_date=d0,
+        end_date=d1,
         data_dir=data_dir,
         log_hint={},
     )
     assert status["kind"] == "download_contract_range"
     assert status["summary"]["contracts_total"] == 2
-    assert status["summary"]["days_expected_total"] == 7
-    assert status["summary"]["days_done_total"] == 6
-    assert 0.84 < status["summary"]["pct"] < 0.86
+    assert status["summary"]["days_expected_total"] == 8
+    assert status["summary"]["days_done_total"] == 7
+    assert 0.86 < status["summary"]["pct"] < 0.89
 
 
 def test_compute_range_progress_v2_scans_lake_v2(tmp_path: Path) -> None:
     from ghtrader.control.ingest_status import compute_download_contract_range_status
 
     data_dir = tmp_path / "data"
-    _write_calendar_cache(
-        data_dir,
-        days=[
-            date(2025, 1, 2),
-            date(2025, 1, 3),
-            date(2025, 1, 6),
-            date(2025, 1, 7),
-            date(2025, 2, 3),
-            date(2025, 2, 4),
-            date(2025, 2, 5),
-        ],
-    )
-    _write_active_ranges_cache(
-        data_dir,
-        exchange="SHFE",
-        var="cu",
-        rows=[
-            {"symbol": "CU2501", "first_active": "2025-01-02", "last_active": "2025-01-07"},
-            {"symbol": "CU2502", "first_active": "2025-02-03", "last_active": "2025-02-05"},
-        ],
-    )
+    d0 = date(2025, 1, 2)
+    d1 = date(2025, 1, 7)
 
     sym1 = "SHFE.cu2501"
     _touch_tick_day_v2(data_dir, sym1, date(2025, 1, 2))
@@ -239,21 +184,24 @@ def test_compute_range_progress_v2_scans_lake_v2(tmp_path: Path) -> None:
     _write_no_data_dates_v2(data_dir, sym1, [date(2025, 1, 6)])
 
     sym2 = "SHFE.cu2502"
-    _touch_tick_day_v2(data_dir, sym2, date(2025, 2, 3))
-    _touch_tick_day_v2(data_dir, sym2, date(2025, 2, 4))
-    _touch_tick_day_v2(data_dir, sym2, date(2025, 2, 5))
+    _touch_tick_day_v2(data_dir, sym2, date(2025, 1, 2))
+    _touch_tick_day_v2(data_dir, sym2, date(2025, 1, 3))
+    _touch_tick_day_v2(data_dir, sym2, date(2025, 1, 6))
+    _touch_tick_day_v2(data_dir, sym2, date(2025, 1, 7))
 
     status = compute_download_contract_range_status(
         exchange="SHFE",
         var="cu",
         start_contract="2501",
         end_contract="2502",
+        start_date=d0,
+        end_date=d1,
         data_dir=data_dir,
         log_hint={},
         lake_version="v2",
     )
     assert status["kind"] == "download_contract_range"
     assert status["lake_version"] == "v2"
-    assert status["summary"]["days_expected_total"] == 7
-    assert status["summary"]["days_done_total"] == 6
+    assert status["summary"]["days_expected_total"] == 8
+    assert status["summary"]["days_done_total"] == 7
 

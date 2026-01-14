@@ -112,8 +112,9 @@ Problem:
 - Some valid trading days may legitimately have **no ticks available** in TqSdk Pro history (e.g., data gaps, pre-listing boundary days). These must not cause infinite retries.
 
 Requirements:
-- **Trading day source**: use the **akshare futures calendar** (`akshare.futures.cons.get_calendar()`) as the authoritative list of trading days.
-  - If akshare is not available, fallback to weekday-only behavior (best-effort).
+- **Trading day source**: use Shinny/TqSdk’s holiday list to compute trading days (no akshare dependency):
+  - Source URL: `https://files.shinnytech.com/shinny_chinese_holiday.json` (configurable via `TQ_CHINESE_HOLIDAY_URL`)
+  - Trading day rule: weekday AND not in holiday list (best-effort; cache locally).
 - **No-data markers**:
   - For each symbol, persist a set of trading dates that were attempted but returned **zero ticks**, so ingest completion is idempotent.
   - Store at: `data/lake/ticks/symbol=<SYMBOL>/_no_data_dates.json` (ISO dates).
@@ -131,10 +132,11 @@ Requirements:
 Implementation:
 - `src/ghtrader/tq_ingest.py` (`run_live_recorder`)
 
-### 5.3 Parquet data lake (canonical raw store)
+### 5.3 Tick storage (QuestDB canonical + Parquet mirror)
 
-- Append-only raw lake.
-- Partitioning (two lake roots are supported):
+- **Canonical tick store**: QuestDB (daemon time-series DB) stores raw ticks for all contracts.
+- **Parquet mirror**: Parquet lake is retained as a durable mirror and for training/export (rebuildable from QuestDB or double-written at ingest time).
+- Partitioning for the Parquet mirror (two lake roots are supported):
   - **lake_v1 (legacy)**: `data/lake/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet`
   - **lake_v2 (trading-day)**: `data/lake_v2/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet`
     - For **lake_v2**, `date=YYYY-MM-DD` is the **trading day**, not necessarily the wall-clock calendar date of the tick (night session must map to the correct trading day).
@@ -144,6 +146,7 @@ Implementation:
 
 Implementation:
 - `src/ghtrader/lake.py`
+- `src/ghtrader/serving_db.py` (QuestDB schema + sync)
 
 #### 5.3.0.0 Lake versioning and selection
 
@@ -160,19 +163,23 @@ Selection rules:
   - `--lake-version {v1|v2}`
 - Features/labels manifests must record which lake version they were built against and must refuse to mix outputs across lake versions unless `--overwrite` is set.
 
-#### 5.3.0 Akshare daily cache policy (used for roll schedule + active range inference)
+Offline conversion (v1 → v2):
 
-Requirements:
-- Only fetch/cache daily futures data for **trading days** (do not create cached empty files for weekends/holidays).
-- Transient fetch failures must use bounded retry/backoff and be surfaced explicitly (do **not** silently cache an empty DataFrame on error).
+- The system should provide an **offline conversion** command that can populate `lake_v2` from an existing `lake_v1` without network re-download.
+- Conversion must be **idempotent** and **resumable**:
+  - safe to rerun after interruption
+  - must not duplicate data when rerun
+- Conversion must coordinate with other writers using the same cross-session lock system (so it does not corrupt concurrently running ingest/record jobs).
 
-#### 5.3.0.1 Active range cache (contract -> first/last active trading day)
+#### 5.3.0 Contract coverage + L5 availability index (QuestDB-backed)
 
-To avoid repeated large daily scans during contract-range backfills:
-- Persist `contract -> (first_active, last_active)` for `(market,var)` at:
-  - `data/akshare/active_ranges/market=<MKT>/var=<VAR>/active_ranges.parquet`
-  - `data/akshare/active_ranges/market=<MKT>/var=<VAR>/manifest.json` (scanned start/end, created_at)
-- Contract-range download must reuse the cache if it covers the requested scan window.
+To make the data system robust (fill/verify/repair), ghTrader must be able to compute coverage from the canonical tick DB:
+
+- Per contract (symbol):
+  - first/last tick day present (any ticks)
+  - first/last L5 day present (depth levels 2–5 have non-null/non-NaN values)
+  - freshness for active contracts (behind latest trading day → `stale`)
+- The dashboard contract explorer must use this index (or directly query QuestDB) instead of akshare-driven active-ranges.
 
 #### 5.3.0.2 Data integrity validation, checksums, and audit command
 
@@ -211,18 +218,20 @@ Audit command:
   - manifest consistency (manifest row counts match Parquet metadata row counts)
   - derived-vs-raw equivalence for `main_l5` (tick value columns must match raw underlying; `symbol` differs by design; metadata columns must match schedule provenance)
 
-#### 5.3.0.3 Database / query layer (optional; Parquet remains canonical)
+#### 5.3.0.3 Database / query layer (QuestDB canonical ticks; DuckDB optional analytics)
 
-ghTrader’s **canonical storage** for market data and derived datasets is the Parquet lake (`data/lake` / `data/lake_v2`) and Parquet outputs (`data/features`, `data/labels`). A database framework may be introduced as a **query/index layer** but must not become the only copy of data.
+Canonical ticks are stored in QuestDB, but ghTrader must still keep Parquet as a mirror for reproducibility and training.
 
-Goals for a DB layer:
+- **QuestDB (canonical ticks)**:
+  - Stores `ticks_raw` for all contracts/aliases.
+  - Optionally stores `ticks_main_l5` for derived main-with-depth datasets.
+  - Time semantics must be explicit:
+    - Store `datetime_ns` (int64 epoch-ns as provided by TqSdk) AND a QuestDB `TIMESTAMP` column (`ts`) derived from it.
+  - Ingestion must be idempotent and provenance-aware (lake_version, ticks_lake).
 
-- Provide **fast ad-hoc SQL** over ticks/features/labels/metrics for research and the dashboard.
-- Avoid duplicating data unnecessarily; prefer querying Parquet directly when possible.
-- Keep the system **single-host friendly** by default; server/daemon DBs are optional.
-- Do **not** replace operational metadata/locking unless explicitly migrating:
-  - Control-plane jobs/locks remain stored in local SQLite (`runs/control/jobs.db`) by default.
-  - A DB layer may *index* jobs/metrics for richer querying, but SQLite remains the operational source of truth unless a migration is planned.
+- **DuckDB (optional analytics)**:
+  - Used for ad-hoc SQL over Parquet mirrors (`data/lake_v2/...`, `data/features`, `data/labels`) and metrics indexing.
+  - DuckDB outputs are rebuildable caches; it is not the operational source of truth for ticks.
 
 Default (Stage A): embedded analytics DB (DuckDB)
 
@@ -248,17 +257,7 @@ Default (Stage A): embedded analytics DB (DuckDB)
   - Daily pipeline reports under `runs/daily_pipeline/...`
   (Files remain canonical; DuckDB tables are rebuildable indexes.)
 
-Optional (Stage B): serving/index DB (QuestDB / ClickHouse / TimescaleDB)
-
-- If/when the workload demands a daemon DB (concurrency, very large corpora, heavy SQL), ghTrader may support an optional serving backend:
-  - QuestDB (ILP ingestion + PGWire queries) or ClickHouse (MergeTree analytics) are likely fits for tick-heavy workloads.
-  - Postgres/TimescaleDB is a fit when strong transactional semantics are needed for metadata + moderate time-series volumes.
-- Serving DB ingestion must be **derived from Parquet** and must preserve provenance:
-  - Backfill: ingest selected `(lake_version, ticks_lake, symbol, date)` partitions into DB.
-  - Incremental: ingest new partitions as they appear (or double-write from live recorder), without breaking append-only Parquet semantics.
-- Time semantics must be explicit:
-  - Parquet stores `datetime` as **epoch-nanoseconds** (int64) in Beijing time (as provided by TqSdk).
-  - Serving DB schemas must either (a) store the same `datetime_ns` int64 or (b) convert to UTC timestamps and record the conversion rule; mixing conventions is forbidden.
+QuestDB is the chosen canonical tick store for this phase.
 
 #### 5.3.1 Derived dataset: “main-with-depth” (materialized continuity with L5)
 
@@ -307,6 +306,10 @@ We treat the roll schedule as **given**, not “invented” by ghTrader. The rul
   - `oi_other(T) > 1.1 * oi_main(T)`
   then switch effective from **\(T+1\)**.
 - **No intraday switching**.
+
+Data source for the schedule (no akshare):
+- The schedule must be computed from **tick data** by aggregating end-of-day `open_interest` from the canonical tick DB (QuestDB).
+- For the “main-with-depth” dataset, the effective schedule range must start at the earliest date where the main contract has **true L5** available (levels 2–5 non-null/non-NaN), to avoid mixing L1-only eras into depth-model training.
 
 Continuous code semantics (vendor conventions):
 
@@ -409,6 +412,23 @@ Requirements:
   - Dashboard must bind to `127.0.0.1` by default (no public exposure).
   - Operator accesses via SSH port-forward: `ssh -L 8000:127.0.0.1:8000 ops@server`.
   - Optional shared token (defense-in-depth) may be supported.
+- **Information architecture (single Ops page)**:
+  - The dashboard should provide a **single Operations page**: `GET /ops`
+    - This page consolidates the most-used operational controls and status into one place.
+    - It must be usable without hopping across many sub-pages.
+  - `/ops` must include clearly separated sections (accordion or tabs are fine):
+    - Ingest
+    - QuestDB sync
+    - Schedule
+    - main_l5
+    - Build (features/labels)
+    - Model/Train
+    - Eval
+    - Trading
+    - Integrity
+    - Locks
+  - Existing legacy routes like `/ops/ingest`, `/ops/build`, etc. may remain for compatibility, but should be treated as:
+    - thin wrappers for `/ops` sections, or redirects to `/ops#<section>`.
 - **Job execution model**:
   - Long-running operations must run as **subprocess jobs** (not in-process), so they are cancellable and resilient to UI restarts.
   - Job history must **persist across dashboard restarts**.
@@ -432,6 +452,14 @@ Requirements:
     - `build`, `train`, `benchmark`, `compare`, `backtest`, `paper`, `daily-train`, `sweep`
     - `main-schedule`, `main-depth`
     - `audit`
+    - `db serve-sync` (sync Parquet mirror → QuestDB canonical)
+  - The `/ops` page must provide a “happy path” set of **pipeline buttons** that maps to the canonical workflow:
+    - **Sync to QuestDB** (from local Parquet mirror)
+    - **Compute schedule** (OI rule; QuestDB-backed)
+    - **Build main_l5 (L5 era only)**
+    - **Build features/labels**
+    - **Train**
+    - Each button must clearly indicate preconditions (e.g. “QuestDB not reachable”, “schedule missing”, “main_l5 not built”).
 - **Observability**:
   - Must display data coverage (lake partitions by symbol/date, features/labels coverage).
     - Coverage UI must support both tick lake roots:
@@ -440,7 +468,29 @@ Requirements:
     - The operator must be able to view coverage for `v1`, `v2`, or both (defaulting to `GHTRADER_LAKE_VERSION`).
   - Must display **ingest progress** for running/queued ingest jobs:
     - `download`: % complete over requested trading-day range (includes no-data markers)
-    - `download-contract-range`: per-contract and overall % complete using active-ranges cache + trading calendar + no-data markers
+    - `download-contract-range`: per-contract and overall % complete using trading calendar + no-data markers (no akshare active-ranges)
+  - Must display a **contract explorer** (TqSdk-backed catalog + local status):
+    - Operator chooses `exchange` + `variety` (e.g. `SHFE` + `cu`) and a lake root (`v1`/`v2`).
+    - The system lists **all contracts available in TqSdk** for that variety (including expired).
+      - Important: TqSdk’s contract-service queries may not include older (pre-2020-09) instruments. The catalog must merge:
+        - `TqApi.query_quotes(...)` results (contract service)
+        - TqSdk’s bundled pre-2020 cache (`tqsdk/expired_quotes.json.lzma`, used internally as `_pre20_ins_info`)
+    - For each contract, show:
+      - **Local download status**: `not-downloaded` / `incomplete` / `complete` / `stale` (active and behind today).
+      - **Coverage (QuestDB canonical)**:
+        - first/last tick day present
+        - first/last L5 day present
+        - freshness for active contracts (behind latest trading day → `stale`)
+      - **L5 availability**:
+        - **Local L5 present** means depth levels 2–5 have *non-NaN* values in local Parquet (not just columns existing).
+        - **TqSdk L5** is inferred from a small sample probe (TqSdk query) and cached.
+    - Contract explorer actions:
+      - **Fill**: enqueue per-contract `download` jobs (subprocess).
+      - **Probe L5**: enqueue per-contract probe jobs (subprocess).
+      - Optional integrity checks: quick checks + ability to run `audit`.
+      - **Sync to QuestDB**: enqueue a DB sync job for the selected symbol/range (from Parquet mirror).
+    - Bulk Fill/Probe must be **throttled** to avoid starting hundreds of TqSdk-heavy processes:
+      - Use a queue/scheduler that runs at most `GHTRADER_MAX_PARALLEL_TQSDK_JOBS` (default **4**) concurrently.
   - Progress UI must work for **already-running jobs** (no restart required) by using job logs + lake state.
   - Performance: progress computation must be safe to refresh (use caching/TTL; avoid heavy scans every few seconds).
   - Must display basic system status (fast to load; safe to refresh):

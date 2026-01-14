@@ -35,6 +35,7 @@ def test_data_page_lake_version_switching(tmp_path: Path, monkeypatch: pytest.Mo
     # Default uses env (v2)
     r0 = client.get("/data")
     assert r0.status_code == 200
+    assert "Contracts (TqSdk + local coverage)" in r0.text
     assert sym_v2 in r0.text
     assert sym_v1 not in r0.text
 

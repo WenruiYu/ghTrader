@@ -1933,7 +1933,7 @@ def train_model(
         Path to saved model
     """
     from ghtrader.features import read_features_for_symbol, read_features_manifest
-    from ghtrader.labels import read_labels_for_symbol
+    from ghtrader.labels import read_labels_for_symbol, read_labels_manifest
     
     log.info("train.start", model_type=model_type, symbol=symbol, horizon=horizon)
 
@@ -1946,12 +1946,50 @@ def train_model(
     # Load features and labels
     features_df = read_features_for_symbol(data_dir, symbol)
     labels_df = read_labels_for_symbol(data_dir, symbol)
+
+    # Guardrails: ensure features/labels were built against the same tick source.
+    feat_manifest = read_features_manifest(data_dir, symbol)
+    lab_manifest = read_labels_manifest(data_dir, symbol)
+    if not feat_manifest or not lab_manifest:
+        raise ValueError(
+            "Missing features/labels manifest.json. "
+            "Run `ghtrader build` first (and re-run with --overwrite if needed)."
+        )
+    tl_f = str(feat_manifest.get("ticks_lake") or "")
+    tl_l = str(lab_manifest.get("ticks_lake") or "")
+    lv_f = str(feat_manifest.get("lake_version") or "v1")
+    lv_l = str(lab_manifest.get("lake_version") or "v1")
+    if tl_f != tl_l:
+        raise ValueError(f"ticks_lake mismatch between features ({tl_f}) and labels ({tl_l}) for symbol={symbol}")
+    if lv_f != lv_l:
+        raise ValueError(f"lake_version mismatch between features ({lv_f}) and labels ({lv_l}) for symbol={symbol}")
+    if str(symbol).startswith("KQ.m@") and tl_f != "main_l5":
+        raise ValueError(
+            "Continuous symbols (KQ.m@...) must be trained from derived main_l5 ticks. "
+            "Rebuild with: `ghtrader build --ticks-lake main_l5 ...`"
+        )
+    if tl_f == "main_l5":
+        sf = dict(feat_manifest.get("schedule") or {})
+        sl = dict(lab_manifest.get("schedule") or {})
+        hf = str(sf.get("hash") or "")
+        hl = str(sl.get("hash") or "")
+        if not hf or not hl:
+            raise ValueError(
+                "Missing schedule provenance in features/labels manifests. "
+                "Rebuild features+labels with overwrite=True."
+            )
+        if hf != hl:
+            raise ValueError(f"schedule_hash mismatch between features ({hf}) and labels ({hl}) for symbol={symbol}")
+        d0f = str(sf.get("l5_start_date") or "")
+        d0l = str(sl.get("l5_start_date") or "")
+        if d0f and d0l and d0f != d0l:
+            raise ValueError(f"l5_start_date mismatch between features ({d0f}) and labels ({d0l}) for symbol={symbol}")
     
     # Merge on datetime
     df = features_df.merge(labels_df[["datetime", f"label_{horizon}"]], on="datetime")
     
     # Prepare X and y
-    manifest = read_features_manifest(data_dir, symbol)
+    manifest = feat_manifest
     feature_cols = list(manifest.get("enabled_factors") or [])
     if feature_cols:
         # Keep only factors that actually exist on disk (defensive for older caches).

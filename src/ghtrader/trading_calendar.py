@@ -1,48 +1,131 @@
 from __future__ import annotations
 
-import importlib
 import json
-import sys
+import os
+import urllib.request
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import structlog
 
 log = structlog.get_logger()
 
-
-def _repo_root() -> Path:
-    # src/ghtrader/trading_calendar.py -> repo root
-    return Path(__file__).resolve().parent.parent.parent
+DEFAULT_SHINNY_HOLIDAY_URL = "https://files.shinnytech.com/shinny_chinese_holiday.json"
 
 
-def _ensure_akshare_importable() -> None:
+def holiday_url() -> str:
     """
-    Ensure `import akshare` resolves to the real package (not a namespace stub).
+    Return the holiday-list URL used to compute trading days.
 
-    Duplicates the guard used in `ghtrader.akshare_daily` to avoid import cycles.
+    This matches the intent of TqSdk’s holiday list source but is implemented
+    without akshare.
     """
+    u = str(os.environ.get("TQ_CHINESE_HOLIDAY_URL") or DEFAULT_SHINNY_HOLIDAY_URL).strip()
+    return u or DEFAULT_SHINNY_HOLIDAY_URL
+
+
+def holidays_cache_path(data_dir: Path) -> Path:
+    return data_dir / "trading_calendar" / "shinny_chinese_holiday.json"
+
+
+def calendar_cache_path(data_dir: Path) -> Path:
+    return data_dir / "trading_calendar" / "calendar.parquet"
+
+
+def _parse_date_any(s: str) -> date | None:
+    ss = str(s).strip()
+    if not ss:
+        return None
     try:
-        import akshare  # type: ignore
-
-        if getattr(akshare, "__file__", None):
-            return
-        raise ModuleNotFoundError("akshare resolves to a namespace package (not installed)")
+        if "-" in ss:
+            return date.fromisoformat(ss)
     except Exception:
-        akshare_repo = _repo_root() / "akshare"
-        if akshare_repo.exists() and str(akshare_repo) not in sys.path:
-            sys.modules.pop("akshare", None)
-            sys.path.insert(0, str(akshare_repo))
-            importlib.invalidate_caches()
-            try:
-                import akshare  # type: ignore
+        pass
+    try:
+        if len(ss) == 8 and ss.isdigit():
+            return date(int(ss[:4]), int(ss[4:6]), int(ss[6:8]))
+    except Exception:
+        pass
+    return None
 
-                if getattr(akshare, "__file__", None):
-                    return
-            except Exception:
-                pass
-        raise RuntimeError("Akshare is required for trading calendar. Install with: pip install -e ./akshare")
+
+def _extract_holiday_strings(obj: Any) -> list[str]:
+    """
+    Best-effort extractor for a holiday JSON payload.
+
+    We accept a few possible formats:
+    - ["2026-01-01", ...]
+    - {"holidays": [...]} or {"data":[...]}
+    - {"2026": [...], "2025":[...], ...}
+    """
+    if isinstance(obj, list):
+        return [str(x) for x in obj]
+    if isinstance(obj, dict):
+        for k in ("holidays", "holiday", "data"):
+            v = obj.get(k)
+            if isinstance(v, list):
+                return [str(x) for x in v]
+        out: list[str] = []
+        for v in obj.values():
+            if isinstance(v, list):
+                out.extend([str(x) for x in v])
+        if out:
+            return out
+    return []
+
+
+def _fetch_holidays_raw(url: str, *, timeout_s: float = 15.0) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "ghtrader/0.1"})
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        raw = resp.read()
+    return raw.decode("utf-8", errors="replace")
+
+
+def _load_holidays_from_json_text(text: str) -> set[date]:
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return set()
+    items = _extract_holiday_strings(obj)
+    out: set[date] = set()
+    for it in items:
+        d = _parse_date_any(it)
+        if d is not None:
+            out.add(d)
+    return out
+
+
+def get_holidays(*, data_dir: Path, refresh: bool = False) -> set[date]:
+    """
+    Return a cached set of holiday dates.
+
+    If the holiday file cannot be downloaded/parsed, returns an empty set
+    (callers should fall back to weekday-only behavior).
+    """
+    cache = holidays_cache_path(data_dir)
+    if cache.exists() and not refresh:
+        try:
+            text = cache.read_text(encoding="utf-8")
+            days = _load_holidays_from_json_text(text)
+            if days:
+                return days
+        except Exception as e:
+            log.warning("calendar.holidays_cache_read_failed", path=str(cache), error=str(e))
+
+    try:
+        url = holiday_url()
+        text = _fetch_holidays_raw(url)
+        days = _load_holidays_from_json_text(text)
+        if days:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(text, encoding="utf-8")
+            return days
+        log.warning("calendar.holidays_download_empty", url=url)
+    except Exception as e:
+        log.warning("calendar.holidays_download_failed", url=holiday_url(), error=str(e))
+    return set()
 
 
 def _weekday_days_between(start: date, end: date) -> list[date]:
@@ -55,8 +138,14 @@ def _weekday_days_between(start: date, end: date) -> list[date]:
     return out
 
 
-def calendar_cache_path(data_dir: Path) -> Path:
-    return data_dir / "akshare" / "calendar" / "calendar.parquet"
+def _compute_trading_days(*, start: date, end: date, holidays: set[date]) -> list[date]:
+    out: list[date] = []
+    cur = start
+    while cur <= end:
+        if cur.weekday() < 5 and cur not in holidays:
+            out.append(cur)
+        cur += timedelta(days=1)
+    return out
 
 
 def _load_calendar_from_cache(path: Path) -> list[date] | None:
@@ -79,31 +168,13 @@ def _write_calendar_cache(path: Path, days: list[date]) -> None:
     df.to_parquet(path, index=False)
 
 
-def _load_calendar_from_akshare() -> list[date]:
-    _ensure_akshare_importable()
-    from akshare.futures import cons  # type: ignore
-
-    raw = cons.get_calendar()
-    out: list[date] = []
-    for s in raw:
-        try:
-            out.append(date.fromisoformat(f"{s[:4]}-{s[4:6]}-{s[6:8]}"))
-        except Exception:
-            continue
-    if not out:
-        raise RuntimeError("akshare futures calendar is empty")
-    return sorted(set(out))
-
-
-def get_trading_calendar(
-    *,
-    data_dir: Path,
-    refresh: bool = False,
-) -> list[date]:
+def get_trading_calendar(*, data_dir: Path, refresh: bool = False) -> list[date]:
     """
-    Return the global China trading calendar used by akshare futures functions.
+    Return a cached list of trading days (weekday minus Shinny holiday list).
 
-    If akshare is unavailable, falls back to a weekday-only approximation.
+    This is a global China futures trading-day approximation (sufficient for
+    ingest bookkeeping and night-session trading-day mapping). If holidays are
+    unavailable, returns an empty list (callers may fall back to weekday-only).
     """
     cache = calendar_cache_path(data_dir)
     if not refresh:
@@ -111,28 +182,38 @@ def get_trading_calendar(
         if cached:
             return cached
 
-    try:
-        days = _load_calendar_from_akshare()
-        _write_calendar_cache(cache, days)
-        return days
-    except Exception as e:
-        log.warning("calendar.akshare_unavailable", error=str(e))
-        # Fallback is only used when akshare isn't installed; we do not cache fallback.
-        # Callers should treat this as best-effort.
+    # Compute a practical calendar window and cache it.
+    holidays = get_holidays(data_dir=data_dir, refresh=refresh)
+    if not holidays:
         return []
 
+    start = date(2000, 1, 1)
+    end = date.today() + timedelta(days=366)
+    days = _compute_trading_days(start=start, end=end, holidays=holidays)
+    try:
+        _write_calendar_cache(cache, days)
+    except Exception as e:
+        log.warning("calendar.cache_write_failed", path=str(cache), error=str(e))
+    return days
 
-def is_trading_day(
-    *,
-    day: date,
-    data_dir: Path,
-    refresh: bool = False,
-) -> bool:
-    days = get_trading_calendar(data_dir=data_dir, refresh=refresh)
-    if not days:
-        # fallback approximation
+
+def is_trading_day(*, day: date, data_dir: Path, refresh: bool = False) -> bool:
+    holidays = get_holidays(data_dir=data_dir, refresh=refresh)
+    if not holidays:
         return day.weekday() < 5
-    return day in set(days)
+    return day.weekday() < 5 and day not in holidays
+
+
+def next_trading_day(*, day: date, data_dir: Path, refresh: bool = False) -> date:
+    """
+    Return the next trading day strictly after `day`.
+    """
+    d = day + timedelta(days=1)
+    for _ in range(14):  # bounded: long holiday weeks exist
+        if is_trading_day(day=d, data_dir=data_dir, refresh=refresh):
+            return d
+        d += timedelta(days=1)
+    return d
 
 
 def get_trading_days(
@@ -143,13 +224,12 @@ def get_trading_days(
     data_dir: Path,
     refresh: bool = False,
 ) -> list[date]:
+    _ = market
     if end < start:
         return []
 
-    days = get_trading_calendar(data_dir=data_dir, refresh=refresh)
-    if not days:
+    holidays = get_holidays(data_dir=data_dir, refresh=refresh)
+    if not holidays:
         return _weekday_days_between(start, end)
-
-    # calendar is globally sorted; filter by range
-    return [d for d in days if start <= d <= end]
+    return _compute_trading_days(start=start, end=end, holidays=holidays)
 

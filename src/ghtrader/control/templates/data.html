@@ -129,5 +129,254 @@
       </tbody>
     </table>
   </div>
+
+  <h3>Contracts (TqSdk + local coverage)</h3>
+  <div class="card">
+    <div class="grid2">
+      <div>
+        <label>Exchange</label>
+        <select id="contractsExchange">
+          <option value="SHFE" selected>SHFE</option>
+        </select>
+      </div>
+      <div>
+        <label>Variety</label>
+        <select id="contractsVar">
+          <option value="cu" selected>cu</option>
+          <option value="au">au</option>
+          <option value="ag">ag</option>
+        </select>
+      </div>
+      <div>
+        <label>Lake version</label>
+        <select id="contractsLake">
+          <option value="v1" {% if lake_version == "v1" %}selected{% endif %}>v1</option>
+          <option value="v2" {% if lake_version == "v2" %}selected{% endif %}>v2</option>
+        </select>
+      </div>
+      <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap;">
+        <button type="button" id="contractsRefreshBtn" class="btn" style="margin-top:0;">Refresh</button>
+        <button type="button" id="contractsProbeAllBtn" class="btn btn-secondary" style="margin-top:0;">Probe L5 (all)</button>
+        <button type="button" id="contractsFillAllBtn" class="btn btn-secondary" style="margin-top:0;">Fill missing (all)</button>
+      </div>
+    </div>
+    <div id="contractsStatus" class="muted" style="margin-top:10px;">Idle.</div>
+  </div>
+
+  <div class="tableWrap">
+    <table class="table" id="contractsTable">
+      <thead>
+        <tr>
+          <th>Contract</th>
+          <th>Active</th>
+          <th>Status</th>
+          <th>Local days</th>
+          <th>Local min</th>
+          <th>Local max</th>
+          <th>DB tick</th>
+          <th>DB L5</th>
+          <th>Completeness</th>
+          <th>Local L5</th>
+          <th>TqSdk L5 probe</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="contractsTbody">
+        <tr><td colspan="10" class="muted">Click Refresh to load.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    (function() {
+      const qs = new URLSearchParams(window.location.search);
+      const token = qs.get("token");
+      function withToken(url) {
+        if (!token) return url;
+        const u = new URL(url, window.location.origin);
+        u.searchParams.set("token", token);
+        return u.toString();
+      }
+
+      const elExchange = document.getElementById("contractsExchange");
+      const elVar = document.getElementById("contractsVar");
+      const elLake = document.getElementById("contractsLake");
+      const elStatus = document.getElementById("contractsStatus");
+      const elTbody = document.getElementById("contractsTbody");
+      const btnRefresh = document.getElementById("contractsRefreshBtn");
+      const btnProbeAll = document.getElementById("contractsProbeAllBtn");
+      const btnFillAll = document.getElementById("contractsFillAllBtn");
+
+      function setStatus(msg) {
+        elStatus.textContent = msg;
+      }
+
+      function fmtPct(p) {
+        if (p === null || p === undefined) return "";
+        const x = Math.max(0, Math.min(1, Number(p)));
+        return (x * 100).toFixed(1) + "%";
+      }
+
+      function fmtProbeCell(p) {
+        if (!p) return "<span class=\"muted\">unknown</span>";
+        const day = p.probed_day ? (" <span class=\"mono muted\">" + p.probed_day + "</span>") : "";
+        if (p.l5_present === true) return "<span class=\"pill pill-succeeded\">yes</span>" + day;
+        if (p.l5_present === false) return "<span class=\"pill pill-failed\">no</span>" + day;
+        return "<span class=\"muted\">unknown</span>";
+      }
+
+      function rowHtml(r) {
+        const active = (r.expired === false);
+        const activeCell = active ? "<span class=\"pill pill-succeeded\">active</span>" : "<span class=\"pill\">expired</span>";
+        let statusCell = "<span class=\"pill pill-queued\">unknown</span>";
+        const st = String(r.status || "");
+        if (st === "complete") statusCell = "<span class=\"pill pill-succeeded\">complete</span>";
+        else if (st === "stale") statusCell = "<span class=\"pill pill-running\">stale</span>";
+        else if (st === "incomplete") statusCell = "<span class=\"pill pill-running\">incomplete</span>";
+        else if (st === "not-downloaded") statusCell = "<span class=\"pill\">not-downloaded</span>";
+        const l5 = r.local_l5 || {};
+        let l5Text = "";
+        if (l5.status === "ready") {
+          l5Text = String(l5.l5_days || 0) + " day(s)";
+          if (l5.l5_min && l5.l5_max) l5Text += " (" + l5.l5_min + " → " + l5.l5_max + ")";
+        } else if (l5.status === "missing_pyarrow") {
+          l5Text = "missing pyarrow";
+        } else if (l5.status === "no_local_data") {
+          l5Text = "";
+        } else {
+          l5Text = "scanning " + String(l5.scanned_days || 0) + "/" + String(l5.total_days || 0);
+        }
+
+        const qc = r.questdb_coverage || null;
+        const dbTick = qc && (qc.first_tick_day || qc.last_tick_day) ? ((qc.first_tick_day || "") + " → " + (qc.last_tick_day || "")) : "";
+        const dbL5 = qc && (qc.first_l5_day || qc.last_l5_day) ? ((qc.first_l5_day || "") + " → " + (qc.last_l5_day || "")) : "";
+
+        const actions = [
+          "<button type=\"button\" class=\"btn btn-secondary\" style=\"margin-top:0; padding:6px 10px; font-size:12px;\" data-action=\"probe\" data-symbol=\"" + r.symbol + "\">Probe</button>",
+          "<button type=\"button\" class=\"btn btn-secondary\" style=\"margin-top:0; padding:6px 10px; font-size:12px;\" data-action=\"fill\" data-symbol=\"" + r.symbol + "\">Fill</button>",
+          "<button type=\"button\" class=\"btn btn-secondary\" style=\"margin-top:0; padding:6px 10px; font-size:12px;\" data-action=\"audit\" data-symbol=\"" + r.symbol + "\">Audit</button>",
+        ].join(" ");
+
+        return [
+          "<tr data-symbol=\"" + r.symbol + "\">",
+            "<td class=\"mono\">" + r.symbol + "</td>",
+            "<td>" + activeCell + "</td>",
+            "<td>" + statusCell + "</td>",
+            "<td>" + String(r.local_days_downloaded || 0) + "</td>",
+            "<td class=\"mono\">" + (r.local_min || "") + "</td>",
+            "<td class=\"mono\">" + (r.local_max || "") + "</td>",
+            "<td class=\"mono\">" + dbTick + "</td>",
+            "<td class=\"mono\">" + dbL5 + "</td>",
+            "<td>" + fmtPct(r.pct) + "</td>",
+            "<td>" + l5Text + "</td>",
+            "<td>" + fmtProbeCell(r.tqsdk_probe) + "</td>",
+            "<td>" + actions + "</td>",
+          "</tr>"
+        ].join("");
+      }
+
+      async function fetchContracts(opts) {
+        opts = opts || {};
+        const ex = elExchange.value;
+        const v = elVar.value;
+        const lv = elLake.value;
+        const refresh = opts.refresh ? "1" : "0";
+        const refreshL5 = opts.refreshL5 ? "1" : "0";
+        const url = withToken("/api/contracts?exchange=" + encodeURIComponent(ex) + "&var=" + encodeURIComponent(v) + "&lake_version=" + encodeURIComponent(lv) + "&refresh=" + refresh + "&refresh_l5=" + refreshL5);
+        setStatus("Loading contracts from TqSdk + local...");
+        const resp = await fetch(url, { headers: token ? { "x-auth-token": token } : {} });
+        const body = await resp.json();
+        if (!resp.ok || !body.ok) {
+          const err = (body && (body.error || body.detail)) ? (body.error || body.detail) : ("HTTP " + resp.status);
+          throw new Error(err);
+        }
+        return body;
+      }
+
+      async function refreshTable(opts) {
+        try {
+          const body = await fetchContracts(opts);
+          const rows = body.contracts || [];
+          if (!rows.length) {
+            elTbody.innerHTML = "<tr><td colspan=\"10\" class=\"muted\">No contracts returned.</td></tr>";
+            setStatus("No contracts returned.");
+            return;
+          }
+          elTbody.innerHTML = rows.map(rowHtml).join("");
+          setStatus("Loaded " + rows.length + " contracts.");
+        } catch (e) {
+          elTbody.innerHTML = "<tr><td colspan=\"10\" class=\"muted\">Failed to load contracts.</td></tr>";
+          setStatus("Error: " + String(e && e.message ? e.message : e));
+        }
+      }
+
+      async function postJson(path, payload) {
+        const url = withToken(path);
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: Object.assign({ "Content-Type": "application/json" }, token ? { "x-auth-token": token } : {}),
+          body: JSON.stringify(payload || {})
+        });
+        const body = await resp.json().catch(() => ({}));
+        if (!resp.ok || !body.ok) {
+          const err = (body && (body.error || body.detail)) ? (body.error || body.detail) : ("HTTP " + resp.status);
+          throw new Error(err);
+        }
+        return body;
+      }
+
+      btnRefresh.addEventListener("click", () => refreshTable({ refresh: true }));
+      btnProbeAll.addEventListener("click", async () => {
+        try {
+          setStatus("Enqueuing probe jobs...");
+          const ex = elExchange.value;
+          const v = elVar.value;
+          const lv = elLake.value;
+          await postJson("/api/contracts/enqueue-probe-l5", { exchange: ex, var: v, lake_version: lv, scope: "all" });
+          setStatus("Probe jobs enqueued. Check Jobs tab.");
+        } catch (e) {
+          setStatus("Error: " + String(e && e.message ? e.message : e));
+        }
+      });
+      btnFillAll.addEventListener("click", async () => {
+        try {
+          setStatus("Enqueuing fill jobs...");
+          const ex = elExchange.value;
+          const v = elVar.value;
+          const lv = elLake.value;
+          await postJson("/api/contracts/enqueue-fill", { exchange: ex, var: v, lake_version: lv, scope: "missing" });
+          setStatus("Fill jobs enqueued. Check Jobs tab.");
+        } catch (e) {
+          setStatus("Error: " + String(e && e.message ? e.message : e));
+        }
+      });
+
+      document.getElementById("contractsTable").addEventListener("click", async (ev) => {
+        const t = ev.target;
+        if (!t || !t.dataset) return;
+        const action = t.dataset.action;
+        const sym = t.dataset.symbol;
+        if (!action || !sym) return;
+        try {
+          if (action === "probe") {
+            setStatus("Enqueuing probe for " + sym + "...");
+            await postJson("/api/contracts/enqueue-probe-l5", { exchange: elExchange.value, var: elVar.value, lake_version: elLake.value, symbols: [sym] });
+            setStatus("Probe enqueued for " + sym + ".");
+          } else if (action === "fill") {
+            setStatus("Enqueuing fill for " + sym + "...");
+            await postJson("/api/contracts/enqueue-fill", { exchange: elExchange.value, var: elVar.value, lake_version: elLake.value, symbols: [sym] });
+            setStatus("Fill enqueued for " + sym + ".");
+          } else if (action === "audit") {
+            setStatus("Starting audit for " + sym + "...");
+            const r = await postJson("/api/contracts/enqueue-audit", { lake_version: elLake.value, symbols: [sym] });
+            const jobId = (r.started && r.started.length) ? r.started[0] : "";
+            setStatus("Audit started for " + sym + (jobId ? (" (job " + jobId + ")") : "") + ". Check Jobs tab.");
+          }
+        } catch (e) {
+          setStatus("Error: " + String(e && e.message ? e.message : e));
+        }
+      });
+    })();
+  </script>
 {% endblock %}
 

@@ -8,8 +8,6 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-import pandas as pd
-
 
 IngestKind = Literal["download", "download_contract_range", "record", "unknown"]
 
@@ -276,11 +274,6 @@ def parse_ingest_command(argv: list[str]) -> dict[str, Any]:
             continue
         if t.startswith("--"):
             k = t[2:].replace("-", "_")
-            # Boolean flags (when present without a value)
-            if k in {"refresh_akshare"}:
-                args[k] = True
-                i += 1
-                continue
             if i + 1 < len(toks) and not str(toks[i + 1]).startswith("-"):
                 args[k] = toks[i + 1]
                 i += 2
@@ -315,43 +308,41 @@ def parse_ingest_command(argv: list[str]) -> dict[str, Any]:
     return {"kind": kind, "args": args}
 
 
-def _active_ranges_cache_paths(data_dir: Path, *, exchange: str, var: str) -> tuple[Path, Path]:
-    root = data_dir / "akshare" / "active_ranges" / f"market={exchange.upper()}" / f"var={var.lower()}"
-    return root / "active_ranges.parquet", root / "manifest.json"
-
-
-def _read_active_ranges(data_dir: Path, *, exchange: str, var: str) -> pd.DataFrame | None:
-    p_ranges, p_manifest = _active_ranges_cache_paths(data_dir, exchange=exchange, var=var)
-    if not p_ranges.exists() or not p_manifest.exists():
-        return None
+def _detect_latest_contract_yymm_from_tqsdk(*, exchange: str, var: str) -> str | None:
+    """
+    Best-effort: detect latest YYMM using TqSdk contract catalog (no akshare).
+    """
     try:
-        return pd.read_parquet(p_ranges)
+        from ghtrader.config import get_runs_dir
+        from ghtrader.tqsdk_catalog import get_contract_catalog
+
+        ex = str(exchange).upper().strip()
+        v = str(var).lower().strip()
+        cat = get_contract_catalog(exchange=ex, var=v, runs_dir=get_runs_dir(), refresh=False)
+        if not bool(cat.get("ok", False)):
+            return None
+        contracts = list(cat.get("contracts") or [])
+        best_key = -1
+        best_yymm = None
+        for c in contracts:
+            sym = str((c or {}).get("symbol") or "").strip()
+            if not sym:
+                continue
+            tail = sym.split(".", 1)[-1]
+            digits = "".join([ch for ch in tail if ch.isdigit()])
+            if len(digits) < 4:
+                continue
+            yymm = digits[-4:]
+            if not yymm.isdigit():
+                continue
+            yy, mm = _parse_contract_yymm(yymm)
+            key = yy * 100 + mm
+            if key > best_key:
+                best_key = key
+                best_yymm = yymm
+        return best_yymm
     except Exception:
         return None
-
-
-def _resolve_end_contract_auto(daily_ranges: pd.DataFrame, *, var_upper: str) -> str | None:
-    if daily_ranges is None or daily_ranges.empty:
-        return None
-    if "symbol" not in daily_ranges.columns:
-        return None
-    sym = daily_ranges["symbol"].astype(str).str.upper().str.strip()
-    sym = sym[sym.str.startswith(var_upper)]
-    if sym.empty:
-        return None
-    yymm = sym.str.extract(r"(\d+)$", expand=False).dropna().astype(str).str[-4:]
-    yymm = yymm[yymm.str.fullmatch(r"\d{4}")]
-    if yymm.empty:
-        return None
-    best_key = -1
-    best = None
-    for s in sorted(set(yymm.tolist())):
-        yy, mm = _parse_contract_yymm(s)
-        key = yy * 100 + mm
-        if key > best_key:
-            best_key = key
-            best = s
-    return best
 
 
 def compute_download_contract_range_status(
@@ -360,25 +351,22 @@ def compute_download_contract_range_status(
     var: str,
     start_contract: str,
     end_contract: str,
+    start_date: date,
+    end_date: date,
     data_dir: Path,
     log_hint: dict[str, Any] | None = None,
     lake_version: str | None = None,
 ) -> dict[str, Any]:
     """
-    Compute progress for `ghtrader download-contract-range` using active ranges + lake + no-data markers.
+    Compute progress for `ghtrader download-contract-range` using:
+    - configured backfill date window (start_date/end_date)
+    - Parquet lake partitions + _no_data_dates.json markers
+
+    Note: akshare/active-ranges have been removed.
     """
     ex = str(exchange).upper().strip()
     var_l = str(var).lower().strip()
     var_u = var_l.upper()
-
-    df_ranges = _read_active_ranges(data_dir, exchange=ex, var=var_l)
-    if df_ranges is None:
-        return {
-            "kind": "download_contract_range",
-            "exchange": ex,
-            "var": var_l,
-            "error": "missing active_ranges cache (run download-contract-range once to build it)",
-        }
 
     resolved_end = str(end_contract).strip()
     if resolved_end.lower() in {"auto", "latest"}:
@@ -386,65 +374,38 @@ def compute_download_contract_range_status(
         if log_hint and log_hint.get("detected_end_contract"):
             resolved_end = str(log_hint["detected_end_contract"])
         else:
-            auto = _resolve_end_contract_auto(df_ranges, var_upper=var_u)
+            auto = _detect_latest_contract_yymm_from_tqsdk(exchange=ex, var=var_l)
             if auto:
-                resolved_end = auto
+                resolved_end = str(auto)
 
     yymms = _iter_contract_yymms(str(start_contract), str(resolved_end))
     raw_contracts = [f"{var_u}{yymm}" for yymm in yymms]
-
-    # Build ranges dict (raw symbol -> (first,last))
-    ranges: dict[str, tuple[date, date]] = {}
-    try:
-        for _, r in df_ranges.iterrows():
-            sym = str(r.get("symbol") or "").strip().upper()
-            fs = str(r.get("first_active") or "").strip()
-            ls = str(r.get("last_active") or "").strip()
-            d0 = _parse_yyyymmdd(fs)
-            d1 = _parse_yyyymmdd(ls)
-            if not sym or d0 is None or d1 is None:
-                continue
-            ranges[sym] = (d0, d1)
-    except Exception:
-        ranges = {}
 
     cal = _load_calendar(data_dir)
     cal_set = set(cal) if cal else None
 
     current_symbol = str((log_hint or {}).get("current_symbol") or "").strip() or None
 
+    if end_date < start_date:
+        raise ValueError("end_date must be >= start_date")
+    start_iso = start_date.isoformat()
+    end_iso = end_date.isoformat()
+    expected_per_contract = _count_trading_days(cal, start=start_date, end=end_date)
+
     contracts: list[dict[str, Any]] = []
     days_expected_total = 0
     days_done_total = 0
     contracts_done = 0
-    skipped = 0
 
     for raw in raw_contracts:
         tick_symbol = f"{ex}.{var_l}{raw[len(var_u):]}"
-        if raw not in ranges:
-            skipped += 1
-            contracts.append(
-                {
-                    "raw_contract": raw,
-                    "symbol": tick_symbol,
-                    "status": "skipped",
-                    "reason": "no_active_range",
-                    "days_expected": 0,
-                    "days_done": 0,
-                    "pct": 0.0,
-                    "is_current": bool(current_symbol and tick_symbol == current_symbol),
-                }
-            )
-            continue
-
-        first, last = ranges[raw]
-        expected = _count_trading_days(cal, start=first, end=last)
-        days_expected_total += int(expected)
+        expected = int(expected_per_contract)
+        days_expected_total += int(expected_per_contract)
 
         downloaded_set, min_dl, max_dl = _scan_downloaded_date_dirs(
             _ticks_symbol_dir(data_dir, tick_symbol, lake_version=lake_version),
-            start_iso=first.isoformat(),
-            end_iso=last.isoformat(),
+            start_iso=start_iso,
+            end_iso=end_iso,
         )
 
         no_data_raw = _read_json_list(_no_data_dates_path(data_dir, tick_symbol, lake_version=lake_version))
@@ -453,7 +414,7 @@ def compute_download_contract_range_status(
             ds_s = str(ds).strip()
             if not ds_s:
                 continue
-            if ds_s < first.isoformat() or ds_s > last.isoformat():
+            if ds_s < start_iso or ds_s > end_iso:
                 continue
             d = _parse_yyyymmdd(ds_s)
             if d is None:
@@ -480,8 +441,8 @@ def compute_download_contract_range_status(
                 "raw_contract": raw,
                 "symbol": tick_symbol,
                 "status": "active",
-                "first_active": first.isoformat(),
-                "last_active": last.isoformat(),
+                "backfill_start": start_iso,
+                "backfill_end": end_iso,
                 "days_expected": int(expected),
                 "days_downloaded": int(len(downloaded_set)),
                 "days_no_data": int(no_data_effective),
@@ -504,6 +465,8 @@ def compute_download_contract_range_status(
         "exchange": ex,
         "var": var_l,
         "lake_version": str(lake_version or "v1"),
+        "start_date": start_iso,
+        "end_date": end_iso,
         "start_contract": str(start_contract),
         "end_contract": str(end_contract),
         "resolved_end_contract": str(resolved_end),
@@ -511,7 +474,6 @@ def compute_download_contract_range_status(
         "summary": {
             "contracts_total": int(len(raw_contracts)),
             "contracts_done": int(contracts_done),
-            "contracts_skipped": int(skipped),
             "days_expected_total": int(days_expected_total),
             "days_done_total": int(days_done_total),
             "pct": pct_total,
@@ -589,10 +551,18 @@ def ingest_status_for_job(
         var = str(args.get("var") or args.get("variety") or "").strip()
         start_c = str(args.get("start_contract") or "").strip()
         end_c = str(args.get("end_contract") or "").strip()
+        start_s = str(args.get("start_date") or "").strip()
+        end_s = str(args.get("end_date") or "").strip()
         if not var or not start_c or not end_c:
             return {"kind": "unknown", "job_id": job_id, "error": "missing required args for download-contract-range"}
 
-        cache_key = f"range:{data_dir}:{lv}:{ex}:{var}:{start_c}:{end_c}:{log_hint.get('detected_end_contract','')}"
+        # New contract-range path is defined over an explicit date window; default is 2015-01-01..today.
+        d0 = _parse_yyyymmdd(start_s) if start_s else date(2015, 1, 1)
+        d1 = _parse_yyyymmdd(end_s) if end_s else date.today()
+        if d0 is None or d1 is None:
+            return {"kind": "unknown", "job_id": job_id, "error": "invalid start-date/end-date"}
+
+        cache_key = f"range:{data_dir}:{lv}:{ex}:{var}:{start_c}:{end_c}:{d0.isoformat()}:{d1.isoformat()}:{log_hint.get('detected_end_contract','')}"
         cached = _cache_get(cache_key, ttl_s=ttl_s)
         if cached is not None:
             cached["job_id"] = job_id
@@ -603,6 +573,8 @@ def ingest_status_for_job(
             var=var,
             start_contract=start_c,
             end_contract=end_c,
+            start_date=d0,
+            end_date=d1,
             data_dir=data_dir,
             log_hint=log_hint,
             lake_version=lv,

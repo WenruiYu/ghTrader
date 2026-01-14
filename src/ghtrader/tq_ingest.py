@@ -303,174 +303,44 @@ def _iter_contract_yymms(start_contract: str, end_contract: str) -> list[str]:
     return out
 
 
-def _infer_active_ranges_from_daily(
-    daily: pd.DataFrame,
-    *,
-    var_upper: str,
-) -> dict[str, tuple[date, date]]:
+def _detect_latest_contract_yymm_from_tqsdk(*, exchange: str, var: str) -> str:
     """
-    Infer first/last active trading day per contract from daily data.
+    Detect the latest listed contract YYMM using TqSdk's contract catalog.
 
-    Heuristic: a day is considered active if (open_interest > 0) OR (volume > 0).
+    This replaces the old akshare-based "auto end_contract" behavior.
     """
-    if daily.empty:
-        return {}
+    from ghtrader.config import get_runs_dir
+    from ghtrader.tqsdk_catalog import get_contract_catalog
 
-    df = daily.copy()
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-    df["open_interest"] = pd.to_numeric(df.get("open_interest"), errors="coerce")
-    df["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
-
-    if "variety" in df.columns:
-        df = df[df["variety"].astype(str).str.upper() == var_upper]
-    else:
-        df = df[df["symbol"].astype(str).str.upper().str.startswith(var_upper)]
-
-    df = df.dropna(subset=["date", "symbol"])
-    active = df[(df["open_interest"].fillna(0) > 0) | (df["volume"].fillna(0) > 0)]
-    if active.empty:
-        return {}
-
-    ranges = active.groupby(active["symbol"].astype(str))["date"].agg(["min", "max"]).to_dict(orient="index")
-    return {sym: (v["min"], v["max"]) for sym, v in ranges.items()}
-
-
-def _update_active_ranges_from_daily_frame(
-    ranges: dict[str, tuple[date, date]],
-    daily_df: pd.DataFrame,
-    *,
-    var_upper: str,
-) -> None:
-    """
-    Streaming active-range updater (in-place).
-
-    This matches `_infer_active_ranges_from_daily` semantics:
-    active day := (open_interest > 0) OR (volume > 0)
-    """
-    if daily_df is None or daily_df.empty:
-        return
-
-    df = daily_df.copy()
-    df["date"] = pd.to_datetime(df.get("date"), errors="coerce").dt.date
-    df["open_interest"] = pd.to_numeric(df.get("open_interest"), errors="coerce")
-    df["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
-
-    if "variety" in df.columns:
-        df = df[df["variety"].astype(str).str.upper() == var_upper]
-    else:
-        df = df[df["symbol"].astype(str).str.upper().str.startswith(var_upper)]
-
-    df = df.dropna(subset=["date", "symbol"])
-    active = df[(df["open_interest"].fillna(0) > 0) | (df["volume"].fillna(0) > 0)]
-    if active.empty:
-        return
-
-    for _, row in active.iterrows():
-        sym = str(row["symbol"])
-        d = row["date"]
-        if not isinstance(d, date):
-            continue
-        if sym not in ranges:
-            ranges[sym] = (d, d)
-        else:
-            s, e = ranges[sym]
-            if d < s:
-                s = d
-            if d > e:
-                e = d
-            ranges[sym] = (s, e)
-
-
-def _active_ranges_cache_dir(data_dir: Path, exchange: str, var: str) -> Path:
-    return data_dir / "akshare" / "active_ranges" / f"market={exchange.upper()}" / f"var={var.lower()}"
-
-
-def _read_active_ranges_cache(data_dir: Path, exchange: str, var: str) -> tuple[pd.DataFrame | None, dict | None]:
-    root = _active_ranges_cache_dir(data_dir, exchange, var)
-    p_ranges = root / "active_ranges.parquet"
-    p_manifest = root / "manifest.json"
-    if not p_ranges.exists() or not p_manifest.exists():
-        return None, None
-    try:
-        df = pd.read_parquet(p_ranges)
-        with open(p_manifest, "r") as f:
-            manifest = json.load(f)
-        return df, manifest
-    except Exception as e:
-        log.warning("tq_ingest.active_ranges_cache_read_failed", root=str(root), error=str(e))
-        return None, None
-
-
-def _write_active_ranges_cache(
-    *,
-    data_dir: Path,
-    exchange: str,
-    var: str,
-    ranges: dict[str, tuple[date, date]],
-    scanned_start: date,
-    scanned_end: date,
-) -> Path:
-    root = _active_ranges_cache_dir(data_dir, exchange, var)
-    root.mkdir(parents=True, exist_ok=True)
-
-    rows = [
-        {"symbol": sym, "first_active": s.isoformat(), "last_active": e.isoformat()}
-        for sym, (s, e) in sorted(ranges.items())
-    ]
-    df = pd.DataFrame(rows)
-    out_path = root / "active_ranges.parquet"
-    df.to_parquet(out_path, index=False)
-
-    manifest = {
-        "exchange": exchange.upper(),
-        "var": var.lower(),
-        "scanned_start": scanned_start.isoformat(),
-        "scanned_end": scanned_end.isoformat(),
-        "created_at": datetime.utcnow().isoformat() + "Z",
-        "n_symbols": len(df),
-    }
-    with open(root / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
-
-    return out_path
-
-
-def _detect_latest_contract_yymm_from_daily(daily: pd.DataFrame, *, var_upper: str) -> str:
-    """
-    Detect the latest listed contract YYMM from akshare daily data.
-
-    This uses the max contract month found in recent daily rows for the variety.
-    """
-    if daily is None or daily.empty:
-        raise RuntimeError("Cannot auto-detect end_contract: daily data is empty")
-
-    df = daily.copy()
-    if "variety" in df.columns:
-        df = df[df["variety"].astype(str).str.upper() == var_upper]
-    else:
-        df = df[df["symbol"].astype(str).str.upper().str.startswith(var_upper)]
-
-    if df.empty:
-        raise RuntimeError(f"Cannot auto-detect end_contract: no rows for variety={var_upper}")
-
-    sym = df["symbol"].astype(str).str.upper().str.strip()
-    # Expect symbols like CU2602; extract trailing digits and keep last 4 (YYMM).
-    yymm = sym.str.extract(r"(\d+)$", expand=False).dropna().astype(str).str[-4:]
-    yymm = yymm[yymm.str.fullmatch(r"\d{4}")]
-    if yymm.empty:
-        raise RuntimeError(f"Cannot auto-detect end_contract: no parsable YYMM in symbols for {var_upper}")
+    ex = str(exchange).upper().strip()
+    v = str(var).lower().strip()
+    cat = get_contract_catalog(exchange=ex, var=v, runs_dir=get_runs_dir(), refresh=False)
+    if not bool(cat.get("ok", False)):
+        raise RuntimeError(str(cat.get("error") or "tqsdk_catalog_failed"))
+    contracts = list(cat.get("contracts") or [])
 
     best_key = -1
     best_yymm = ""
-    for s in sorted(set(yymm.tolist())):
-        yy, mm = _parse_contract_yymm(s)
+    for c in contracts:
+        sym = str((c or {}).get("symbol") or "").strip()
+        if not sym:
+            continue
+        # Expect SHFE.cu2602 -> tail digits -> YYMM
+        tail = sym.split(".", 1)[-1]
+        digits = "".join([ch for ch in tail if ch.isdigit()])
+        if len(digits) < 4:
+            continue
+        yymm = digits[-4:]
+        if not yymm.isdigit():
+            continue
+        yy, mm = _parse_contract_yymm(yymm)
         key = yy * 100 + mm
         if key > best_key:
             best_key = key
-            best_yymm = s
+            best_yymm = yymm
 
     if not best_yymm:
-        raise RuntimeError("Cannot auto-detect end_contract: no candidates")
+        raise RuntimeError(f"Cannot auto-detect end_contract via TqSdk catalog: {ex}.{v}")
     return best_yymm
 
 
@@ -482,7 +352,8 @@ def download_contract_range(
     end_contract: str,
     data_dir: Path,
     chunk_days: int = 5,
-    refresh_akshare: bool = False,
+    start_date: date | None = None,
+    end_date: date | None = None,
     lake_version: LakeVersion = "v1",
 ) -> None:
     """
@@ -491,38 +362,29 @@ def download_contract_range(
     Example:
       exchange=SHFE, var=cu, start_contract=1601, end_contract=2701
 
-    We infer each contract's active trading date range using akshare daily data,
-    then call `download_historical_ticks()` for only that inferred window.
+    Note:
+    - akshare has been removed. This command no longer infers active ranges.
+    - It instead downloads the requested contract set over a configurable date window,
+      relying on no-data markers to remain idempotent for pre-listing days.
     """
-    from ghtrader.akshare_daily import fetch_futures_daily_range, iter_futures_daily_range
-
     ex = exchange.upper().strip()
     var_l = var.lower().strip()
     var_u = var_l.upper()
 
-    # Allow end_contract auto-detection from recent daily data.
+    # Allow end_contract auto-detection from TqSdk catalog.
     if str(end_contract).strip().lower() in {"auto", "latest"}:
-        today = date.today()
-        detect_start = today - timedelta(days=120)
-        detect_daily = fetch_futures_daily_range(
-            data_dir=data_dir,
-            market=ex,
-            start=detect_start,
-            end=today,
-            refresh=refresh_akshare,
-        )
-        end_contract = _detect_latest_contract_yymm_from_daily(detect_daily, var_upper=var_u)
+        end_contract = _detect_latest_contract_yymm_from_tqsdk(exchange=ex, var=var_l)
         log.info("tq_ingest.detected_end_contract", var=var_l, end_contract=end_contract)
 
     yymms = _iter_contract_yymms(start_contract, end_contract)
     raw_contracts = [f"{var_u}{yymm}" for yymm in yymms]
 
-    # Fetch a conservative daily window around the contract range.
-    sy, sm = _parse_contract_yymm(start_contract)
-    fetch_start = date(sy, sm, 1) - timedelta(days=450)
-    # We only need daily data up to *today* to infer historical active ranges.
-    # Avoid wasting time caching far-future empty days.
-    fetch_end = date.today()
+    # Default to a practical backfill window if not specified.
+    # (Avoid extremely early years unless the operator explicitly requests it.)
+    s_date = start_date or date(2015, 1, 1)
+    e_date = end_date or date.today()
+    if e_date < s_date:
+        raise ValueError("end_date must be >= start_date")
 
     log.info(
         "tq_ingest.range_start",
@@ -531,69 +393,19 @@ def download_contract_range(
         start_contract=start_contract,
         end_contract=end_contract,
         n_contracts=len(raw_contracts),
-        daily_start=str(fetch_start),
-        daily_end=str(fetch_end),
+        start_date=str(s_date),
+        end_date=str(e_date),
     )
-
-    # Active ranges cache: reuse if it covers the scan window.
-    cached_df, cached_manifest = _read_active_ranges_cache(data_dir, ex, var_l)
-    ranges: dict[str, tuple[date, date]] = {}
-    reused_cache = False
-    if (
-        cached_df is not None
-        and cached_manifest is not None
-        and not refresh_akshare
-        and str(cached_manifest.get("scanned_start")) <= fetch_start.isoformat()
-        and str(cached_manifest.get("scanned_end")) >= fetch_end.isoformat()
-    ):
-        try:
-            for _, r in cached_df.iterrows():
-                ranges[str(r["symbol"])] = (
-                    date.fromisoformat(str(r["first_active"])),
-                    date.fromisoformat(str(r["last_active"])),
-                )
-            reused_cache = True
-            log.info("tq_ingest.active_ranges_cache_reused", exchange=ex, var=var_l, n=len(ranges))
-        except Exception as e:
-            log.warning("tq_ingest.active_ranges_cache_bad", error=str(e))
-            ranges = {}
-
-    if not reused_cache:
-        # Stream daily frames (trading days only) to build ranges without huge in-memory DataFrames.
-        for df_day in iter_futures_daily_range(
-            data_dir=data_dir,
-            market=ex,
-            start=fetch_start,
-            end=fetch_end,
-            refresh=refresh_akshare,
-            skip_errors=True,
-        ):
-            _update_active_ranges_from_daily_frame(ranges, df_day, var_upper=var_u)
-
-        _write_active_ranges_cache(
-            data_dir=data_dir,
-            exchange=ex,
-            var=var_l,
-            ranges=ranges,
-            scanned_start=fetch_start,
-            scanned_end=fetch_end,
-        )
-        log.info("tq_ingest.active_ranges_cache_written", exchange=ex, var=var_l, n=len(ranges))
 
     n_skipped = 0
     for raw in raw_contracts:
-        if raw not in ranges:
-            log.warning("tq_ingest.no_active_range", contract=raw)
-            n_skipped += 1
-            continue
-        c_start, c_end = ranges[raw]
         symbol = f"{ex}.{var_l}{raw[len(var_u):]}"
-        log.info("tq_ingest.contract_download", symbol=symbol, start=str(c_start), end=str(c_end))
+        log.info("tq_ingest.contract_download", symbol=symbol, start=str(s_date), end=str(e_date))
         try:
             download_historical_ticks(
                 symbol=symbol,
-                start_date=c_start,
-                end_date=c_end,
+                start_date=s_date,
+                end_date=e_date,
                 data_dir=data_dir,
                 chunk_days=chunk_days,
                 lake_version=lake_version,

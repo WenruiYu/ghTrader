@@ -24,7 +24,6 @@ import numpy as np
 import pandas as pd
 import structlog
 
-from ghtrader.akshare_daily import fetch_futures_daily_range, normalize_akshare_symbol_to_tqsdk
 from ghtrader.config import get_data_dir
 
 log = structlog.get_logger()
@@ -57,6 +56,41 @@ class MainScheduleResult:
     manifest_path: Path
 
 
+def normalize_contract_symbol(raw_symbol: str, *, exchange: str = "SHFE") -> str:
+    """
+    Normalize a contract identifier into TqSdk symbol form.
+
+    Examples:
+    - "SHFE.cu2602" -> "SHFE.cu2602" (no-op)
+    - "CU2602"      -> "SHFE.cu2602"
+    """
+    s = str(raw_symbol).strip()
+    ex = str(exchange).upper().strip()
+
+    # Already in TqSdk dotted form: normalize case, but avoid mangling continuous aliases like KQ.m@...
+    if "." in s:
+        if s.startswith("KQ.") or s.startswith("KQ.m@"):
+            return s
+        head, tail = s.split(".", 1)
+        # Only normalize obvious exchange-prefixed symbols (e.g. SHFE.cu2602).
+        if head.isalpha() and 2 <= len(head) <= 6:
+            return f"{head.upper()}.{tail.lower()}"
+        return s
+    # Letters + digits (best-effort).
+    letters = ""
+    digits = ""
+    for ch in s:
+        if ch.isalpha() and not digits:
+            letters += ch
+        elif ch.isdigit():
+            digits += ch
+    letters = letters.lower().strip()
+    digits = digits.strip()
+    if letters and digits:
+        return f"{ex}.{letters}{digits}"
+    return s
+
+
 def compute_shfe_main_schedule_from_daily(
     daily: pd.DataFrame,
     *,
@@ -68,11 +102,14 @@ def compute_shfe_main_schedule_from_daily(
     Pure schedule computation (no IO, no network).
 
     Args:
-        daily: akshare-style daily futures DataFrame with columns:
+        daily: daily OI DataFrame with columns:
           - date, symbol, open_interest (and optionally variety)
+        Symbols may be either:
+          - TqSdk symbols (e.g. SHFE.cu2602), or
+          - raw contract codes (e.g. CU2602) which will be normalized.
         var: Variety code (e.g. 'cu', 'au', 'ag')
         rule_threshold: Switch threshold (default 1.1)
-        market: Exchange/market tag for TqSdk normalization (default SHFE)
+        market: Exchange/market tag (default SHFE)
     """
     if daily is None or daily.empty:
         raise ValueError("daily data is empty")
@@ -87,11 +124,13 @@ def compute_shfe_main_schedule_from_daily(
     df["date"] = _to_date_series(df["date"])
     df["open_interest"] = pd.to_numeric(df["open_interest"], errors="coerce")
 
-    # Filter to target variety only
+    # Normalize symbols into TqSdk form, then filter to target variety only.
+    df["symbol"] = df["symbol"].astype(str).str.strip().map(lambda s: normalize_contract_symbol(s, exchange=market))
     if "variety" in df.columns:
         df = df[df["variety"].astype(str).str.upper() == var_u]
     else:
-        df = df[df["symbol"].astype(str).str.upper().str.startswith(var_u)]
+        tail = df["symbol"].astype(str).str.split(".", n=1).str[-1]
+        df = df[tail.str.upper().str.startswith(var_u)]
 
     df = df.dropna(subset=["date", "symbol", "open_interest"])
     if df.empty:
@@ -110,7 +149,7 @@ def compute_shfe_main_schedule_from_daily(
         raise ValueError("No trading days found")
 
     rows: list[dict[str, Any]] = []
-    current_main_raw: str | None = None
+    current_main: str | None = None
 
     for i, day in enumerate(days):
         # Reference OI day for decision: yesterday, except for the first day where we have no prior info.
@@ -119,54 +158,54 @@ def compute_shfe_main_schedule_from_daily(
         if ref is None or ref.empty:
             continue
 
-        top_raw = str(ref.iloc[0]["symbol"])
+        top_sym = str(ref.iloc[0]["symbol"])
         top_oi = float(ref.iloc[0]["open_interest"])
 
-        prev_main_raw = current_main_raw
+        prev_main = current_main
         prev_main_oi = float("nan")
-        if prev_main_raw is not None:
-            match = ref[ref["symbol"].astype(str) == prev_main_raw]
+        if prev_main is not None:
+            match = ref[ref["symbol"].astype(str) == prev_main]
             if not match.empty:
                 prev_main_oi = float(match["open_interest"].iloc[0])
 
         # Next-best = best contract excluding prev_main (for diagnostics)
-        if prev_main_raw is not None:
-            alt = ref[ref["symbol"].astype(str) != prev_main_raw]
+        if prev_main is not None:
+            alt = ref[ref["symbol"].astype(str) != prev_main]
             if not alt.empty:
-                next_best_raw = str(alt.iloc[0]["symbol"])
+                next_best = str(alt.iloc[0]["symbol"])
                 next_best_oi = float(alt.iloc[0]["open_interest"])
             else:
-                next_best_raw = ""
+                next_best = ""
                 next_best_oi = float("nan")
         else:
-            next_best_raw = ""
+            next_best = ""
             next_best_oi = float("nan")
 
         # Apply rule to compute main effective on `day`
         switch_flag = False
-        if prev_main_raw is None:
-            current_main_raw = top_raw
+        if prev_main is None:
+            current_main = top_sym
         elif not np.isfinite(prev_main_oi):
             # If prior main isn't present in the ref data, reset to max.
             switch_flag = True
-            current_main_raw = top_raw
-        elif top_raw != prev_main_raw and top_oi > prev_main_oi * float(rule_threshold):
+            current_main = top_sym
+        elif top_sym != prev_main and top_oi > prev_main_oi * float(rule_threshold):
             switch_flag = True
-            current_main_raw = top_raw
+            current_main = top_sym
         else:
-            current_main_raw = prev_main_raw
+            current_main = prev_main
 
         # Main OI as measured on ref_day
-        main_match = ref[ref["symbol"].astype(str) == current_main_raw]
+        main_match = ref[ref["symbol"].astype(str) == current_main]
         main_oi = float(main_match["open_interest"].iloc[0]) if not main_match.empty else float("nan")
 
         rows.append(
             {
                 "date": day,
-                "main_contract": normalize_akshare_symbol_to_tqsdk(current_main_raw, exchange=market),
+                "main_contract": str(current_main or ""),
                 "main_oi": main_oi,
                 "next_best_contract": (
-                    normalize_akshare_symbol_to_tqsdk(next_best_raw, exchange=market) if next_best_raw else ""
+                    str(next_best or "") if next_best else ""
                 ),
                 "next_best_oi": next_best_oi,
                 "switch_flag": bool(switch_flag),
@@ -201,7 +240,6 @@ def build_shfe_main_schedule(
     end: date,
     rule_threshold: float = 1.1,
     data_dir: Path | None = None,
-    refresh_akshare: bool = False,
 ) -> MainScheduleResult:
     """
     Build and persist an SHFE-style main contract schedule for a given variety.
@@ -211,72 +249,17 @@ def build_shfe_main_schedule(
         start/end: Date range to build (inclusive)
         rule_threshold: Switch threshold (default 1.1)
         data_dir: ghTrader data dir (defaults to config)
-        refresh_akshare: Force re-download of cached daily data
     """
-    if data_dir is None:
-        data_dir = get_data_dir()
+    # NOTE: akshare has been removed. Schedule building is now QuestDB-backed.
+    from ghtrader.main_schedule_db import build_shfe_main_schedule_from_questdb
 
-    if end < start:
-        raise ValueError("end must be >= start")
-
-    market = "SHFE"
-    var_u = var.upper()
-
-    daily = fetch_futures_daily_range(
-        data_dir=data_dir,
-        market=market,
+    return build_shfe_main_schedule_from_questdb(
+        var=var,
         start=start,
         end=end,
-        refresh=refresh_akshare,
-    )
-    if daily is None or daily.empty:
-        raise RuntimeError(f"No daily data returned for {market} {start}..{end}")
-    schedule = compute_shfe_main_schedule_from_daily(
-        daily,
-        var=var,
         rule_threshold=rule_threshold,
-        market=market,
-    )
-
-    # Persist
-    out_dir = _schedule_dir(data_dir, var)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    schedule_path = out_dir / "schedule.parquet"
-    schedule.to_parquet(schedule_path, index=False)
-
-    schedule_hash = _stable_hash_df(schedule)
-    manifest = {
-        "created_at": datetime.now().isoformat(),
-        "market": market,
-        "variety": var.lower(),
-        "start_date": start.isoformat(),
-        "end_date": end.isoformat(),
-        "rule_threshold": float(rule_threshold),
-        "rows": int(len(schedule)),
-        "schedule_hash": schedule_hash,
-        "schedule_path": str(schedule_path),
-        "distinct_main_contracts": sorted([c for c in schedule["main_contract"].unique().tolist() if c]),
-        "source": "akshare",
-    }
-    manifest_path = out_dir / "manifest.json"
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2, default=str)
-
-    log.info(
-        "main_schedule.built",
-        var=var.lower(),
-        start=start.isoformat(),
-        end=end.isoformat(),
-        threshold=float(rule_threshold),
-        rows=len(schedule),
-        schedule_hash=schedule_hash,
-        path=str(schedule_path),
-    )
-
-    return MainScheduleResult(
-        schedule=schedule,
-        schedule_hash=schedule_hash,
-        schedule_path=schedule_path,
-        manifest_path=manifest_path,
+        data_dir=data_dir,
+        lake_version="v2",
+        exchange="SHFE",
     )
 

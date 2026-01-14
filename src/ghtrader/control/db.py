@@ -206,6 +206,58 @@ class JobStore:
             ).fetchall()
         return [self._row_to_record(r) for r in rows]
 
+    def list_active_jobs(self) -> list[JobRecord]:
+        """
+        Return jobs that are logically active in the system (running, or queued while waiting on locks).
+
+        Important: lock acquisition happens inside the CLI process which may temporarily mark the job as
+        status='queued' while the PID is already running and waiting.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM jobs WHERE status IN ('running','queued') AND pid IS NOT NULL ORDER BY created_at DESC",
+            ).fetchall()
+        return [self._row_to_record(r) for r in rows]
+
+    def list_unstarted_queued_jobs(self, *, limit: int = 200) -> list[JobRecord]:
+        """
+        Return queued jobs that have not been spawned yet (pid is NULL).
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM jobs WHERE status='queued' AND pid IS NULL ORDER BY created_at ASC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [self._row_to_record(r) for r in rows]
+
+    def try_mark_started(self, *, job_id: str, pid: int, started_at: str, log_path: Path | None = None) -> bool:
+        """
+        Atomically mark a queued (unstarted) job as running.
+
+        This is used by schedulers to avoid double-starting the same queued job when multiple dashboard
+        instances are running.
+        """
+        now = _now_iso()
+        with self._connect() as con:
+            cur = con.execute(
+                """
+                UPDATE jobs
+                SET
+                  updated_at=?,
+                  status='running',
+                  pid=?,
+                  started_at=?,
+                  log_path=COALESCE(log_path, ?)
+                WHERE
+                  id=?
+                  AND status='queued'
+                  AND pid IS NULL
+                """,
+                (now, int(pid), str(started_at), str(log_path) if log_path is not None else None, str(job_id)),
+            )
+            con.commit()
+            return bool(cur.rowcount == 1)
+
     def _row_to_record(self, row: sqlite3.Row) -> JobRecord:
         cmd = json.loads(row["command_json"])
         waiting = row["waiting_locks_json"]

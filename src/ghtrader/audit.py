@@ -179,7 +179,13 @@ def _read_date_manifest(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def audit_ticks_root(root: Path, *, dataset: str, expected_schema: pa.Schema) -> list[Finding]:
+def audit_ticks_root(
+    root: Path,
+    *,
+    dataset: str,
+    expected_schema: pa.Schema,
+    only_symbols: set[str] | None = None,
+) -> list[Finding]:
     findings: list[Finding] = []
     if not root.exists():
         return [Finding("warning", "missing_dataset", f"Dataset root missing: {root}", path=str(root))]
@@ -187,6 +193,10 @@ def audit_ticks_root(root: Path, *, dataset: str, expected_schema: pa.Schema) ->
     for sym_dir in sorted(root.iterdir()):
         if not sym_dir.is_dir() or not sym_dir.name.startswith("symbol="):
             continue
+        if only_symbols is not None:
+            sym = sym_dir.name.split("=", 1)[-1]
+            if sym not in only_symbols:
+                continue
         for date_dir in sorted(sym_dir.iterdir()):
             if not date_dir.is_dir() or not date_dir.name.startswith("date="):
                 continue
@@ -452,6 +462,7 @@ def run_audit(
     runs_dir: Path,
     scopes: list[str],
     lake_version: LakeVersion = "v1",
+    symbols: list[str] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     run_id = uuid.uuid4().hex[:12]
     findings: list[Finding] = []
@@ -460,13 +471,22 @@ def run_audit(
         pa.field("segment_id", pa.int64())
     )
     lake_root = lake_root_dir(data_dir, lake_version)
+    only = {str(s).strip() for s in (symbols or []) if str(s).strip()} or None
 
     if "ticks" in scopes or "all" in scopes:
-        findings.extend(audit_ticks_root(lake_root / "ticks", dataset="ticks_raw", expected_schema=TICK_ARROW_SCHEMA))
+        findings.extend(
+            audit_ticks_root(lake_root / "ticks", dataset="ticks_raw", expected_schema=TICK_ARROW_SCHEMA, only_symbols=only)
+        )
     if "main_l5" in scopes or "all" in scopes:
         expected = main_l5_schema_v2 if lake_version == "v2" else TICK_ARROW_SCHEMA
-        findings.extend(audit_ticks_root(lake_root / "main_l5" / "ticks", dataset="ticks_main_l5", expected_schema=expected))
-        findings.extend(_audit_main_l5_equivalence(data_dir, lake_version=lake_version))
+        findings.extend(
+            audit_ticks_root(
+                lake_root / "main_l5" / "ticks", dataset="ticks_main_l5", expected_schema=expected, only_symbols=only
+            )
+        )
+        # Equivalence audit is global and can be expensive; skip when symbol-filtered.
+        if only is None:
+            findings.extend(_audit_main_l5_equivalence(data_dir, lake_version=lake_version))
     if "features" in scopes or "all" in scopes:
         findings.extend(audit_features_or_labels_root(data_dir / "features", dataset="features"))
     if "labels" in scopes or "all" in scopes:

@@ -154,3 +154,44 @@ def get_lake_version() -> str:
     if v in {"v1", "v2"}:
         return v
     raise RuntimeError(f"Invalid GHTRADER_LAKE_VERSION={v!r} (expected 'v1' or 'v2')")
+
+
+# ---------------------------------------------------------------------------
+# QuestDB (canonical tick DB) connection defaults
+# ---------------------------------------------------------------------------
+
+
+def get_questdb_host() -> str:
+    load_config()
+    return str(get_env("GHTRADER_QUESTDB_HOST", "127.0.0.1") or "127.0.0.1")
+
+
+def get_questdb_ilp_port() -> int:
+    load_config()
+    try:
+        return int(get_env("GHTRADER_QUESTDB_ILP_PORT", "9009") or 9009)
+    except Exception:
+        return 9009
+
+
+def get_questdb_pg_port() -> int:
+    load_config()
+    try:
+        return int(get_env("GHTRADER_QUESTDB_PG_PORT", "8812") or 8812)
+    except Exception:
+        return 8812
+
+
+def get_questdb_pg_user() -> str:
+    load_config()
+    return str(get_env("GHTRADER_QUESTDB_PG_USER", "admin") or "admin")
+
+
+def get_questdb_pg_password() -> str:
+    load_config()
+    return str(get_env("GHTRADER_QUESTDB_PG_PASSWORD", "quest") or "quest")
+
+
+def get_questdb_pg_dbname() -> str:
+    load_config()
+    return str(get_env("GHTRADER_QUESTDB_PG_DBNAME", "qdb") or "qdb")

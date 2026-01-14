@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 import shutil
 import uuid
 
@@ -24,6 +24,12 @@ import structlog
 from ghtrader.lake import LakeVersion, TicksLake, list_available_dates_in_lake, read_ticks_for_symbol, ticks_symbol_dir
 
 log = structlog.get_logger()
+
+def _stable_hash_df(df: pd.DataFrame) -> str:
+    import hashlib
+
+    payload = df.to_csv(index=False).encode()
+    return hashlib.sha256(payload).hexdigest()[:16]
 
 # Label classes
 LabelClass = Literal["DOWN", "FLAT", "UP"]
@@ -183,46 +189,66 @@ def build_labels_for_symbol(
 
     max_h = max(horizons) if horizons else 0
 
-    # For derived ticks, avoid cross-day lookahead on roll boundaries.
+    # For derived ticks, avoid cross-day lookahead on roll boundaries + record schedule provenance.
     underlying_by_date: dict[date, str] = {}
     segment_id_by_date: dict[date, int] = {}
+    schedule_prov: dict[str, Any] = {}
     if ticks_lake == "main_l5":
-        try:
-            schedule_path = ticks_symbol_dir(
+        schedule_path = (
+            ticks_symbol_dir(
                 data_dir,
                 symbol,
                 ticks_lake="main_l5",
                 lake_version=lake_version,
-            ) / "schedule.parquet"
-            if schedule_path.exists():
-                sched = pd.read_parquet(schedule_path)
-                if "date" in sched.columns and "main_contract" in sched.columns:
-                    sched = sched.copy()
-                    sched["date"] = pd.to_datetime(sched["date"], errors="coerce").dt.date
-                    sched = sched.dropna(subset=["date", "main_contract"])
-                    # Ensure segment_id exists for older schedule copies.
-                    if "segment_id" not in sched.columns:
-                        seg_ids: list[int] = []
+            )
+            / "schedule.parquet"
+        )
+        if not schedule_path.exists():
+            raise ValueError(
+                f"Missing schedule.parquet for derived ticks: {schedule_path}. "
+                "Run `ghtrader main-l5` (or `main-depth`) first."
+            )
+        try:
+            sched = pd.read_parquet(schedule_path)
+            if "date" not in sched.columns or "main_contract" not in sched.columns:
+                raise ValueError(f"Unexpected schedule schema: {list(sched.columns)}")
+            sched = sched.copy()
+            sched["date"] = pd.to_datetime(sched["date"], errors="coerce").dt.date
+            sched = sched.dropna(subset=["date", "main_contract"]).sort_values("date").reset_index(drop=True)
+            # Ensure segment_id exists for older schedule copies.
+            if "segment_id" not in sched.columns:
+                seg_ids: list[int] = []
+                seg = 0
+                prev: str | None = None
+                for mc in sched["main_contract"].astype(str).tolist():
+                    if prev is None:
                         seg = 0
-                        prev: str | None = None
-                        for mc in sched["main_contract"].astype(str).tolist():
-                            if prev is None:
-                                seg = 0
-                            elif mc != prev:
-                                seg += 1
-                            seg_ids.append(int(seg))
-                            prev = mc
-                        sched["segment_id"] = seg_ids
+                    elif mc != prev:
+                        seg += 1
+                    seg_ids.append(int(seg))
+                    prev = mc
+                sched["segment_id"] = seg_ids
 
-                    for _, r in sched.iterrows():
-                        d = r["date"]
-                        underlying_by_date[d] = str(r["main_contract"])
-                        try:
-                            segment_id_by_date[d] = int(r.get("segment_id", 0) or 0)
-                        except Exception:
-                            segment_id_by_date[d] = 0
+            for _, r in sched.iterrows():
+                d = r["date"]
+                underlying_by_date[d] = str(r["main_contract"])
+                try:
+                    segment_id_by_date[d] = int(r.get("segment_id", 0) or 0)
+                except Exception:
+                    segment_id_by_date[d] = 0
+
+            schedule_hash = _stable_hash_df(sched[["date", "main_contract", "segment_id"]])
+            d0 = sched["date"].min()
+            d1 = sched["date"].max()
+            schedule_prov = {
+                "path": str(schedule_path),
+                "hash": str(schedule_hash),
+                "l5_start_date": (d0.isoformat() if hasattr(d0, "isoformat") else str(d0)),
+                "end_date": (d1.isoformat() if hasattr(d1, "isoformat") else str(d1)),
+                "rows": int(len(sched)),
+            }
         except Exception as e:
-            log.warning("labels.schedule_load_failed", symbol=symbol, error=str(e))
+            raise ValueError(f"Failed to load schedule.parquet for derived ticks ({e})") from e
 
     # Canonical schema for partitions
     schema_fields: list[pa.Field] = [pa.field("symbol", pa.string()), pa.field("datetime", pa.int64())]
@@ -256,6 +282,12 @@ def build_labels_for_symbol(
                     raise ValueError("threshold_k mismatch")
                 if str(existing.get("schema_hash") or "") != expected_schema_hash:
                     raise ValueError("schema_hash mismatch")
+                if ticks_lake == "main_l5" and schedule_prov:
+                    ex_sched = dict(existing.get("schedule") or {})
+                    if str(ex_sched.get("hash") or "") and str(ex_sched.get("hash")) != str(schedule_prov.get("hash") or ""):
+                        raise ValueError("schedule_hash mismatch")
+                    if str(ex_sched.get("l5_start_date") or "") and str(ex_sched.get("l5_start_date")) != str(schedule_prov.get("l5_start_date") or ""):
+                        raise ValueError("l5_start_date mismatch")
             except Exception as e:
                 raise ValueError(
                     f"Existing labels manifest does not match requested build ({e}). "
@@ -410,6 +442,8 @@ def build_labels_for_symbol(
             "row_counts": row_counts,
             "files": files,
         }
+        if ticks_lake == "main_l5" and schedule_prov:
+            manifest["schedule"] = schedule_prov
         write_json_atomic(out_root / "manifest.json", manifest)
     except Exception as e:
         log.warning("labels.manifest_failed", symbol=symbol, error=str(e))
@@ -449,6 +483,19 @@ def read_labels_for_symbol(data_dir: Path, symbol: str) -> pd.DataFrame:
     combined = pa.concat_tables(tables)
     df = combined.to_pandas()
     return df.sort_values("datetime").reset_index(drop=True)
+
+
+def read_labels_manifest(data_dir: Path, symbol: str) -> dict[str, Any]:
+    """Read the labels manifest for a symbol (if present)."""
+    p = labels_dir(data_dir) / f"symbol={symbol}" / "manifest.json"
+    if not p.exists():
+        return {}
+    try:
+        import json
+
+        return dict(json.loads(p.read_text()))
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------

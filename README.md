@@ -56,7 +56,6 @@ source .venv/bin/activate
 
 # Install in editable mode (includes vendored tqsdk-python)
 pip install -e ./tqsdk-python
-pip install -e ./akshare
 pip install -e .[dev,control]
 
 # Configure TqSdk credentials (Pro account with tq_dl required)
@@ -71,6 +70,9 @@ export TQSDK_PASSWORD="your_password"
 # Recommended: use the trading-day partitioned lake (lake_v2) by default
 # (alternative: pass --lake-version v2 on relevant commands)
 export GHTRADER_LAKE_VERSION=v2
+
+# Optional: override trading calendar holiday list (no akshare)
+export TQ_CHINESE_HOLIDAY_URL="https://files.shinnytech.com/shinny_chinese_holiday.json"
 
 # Download historical L5 ticks for a symbol and date range
 ghtrader download --symbol SHFE.cu2502 --start 2024-01-01 --end 2024-01-31 --lake-version v2
@@ -192,6 +194,40 @@ ghtrader sql --query "SELECT * FROM run_metrics ORDER BY created_at DESC" --out 
 Optional serving DB hooks (require external daemons):
 - `ghtrader db benchmark ...` (QuestDB/ClickHouse ingest/query benchmark)
 - `ghtrader db serve-sync ...` (best-effort backfill/incremental sync from Parquet partitions)
+
+---
+
+## QuestDB (canonical ticks; optional but recommended)
+
+ghTrader can use **QuestDB** as the canonical time-series store for ticks (Parquet remains the reproducible mirror for training and audits).
+
+Install the QuestDB extras:
+
+```bash
+pip install -e ".[questdb]"
+```
+
+Configure connection (see `env.example`):
+- `GHTRADER_QUESTDB_HOST`
+- `GHTRADER_QUESTDB_ILP_PORT` (default `9009`)
+- `GHTRADER_QUESTDB_PG_PORT` (default `8812`)
+- `GHTRADER_QUESTDB_PG_USER` / `GHTRADER_QUESTDB_PG_PASSWORD` / `GHTRADER_QUESTDB_PG_DBNAME`
+
+Common flows:
+
+```bash
+# Sync locally-downloaded Parquet ticks to QuestDB (per symbol)
+ghtrader db serve-sync --backend questdb --symbol SHFE.cu2602 --ticks-lake raw --lake-version v2
+
+# Sync all locally-downloaded contracts for a variety
+ghtrader db serve-sync-variety --exchange SHFE --var cu --lake-version v2
+
+# Build the SHFE-style OI roll schedule from QuestDB (required before main_l5)
+ghtrader main-schedule --var cu --start 2015-01-01 --end 2026-01-01
+
+# Build derived main_l5 ticks for the L5 era only (writes to data/lake_v2/main_l5/...)
+ghtrader main-l5 --var cu --lake-version v2
+```
 
 ## Labels (event-time, multi-horizon)
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from ghtrader.akshare_daily import normalize_akshare_symbol_to_tqsdk
+from ghtrader.main_contract import normalize_contract_symbol
 
 
 @pytest.mark.parametrize(
@@ -14,6 +14,6 @@ from ghtrader.akshare_daily import normalize_akshare_symbol_to_tqsdk
         ("SHFE.CU2602", "SHFE.cu2602"),
     ],
 )
-def test_normalize_akshare_symbol_to_tqsdk(raw: str, expected: str):
-    assert normalize_akshare_symbol_to_tqsdk(raw, exchange="SHFE") == expected
+def test_normalize_contract_symbol(raw: str, expected: str):
+    assert normalize_contract_symbol(raw, exchange="SHFE") == expected
 

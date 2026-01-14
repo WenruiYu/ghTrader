@@ -164,6 +164,95 @@ class JobManager:
         assert out is not None
         return out
 
+    def enqueue_job(self, spec: JobSpec) -> JobRecord:
+        """
+        Create a queued job record without spawning the subprocess.
+
+        Intended for bulk operations (downloads / probes) where we want to avoid
+        starting hundreds of processes at once.
+        """
+        job_id = uuid.uuid4().hex[:12]
+        log_path = self.logs_dir / f"job-{job_id}.log"
+        argv = _normalize_argv(list(spec.argv))
+        self.store.create_job(
+            job_id=job_id,
+            title=spec.title,
+            command=argv,
+            cwd=spec.cwd,
+            source="dashboard",
+            log_path=log_path,
+        )
+        out = self.store.get_job(job_id)
+        assert out is not None
+        return out
+
+    def start_queued_job(self, job_id: str) -> JobRecord | None:
+        """
+        Spawn a previously-enqueued job (status=queued, pid IS NULL).
+
+        Uses an atomic DB claim to avoid double-start when multiple dashboards run.
+        """
+        job = self.store.get_job(job_id)
+        if job is None:
+            return None
+        if job.pid is not None:
+            return job
+        if job.status != "queued":
+            return job
+
+        argv = _normalize_argv(list(job.command))
+        cwd = Path(str(job.cwd))
+        log_path = Path(job.log_path) if job.log_path else (self.logs_dir / f"job-{job_id}.log")
+        started_at = _now_iso()
+
+        env = os.environ.copy()
+        env["GHTRADER_JOB_ID"] = job_id
+        env["GHTRADER_JOB_SOURCE"] = str(job.source or "dashboard")
+        env["GHTRADER_JOB_LOG_PATH"] = str(log_path)
+
+        with open(log_path, "ab", buffering=0) as f:
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(cwd),
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                preexec_fn=os.setsid,
+            )
+
+        claimed = False
+        try:
+            claimed = self.store.try_mark_started(job_id=job_id, pid=int(proc.pid), started_at=started_at, log_path=log_path)
+        except Exception:
+            claimed = False
+
+        if not claimed:
+            # Another scheduler beat us to it. Terminate our duplicate quickly.
+            try:
+                os.killpg(int(proc.pid), signal.SIGTERM)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            return self.store.get_job(job_id) or job
+
+        def _waiter() -> None:
+            try:
+                exit_code = proc.wait()
+                current = self.store.get_job(job_id)
+                if current is None or current.status not in {"running", "queued"}:
+                    return
+                status = "succeeded" if exit_code == 0 else "failed"
+                self.store.update_job(job_id, status=status, exit_code=int(exit_code), finished_at=_now_iso())
+            except Exception as e:
+                self.store.update_job(job_id, status="failed", finished_at=_now_iso(), error=str(e))
+
+        t = threading.Thread(target=_waiter, name=f"job-wait-{job_id}", daemon=True)
+        t.start()
+
+        return self.store.get_job(job_id) or job
+
     def cancel_job(self, job_id: str) -> bool:
         job = self.store.get_job(job_id)
         if job is None or job.pid is None:

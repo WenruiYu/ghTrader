@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -81,15 +82,22 @@ def build_router() -> Any:
     # Ops pages (full-form parity with CLI)
     # ---------------------------------------------------------------------
 
-    @router.get("/ops/ingest")
-    def ops_ingest(request: Request):
+    @router.get("/ops")
+    def ops(request: Request):
         _require_auth(request)
         store = request.app.state.job_store
+
+        jobs = store.list_jobs(limit=200)
+        running_count = len([j for j in jobs if j.status == "running"])
+        queued_count = len([j for j in jobs if j.status == "queued"])
+        recent_count = len(jobs)
+
+        # Ingest statuses (same as legacy /ops/ingest page)
         ingest_statuses: list[dict[str, Any]] = []
         try:
             from ghtrader.control.ingest_status import ingest_status_for_job, parse_ingest_command
 
-            for job in store.list_jobs(limit=200):
+            for job in jobs:
                 if job.status not in {"queued", "running"}:
                     continue
                 kind = parse_ingest_command(job.command).get("kind")
@@ -113,55 +121,127 @@ def build_router() -> Any:
                 ingest_statuses.append(s)
         except Exception:
             ingest_statuses = []
+
+        # Trading runs (same as legacy /ops/trading page)
+        runs_dir = get_runs_dir()
+        trading_dir = runs_dir / "trading"
+        runs: list[dict[str, Any]] = []
+        try:
+            if trading_dir.exists():
+                for p in sorted([d for d in trading_dir.iterdir() if d.is_dir()], key=lambda x: x.name, reverse=True)[:50]:
+                    last = _read_last_jsonl_line(p / "snapshots.jsonl")
+                    runs.append(
+                        {
+                            "run_id": p.name,
+                            "last_ts": (last or {}).get("ts", ""),
+                            "balance": ((last or {}).get("account") or {}).get("balance", ""),
+                        }
+                    )
+        except Exception:
+            runs = []
+
+        # Locks (same as legacy /ops/locks page)
+        locks = []
+        try:
+            from ghtrader.control.locks import LockStore
+
+            locks = LockStore(runs_dir / "control" / "jobs.db").list_locks()
+        except Exception:
+            locks = []
+
+        # Audit reports (same as legacy /ops/integrity page)
+        reports = []
+        try:
+            reports_dir = runs_dir / "audit"
+            if reports_dir.exists():
+                reports = sorted([p.name for p in reports_dir.glob("*.json")], reverse=True)[:50]
+        except Exception:
+            reports = []
+
+        # QuestDB reachability (best-effort).
+        questdb: dict[str, Any] = {"ok": False}
+        try:
+            from ghtrader.config import (
+                get_questdb_host,
+                get_questdb_ilp_port,
+                get_questdb_pg_dbname,
+                get_questdb_pg_password,
+                get_questdb_pg_port,
+                get_questdb_pg_user,
+            )
+
+            host = get_questdb_host()
+            pg_port = int(get_questdb_pg_port())
+            ilp_port = int(get_questdb_ilp_port())
+            questdb.update({"host": host, "pg_port": pg_port, "ilp_port": ilp_port})
+            try:
+                import psycopg  # type: ignore
+
+                with psycopg.connect(
+                    user=str(get_questdb_pg_user()),
+                    password=str(get_questdb_pg_password()),
+                    host=str(host),
+                    port=int(pg_port),
+                    dbname=str(get_questdb_pg_dbname()),
+                ) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                questdb["ok"] = True
+            except Exception as e:
+                questdb["ok"] = False
+                questdb["error"] = str(e)
+        except Exception as e:
+            questdb["ok"] = False
+            questdb["error"] = str(e)
+
+        # Defaults for schedule builder quick actions
+        default_schedule_start = "2015-01-01"
+        default_schedule_end = datetime.now().date().isoformat()
+
         return templates.TemplateResponse(
-            "ops_ingest.html",
-            {"request": request, "title": "Ingest", "token_qs": _token_qs(request), "ingest_statuses": ingest_statuses},
+            "ops.html",
+            {
+                "request": request,
+                "title": "Operations",
+                "token_qs": _token_qs(request),
+                "running_count": running_count,
+                "queued_count": queued_count,
+                "recent_count": recent_count,
+                "ingest_statuses": ingest_statuses,
+                "runs": runs,
+                "locks": locks,
+                "reports": reports,
+                "questdb": questdb,
+                "default_schedule_start": default_schedule_start,
+                "default_schedule_end": default_schedule_end,
+            },
         )
+
+    @router.get("/ops/ingest")
+    def ops_ingest(request: Request):
+        _require_auth(request)
+        return RedirectResponse(url=f"/ops{_token_qs(request)}#ingest", status_code=303)
 
     @router.get("/ops/build")
     def ops_build(request: Request):
         _require_auth(request)
-        return templates.TemplateResponse(
-            "ops_build.html",
-            {"request": request, "title": "Build", "token_qs": _token_qs(request)},
-        )
+        return RedirectResponse(url=f"/ops{_token_qs(request)}#schedule", status_code=303)
 
     @router.get("/ops/model")
     def ops_model(request: Request):
         _require_auth(request)
-        return templates.TemplateResponse(
-            "ops_model.html",
-            {"request": request, "title": "Model", "token_qs": _token_qs(request)},
-        )
+        return RedirectResponse(url=f"/ops{_token_qs(request)}#model", status_code=303)
 
     @router.get("/ops/eval")
     def ops_eval(request: Request):
         _require_auth(request)
-        return templates.TemplateResponse(
-            "ops_eval.html",
-            {"request": request, "title": "Eval", "token_qs": _token_qs(request)},
-        )
+        return RedirectResponse(url=f"/ops{_token_qs(request)}#eval", status_code=303)
 
     @router.get("/ops/trading")
     def ops_trading(request: Request):
         _require_auth(request)
-        runs_dir = get_runs_dir()
-        trading_dir = runs_dir / "trading"
-        runs: list[dict[str, Any]] = []
-        if trading_dir.exists():
-            for p in sorted([d for d in trading_dir.iterdir() if d.is_dir()], key=lambda x: x.name, reverse=True)[:50]:
-                last = _read_last_jsonl_line(p / "snapshots.jsonl")
-                runs.append(
-                    {
-                        "run_id": p.name,
-                        "last_ts": (last or {}).get("ts", ""),
-                        "balance": ((last or {}).get("account") or {}).get("balance", ""),
-                    }
-                )
-        return templates.TemplateResponse(
-            "ops_trading.html",
-            {"request": request, "title": "Trading", "token_qs": _token_qs(request), "runs": runs},
-        )
+        return RedirectResponse(url=f"/ops{_token_qs(request)}#trading", status_code=303)
 
     @router.get("/ops/trading/run/{run_id}")
     def ops_trading_run(request: Request, run_id: str):
@@ -190,27 +270,12 @@ def build_router() -> Any:
     @router.get("/ops/locks")
     def ops_locks(request: Request):
         _require_auth(request)
-        runs_dir = get_runs_dir()
-        from ghtrader.control.locks import LockStore
-
-        locks = LockStore(runs_dir / "control" / "jobs.db").list_locks()
-        return templates.TemplateResponse(
-            "ops_locks.html",
-            {"request": request, "title": "Locks", "token_qs": _token_qs(request), "locks": locks},
-        )
+        return RedirectResponse(url=f"/ops{_token_qs(request)}#locks", status_code=303)
 
     @router.get("/ops/integrity")
     def ops_integrity(request: Request):
         _require_auth(request)
-        runs_dir = get_runs_dir()
-        reports_dir = runs_dir / "audit"
-        reports = []
-        if reports_dir.exists():
-            reports = sorted([p.name for p in reports_dir.glob("*.json")], reverse=True)[:50]
-        return templates.TemplateResponse(
-            "ops_integrity.html",
-            {"request": request, "title": "Integrity", "token_qs": _token_qs(request), "reports": reports},
-        )
+        return RedirectResponse(url=f"/ops{_token_qs(request)}#integrity", status_code=303)
 
     @router.get("/ops/integrity/report/{name}")
     def ops_integrity_report(request: Request, name: str):
@@ -263,9 +328,10 @@ def build_router() -> Any:
         var = str(form.get("variety") or "").strip()
         start_contract = str(form.get("start_contract") or "").strip()
         end_contract = str(form.get("end_contract") or "").strip()
+        start_date = str(form.get("start_date") or "").strip()
+        end_date = str(form.get("end_date") or "").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
         chunk_days = str(form.get("chunk_days") or "5").strip()
-        refresh_akshare = str(form.get("refresh_akshare") or "false").strip().lower() == "true"
         lake_version = str(form.get("lake_version") or "v1").strip()
         if not var or not start_contract or not end_contract:
             raise HTTPException(status_code=400, detail="var/start_contract/end_contract required")
@@ -284,10 +350,15 @@ def build_router() -> Any:
             data_dir,
             "--chunk-days",
             chunk_days,
-            "--refresh-akshare" if refresh_akshare else "--no-refresh-akshare",
+        )
+        if start_date:
+            argv += ["--start-date", start_date]
+        if end_date:
+            argv += ["--end-date", end_date]
+        argv += [
             "--lake-version",
             lake_version,
-        )
+        ]
         title = f"download-contract-range {var} {start_contract}->{end_contract} lake={lake_version}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
@@ -308,6 +379,97 @@ def build_router() -> Any:
         argv += ["--data-dir", data_dir]
         argv += ["--lake-version", lake_version]
         title = f"record {symbols} lake={lake_version}"
+        jm = request.app.state.job_manager
+        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+
+    @router.post("/ops/db/serve_sync_variety")
+    async def ops_db_serve_sync_variety(request: Request):
+        _require_auth(request)
+        form = await request.form()
+        exchange = str(form.get("exchange") or "SHFE").strip()
+        variety = str(form.get("variety") or "cu").strip()
+        lake_version = str(form.get("lake_version") or "v2").strip()
+        data_dir = str(form.get("data_dir") or "data").strip()
+        runs_dir = str(form.get("runs_dir") or "runs").strip()
+        host = str(form.get("host") or "127.0.0.1").strip()
+        questdb_ilp_port = str(form.get("questdb_ilp_port") or "9009").strip()
+        questdb_pg_port = str(form.get("questdb_pg_port") or "8812").strip()
+
+        argv = python_module_argv(
+            "ghtrader.cli",
+            "db",
+            "serve-sync-variety",
+            "--exchange",
+            exchange,
+            "--var",
+            variety,
+            "--lake-version",
+            lake_version,
+            "--data-dir",
+            data_dir,
+            "--runs-dir",
+            runs_dir,
+            "--host",
+            host,
+            "--questdb-ilp-port",
+            questdb_ilp_port,
+            "--questdb-pg-port",
+            questdb_pg_port,
+        )
+        title = f"db serve-sync-variety {exchange}.{variety} lake={lake_version}"
+        jm = request.app.state.job_manager
+        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+
+    @router.post("/ops/db/serve_sync")
+    async def ops_db_serve_sync(request: Request):
+        _require_auth(request)
+        form = await request.form()
+        symbol = str(form.get("symbol") or "").strip()
+        ticks_lake = str(form.get("ticks_lake") or "raw").strip()
+        lake_version = str(form.get("lake_version") or "v2").strip()
+        mode = str(form.get("mode") or "incremental").strip()
+        start = str(form.get("start") or "").strip()
+        end = str(form.get("end") or "").strip()
+        data_dir = str(form.get("data_dir") or "data").strip()
+        runs_dir = str(form.get("runs_dir") or "runs").strip()
+        host = str(form.get("host") or "127.0.0.1").strip()
+        questdb_ilp_port = str(form.get("questdb_ilp_port") or "9009").strip()
+        questdb_pg_port = str(form.get("questdb_pg_port") or "8812").strip()
+        if not symbol:
+            raise HTTPException(status_code=400, detail="symbol required")
+
+        argv = python_module_argv(
+            "ghtrader.cli",
+            "db",
+            "serve-sync",
+            "--backend",
+            "questdb",
+            "--symbol",
+            symbol,
+            "--ticks-lake",
+            ticks_lake,
+            "--lake-version",
+            lake_version,
+            "--mode",
+            mode,
+            "--data-dir",
+            data_dir,
+            "--runs-dir",
+            runs_dir,
+            "--host",
+            host,
+            "--questdb-ilp-port",
+            questdb_ilp_port,
+            "--questdb-pg-port",
+            questdb_pg_port,
+        )
+        if start:
+            argv += ["--start", start]
+        if end:
+            argv += ["--end", end]
+        title = f"db serve-sync {symbol} ticks_lake={ticks_lake} lake={lake_version}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -355,7 +517,6 @@ def build_router() -> Any:
         start_date = str(form.get("start_date") or "").strip()
         end_date = str(form.get("end_date") or "").strip()
         threshold = str(form.get("threshold") or "1.1").strip()
-        refresh_akshare = str(form.get("refresh_akshare") or "false").strip().lower() == "true"
         data_dir = str(form.get("data_dir") or "data").strip()
         if not start_date or not end_date:
             raise HTTPException(status_code=400, detail="start_date/end_date required")
@@ -372,9 +533,40 @@ def build_router() -> Any:
             threshold,
             "--data-dir",
             data_dir,
-            "--refresh-akshare" if refresh_akshare else "--no-refresh-akshare",
         )
         title = f"main-schedule {var} {start_date}->{end_date}"
+        jm = request.app.state.job_manager
+        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+
+    @router.post("/ops/build/main_l5")
+    async def ops_build_main_l5(request: Request):
+        _require_auth(request)
+        form = await request.form()
+        var = str(form.get("variety") or "cu").strip()
+        derived_symbol = str(form.get("derived_symbol") or f"KQ.m@SHFE.{var}").strip()
+        schedule_path = str(form.get("schedule_path") or "").strip()
+        overwrite = str(form.get("overwrite") or "false").strip().lower() == "true"
+        data_dir = str(form.get("data_dir") or "data").strip()
+        lake_version = str(form.get("lake_version") or "v2").strip()
+        if not var or not derived_symbol:
+            raise HTTPException(status_code=400, detail="variety/derived_symbol required")
+        argv = python_module_argv(
+            "ghtrader.cli",
+            "main-l5",
+            "--var",
+            var,
+            "--symbol",
+            derived_symbol,
+            "--data-dir",
+            data_dir,
+            "--overwrite" if overwrite else "--no-overwrite",
+            "--lake-version",
+            lake_version,
+        )
+        if schedule_path:
+            argv += ["--schedule-path", schedule_path]
+        title = f"main-l5 {var} {derived_symbol} lake={lake_version}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -800,6 +992,39 @@ def build_router() -> Any:
                 lake_version,
             )
             title = f"download-contract-range {var} {start_contract}->{end_contract} lake={lake_version}"
+        elif job_type == "lake_convert_v1_to_v2":
+            # Offline repack: lake_v1 -> lake_v2 (trading-day partitioning)
+            sym_raw = symbol_or_var
+            syms: list[str] = []
+            if sym_raw:
+                # Allow comma-separated list.
+                syms = [s.strip() for s in str(sym_raw).replace(" ", ",").split(",") if s.strip()]
+
+            start_date = str(form.get("convert_start_date") or "").strip()
+            end_date = str(form.get("convert_end_date") or "").strip()
+            dry_run = str(form.get("convert_dry_run") or "").strip().lower() in {"true", "1", "yes", "on"}
+            copy_no_data = str(form.get("convert_copy_no_data") or "").strip().lower() in {"true", "1", "yes", "on"}
+
+            argv_args: list[str] = ["lake-convert-v1-to-v2", "--data-dir", str(data_dir)]
+            for s in syms:
+                argv_args += ["--symbol", s]
+            if start_date:
+                argv_args += ["--start", start_date]
+            if end_date:
+                argv_args += ["--end", end_date]
+            if dry_run:
+                argv_args += ["--dry-run"]
+            if copy_no_data:
+                argv_args += ["--copy-no-data"]
+
+            argv = python_module_argv("ghtrader.cli", *argv_args)
+            title = "lake-convert-v1-to-v2"
+            if syms:
+                title += f" symbols={len(syms)}"
+            if start_date or end_date:
+                title += f" {start_date or '*'}->{end_date or '*'}"
+            if dry_run:
+                title += " (dry-run)"
         elif job_type == "build":
             symbol = symbol_or_var
             if not symbol:

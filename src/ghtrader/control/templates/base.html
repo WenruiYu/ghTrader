@@ -13,13 +13,7 @@
         {% set path = request.url.path %}
         <a href="/{{ token_qs }}" class="{% if path == '/' %}active{% endif %}">Home</a>
         <a href="/jobs{{ token_qs }}" class="{% if path.startswith('/jobs') %}active{% endif %}">Jobs</a>
-        <a href="/ops/ingest{{ token_qs }}" class="{% if path.startswith('/ops/ingest') %}active{% endif %}">Ingest</a>
-        <a href="/ops/build{{ token_qs }}" class="{% if path.startswith('/ops/build') %}active{% endif %}">Build</a>
-        <a href="/ops/model{{ token_qs }}" class="{% if path.startswith('/ops/model') %}active{% endif %}">Model</a>
-        <a href="/ops/eval{{ token_qs }}" class="{% if path.startswith('/ops/eval') %}active{% endif %}">Eval</a>
-        <a href="/ops/trading{{ token_qs }}" class="{% if path.startswith('/ops/trading') %}active{% endif %}">Trading</a>
-        <a href="/ops/locks{{ token_qs }}" class="{% if path.startswith('/ops/locks') %}active{% endif %}">Locks</a>
-        <a href="/ops/integrity{{ token_qs }}" class="{% if path.startswith('/ops/integrity') %}active{% endif %}">Integrity</a>
+        <a href="/ops{{ token_qs }}" class="{% if path.startswith('/ops') %}active{% endif %}">Ops</a>
         <a href="/data{{ token_qs }}" class="{% if path.startswith('/data') %}active{% endif %}">Data</a>
         <a href="/explorer{{ token_qs }}" class="{% if path.startswith('/explorer') %}active{% endif %}">Explorer</a>
         <a href="/system{{ token_qs }}" class="{% if path.startswith('/system') %}active{% endif %}">System</a>

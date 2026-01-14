@@ -13,6 +13,7 @@
       <label>Job type</label>
       <select name="job_type" id="jobType">
         <option value="download_contract_range">download-contract-range</option>
+        <option value="lake_convert_v1_to_v2">lake convert v1 → v2 (offline)</option>
         <option value="build">build (labels+features)</option>
         <option value="train">train</option>
         <option value="benchmark">benchmark</option>
@@ -111,6 +112,32 @@
         </div>
       </details>
 
+      <details id="groupLakeConvert">
+        <summary>lake convert v1 → v2 options</summary>
+        <p class="muted">
+          Converts raw ticks from <span class="mono">data/lake</span> to <span class="mono">data/lake_v2</span>
+          by re-partitioning night-session ticks (≥18:00) into the next trading day.
+          Leave “Symbol / Variety” blank to convert all symbols in lake_v1, or use a comma-separated list.
+        </p>
+        <div class="grid3">
+          <div>
+            <label>Start date (optional)</label>
+            <input name="convert_start_date" placeholder="YYYY-MM-DD"/>
+          </div>
+          <div>
+            <label>End date (optional)</label>
+            <input name="convert_end_date" placeholder="YYYY-MM-DD"/>
+          </div>
+          <div>
+            <label>Options</label>
+            <div class="inlineControls">
+              <label><input type="checkbox" name="convert_dry_run" value="true"/> dry-run</label>
+              <label><input type="checkbox" name="convert_copy_no_data" value="true"/> copy no-data markers</label>
+            </div>
+          </div>
+        </div>
+      </details>
+
       <button type="submit">Start</button>
     </form>
   </div>
@@ -173,6 +200,7 @@
 
       const groups = {
         contract: document.getElementById("groupContractRange"),
+        lakeConvert: document.getElementById("groupLakeConvert"),
         model: document.getElementById("groupModel"),
         mainSchedule: document.getElementById("groupMainSchedule"),
         mainDepth: document.getElementById("groupMainDepth"),
@@ -186,12 +214,14 @@
       function syncFormByType() {
         const t = (jobType && jobType.value) ? jobType.value : "";
         setGroupVisible(groups.contract, t === "download_contract_range");
+        setGroupVisible(groups.lakeConvert, t === "lake_convert_v1_to_v2");
         setGroupVisible(groups.model, t === "train" || t === "benchmark");
         setGroupVisible(groups.mainSchedule, t === "main_schedule");
         setGroupVisible(groups.mainDepth, t === "main_depth");
 
         // Open the relevant section by default to reduce missed-required-fields.
         if (groups.contract) groups.contract.open = (t === "download_contract_range");
+        if (groups.lakeConvert) groups.lakeConvert.open = (t === "lake_convert_v1_to_v2");
         if (groups.model) groups.model.open = (t === "train" || t === "benchmark");
         if (groups.mainSchedule) groups.mainSchedule.open = (t === "main_schedule");
         if (groups.mainDepth) groups.mainDepth.open = (t === "main_depth");
@@ -199,6 +229,8 @@
         if (!symbolOrVar) return;
         if (t === "download_contract_range" || t === "main_schedule") {
           symbolOrVar.placeholder = "e.g. cu";
+        } else if (t === "lake_convert_v1_to_v2") {
+          symbolOrVar.placeholder = "e.g. SHFE.cu2602 (blank = all; comma-separated ok)";
         } else {
           symbolOrVar.placeholder = "e.g. SHFE.cu2602";
         }

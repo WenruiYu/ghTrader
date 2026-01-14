@@ -330,7 +330,7 @@ def run_hyperparam_sweep(
         raise RuntimeError("Ray is required for sweeps. Install with: pip install ray[tune]")
     
     from ghtrader.features import read_features_for_symbol, read_features_manifest
-    from ghtrader.labels import read_labels_for_symbol
+    from ghtrader.labels import read_labels_for_symbol, read_labels_manifest
     from ghtrader.models import create_model
     
     log.info("sweep.start", symbol=symbol, model_type=model_type, n_trials=n_trials)
@@ -340,7 +340,25 @@ def run_hyperparam_sweep(
     labels_df = read_labels_for_symbol(data_dir, symbol)
     df = features_df.merge(labels_df[["datetime", f"label_{horizon}"]], on="datetime")
     
+    # Guardrails: ensure features/labels manifests align.
     manifest = read_features_manifest(data_dir, symbol)
+    lab_manifest = read_labels_manifest(data_dir, symbol)
+    if not manifest or not lab_manifest:
+        raise ValueError("Missing features/labels manifest.json. Run `ghtrader build` first.")
+    tl_f = str(manifest.get("ticks_lake") or "")
+    tl_l = str(lab_manifest.get("ticks_lake") or "")
+    if tl_f != tl_l:
+        raise ValueError(f"ticks_lake mismatch between features ({tl_f}) and labels ({tl_l}) for symbol={symbol}")
+    if str(symbol).startswith("KQ.m@") and tl_f != "main_l5":
+        raise ValueError("Continuous symbols (KQ.m@...) must use derived main_l5 ticks for sweep.")
+    if tl_f == "main_l5":
+        sf = dict(manifest.get("schedule") or {})
+        sl = dict(lab_manifest.get("schedule") or {})
+        hf = str(sf.get("hash") or "")
+        hl = str(sl.get("hash") or "")
+        if hf and hl and hf != hl:
+            raise ValueError(f"schedule_hash mismatch between features ({hf}) and labels ({hl}) for symbol={symbol}")
+
     feature_cols = list(manifest.get("enabled_factors") or [])
     if feature_cols:
         feature_cols = [c for c in feature_cols if c in features_df.columns]

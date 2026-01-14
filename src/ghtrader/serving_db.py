@@ -13,7 +13,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import structlog
 
-from ghtrader.lake import LakeVersion, TicksLake, list_available_dates_in_lake, ticks_date_dir
+from ghtrader.lake import LakeVersion, TICK_COLUMN_NAMES, TicksLake, list_available_dates_in_lake, ticks_date_dir
 
 log = structlog.get_logger()
 
@@ -126,18 +126,11 @@ class QuestDBBackend(ServingDBBackend):
     def ensure_table(self, *, table: str, include_segment_metadata: bool) -> None:
         # Best-effort DDL via PGWire. ILP can auto-create but may not create WAL/partitioning settings.
         psycopg = self._psycopg()
-        cols = [
-            "symbol SYMBOL",
-            "ts TIMESTAMP",
-            "datetime_ns LONG",
-            "last_price DOUBLE",
-            "bid_price1 DOUBLE",
-            "ask_price1 DOUBLE",
-            "volume DOUBLE",
-            "open_interest DOUBLE",
-            "lake_version SYMBOL",
-            "ticks_lake SYMBOL",
-        ]
+        # Store the full canonical tick schema (including L5 columns) plus provenance tags.
+        tick_numeric_cols = [c for c in TICK_COLUMN_NAMES if c not in {"symbol", "datetime"}]
+        cols = ["symbol SYMBOL", "ts TIMESTAMP", "datetime_ns LONG", "trading_day SYMBOL"]
+        cols += [f"{c} DOUBLE" for c in tick_numeric_cols]
+        cols += ["lake_version SYMBOL", "ticks_lake SYMBOL"]
         if include_segment_metadata:
             cols += ["underlying_contract SYMBOL", "segment_id LONG"]
 
@@ -157,6 +150,22 @@ class QuestDBBackend(ServingDBBackend):
             with psycopg.connect(**conn_params) as conn:
                 with conn.cursor() as cur:
                     cur.execute(ddl)
+                    # Best-effort schema evolution: add any newly-required columns to existing tables.
+                    # QuestDB lacks strong IF NOT EXISTS for columns across versions; ignore failures.
+                    for name, typ in [("trading_day", "SYMBOL")] + [(c, "DOUBLE") for c in tick_numeric_cols] + [
+                        ("lake_version", "SYMBOL"),
+                        ("ticks_lake", "SYMBOL"),
+                    ]:
+                        try:
+                            cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
+                        except Exception:
+                            pass
+                    if include_segment_metadata:
+                        for name, typ in [("underlying_contract", "SYMBOL"), ("segment_id", "LONG")]:
+                            try:
+                                cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
+                            except Exception:
+                                pass
         except Exception as e:
             log.warning("serving_db.questdb_ddl_failed", table=table, error=str(e))
 
@@ -189,18 +198,10 @@ class ClickHouseBackend(ServingDBBackend):
 
     def ensure_table(self, *, table: str, include_segment_metadata: bool) -> None:
         client = self._client()
-        cols = [
-            "symbol String",
-            "ts DateTime64(9)",
-            "datetime_ns Int64",
-            "last_price Float64",
-            "bid_price1 Float64",
-            "ask_price1 Float64",
-            "volume Float64",
-            "open_interest Float64",
-            "lake_version LowCardinality(String)",
-            "ticks_lake LowCardinality(String)",
-        ]
+        tick_numeric_cols = [c for c in TICK_COLUMN_NAMES if c not in {"symbol", "datetime"}]
+        cols = ["symbol String", "ts DateTime64(9)", "datetime_ns Int64", "trading_day String"]
+        cols += [f"{c} Float64" for c in tick_numeric_cols]
+        cols += ["lake_version LowCardinality(String)", "ticks_lake LowCardinality(String)"]
         if include_segment_metadata:
             cols += ["underlying_contract LowCardinality(String)", "segment_id Int64"]
         client.command(
@@ -312,20 +313,18 @@ def sync_ticks_to_serving_db(
             continue
 
         # Prepare columns for serving DB.
-        df2 = pd.DataFrame(
-            {
-                "symbol": df["symbol"].astype(str),
-                "ts": pd.to_datetime(df["datetime"].astype("int64"), unit="ns", utc=True),
-                "datetime_ns": df["datetime"].astype("int64"),
-                "last_price": pd.to_numeric(df.get("last_price"), errors="coerce"),
-                "bid_price1": pd.to_numeric(df.get("bid_price1"), errors="coerce"),
-                "ask_price1": pd.to_numeric(df.get("ask_price1"), errors="coerce"),
-                "volume": pd.to_numeric(df.get("volume"), errors="coerce"),
-                "open_interest": pd.to_numeric(df.get("open_interest"), errors="coerce"),
-                "lake_version": str(lake_version),
-                "ticks_lake": str(ticks_lake),
-            }
-        )
+        dt_ns = pd.to_numeric(df.get("datetime"), errors="coerce").fillna(0).astype("int64")
+        df2 = pd.DataFrame({"symbol": df["symbol"].astype(str), "datetime_ns": dt_ns})
+        # Important: ghTrader tick times are stored as epoch-nanoseconds in Beijing trading time semantics.
+        # We keep the same wall-clock values in the DB by ingesting a tz-naive timestamp derived from the int64 ns.
+        df2["ts"] = pd.to_datetime(dt_ns, unit="ns")
+        df2["trading_day"] = str(d.isoformat())
+
+        for col in [c for c in TICK_COLUMN_NAMES if c not in {"symbol", "datetime"}]:
+            df2[col] = pd.to_numeric(df.get(col), errors="coerce")
+
+        df2["lake_version"] = str(lake_version)
+        df2["ticks_lake"] = str(ticks_lake)
         if include_seg:
             df2["underlying_contract"] = df.get("underlying_contract", "").astype(str)
             df2["segment_id"] = pd.to_numeric(df.get("segment_id"), errors="coerce").fillna(-1).astype("int64")

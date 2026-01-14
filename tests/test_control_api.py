@@ -8,7 +8,6 @@ import time
 from datetime import date
 from pathlib import Path
 
-import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
@@ -57,26 +56,6 @@ def test_control_api_job_lifecycle(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert "api-hello" in log_text
 
 
-def _write_calendar_cache(data_dir: Path, days: list[date]) -> None:
-    p = data_dir / "akshare" / "calendar" / "calendar.parquet"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame({"date": pd.to_datetime([d.isoformat() for d in days])})
-    df.to_parquet(p, index=False)
-
-
-def _write_active_ranges_cache(data_dir: Path, *, exchange: str, var: str, rows: list[dict]) -> None:
-    root = data_dir / "akshare" / "active_ranges" / f"market={exchange.upper()}" / f"var={var.lower()}"
-    root.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(rows)
-    df.to_parquet(root / "active_ranges.parquet", index=False)
-    (root / "manifest.json").write_text(
-        json.dumps(
-            {"exchange": exchange.upper(), "var": var.lower(), "scanned_start": "2000-01-01", "scanned_end": "2100-01-01"},
-            indent=2,
-        )
-    )
-
-
 def _touch_tick_day(data_dir: Path, symbol: str, day: date) -> None:
     d = data_dir / "lake" / "ticks" / f"symbol={symbol}" / f"date={day.isoformat()}"
     d.mkdir(parents=True, exist_ok=True)
@@ -102,37 +81,16 @@ def test_control_api_ingest_status_endpoints(tmp_path: Path, monkeypatch: pytest
     store = app.state.job_store
     data_dir = tmp_path / "data"
 
-    _write_calendar_cache(
-        data_dir,
-        days=[
-            date(2025, 1, 2),
-            date(2025, 1, 3),
-            date(2025, 1, 6),
-            date(2025, 1, 7),
-            date(2025, 2, 3),
-            date(2025, 2, 4),
-            date(2025, 2, 5),
-        ],
-    )
-    _write_active_ranges_cache(
-        data_dir,
-        exchange="SHFE",
-        var="cu",
-        rows=[
-            {"symbol": "CU2501", "first_active": "2025-01-02", "last_active": "2025-01-07"},
-            {"symbol": "CU2502", "first_active": "2025-02-03", "last_active": "2025-02-05"},
-        ],
-    )
-
     sym1 = "SHFE.cu2501"
     _touch_tick_day(data_dir, sym1, date(2025, 1, 2))
     _touch_tick_day(data_dir, sym1, date(2025, 1, 3))
     _write_no_data_dates(data_dir, sym1, [date(2025, 1, 6)])
 
     sym2 = "SHFE.cu2502"
-    _touch_tick_day(data_dir, sym2, date(2025, 2, 3))
-    _touch_tick_day(data_dir, sym2, date(2025, 2, 4))
-    _touch_tick_day(data_dir, sym2, date(2025, 2, 5))
+    _touch_tick_day(data_dir, sym2, date(2025, 1, 2))
+    _touch_tick_day(data_dir, sym2, date(2025, 1, 3))
+    _touch_tick_day(data_dir, sym2, date(2025, 1, 6))
+    _touch_tick_day(data_dir, sym2, date(2025, 1, 7))
 
     job_id = "ingest123"
     log_path = tmp_path / "runs" / "control" / "logs" / f"job-{job_id}.log"
@@ -160,11 +118,14 @@ def test_control_api_ingest_status_endpoints(tmp_path: Path, monkeypatch: pytest
         "2501",
         "--end-contract",
         "2502",
+        "--start-date",
+        "2025-01-02",
+        "--end-date",
+        "2025-01-07",
         "--data-dir",
         str(data_dir),
         "--chunk-days",
         "5",
-        "--no-refresh-akshare",
     ]
     store.create_job(job_id=job_id, title="download-contract-range cu 2501->2502", command=cmd, cwd=tmp_path, source="terminal", log_path=log_path)
     store.update_job(job_id, status="running", pid=123, started_at="2026-01-01T00:00:00Z")
@@ -173,8 +134,8 @@ def test_control_api_ingest_status_endpoints(tmp_path: Path, monkeypatch: pytest
     assert r.status_code == 200
     s = r.json()
     assert s["kind"] == "download_contract_range"
-    assert s["summary"]["days_expected_total"] == 7
-    assert s["summary"]["days_done_total"] == 6
+    assert s["summary"]["days_expected_total"] == 8
+    assert s["summary"]["days_done_total"] == 7
     assert s["job_status"] == "running"
 
     r2 = client.get("/api/ingest/status")
