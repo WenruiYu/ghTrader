@@ -1,11 +1,17 @@
 {% extends "base.html" %}
 {% block content %}
-  <h2>SQL Explorer (DuckDB)</h2>
+  <div class="section-header">
+    <h2>SQL Explorer</h2>
+    <div class="section-header-actions">
+      <span class="pill">QuestDB</span>
+      <a class="btn btn-secondary btn-sm" href="/explorer{{ token_qs }}">Refresh</a>
+    </div>
+  </div>
 
   <div class="card">
     <p class="muted">
-      Read-only SQL over the Parquet lake via DuckDB. Only <span class="mono">SELECT</span>/<span class="mono">WITH</span> is allowed.
-      For best performance, run <span class="mono">ghtrader db init</span> once to materialize views into <span class="mono">data/ghtrader.duckdb</span>.
+      Read-only SQL over QuestDB (canonical ticks) via PGWire. Only <span class="mono">SELECT</span>/<span class="mono">WITH</span> is allowed.
+      Ensure QuestDB is running and tables exist (run <span class="mono">ghtrader db questdb-init</span>).
     </p>
 
     {% if error %}
@@ -18,10 +24,10 @@
           <label>Sample queries</label>
           <select id="sampleQuery">
             <option value="" selected>(select)</option>
-            <option value="SELECT COUNT(*) AS n_ticks FROM ticks_raw_v2">Count ticks_raw_v2 rows</option>
-            <option value="SELECT hive_symbol, COUNT(*) AS n_rows FROM ticks_raw_v2 GROUP BY hive_symbol ORDER BY n_rows DESC LIMIT 20">Top symbols by rows (ticks_raw_v2)</option>
-            <option value="SELECT kind, COUNT(*) AS n FROM run_metrics GROUP BY kind ORDER BY n DESC">Run metrics counts by kind</option>
-            <option value="SELECT run_id, kind, symbol, model, created_at FROM run_metrics ORDER BY created_at DESC LIMIT 50">Latest run metrics</option>
+            <option value="SELECT count() AS n_ticks FROM ghtrader_ticks_raw_v2">Count raw ticks rows</option>
+            <option value="SELECT symbol, count() AS n_rows FROM ghtrader_ticks_raw_v2 GROUP BY symbol ORDER BY n_rows DESC LIMIT 20">Top symbols by rows (raw)</option>
+            <option value="SELECT symbol, min(cast(trading_day as string)) AS first_day, max(cast(trading_day as string)) AS last_day, count(DISTINCT cast(trading_day as string)) AS n_days FROM ghtrader_ticks_raw_v2 WHERE lake_version='v2' AND ticks_lake='raw' GROUP BY symbol ORDER BY n_days DESC LIMIT 20">Coverage bounds by symbol (raw)</option>
+            <option value="SELECT ts, symbol, last_price FROM ghtrader_ticks_raw_v2 WHERE symbol='SHFE.cu2602' ORDER BY ts DESC LIMIT 50">Latest ticks for SHFE.cu2602</option>
           </select>
         </div>
         <div class="muted" style="display:flex; align-items:flex-end;">
@@ -32,17 +38,10 @@
         <label>Query</label>
         <textarea name="query" rows="10" class="mono" style="width:100%;" id="queryBox">{{ query or "" }}</textarea>
       </div>
-      <div class="grid3">
+      <div class="grid2">
         <div>
           <label>Max rows</label>
           <input name="limit" type="number" min="1" step="1" value="{{ limit or 200 }}"/>
-        </div>
-        <div>
-          <label>Include metrics index (slow)</label>
-          <select name="include_metrics">
-            <option value="false" {% if not include_metrics %}selected{% endif %}>false</option>
-            <option value="true" {% if include_metrics %}selected{% endif %}>true</option>
-          </select>
         </div>
         <div style="display:flex; align-items:flex-end;">
           <button type="submit">Run query</button>
@@ -52,14 +51,12 @@
   </div>
 
   <div class="card">
-    <h3>Available views (if initialized)</h3>
+    <h3>Available tables</h3>
     <ul>
-      <li><span class="mono">ticks_raw_v2</span></li>
-      <li><span class="mono">ticks_main_l5_v2</span></li>
-      <li><span class="mono">features_all</span>, <span class="mono">labels_all</span></li>
-      <li><span class="mono">run_metrics</span> (if indexed via <span class="mono">ghtrader db ingest-metrics</span>)</li>
+      <li><span class="mono">ghtrader_ticks_raw_v2</span></li>
+      <li><span class="mono">ghtrader_ticks_main_l5_v2</span></li>
     </ul>
-    <p class="muted">Tip: most views include <span class="mono">hive_symbol</span> and <span class="mono">hive_date</span> extracted from Parquet paths.</p>
+    <p class="muted">Tip: most tick tables include <span class="mono">lake_version</span>, <span class="mono">ticks_lake</span>, and <span class="mono">trading_day</span>.</p>
   </div>
 
   {% if columns and rows %}

@@ -15,7 +15,7 @@ from ghtrader.lake import LakeVersion, TicksLake, read_ticks_for_symbol_arrow
 log = structlog.get_logger()
 
 
-DBType = Literal["duckdb", "questdb", "clickhouse"]
+DBType = Literal["questdb"]
 
 
 @dataclass(frozen=True)
@@ -30,11 +30,6 @@ class BenchConfig:
     questdb_pg_user: str = "admin"
     questdb_pg_password: str = "quest"
     questdb_pg_dbname: str = "qdb"
-
-    # ClickHouse specifics
-    clickhouse_database: str = "default"
-    clickhouse_user: str = "default"
-    clickhouse_password: str = ""
 
 
 @dataclass(frozen=True)
@@ -94,7 +89,7 @@ def benchmark_questdb(*, df: pd.DataFrame, cfg: BenchConfig, table_name: str) ->
     """
     Benchmark QuestDB ingestion (ILP) + a simple query (PGWire).
 
-    Requires extras: questdb-ingress + psycopg[binary].
+    Requires extras: questdb (Python client) + psycopg[binary].
     """
     if df.empty:
         raise ValueError("Empty dataframe (no ticks to benchmark)")
@@ -145,70 +140,6 @@ def benchmark_questdb(*, df: pd.DataFrame, cfg: BenchConfig, table_name: str) ->
     )
 
 
-def benchmark_clickhouse(*, df: pd.DataFrame, cfg: BenchConfig, table_name: str) -> BenchResult:
-    """
-    Benchmark ClickHouse ingestion + a simple query.
-
-    Requires extras: clickhouse-connect.
-    """
-    if df.empty:
-        raise ValueError("Empty dataframe (no ticks to benchmark)")
-
-    try:
-        import clickhouse_connect  # type: ignore
-    except Exception as e:
-        raise RuntimeError("clickhouse-connect not installed. Install with: pip install -e '.[clickhouse]'") from e
-
-    df2 = df.copy()
-    df2["ts"] = pd.to_datetime(df2["datetime"].astype("int64"), unit="ns", utc=True)
-
-    client = clickhouse_connect.get_client(
-        host=cfg.host,
-        port=int(cfg.port or 8123),
-        username=cfg.clickhouse_user,
-        password=cfg.clickhouse_password,
-        database=cfg.clickhouse_database,
-    )
-
-    # Create table (idempotent-ish)
-    client.command(
-        f"""
-        CREATE TABLE IF NOT EXISTS {table_name} (
-          symbol String,
-          ts DateTime64(9),
-          last_price Float64,
-          bid_price1 Float64,
-          ask_price1 Float64,
-          volume Float64,
-          open_interest Float64
-        ) ENGINE = MergeTree
-        PARTITION BY toYYYYMMDD(ts)
-        ORDER BY (symbol, ts)
-        """
-    )
-
-    t0 = time.time()
-    # Insert using rows for maximum compatibility (pandas-native paths vary by client version).
-    rows = df2[["symbol", "ts", "last_price", "bid_price1", "ask_price1", "volume", "open_interest"]].to_records(index=False).tolist()
-    client.insert(table_name, rows, column_names=["symbol", "ts", "last_price", "bid_price1", "ask_price1", "volume", "open_interest"])
-    ingest_s = time.time() - t0
-
-    q = f"SELECT count(*) FROM {table_name}"
-    t1 = time.time()
-    _ = client.query(q).result_rows
-    query_s = time.time() - t1
-
-    return BenchResult(
-        db_type="clickhouse",
-        table=table_name,
-        rows=int(len(df2)),
-        ingest_seconds=float(ingest_s),
-        query_seconds=float(query_s),
-        query=q,
-        extra={},
-    )
-
-
 def write_bench_report(*, runs_dir: Path, report: dict[str, Any]) -> Path:
     out_dir = runs_dir / "db_bench"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -228,12 +159,10 @@ def run_db_benchmark(
     ticks_lake: TicksLake,
     lake_version: LakeVersion,
     max_rows: int,
-    questdb: bool,
-    clickhouse: bool,
     host: str,
 ) -> tuple[Path, dict[str, Any]]:
     """
-    Run best-effort DB benchmark against local QuestDB/ClickHouse instances.
+    Run best-effort DB benchmark against local QuestDB.
 
     This command is intended for operator machines where the DB daemons already exist.
     """
@@ -252,21 +181,12 @@ def run_db_benchmark(
     results: list[BenchResult] = []
     errs: list[str] = []
 
-    if questdb:
-        try:
-            cfg = BenchConfig(db_type="questdb", host=host)
-            res = benchmark_questdb(df=df, cfg=cfg, table_name="ghtrader_ticks_bench")
-            results.append(res)
-        except Exception as e:
-            errs.append(f"questdb: {e}")
-
-    if clickhouse:
-        try:
-            cfg = BenchConfig(db_type="clickhouse", host=host)
-            res = benchmark_clickhouse(df=df, cfg=cfg, table_name="ghtrader_ticks_bench")
-            results.append(res)
-        except Exception as e:
-            errs.append(f"clickhouse: {e}")
+    try:
+        cfg = BenchConfig(db_type="questdb", host=host)
+        res = benchmark_questdb(df=df, cfg=cfg, table_name="ghtrader_ticks_bench")
+        results.append(res)
+    except Exception as e:
+        errs.append(f"questdb: {e}")
 
     report: dict[str, Any] = {
         "run_id": datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"),

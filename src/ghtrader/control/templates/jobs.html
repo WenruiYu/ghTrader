@@ -1,6 +1,11 @@
 {% extends "base.html" %}
 {% block content %}
-  <h2>Jobs</h2>
+  <div class="section-header">
+    <h2>Jobs</h2>
+    <div class="section-header-actions">
+      <a class="btn btn-secondary btn-sm" href="/jobs{{ token_qs }}">Refresh</a>
+    </div>
+  </div>
 
   <div class="card">
     <h3>Start a job (quick)</h3>

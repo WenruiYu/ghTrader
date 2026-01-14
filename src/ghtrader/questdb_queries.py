@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import re
 import structlog
 
 log = structlog.get_logger()
@@ -35,6 +36,101 @@ def _connect(cfg: QuestDBQueryConfig):
         port=int(cfg.pg_port),
         dbname=cfg.pg_dbname,
     )
+
+
+_READ_ONLY_START_RE = re.compile(r"^\s*(with|select)\b", flags=re.IGNORECASE)
+_DISALLOWED_SQL_RE = re.compile(
+    r"\b(insert|update|delete|drop|create|alter|truncate|grant|revoke|copy|vacuum|analyze|attach|detach)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def sanitize_read_only_sql(query: str) -> str:
+    """
+    Best-effort guardrail for the dashboard SQL explorer.
+
+    Allows only single-statement SELECT/WITH queries.
+    """
+    q = str(query or "").strip()
+    if not q:
+        raise ValueError("Query is required")
+
+    # Disallow multi-statement queries. Allow at most one trailing semicolon.
+    if ";" in q:
+        q2 = q.rstrip()
+        if q2.endswith(";"):
+            q2 = q2[:-1].rstrip()
+        if ";" in q2:
+            raise ValueError("Only one SQL statement is allowed")
+        q = q2
+
+    if not _READ_ONLY_START_RE.match(q):
+        raise ValueError("Only SELECT/WITH queries are allowed")
+
+    if _DISALLOWED_SQL_RE.search(q):
+        raise ValueError("Disallowed keyword in query (read-only mode)")
+
+    return q
+
+
+def query_sql_read_only(
+    *,
+    cfg: QuestDBQueryConfig,
+    query: str,
+    limit: int = 200,
+    connect_timeout_s: int = 2,
+) -> tuple[list[str], list[dict[str, str]]]:
+    """
+    Run a read-only SQL query against QuestDB via PGWire.
+
+    Returns: (columns, rows) where rows is a list of stringified dict records.
+
+    Notes:
+    - Enforces a row cap best-effort by wrapping the query with a LIMIT.
+    - If wrapping fails (e.g., unsupported nested WITH), falls back to fetching at most `limit` rows client-side.
+    """
+    q = sanitize_read_only_sql(query=query)
+    lim = max(1, min(int(limit or 200), 500))
+
+    psycopg = _psycopg()
+    cols: list[str] = []
+    rows_out: list[dict[str, str]] = []
+
+    def _stringify(v: Any) -> str:
+        if v is None:
+            return ""
+        try:
+            return str(v)
+        except Exception:
+            return ""
+
+    # Best-effort: execute a wrapped query to enforce LIMIT in the engine.
+    wrapped = f"SELECT * FROM ({q}) LIMIT {lim}"
+    with psycopg.connect(
+        user=cfg.pg_user,
+        password=cfg.pg_password,
+        host=cfg.host,
+        port=int(cfg.pg_port),
+        dbname=cfg.pg_dbname,
+        connect_timeout=int(connect_timeout_s),
+    ) as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(wrapped)
+            except Exception:
+                # Fallback: execute user query as-is and fetch at most `lim`.
+                cur.execute(q)
+            desc = cur.description or []
+            cols = [str(d.name) for d in desc if getattr(d, "name", None)]
+            fetched = cur.fetchmany(size=lim)
+            for r in fetched:
+                try:
+                    row = {c: _stringify(v) for c, v in zip(cols, r)}
+                except Exception:
+                    row = {}
+                rows_out.append(row)
+
+    return cols, rows_out
 
 
 def _l5_condition_sql() -> str:

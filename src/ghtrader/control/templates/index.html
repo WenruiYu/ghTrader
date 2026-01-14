@@ -355,7 +355,10 @@
     const pipe = data.pipeline || {};
     const alerts = [];
     if (data.questdb_ok === false) {
-      alerts.push(_bannerHtml("error", "QuestDB is offline", "DB-backed pages will be degraded. Check the QuestDB container/service and credentials.", `/ops${tokenQs}`, "Open Ops"));
+      const hint = "DB-backed pages will be degraded. Start QuestDB with: " +
+        "<span class=\"mono\">docker compose -f infra/questdb/docker-compose.yml up -d</span> " +
+        "then verify: <span class=\"mono\">ghtrader db questdb-health</span>.";
+      alerts.push(_bannerHtml("error", "QuestDB is offline", hint, `/data${tokenQs}#sync`, "Open DB Sync"));
     }
     if (pipe.schedule && pipe.schedule.state !== "ok") {
       alerts.push(_bannerHtml("warn", "Main schedule is missing", "Build the main-contract schedule before running main_l5 / features.", `/ops${tokenQs}#build`, "Build Schedule"));

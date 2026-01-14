@@ -21,7 +21,7 @@ class _Call:
 
 class _FakeBackend(ServingDBBackend):
     def __init__(self):
-        super().__init__(config=ServingDBConfig(backend="clickhouse"))
+        super().__init__(config=ServingDBConfig(backend="questdb"))
         self.ensure_calls: list[tuple[str, bool]] = []
         self.ingest_calls: list[_Call] = []
 
@@ -76,7 +76,7 @@ def test_serving_db_sync_incremental_records_state_and_includes_segment_metadata
 
     out = sync_ticks_to_serving_db(
         backend=backend,
-        backend_type="clickhouse",
+        backend_type="questdb",
         table="ticks_test",
         data_dir=data_dir,
         symbol=derived,

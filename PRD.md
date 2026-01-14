@@ -205,9 +205,9 @@ Audit command:
   - manifest consistency (manifest row counts match Parquet metadata row counts)
   - derived-vs-raw equivalence for `main_l5` (tick value columns must match raw underlying; `symbol` differs by design; metadata columns must match schedule provenance)
 
-#### 5.3.0.3 Database / query layer (QuestDB canonical ticks; DuckDB optional analytics)
+#### 5.3.0.3 Database / query layer (QuestDB-only)
 
-Canonical ticks are stored in QuestDB, but ghTrader must still keep Parquet as a mirror for reproducibility and training.
+Canonical ticks are stored in QuestDB, and ghTrader keeps Parquet as a durable mirror for reproducibility, audits, and training.
 
 - **QuestDB (canonical ticks)**:
   - Stores `ticks_raw` for all contracts/aliases.
@@ -216,41 +216,14 @@ Canonical ticks are stored in QuestDB, but ghTrader must still keep Parquet as a
     - Store `datetime_ns` (int64 epoch-ns as provided by TqSdk) AND a QuestDB `TIMESTAMP` column (`ts`) derived from it.
   - Ingestion must be idempotent and provenance-aware (lake_version, ticks_lake).
 
-- **DuckDB (optional analytics)**:
-  - Used for ad-hoc SQL over Parquet mirrors (`data/lake_v2/...`, `data/features`, `data/labels`) and metrics indexing.
-  - DuckDB outputs are rebuildable caches; it is not the operational source of truth for ticks.
+- **No embedded Parquet SQL engine**:
+  - ghTrader does **not** ship an embedded SQL engine for querying the Parquet mirror.
+  - Parquet remains the canonical mirror for training/audit; use Python (pandas/pyarrow) or external tools for ad-hoc analysis when needed.
 
-Default (Stage A): embedded analytics DB (DuckDB)
-
-- DuckDB is the default embedded query engine for **SQL over Parquet** (lakehouse-style), without changing the canonical Parquet storage model.
-- Default DB path (if persisted): `data/ghtrader.duckdb` (rebuildable cache/index).
-- Views (Parquet-backed; created/refreshed by CLI init):
-  - `ticks_raw_v2` over `data/lake_v2/ticks/...`
-  - `ticks_main_l5_v2` over `data/lake_v2/main_l5/ticks/...`
-  - `features_all` over `data/features/...`
-  - `labels_all` over `data/labels/...`
-  - `run_metrics` (when metrics are indexed from `runs/`)
-- CLI entrypoints:
-  - `ghtrader db init` (create/refresh views; optionally index metrics)
-  - `ghtrader db ingest-metrics` (index JSON reports under `runs/` into `run_metrics`)
-  - `ghtrader sql` (run **SELECT/WITH-only** queries; export `.csv` or `.parquet`)
-- Dashboard Explorer:
+- **Dashboard SQL Explorer (QuestDB-backed)**:
   - HTML: `/explorer`
-  - JSON: `POST /api/db/query`
-  - Guardrails: read-only (SELECT/WITH only + disallowed keyword blocklist), capped row limits, and intended for local-only access via SSH forwarding.
-- Dashboard API endpoints (JSON):
-  - `GET /api/dashboard/summary` - aggregated KPIs for dashboard home (running/queued jobs, QuestDB status, data symbols, model count, trading status, pipeline status)
-  - `GET /api/models/inventory` - list trained model artifacts from `artifacts/` directory
-  - `GET /api/trading/status` - current trading run status from `runs/trading/`
-  - `GET /api/jobs` - list jobs with optional limit
-  - `GET /api/system` - system metrics (CPU, memory, GPU, disk)
-  - `GET /api/contracts` - contract catalog with coverage status
-  - `GET /api/ingest/status` - ingest job progress
-- ghTrader should optionally index **experiment/evaluation outputs** into DuckDB tables for easy comparisons:
-  - Backtests under `runs/<symbol>/<model>/<run_id>/...`
-  - Benchmarks under `runs/benchmarks/...`
-  - Daily pipeline reports under `runs/daily_pipeline/...`
-  (Files remain canonical; DuckDB tables are rebuildable indexes.)
+  - JSON: `POST /api/questdb/query`
+  - Guardrails: read-only (single-statement `SELECT`/`WITH` only), capped row limits, and intended for local-only access via SSH forwarding.
 
 QuestDB is the chosen canonical tick store for this phase.
 
@@ -415,7 +388,7 @@ Requirements:
     - **Models** (`/models`): Model inventory, training, benchmarks
     - **Trading** (`/trading`): Trading console, positions, run history
     - **Ops** (`/ops`): Pipeline operations, ingest, schedule/build, integrity, locks
-    - **SQL** (`/explorer`): DuckDB SQL explorer
+    - **SQL** (`/explorer`): QuestDB SQL explorer (read-only)
     - **System** (`/system`): CPU/memory/disk/GPU monitoring
   - Each page uses **tabbed layouts** to organize related functionality without excessive scrolling.
   - Navigation includes:
@@ -432,7 +405,7 @@ Requirements:
   - **Data hub** (`/data`):
     - Tab 1: Coverage overview (ticks, main_l5, features, labels tables)
     - Tab 2: Contract explorer (TqSdk catalog + local + QuestDB status)
-    - Tab 3: DB sync (QuestDB sync forms, status, convert v1→v2)
+    - Tab 3: DB sync (QuestDB sync forms + status)
   - **Models** (`/models`):
     - Tab 1: Model inventory (list trained artifacts with search/filter)
     - Tab 2: Training (train form + sweep form + active training jobs)
@@ -479,6 +452,13 @@ Requirements:
     - **Build features/labels**
     - **Train**
     - Each button must clearly indicate preconditions (e.g. “QuestDB not reachable”, “schedule missing”, “main_l5 not built”).
+  - **Optional automation: daily Update scheduler (dashboard)**:
+    - The dashboard may enqueue at most **one** `ghtrader update` job per **trading day** for configured targets (e.g. `SHFE:cu`).
+    - It must avoid duplicates if an update job is already running/queued for the same target that day (multi-session safe).
+    - Controlled by environment variables:
+      - `GHTRADER_DAILY_UPDATE_TARGETS` (comma-separated, e.g. `SHFE:cu,SHFE:au`)
+      - `GHTRADER_DAILY_UPDATE_RECENT_EXPIRED_DAYS` (default `10`)
+    - Manual triggers must remain available (Data hub “Update” button, CLI `ghtrader update`).
 - **Observability**:
   - Must display data coverage (lake partitions by symbol/date, features/labels coverage).
     - Coverage UI is **v2-only** (`data/lake_v2/...`).

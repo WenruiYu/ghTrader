@@ -58,6 +58,7 @@ def build_router() -> Any:
         default_schedule_end = datetime.now().date().isoformat()
 
         return templates.TemplateResponse(
+            request,
             "index.html",
             {
                 "request": request,
@@ -79,6 +80,7 @@ def build_router() -> Any:
         jobs = store.list_jobs(limit=200)
         running = [j for j in jobs if j.status == "running"]
         return templates.TemplateResponse(
+            request,
             "jobs.html",
             {
                 "request": request,
@@ -100,6 +102,7 @@ def build_router() -> Any:
         jobs = store.list_jobs(limit=50)
         running = [j for j in jobs if j.status == "running"]
         return templates.TemplateResponse(
+            request,
             "models.html",
             {
                 "request": request,
@@ -139,6 +142,7 @@ def build_router() -> Any:
             runs = []
 
         return templates.TemplateResponse(
+            request,
             "trading.html",
             {
                 "request": request,
@@ -271,6 +275,7 @@ def build_router() -> Any:
         default_schedule_end = datetime.now().date().isoformat()
 
         return templates.TemplateResponse(
+            request,
             "ops.html",
             {
                 "request": request,
@@ -297,7 +302,7 @@ def build_router() -> Any:
     @router.get("/ops/build")
     def ops_build(request: Request):
         _require_auth(request)
-        return RedirectResponse(url=f"/ops{_token_qs(request)}#schedule", status_code=303)
+        return RedirectResponse(url=f"/ops{_token_qs(request)}#build", status_code=303)
 
     @router.get("/ops/model")
     def ops_model(request: Request):
@@ -324,6 +329,7 @@ def build_router() -> Any:
             raise HTTPException(status_code=404, detail="run not found")
         last = _read_last_jsonl_line(root / "snapshots.jsonl")
         return templates.TemplateResponse(
+            request,
             "trading_run.html",
             {
                 "request": request,
@@ -1187,6 +1193,7 @@ def build_router() -> Any:
             raise HTTPException(status_code=404, detail="Job not found")
         log_text = jm.read_log_tail(job_id)
         return templates.TemplateResponse(
+            request,
             "job_detail.html",
             {
                 "request": request,
@@ -1259,6 +1266,7 @@ def build_router() -> Any:
             questdb["error"] = str(e)
 
         return templates.TemplateResponse(
+            request,
             "data.html",
             {
                 "request": request,
@@ -1283,8 +1291,9 @@ def build_router() -> Any:
         jobs = store.list_jobs(limit=50)
         running = [j for j in jobs if j.status == "running"]
 
-        q = "SELECT COUNT(*) AS n_ticks FROM ticks_raw_v2"
+        q = "SELECT count() AS n_ticks FROM ghtrader_ticks_raw_v2"
         return templates.TemplateResponse(
+            request,
             "explorer.html",
             {
                 "request": request,
@@ -1293,7 +1302,6 @@ def build_router() -> Any:
                 "running_count": len(running),
                 "query": q,
                 "limit": 200,
-                "include_metrics": False,
                 "columns": [],
                 "rows": [],
                 "error": "",
@@ -1306,7 +1314,6 @@ def build_router() -> Any:
         form = await request.form()
         query = str(form.get("query") or "").strip()
         limit_raw = str(form.get("limit") or "200").strip()
-        include_metrics = str(form.get("include_metrics") or "false").strip().lower() == "true"
 
         try:
             limit = int(limit_raw)
@@ -1315,52 +1322,35 @@ def build_router() -> Any:
         limit = max(1, min(limit, 500))
 
         columns: list[str] = []
-        rows: list[dict[str, Any]] = []
+        rows: list[dict[str, str]] = []
         err = ""
 
         if not query:
             err = "Query is required."
         else:
             try:
-                from ghtrader.db import DuckDBBackend, DuckDBConfig, DuckDBNotInstalled
+                from ghtrader.config import (
+                    get_questdb_host,
+                    get_questdb_pg_dbname,
+                    get_questdb_pg_password,
+                    get_questdb_pg_port,
+                    get_questdb_pg_user,
+                )
+                from ghtrader.questdb_queries import QuestDBQueryConfig, query_sql_read_only
 
-                data_dir = get_data_dir()
-                runs_dir = get_runs_dir()
-                db_path = data_dir / "ghtrader.duckdb"
-
-                # Prefer a prepared DB file (created via `ghtrader db init`).
-                tried_file = False
-                if db_path.exists():
-                    tried_file = True
-                    try:
-                        backend = DuckDBBackend(config=DuckDBConfig(db_path=db_path, read_only=True))
-                        with backend.connect() as con:
-                            df = backend.query_df_limited(con=con, sql=query, limit=limit)
-                        columns = df.columns.tolist()
-                        rows = df.astype(str).to_dict(orient="records")
-                    except Exception:
-                        # Fall back to in-memory views if the DB file is missing views/tables.
-                        columns = []
-                        rows = []
-
-                if not rows:
-                    backend = DuckDBBackend(config=DuckDBConfig(db_path=None, read_only=False))
-                    with backend.connect() as con:
-                        backend.init_views(con=con, data_dir=data_dir)
-                        if include_metrics:
-                            backend.ingest_runs_metrics(con=con, runs_dir=runs_dir)
-                        df = backend.query_df_limited(con=con, sql=query, limit=limit)
-                    columns = df.columns.tolist()
-                    rows = df.astype(str).to_dict(orient="records")
-
-                if tried_file and db_path.exists() and not rows:
-                    err = "DuckDB file exists but query failed; fell back to in-memory views (consider running `ghtrader db init`)."
-            except DuckDBNotInstalled:
-                err = "DuckDB is not installed on the server. Install with: pip install -e '.[db,control]'"
+                cfg = QuestDBQueryConfig(
+                    host=str(get_questdb_host()),
+                    pg_port=int(get_questdb_pg_port()),
+                    pg_user=str(get_questdb_pg_user()),
+                    pg_password=str(get_questdb_pg_password()),
+                    pg_dbname=str(get_questdb_pg_dbname()),
+                )
+                columns, rows = query_sql_read_only(cfg=cfg, query=query, limit=int(limit), connect_timeout_s=2)
             except Exception as e:
                 err = str(e)
 
         return templates.TemplateResponse(
+            request,
             "explorer.html",
             {
                 "request": request,
@@ -1368,7 +1358,6 @@ def build_router() -> Any:
                 "token_qs": _token_qs(request),
                 "query": query,
                 "limit": limit,
-                "include_metrics": include_metrics,
                 "columns": columns,
                 "rows": rows,
                 "error": err,
@@ -1387,6 +1376,7 @@ def build_router() -> Any:
         artifacts_dir = get_artifacts_dir()
 
         return templates.TemplateResponse(
+            request,
             "system.html",
             {
                 "request": request,

@@ -598,7 +598,7 @@ details > summary { cursor: pointer; font-weight: 800; }
   flex-wrap: wrap;
   gap: 8px;
 }
-.section-header h3 { margin: 0; }
+.section-header h2, .section-header h3 { margin: 0; }
 .section-header-actions { display: flex; gap: 8px; }
 .section-header-actions .btn { margin-top: 0; padding: 6px 12px; font-size: 12px; }
 

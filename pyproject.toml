@@ -26,7 +26,6 @@ dev = [
   "pytest>=8.0",
   "pytest-cov>=5.0",
   "httpx>=0.27",
-  "duckdb>=1.1.0",
 ]
 control = [
   "fastapi>=0.110",
@@ -35,15 +34,9 @@ control = [
   "python-multipart>=0.0.9",
   "psutil>=5.9",
 ]
-db = [
-  "duckdb>=1.1.0",
-]
 questdb = [
-  "questdb-ingress>=1.0.0",
+  "questdb>=4.1.0",
   "psycopg[binary]>=3.2.0",
-]
-clickhouse = [
-  "clickhouse-connect>=0.8.0",
 ]
 tabular = [
   "xgboost>=2.0",

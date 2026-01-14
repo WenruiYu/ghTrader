@@ -1043,10 +1043,10 @@ def create_app() -> Any:
             out.append(status)
         return {"jobs": out}
 
-    @app.post("/api/db/query", response_class=JSONResponse)
-    async def api_db_query(request: Request) -> dict[str, Any]:
+    @app.post("/api/questdb/query", response_class=JSONResponse)
+    async def api_questdb_query(request: Request) -> dict[str, Any]:
         """
-        Read-only DuckDB query endpoint (guarded).
+        Read-only QuestDB query endpoint (guarded).
 
         Intended for local SSH-forwarded dashboard use only.
         """
@@ -1055,7 +1055,6 @@ def create_app() -> Any:
 
         payload = await request.json()
         query = str(payload.get("query") or "").strip()
-        include_metrics = bool(payload.get("include_metrics") or False)
         try:
             limit = int(payload.get("limit") or 200)
         except Exception:
@@ -1066,30 +1065,28 @@ def create_app() -> Any:
             raise HTTPException(status_code=400, detail="query is required")
 
         try:
-            from ghtrader.db import DuckDBBackend, DuckDBConfig, DuckDBNotInstalled
+            from ghtrader.config import (
+                get_questdb_host,
+                get_questdb_pg_dbname,
+                get_questdb_pg_password,
+                get_questdb_pg_port,
+                get_questdb_pg_user,
+            )
+            from ghtrader.questdb_queries import QuestDBQueryConfig, query_sql_read_only
 
-            data_dir = get_data_dir()
-            runs_dir = get_runs_dir()
-            db_path = data_dir / "ghtrader.duckdb"
-
-            # Prefer a prepared DB file; fall back to in-memory views.
-            if db_path.exists():
-                try:
-                    backend = DuckDBBackend(config=DuckDBConfig(db_path=db_path, read_only=True))
-                    with backend.connect() as con:
-                        df = backend.query_df_limited(con=con, sql=query, limit=limit)
-                    return {"columns": df.columns.tolist(), "rows": df.astype(str).to_dict(orient="records")}
-                except Exception:
-                    pass
-
-            backend = DuckDBBackend(config=DuckDBConfig(db_path=None, read_only=False))
-            with backend.connect() as con:
-                backend.init_views(con=con, data_dir=data_dir)
-                if include_metrics:
-                    backend.ingest_runs_metrics(con=con, runs_dir=runs_dir)
-                df = backend.query_df_limited(con=con, sql=query, limit=limit)
-            return {"columns": df.columns.tolist(), "rows": df.astype(str).to_dict(orient="records")}
-        except DuckDBNotInstalled as e:
+            cfg = QuestDBQueryConfig(
+                host=str(get_questdb_host()),
+                pg_port=int(get_questdb_pg_port()),
+                pg_user=str(get_questdb_pg_user()),
+                pg_password=str(get_questdb_pg_password()),
+                pg_dbname=str(get_questdb_pg_dbname()),
+            )
+            cols, rows = query_sql_read_only(cfg=cfg, query=query, limit=int(limit), connect_timeout_s=2)
+            return {"ok": True, "columns": cols, "rows": rows}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except RuntimeError as e:
+            # Missing dependency / config issues.
             raise HTTPException(status_code=500, detail=str(e)) from e
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e)) from e

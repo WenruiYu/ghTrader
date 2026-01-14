@@ -297,6 +297,10 @@
               <span class="status-dot status-dot-error"></span>
               <span>Not reachable</span>
             </div>
+            <div class="muted text-sm" style="margin-bottom:8px;">
+              Start QuestDB: <span class="mono">docker compose -f infra/questdb/docker-compose.yml up -d</span><br>
+              Verify: <span class="mono">ghtrader db questdb-health</span>
+            </div>
             {% if questdb and questdb.error %}
               <div class="muted text-sm mono">{{ questdb.error }}</div>
             {% endif %}

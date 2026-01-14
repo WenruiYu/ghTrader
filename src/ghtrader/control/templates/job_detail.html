@@ -1,6 +1,12 @@
 {% extends "base.html" %}
 {% block content %}
-  <h2>Job {{ job.id }}</h2>
+  <div class="section-header">
+    <h2 class="mono">Job {{ job.id }}</h2>
+    <div class="section-header-actions">
+      <a class="btn btn-secondary btn-sm" href="/jobs{{ token_qs }}">Back</a>
+      <a class="btn btn-secondary btn-sm" href="/jobs/{{ job.id }}{{ token_qs }}">Refresh</a>
+    </div>
+  </div>
 
   <div class="card">
     <div><b>Status:</b> <span class="pill pill-{{ job.status }}" id="jobStatusPill">{{ job.status }}</span></div>
@@ -18,7 +24,7 @@
 
     {% if job.status == "running" %}
       <form method="post" action="/jobs/{{ job.id }}/cancel{{ token_qs }}">
-        <button class="danger" type="submit">Cancel (SIGTERM)</button>
+        <button class="btn btn-danger btn-sm" type="submit">Cancel (SIGTERM)</button>
       </form>
     {% endif %}
   </div>

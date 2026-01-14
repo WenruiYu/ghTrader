@@ -1147,14 +1147,14 @@ def audit(
 
 
 # ---------------------------------------------------------------------------
-# db/sql (DuckDB lakehouse query layer)
+# db (QuestDB utilities)
 # ---------------------------------------------------------------------------
 
 
 @main.group("db")
 @click.pass_context
 def db_group(ctx: click.Context) -> None:
-    """Database/query-layer utilities (DuckDB-backed lakehouse)."""
+    """Database/query-layer utilities (QuestDB)."""
     _ = ctx
 
 
@@ -1293,65 +1293,6 @@ def db_questdb_init(
     )
 
 
-@db_group.command("init")
-@click.option("--data-dir", default="data", help="Data directory root")
-@click.option("--runs-dir", default="runs", help="Runs directory root")
-@click.option("--db-path", default="", help="DuckDB database file path (default: <data-dir>/ghtrader.duckdb)")
-@click.option("--with-views/--no-with-views", default=True, show_default=True, help="Create/refresh Parquet-backed views")
-@click.option("--with-metrics/--no-with-metrics", default=True, show_default=True, help="Index runs/ metrics JSON into DuckDB")
-@click.pass_context
-def db_init(
-    ctx: click.Context,
-    data_dir: str,
-    runs_dir: str,
-    db_path: str,
-    with_views: bool,
-    with_metrics: bool,
-) -> None:
-    """Initialize (or refresh) the DuckDB query/index database."""
-    from ghtrader.db import DuckDBBackend, DuckDBConfig
-
-    log = structlog.get_logger()
-    data_root = Path(data_dir)
-    runs_root = Path(runs_dir)
-    db_file = Path(db_path) if str(db_path).strip() else (data_root / "ghtrader.duckdb")
-
-    backend = DuckDBBackend(config=DuckDBConfig(db_path=db_file, read_only=False))
-    with backend.connect() as con:
-        created_views: list[str] = []
-        if with_views:
-            created_views = backend.init_views(con=con, data_dir=data_root)
-        backend.init_metrics_tables(con=con)
-        n_metrics = backend.ingest_runs_metrics(con=con, runs_dir=runs_root) if with_metrics else 0
-
-    log.info(
-        "db.init_done",
-        db_path=str(db_file),
-        views_created=len(created_views),
-        metrics_rows=int(n_metrics),
-    )
-
-
-@db_group.command("ingest-metrics")
-@click.option("--runs-dir", default="runs", help="Runs directory root")
-@click.option("--data-dir", default="data", help="Data directory root (for default db path)")
-@click.option("--db-path", default="", help="DuckDB database file path (default: <data-dir>/ghtrader.duckdb)")
-@click.pass_context
-def db_ingest_metrics(ctx: click.Context, runs_dir: str, data_dir: str, db_path: str) -> None:
-    """Index runs/ metrics JSON into DuckDB (idempotent by path)."""
-    from ghtrader.db import DuckDBBackend, DuckDBConfig
-
-    log = structlog.get_logger()
-    data_root = Path(data_dir)
-    runs_root = Path(runs_dir)
-    db_file = Path(db_path) if str(db_path).strip() else (data_root / "ghtrader.duckdb")
-
-    backend = DuckDBBackend(config=DuckDBConfig(db_path=db_file, read_only=False))
-    with backend.connect() as con:
-        n = backend.ingest_runs_metrics(con=con, runs_dir=runs_root)
-    log.info("db.ingest_metrics_done", db_path=str(db_file), rows=int(n))
-
-
 @db_group.command("benchmark")
 @click.option("--symbol", required=True, help="Symbol to benchmark (e.g. SHFE.cu2602 or KQ.m@SHFE.cu)")
 @click.option("--start", required=True, type=click.DateTime(formats=["%Y-%m-%d"]), help="Start date (YYYY-MM-DD)")
@@ -1366,9 +1307,7 @@ def db_ingest_metrics(ctx: click.Context, runs_dir: str, data_dir: str, db_path:
     help="Which ticks lake to benchmark (raw vs main_l5).",
 )
 @click.option("--max-rows", default=200000, type=int, show_default=True, help="Max rows to load/ingest for the benchmark")
-@click.option("--host", default="127.0.0.1", show_default=True, help="DB host (QuestDB/ClickHouse)")
-@click.option("--questdb/--no-questdb", default=True, show_default=True, help="Run QuestDB benchmark (requires QuestDB running)")
-@click.option("--clickhouse/--no-clickhouse", default=False, show_default=True, help="Run ClickHouse benchmark (requires ClickHouse running)")
+@click.option("--host", default="127.0.0.1", show_default=True, help="QuestDB host")
 @click.pass_context
 def db_benchmark(
     ctx: click.Context,
@@ -1380,10 +1319,8 @@ def db_benchmark(
     ticks_lake: str,
     max_rows: int,
     host: str,
-    questdb: bool,
-    clickhouse: bool,
 ) -> None:
-    """Benchmark optional serving DBs (QuestDB/ClickHouse) on a real tick sample."""
+    """Benchmark QuestDB ingestion/query on a real tick sample."""
     from ghtrader.db_bench import run_db_benchmark
 
     log = structlog.get_logger()
@@ -1396,15 +1333,12 @@ def db_benchmark(
         ticks_lake=ticks_lake,  # type: ignore[arg-type]
         lake_version="v2",
         max_rows=int(max_rows),
-        questdb=bool(questdb),
-        clickhouse=bool(clickhouse),
         host=str(host),
     )
     log.info("db.benchmark_done", report_path=str(out_path), n_results=len(report.get("results") or []), n_errors=len(report.get("errors") or []))
 
 
 @db_group.command("serve-sync")
-@click.option("--backend", "backend_name", required=True, type=click.Choice(["questdb", "clickhouse"]), help="Serving DB backend")
 @click.option("--table", default="", help="Destination table name (default: ghtrader_ticks_<ticks_lake>_<lake_version>)")
 @click.option("--symbol", required=True, help="Symbol to sync (specific or derived)")
 @click.option(
@@ -1420,22 +1354,15 @@ def db_benchmark(
 @click.option("--data-dir", default="data", help="Data directory root")
 @click.option("--runs-dir", default="runs", help="Runs directory root (for state files)")
 @click.option("--state-dir", default="", help="State directory (default: <runs-dir>/db_sync)")
-@click.option("--host", default="127.0.0.1", show_default=True, help="DB host")
-# QuestDB
+@click.option("--host", default="127.0.0.1", show_default=True, help="QuestDB host")
 @click.option("--questdb-ilp-port", default=9009, type=int, show_default=True, help="QuestDB ILP port")
 @click.option("--questdb-pg-port", default=8812, type=int, show_default=True, help="QuestDB PGWire port")
 @click.option("--questdb-pg-user", default="admin", show_default=True, help="QuestDB PGWire user")
 @click.option("--questdb-pg-password", default="quest", show_default=True, help="QuestDB PGWire password")
 @click.option("--questdb-pg-dbname", default="qdb", show_default=True, help="QuestDB PGWire dbname")
-# ClickHouse
-@click.option("--clickhouse-port", default=8123, type=int, show_default=True, help="ClickHouse HTTP port")
-@click.option("--clickhouse-database", default="default", show_default=True, help="ClickHouse database")
-@click.option("--clickhouse-user", default="default", show_default=True, help="ClickHouse username")
-@click.option("--clickhouse-password", default="", show_default=True, help="ClickHouse password")
 @click.pass_context
 def db_serve_sync(
     ctx: click.Context,
-    backend_name: str,
     table: str,
     symbol: str,
     ticks_lake: str,
@@ -1451,12 +1378,8 @@ def db_serve_sync(
     questdb_pg_user: str,
     questdb_pg_password: str,
     questdb_pg_dbname: str,
-    clickhouse_port: int,
-    clickhouse_database: str,
-    clickhouse_user: str,
-    clickhouse_password: str,
 ) -> None:
-    """Sync Parquet tick partitions into an optional serving DB (best-effort)."""
+    """Sync Parquet tick partitions into QuestDB (best-effort)."""
     from ghtrader.serving_db import ServingDBConfig, make_serving_backend, sync_ticks_to_serving_db
 
     log = structlog.get_logger()
@@ -1466,17 +1389,13 @@ def db_serve_sync(
     st_root = Path(state_dir) if str(state_dir).strip() else (runs_root / "db_sync")
 
     cfg = ServingDBConfig(
-        backend=backend_name,  # type: ignore[arg-type]
+        backend="questdb",
         host=str(host),
         questdb_ilp_port=int(questdb_ilp_port),
         questdb_pg_port=int(questdb_pg_port),
         questdb_pg_user=str(questdb_pg_user),
         questdb_pg_password=str(questdb_pg_password),
         questdb_pg_dbname=str(questdb_pg_dbname),
-        clickhouse_port=int(clickhouse_port),
-        clickhouse_database=str(clickhouse_database),
-        clickhouse_user=str(clickhouse_user),
-        clickhouse_password=str(clickhouse_password),
     )
     backend = make_serving_backend(cfg)
 
@@ -1496,7 +1415,7 @@ def db_serve_sync(
 
     log.info(
         "db.serve_sync_done",
-        backend=backend_name,
+        backend="questdb",
         table=tbl,
         symbol=symbol,
         ticks_lake=ticks_lake,
@@ -1640,76 +1559,6 @@ def db_serve_sync_variety(
     )
     if errors:
         raise click.ClickException("Some symbols failed:\n" + "\n".join(errors[:20]))
-
-
-@main.command("sql")
-@click.option("--data-dir", default="data", help="Data directory root")
-@click.option("--runs-dir", default="runs", help="Runs directory root")
-@click.option("--db-path", default="", help="DuckDB database file path (default: <data-dir>/ghtrader.duckdb)")
-@click.option("--init/--no-init", default=True, show_default=True, help="Refresh views before running the query")
-@click.option("--ingest-metrics/--no-ingest-metrics", default=False, show_default=True, help="Index runs/ metrics before query")
-@click.option("--query", default="", help="SQL query string (SELECT/WITH only)")
-@click.option("--query-file", default="", help="Path to a .sql file containing the query")
-@click.option("--out", default="", help="Write results to a file (.csv or .parquet). If empty, prints a preview.")
-@click.option("--limit", default=50, type=int, show_default=True, help="Rows to print when --out is empty")
-@click.pass_context
-def sql_cmd(
-    ctx: click.Context,
-    data_dir: str,
-    runs_dir: str,
-    db_path: str,
-    init: bool,
-    ingest_metrics: bool,
-    query: str,
-    query_file: str,
-    out: str,
-    limit: int,
-) -> None:
-    """Run a SQL query against the DuckDB lakehouse (Parquet-backed views)."""
-    from ghtrader.db import DuckDBBackend, DuckDBConfig
-
-    log = structlog.get_logger()
-    data_root = Path(data_dir)
-    runs_root = Path(runs_dir)
-    db_file = Path(db_path) if str(db_path).strip() else (data_root / "ghtrader.duckdb")
-
-    q = str(query).strip()
-    if not q and str(query_file).strip():
-        q = Path(query_file).read_text()
-    q = str(q).strip()
-    if not q:
-        raise click.UsageError("Must pass --query or --query-file")
-
-    backend = DuckDBBackend(config=DuckDBConfig(db_path=db_file, read_only=False))
-    with backend.connect() as con:
-        if init:
-            backend.init_views(con=con, data_dir=data_root)
-            backend.init_metrics_tables(con=con)
-        if ingest_metrics:
-            backend.ingest_runs_metrics(con=con, runs_dir=runs_root)
-
-        df = backend.query_df(con=con, sql=q)
-
-    if str(out).strip():
-        out_path = Path(out)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        if out_path.suffix.lower() == ".csv":
-            df.to_csv(out_path, index=False)
-        elif out_path.suffix.lower() == ".parquet":
-            df.to_parquet(out_path, index=False)
-        else:
-            raise click.UsageError("Unsupported --out type (use .csv or .parquet)")
-        log.info("sql.wrote", out=str(out_path), rows=int(len(df)))
-        return
-
-    # Print preview
-    if len(df) > int(limit):
-        df2 = df.head(int(limit))
-    else:
-        df2 = df
-    click.echo(df2.to_string(index=False))
-    if len(df) > len(df2):
-        click.echo(f"... {len(df) - len(df2)} more rows (use --out to export full result)")
 
 
 def entrypoint() -> None:

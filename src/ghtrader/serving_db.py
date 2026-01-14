@@ -18,7 +18,7 @@ from ghtrader.lake import LakeVersion, TICK_COLUMN_NAMES, TicksLake, list_availa
 log = structlog.get_logger()
 
 
-ServingBackendType = Literal["questdb", "clickhouse"]
+ServingBackendType = Literal["questdb"]
 
 
 def _now_iso() -> str:
@@ -82,12 +82,6 @@ class ServingDBConfig:
     questdb_pg_password: str = "quest"
     questdb_pg_dbname: str = "qdb"
 
-    # ClickHouse (HTTP)
-    clickhouse_port: int = 8123
-    clickhouse_database: str = "default"
-    clickhouse_user: str = "default"
-    clickhouse_password: str = ""
-
 
 class ServingDBBackend:
     def __init__(self, *, config: ServingDBConfig) -> None:
@@ -104,7 +98,7 @@ class QuestDBBackend(ServingDBBackend):
     """
     QuestDB backend (ILP ingestion; optional SQL for table DDL).
 
-    Requires extras: questdb-ingress + psycopg[binary].
+    Requires extras: questdb (Python client) + psycopg[binary].
     """
 
     def _sender(self):
@@ -185,57 +179,9 @@ class QuestDBBackend(ServingDBBackend):
             sender.dataframe(df, table_name=table, at="ts")
 
 
-class ClickHouseBackend(ServingDBBackend):
-    """
-    ClickHouse backend (MergeTree analytics).
-
-    Requires extras: clickhouse-connect.
-    """
-
-    def _client(self):
-        try:
-            import clickhouse_connect  # type: ignore
-
-            return clickhouse_connect.get_client(
-                host=self.config.host,
-                port=int(self.config.clickhouse_port),
-                username=self.config.clickhouse_user,
-                password=self.config.clickhouse_password,
-                database=self.config.clickhouse_database,
-            )
-        except Exception as e:
-            raise RuntimeError("clickhouse-connect not installed. Install with: pip install -e '.[clickhouse]'") from e
-
-    def ensure_table(self, *, table: str, include_segment_metadata: bool) -> None:
-        client = self._client()
-        tick_numeric_cols = [c for c in TICK_COLUMN_NAMES if c not in {"symbol", "datetime"}]
-        cols = ["symbol String", "ts DateTime64(9)", "datetime_ns Int64", "trading_day String"]
-        cols += [f"{c} Float64" for c in tick_numeric_cols]
-        cols += ["lake_version LowCardinality(String)", "ticks_lake LowCardinality(String)"]
-        if include_segment_metadata:
-            cols += ["underlying_contract LowCardinality(String)", "segment_id Int64"]
-        client.command(
-            f"""
-            CREATE TABLE IF NOT EXISTS {table} (
-              {", ".join(cols)}
-            ) ENGINE = MergeTree
-            PARTITION BY toYYYYMMDD(ts)
-            ORDER BY (symbol, ts)
-            """
-        )
-
-    def ingest_df(self, *, table: str, df: pd.DataFrame) -> None:
-        client = self._client()
-        cols = list(df.columns)
-        rows = df.to_records(index=False).tolist()
-        client.insert(table, rows, column_names=cols)
-
-
 def make_serving_backend(config: ServingDBConfig) -> ServingDBBackend:
     if config.backend == "questdb":
         return QuestDBBackend(config=config)
-    if config.backend == "clickhouse":
-        return ClickHouseBackend(config=config)
     raise ValueError(f"Unknown backend: {config.backend}")
 
 

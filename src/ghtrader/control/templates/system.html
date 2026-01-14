@@ -1,11 +1,15 @@
 {% extends "base.html" %}
 {% block content %}
-  <h2>System</h2>
+  <div class="section-header">
+    <h2>System</h2>
+    <div class="section-header-actions">
+      <button class="btn btn-secondary btn-sm" type="button" id="refreshFastBtn">Refresh now</button>
+      <button class="btn btn-secondary btn-sm" type="button" id="refreshDirBtn">Refresh directory sizes</button>
+    </div>
+  </div>
 
   <div class="card">
     <div class="inlineControls">
-      <button class="btn-secondary" type="button" id="refreshFastBtn">Refresh now</button>
-      <button class="btn-secondary" type="button" id="refreshDirBtn">Refresh directory sizes</button>
       <span class="muted mono" id="updatedAt">last updated: …</span>
       <span class="pill" id="gpuStatusPill">GPU: …</span>
       <span class="pill" id="dirStatusPill">Dir sizes: …</span>
