@@ -1,0 +1,626 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="section-header">
+    <h2>Trading Console</h2>
+    <div class="section-header-actions">
+      <button class="btn btn-sm btn-secondary" id="refreshTrading">Refresh</button>
+    </div>
+  </div>
+
+  <!-- Status Bar -->
+  <div class="card card-compact flex items-center gap-4 flex-wrap" id="tradingStatusBar">
+    <div class="status-indicator" id="tradingModeIndicator">
+      <span class="status-dot status-dot-idle"></span>
+      <span>Mode: Idle</span>
+    </div>
+    <div class="status-indicator" id="tradingLiveEnabledIndicator">
+      <span class="status-dot status-dot-unknown"></span>
+      <span>Live enabled: --</span>
+    </div>
+    <div class="status-indicator" id="tradingAccountIndicator">
+      <span class="status-dot status-dot-idle"></span>
+      <span>Account: --</span>
+    </div>
+    <div class="muted text-sm" id="tradingLastUpdate">Last update: --</div>
+  </div>
+
+  <!-- Tab Navigation -->
+  <div class="tab-nav">
+    <button class="tab-nav-item active" data-tab="status">Live Status</button>
+    <button class="tab-nav-item" data-tab="start">Start Trading</button>
+    <button class="tab-nav-item" data-tab="history">
+      Run History
+      <span class="badge" id="runCountBadge">--</span>
+    </button>
+  </div>
+
+  <!-- Tab: Live Status -->
+  <div class="tab-content active" id="tab-status">
+    <div class="kpi-grid mb-3">
+      <div class="kpi-card">
+        <div class="kpiLabel">Trading Mode</div>
+        <div class="kpiValue" id="kpiMode">Idle</div>
+        <div class="kpiSubtext" id="kpiModeDetail">No active run</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpiLabel">Balance</div>
+        <div class="kpiValue mono" id="kpiBalance">--</div>
+        <div class="kpiSubtext" id="kpiEquity">Equity: --</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpiLabel">Position</div>
+        <div class="kpiValue" id="kpiPosition">0</div>
+        <div class="kpiSubtext" id="kpiPositionSymbol">--</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpiLabel">Unrealized P&L</div>
+        <div class="kpiValue mono" id="kpiPnL">--</div>
+        <div class="kpiSubtext" id="kpiPnLPct">--</div>
+      </div>
+    </div>
+
+    <div class="split-pane">
+      <div>
+        <div class="card">
+          <h3 class="mb-2">Active Run</h3>
+          <div id="activeRunInfo">
+            <div class="empty-state" style="padding:30px;">
+              <div class="empty-state-title">No Active Trading Run</div>
+              <div class="empty-state-text">Start a trading run from the "Start Trading" tab or use the CLI.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3 class="mb-2">Positions</h3>
+          <div class="tableWrap">
+            <table class="table table-compact">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Direction</th>
+                  <th>Volume</th>
+                  <th>Avg Price</th>
+                  <th>Current</th>
+                  <th>P&L</th>
+                </tr>
+              </thead>
+              <tbody id="positionsTbody">
+                <tr><td colspan="6" class="muted">No positions</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card">
+          <h3 class="mb-2">Recent Signals</h3>
+          <div class="tableWrap" style="max-height:200px; overflow:auto;">
+            <table class="table table-compact">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Symbol</th>
+                  <th>Signal</th>
+                  <th>Confidence</th>
+                </tr>
+              </thead>
+              <tbody id="signalsTbody">
+                <tr><td colspan="4" class="muted">No signals</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3 class="mb-2">Risk Metrics</h3>
+          <div class="grid2">
+            <div class="metric-card">
+              <div class="metric-content">
+                <div class="metric-label">Max Position</div>
+                <div class="metric-value" id="riskMaxPos">--</div>
+              </div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-content">
+                <div class="metric-label">Max Order Size</div>
+                <div class="metric-value" id="riskMaxOrder">--</div>
+              </div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-content">
+                <div class="metric-label">Max Ops/Sec</div>
+                <div class="metric-value" id="riskMaxOps">--</div>
+              </div>
+            </div>
+            <div class="metric-card">
+              <div class="metric-content">
+                <div class="metric-label">Daily Loss Limit</div>
+                <div class="metric-value" id="riskDailyLoss">--</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3 class="mb-2">Recent Orders</h3>
+          <div class="tableWrap" style="max-height:150px; overflow:auto;">
+            <table class="table table-compact">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Symbol</th>
+                  <th>Side</th>
+                  <th>Volume</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="ordersTbody">
+                <tr><td colspan="5" class="muted">No orders</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab: Start Trading -->
+  <div class="tab-content" id="tab-start">
+    <div class="split-pane-2-1">
+      <div class="card">
+        <h3 class="mb-2">Start Trading Run</h3>
+        
+        <div class="alert-banner alert-warn mb-3">
+          <div class="alert-banner-icon">!</div>
+          <div class="alert-banner-content">
+            <div class="alert-banner-title">Trading Risk Warning</div>
+            <div>Trading involves significant risk. Start with paper mode before using sim or live. Always use monitor-only mode first when testing real accounts.</div>
+          </div>
+        </div>
+        
+        <form class="form" id="tradeStartForm" method="post" action="/ops/trading/trade{{ token_qs }}">
+          <h4>Mode & Execution</h4>
+          <div class="grid3">
+            <div>
+              <label>Mode</label>
+              <select name="mode" id="tradeModeSelect">
+                <option value="paper" selected>paper (no orders)</option>
+                <option value="sim">sim (simulated)</option>
+                <option value="live">live (real broker)</option>
+              </select>
+            </div>
+            <div>
+              <label>Sim account</label>
+              <select name="sim_account">
+                <option value="tqsim" selected>tqsim (local)</option>
+                <option value="tqkq">tqkq (remote)</option>
+              </select>
+            </div>
+            <div>
+              <label>Executor</label>
+              <select name="executor">
+                <option value="targetpos" selected>targetpos (TargetPosTask)</option>
+                <option value="direct">direct (insert_order)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="card" style="margin:12px 0; background: var(--warn-bg); border-color: var(--warn-border);">
+            <label style="margin:0; display:flex; align-items:center; gap:8px;">
+              <input type="checkbox" id="monitorOnlyCheck" name="monitor_only" checked/>
+              <span class="font-bold">Monitor-only mode (no orders)</span>
+            </label>
+            <div class="muted text-sm" style="margin-top:6px;">Recommended for first real-account testing. Connects and logs but never sends orders.</div>
+          </div>
+
+          <h4>Model & Symbols</h4>
+          <div class="grid3">
+            <div><label>Model</label><input name="model" value="xgboost"/></div>
+            <div><label>Horizon</label><input name="horizon" value="50"/></div>
+            <div><label>Position size</label><input name="position_size" value="1"/></div>
+          </div>
+          <div class="grid2">
+            <div><label>Threshold up</label><input name="threshold_up" value="0.6"/></div>
+            <div><label>Threshold down</label><input name="threshold_down" value="0.6"/></div>
+          </div>
+          <div><label>Symbols (comma-separated)</label><input name="symbols" placeholder="KQ.m@SHFE.cu"/></div>
+
+          <h4>Risk Controls</h4>
+          <div class="grid3">
+            <div><label>Max position</label><input name="max_position" value="1"/></div>
+            <div><label>Max order size</label><input name="max_order_size" value="1"/></div>
+            <div><label>Max ops/sec</label><input name="max_ops_per_sec" value="10"/></div>
+          </div>
+          <div class="grid3">
+            <div><label>Max daily loss</label><input name="max_daily_loss" placeholder="(optional)"/></div>
+            <div>
+              <label>Enforce trading time</label>
+              <select name="enforce_trading_time"><option value="true" selected>true</option><option value="false">false</option></select>
+            </div>
+            <div><label>Snapshot interval (sec)</label><input name="snapshot_interval_sec" value="10"/></div>
+          </div>
+
+          <h4>Execution Settings</h4>
+          <div class="grid2">
+            <div>
+              <label>TP price mode</label>
+              <select name="tp_price"><option value="ACTIVE" selected>ACTIVE</option><option value="PASSIVE">PASSIVE</option></select>
+            </div>
+            <div><label>TP offset priority</label><input name="tp_offset_priority" value="今昨,开"/></div>
+          </div>
+          <div class="grid2">
+            <div>
+              <label>Direct price mode</label>
+              <select name="direct_price_mode"><option value="ACTIVE" selected>ACTIVE</option><option value="PASSIVE">PASSIVE</option></select>
+            </div>
+            <div>
+              <label>Direct advanced</label>
+              <select name="direct_advanced"><option value="" selected>(none)</option><option value="FAK">FAK</option><option value="FOK">FOK</option></select>
+            </div>
+          </div>
+
+          <h4>Paths</h4>
+          <div class="grid3">
+            <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+            <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
+            <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
+          </div>
+
+          <div id="confirmLiveSection" style="display:none; margin-top:12px;">
+            <div class="alert-banner alert-error">
+              <div class="alert-banner-content">
+                <div class="alert-banner-title">Live Trading Confirmation Required</div>
+                <div>Type "I_UNDERSTAND" below to enable live order execution.</div>
+              </div>
+            </div>
+            <div class="alert-banner alert-warn" id="liveEnabledDisabledBanner" style="display:none;">
+              <div class="alert-banner-content">
+                <div class="alert-banner-title">Live order execution is disabled</div>
+                <div>Set <span class="mono">GHTRADER_LIVE_ENABLED=true</span> to allow sending orders. Monitor-only is still allowed.</div>
+              </div>
+            </div>
+            <label>Confirm live</label>
+            <input name="confirm_live" placeholder="I_UNDERSTAND"/>
+          </div>
+
+          <button type="submit" id="tradeStartSubmit" style="margin-top:16px;">Start Trading</button>
+        </form>
+      </div>
+
+      <div>
+        <div class="card">
+          <h3 class="mb-2">Quick Start Presets</h3>
+          <div class="grid2">
+            <button class="btn btn-secondary btn-sm" id="presetPaper">Paper (cu)</button>
+            <button class="btn btn-secondary btn-sm" id="presetSimCu">Sim (cu)</button>
+          </div>
+          <div class="muted text-sm" style="margin-top:8px;">Click to fill form with preset values.</div>
+        </div>
+
+        <div class="card">
+          <h3 class="mb-2">Trading Mode Guide</h3>
+          <div class="mb-2">
+            <span class="pill pill-succeeded">paper</span>
+            <div class="muted text-sm">No orders sent. Computes signals and logs only. Safe for testing model behavior.</div>
+          </div>
+          <div class="mb-2">
+            <span class="pill pill-running">sim</span>
+            <div class="muted text-sm">Orders sent to simulated account (TqSim or TqKq). No real money at risk.</div>
+          </div>
+          <div class="mb-2">
+            <span class="pill pill-failed">live</span>
+            <div class="muted text-sm">Real broker account. Requires GHTRADER_LIVE_ENABLED=true and confirmation. Use monitor-only first.</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3 class="mb-2">Active Trading Jobs</h3>
+          <div id="tradingJobsList">
+            <div class="muted">Loading...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab: Run History -->
+  <div class="tab-content" id="tab-history">
+    <div class="card">
+      <h3 class="mb-2">Trading Run History</h3>
+      <div class="tableWrap">
+        <table class="table table-compact">
+          <thead>
+            <tr>
+              <th>Run ID</th>
+              <th>Last Timestamp</th>
+              <th>Balance</th>
+              <th>Mode</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="runHistoryTbody">
+            {% if runs and runs|length > 0 %}
+              {% for r in runs %}
+              <tr>
+                <td class="mono">{{ r.run_id }}</td>
+                <td class="mono text-xs">{{ r.last_ts }}</td>
+                <td class="mono">{{ r.balance }}</td>
+                <td>--</td>
+                <td><a href="/ops/trading/run/{{ r.run_id }}{{ token_qs }}">View</a></td>
+              </tr>
+              {% endfor %}
+            {% else %}
+              <tr><td colspan="5" class="muted">No trading runs found</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+  window.ghTrader.initTabs({ updateHash: true });
+
+  // Mode/monitor-only logic
+  const modeSelect = document.getElementById("tradeModeSelect");
+  const monitorCheck = document.getElementById("monitorOnlyCheck");
+  const confirmSection = document.getElementById("confirmLiveSection");
+  const liveEnabledBanner = document.getElementById("liveEnabledDisabledBanner");
+  const submitBtn = document.getElementById("tradeStartSubmit");
+  let liveEnabled = null;
+
+  function updateModeUI() {
+    const mode = modeSelect.value;
+    const monitor = monitorCheck.checked;
+    
+    // Show confirm section only for live + not monitor-only
+    confirmSection.style.display = (mode === "live" && !monitor) ? "block" : "none";
+    if (liveEnabledBanner) {
+      liveEnabledBanner.style.display = (mode === "live" && !monitor && liveEnabled === false) ? "flex" : "none";
+    }
+    if (submitBtn) {
+      submitBtn.disabled = (mode === "live" && !monitor && liveEnabled === false);
+    }
+    
+    // Force monitor-only for live mode initial selection
+    if (mode === "live" && !monitor) {
+      // User explicitly unchecked, that's okay
+    }
+  }
+
+  modeSelect.addEventListener("change", updateModeUI);
+  monitorCheck.addEventListener("change", updateModeUI);
+  updateModeUI();
+
+  // Presets
+  document.getElementById("presetPaper").addEventListener("click", () => {
+    modeSelect.value = "paper";
+    monitorCheck.checked = true;
+    document.querySelector('input[name="symbols"]').value = "KQ.m@SHFE.cu";
+    document.querySelector('input[name="model"]').value = "xgboost";
+    updateModeUI();
+    window.ghTrader.toast("Paper preset loaded", "info");
+  });
+
+  document.getElementById("presetSimCu").addEventListener("click", () => {
+    modeSelect.value = "sim";
+    monitorCheck.checked = false;
+    document.querySelector('input[name="symbols"]').value = "KQ.m@SHFE.cu";
+    document.querySelector('input[name="model"]').value = "xgboost";
+    updateModeUI();
+    window.ghTrader.toast("Sim preset loaded", "info");
+  });
+
+  // Load trading status
+  async function loadTradingStatus() {
+    try {
+      const resp = await window.ghTrader.fetchApi("/api/trading/status");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data && data.ok === false) return;
+
+      liveEnabled = (data.live_enabled === true);
+      updateModeUI();
+
+      // Live enabled indicator
+      const liveEl = document.getElementById("tradingLiveEnabledIndicator");
+      if (liveEl) {
+        const dot = liveEl.querySelector(".status-dot");
+        const txt = liveEl.querySelector("span:last-child");
+        if (txt) txt.textContent = "Live enabled: " + (liveEnabled ? "true" : "false");
+        if (dot) dot.className = "status-dot " + (liveEnabled ? "status-dot-ok" : "status-dot-warn");
+      }
+      
+      // Update status bar
+      const modeIndicator = document.getElementById("tradingModeIndicator");
+      const mode = data.mode || "idle";
+      modeIndicator.querySelector("span:last-child").textContent = "Mode: " + mode;
+      modeIndicator.querySelector(".status-dot").className = "status-dot " + (
+        mode === "live" ? "status-dot-error" :
+        mode === "sim" ? "status-dot-warn" :
+        mode === "paper" ? "status-dot-ok" : "status-dot-idle"
+      );
+      
+      document.getElementById("kpiMode").textContent = mode;
+      document.getElementById("kpiModeDetail").textContent = data.run_id ? "Run: " + data.run_id.substring(0, 8) : "No active run";
+      
+      if (data.account) {
+        document.getElementById("kpiBalance").textContent = formatNumber(data.account.balance);
+        document.getElementById("kpiEquity").textContent = "Equity: " + formatNumber(data.account.equity);
+
+        const acctEl = document.getElementById("tradingAccountIndicator");
+        if (acctEl) {
+          const dot = acctEl.querySelector(".status-dot");
+          const txt = acctEl.querySelector("span:last-child");
+          if (txt) txt.textContent = "Account: " + formatNumber(data.account.balance);
+          if (dot) dot.className = "status-dot " + (mode === "live" ? "status-dot-warn" : "status-dot-ok");
+        }
+      }
+      
+      if (data.position) {
+        document.getElementById("kpiPosition").textContent = data.position.volume || 0;
+        document.getElementById("kpiPositionSymbol").textContent = data.position.symbol || "--";
+      }
+      
+      if (data.pnl !== undefined) {
+        document.getElementById("kpiPnL").textContent = formatNumber(data.pnl);
+        try {
+          const bal = data.account && data.account.balance !== undefined ? Number(data.account.balance) : null;
+          const pnl = Number(data.pnl);
+          const pct = (bal && Number.isFinite(bal) && bal !== 0 && Number.isFinite(pnl)) ? (pnl / bal) * 100 : null;
+          document.getElementById("kpiPnLPct").textContent = (pct === null) ? "--" : (pct.toFixed(2) + "%");
+        } catch (e) {
+          document.getElementById("kpiPnLPct").textContent = "--";
+        }
+      }
+      
+      // Update last update time
+      document.getElementById("tradingLastUpdate").textContent = "Last update: " + new Date().toLocaleTimeString();
+      
+      // Update active run info
+      if (data.run_id) {
+        document.getElementById("activeRunInfo").innerHTML = [
+          '<div class="metric-card mb-2">',
+          '<div class="metric-content">',
+          '<div class="metric-label">Run ID</div>',
+          '<div class="metric-value mono">' + data.run_id + '</div>',
+          '</div>',
+          '</div>',
+          '<div class="grid2">',
+          '<div class="text-sm"><span class="muted">Mode:</span> ' + (data.mode || "--") + '</div>',
+          '<div class="text-sm"><span class="muted">Executor:</span> ' + (data.executor || "--") + '</div>',
+          '<div class="text-sm"><span class="muted">Model:</span> ' + (data.model || "--") + '</div>',
+          '<div class="text-sm"><span class="muted">Symbols:</span> ' + ((data.symbols || []).join(", ") || "--") + '</div>',
+          '</div>',
+          '<a href="/ops/trading/run/' + data.run_id + '{{ token_qs }}" class="btn btn-sm btn-secondary" style="margin-top:12px;">View Details</a>',
+        ].join("");
+      } else {
+        document.getElementById("activeRunInfo").innerHTML = [
+          '<div class="empty-state" style="padding:30px;">',
+          '<div class="empty-state-title">No Active Trading Run</div>',
+          '<div class="empty-state-text">Start a trading run from the "Start Trading" tab or use the CLI.</div>',
+          '</div>',
+        ].join("");
+      }
+
+      // Positions table (best-effort; pricing fields may be unavailable)
+      const posTbody = document.getElementById("positionsTbody");
+      if (posTbody) {
+        const pos = data.positions || null;
+        const keys = pos && typeof pos === "object" ? Object.keys(pos) : [];
+        const rows = [];
+        if (keys.length > 0) {
+          keys.forEach((sym) => {
+            const p = pos[sym] || {};
+            if (p.error) return;
+            const vlong = Number(p.volume_long || 0);
+            const vshort = Number(p.volume_short || 0);
+            const net = vlong - vshort;
+            const dir = net > 0 ? "long" : (net < 0 ? "short" : "flat");
+            const pnl = Number(p.float_profit_long || 0) + Number(p.float_profit_short || 0);
+            rows.push([
+              '<tr>',
+              '<td class="mono text-xs">' + sym + '</td>',
+              '<td>' + dir + '</td>',
+              '<td class="mono">' + net + '</td>',
+              '<td class="muted">--</td>',
+              '<td class="muted">--</td>',
+              '<td class="mono">' + formatNumber(pnl) + '</td>',
+              '</tr>',
+            ].join(""));
+          });
+        }
+        posTbody.innerHTML = rows.length ? rows.join("") : '<tr><td colspan="6" class="muted">No positions</td></tr>';
+      }
+      
+      // Risk metrics
+      if (data.risk) {
+        document.getElementById("riskMaxPos").textContent = data.risk.max_position || "--";
+        document.getElementById("riskMaxOrder").textContent = data.risk.max_order_size || "--";
+        document.getElementById("riskMaxOps").textContent = data.risk.max_ops_per_sec || "--";
+        document.getElementById("riskDailyLoss").textContent = data.risk.max_daily_loss || "--";
+      }
+      
+    } catch (e) {
+      // API may not exist yet
+    }
+  }
+
+  async function loadTradingJobs() {
+    try {
+      const resp = await window.ghTrader.fetchApi("/api/jobs?limit=50");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const jobs = (data.jobs || []).filter(j => 
+        j.status === "running" && 
+        (j.title || "").toLowerCase().includes("trade")
+      );
+      
+      const container = document.getElementById("tradingJobsList");
+      if (jobs.length === 0) {
+        container.innerHTML = '<div class="muted">No trading jobs running</div>';
+        return;
+      }
+      
+      container.innerHTML = jobs.map(j => [
+        '<div class="metric-card" style="margin-bottom:8px;">',
+        '<div class="metric-content">',
+        '<div class="metric-label truncate" style="max-width:150px;">' + j.title + '</div>',
+        '<div class="metric-value text-sm"><span class="pill pill-running">running</span></div>',
+        '</div>',
+        '<div style="display:flex; gap:6px;">',
+          '<a href="/jobs/' + j.id + '{{ token_qs }}" class="btn-sm btn-secondary">View</a>',
+          '<button type="button" class="btn-sm btn-secondary" data-action="cancel-job" data-job-id="' + j.id + '">Stop</button>',
+        '</div>',
+        '</div>'
+      ].join("")).join("");
+    } catch (e) {
+      // Ignore
+    }
+  }
+
+  // Stop trading jobs
+  document.getElementById("tradingJobsList").addEventListener("click", async (ev) => {
+    const t = ev.target;
+    if (!t || !t.dataset || t.dataset.action !== "cancel-job") return;
+    const jobId = t.dataset.jobId;
+    if (!jobId) return;
+    try {
+      await window.ghTrader.postJson("/api/jobs/" + jobId + "/cancel", {});
+      window.ghTrader.toast("Stop signal sent", "success");
+      loadTradingJobs();
+    } catch (e) {
+      window.ghTrader.toast("Failed to stop: " + (e.message || e), "error");
+    }
+  });
+
+  function formatNumber(n) {
+    if (n === null || n === undefined) return "--";
+    return Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  document.getElementById("refreshTrading").addEventListener("click", () => {
+    loadTradingStatus();
+    loadTradingJobs();
+    window.ghTrader.toast("Trading status refreshed", "info");
+  });
+
+  // Update run count badge
+  const runRows = document.querySelectorAll("#runHistoryTbody tr:not(.muted)");
+  document.getElementById("runCountBadge").textContent = runRows.length > 0 ? runRows.length : "--";
+
+  // Initial load
+  loadTradingStatus();
+  loadTradingJobs();
+  
+  // Auto-refresh
+  setInterval(loadTradingStatus, 10000);
+  setInterval(loadTradingJobs, 15000);
+})();
+</script>
+{% endblock %}

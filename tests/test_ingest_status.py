@@ -6,14 +6,15 @@ from pathlib import Path
 
 
 def _touch_tick_day(data_dir: Path, symbol: str, day: date) -> None:
-    d = data_dir / "lake" / "ticks" / f"symbol={symbol}" / f"date={day.isoformat()}"
+    # v2-only: data/lake_v2
+    d = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / f"date={day.isoformat()}"
     d.mkdir(parents=True, exist_ok=True)
     # Presence of the date dir indicates a downloaded day; parquet files may be multiple parts.
     (d / "part-test.parquet").write_bytes(b"PAR1")
 
 
 def _write_no_data_dates(data_dir: Path, symbol: str, days: list[date]) -> None:
-    p = data_dir / "lake" / "ticks" / f"symbol={symbol}" / "_no_data_dates.json"
+    p = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / "_no_data_dates.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps([d.isoformat() for d in days], indent=2))
 

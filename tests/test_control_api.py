@@ -57,13 +57,13 @@ def test_control_api_job_lifecycle(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 
 def _touch_tick_day(data_dir: Path, symbol: str, day: date) -> None:
-    d = data_dir / "lake" / "ticks" / f"symbol={symbol}" / f"date={day.isoformat()}"
+    d = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / f"date={day.isoformat()}"
     d.mkdir(parents=True, exist_ok=True)
     (d / "part-test.parquet").write_bytes(b"PAR1")
 
 
 def _write_no_data_dates(data_dir: Path, symbol: str, days: list[date]) -> None:
-    p = data_dir / "lake" / "ticks" / f"symbol={symbol}" / "_no_data_dates.json"
+    p = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / "_no_data_dates.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps([d.isoformat() for d in days], indent=2))
 

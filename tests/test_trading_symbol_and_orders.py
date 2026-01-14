@@ -41,7 +41,7 @@ def test_resolve_continuous_symbol_falls_back_to_derived_schedule_copy(tmp_path:
     from ghtrader.symbol_resolver import resolve_trading_symbol
 
     data_dir = tmp_path / "data"
-    derived_sched = data_dir / "lake" / "main_l5" / "ticks" / "symbol=KQ.m@SHFE.cu" / "schedule.parquet"
+    derived_sched = data_dir / "lake_v2" / "main_l5" / "ticks" / "symbol=KQ.m@SHFE.cu" / "schedule.parquet"
     _write_schedule(
         derived_sched,
         [

@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  questdb:
+    image: questdb/questdb:latest
+    container_name: ghtrader-questdb
+    restart: unless-stopped
+    ports:
+      # Web console + REST API
+      - "9000:9000"
+      # Influx Line Protocol (ILP) ingestion
+      - "9009:9009"
+      # Postgres wire protocol (SQL)
+      - "8812:8812"
+    volumes:
+      - questdb-data:/var/lib/questdb
+    environment:
+      # Disable telemetry
+      - QDB_TELEMETRY_ENABLED=false
+      # Ensure WAL tables are supported (needed for DEDUP UPSERT KEYS).
+      - QDB_CAIRO_WAL_ENABLED=true
+
+volumes:
+  questdb-data:

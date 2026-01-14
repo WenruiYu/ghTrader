@@ -72,48 +72,45 @@ class DuckDBBackend:
         """
         created: list[str] = []
 
-        # ---- ticks: raw + main_l5, v1 + v2 ----
-        lake_roots: list[tuple[str, Path]] = [
-            ("v1", data_dir / "lake"),
-            ("v2", data_dir / "lake_v2"),
-        ]
+        # ---- ticks: raw + main_l5 (v2 only) ----
+        lake_version = "v2"
+        lake_root = data_dir / "lake_v2"
 
-        for lake_version, lake_root in lake_roots:
-            # Raw ticks
-            raw_root = lake_root / "ticks"
-            if _any_parquet(raw_root):
-                glob = _as_posix(raw_root / "symbol=*" / "date=*" / "*.parquet")
-                view = f"ticks_raw_{lake_version}"
-                con.execute(
-                    f"""
-                    CREATE OR REPLACE VIEW {view} AS
-                    SELECT
-                      '{lake_version}' AS lake_version,
-                      regexp_extract(filename, 'symbol=([^/]+)', 1) AS hive_symbol,
-                      regexp_extract(filename, 'date=([0-9-]+)', 1) AS hive_date,
-                      * EXCLUDE (filename)
-                    FROM read_parquet('{glob}', filename=true)
-                    """
-                )
-                created.append(view)
+        # Raw ticks
+        raw_root = lake_root / "ticks"
+        if _any_parquet(raw_root):
+            glob = _as_posix(raw_root / "symbol=*" / "date=*" / "*.parquet")
+            view = "ticks_raw_v2"
+            con.execute(
+                f"""
+                CREATE OR REPLACE VIEW {view} AS
+                SELECT
+                  '{lake_version}' AS lake_version,
+                  regexp_extract(filename, 'symbol=([^/]+)', 1) AS hive_symbol,
+                  regexp_extract(filename, 'date=([0-9-]+)', 1) AS hive_date,
+                  * EXCLUDE (filename)
+                FROM read_parquet('{glob}', filename=true)
+                """
+            )
+            created.append(view)
 
-            # Derived main_l5 ticks
-            main_l5_root = lake_root / "main_l5" / "ticks"
-            if _any_parquet(main_l5_root):
-                glob = _as_posix(main_l5_root / "symbol=*" / "date=*" / "*.parquet")
-                view = f"ticks_main_l5_{lake_version}"
-                con.execute(
-                    f"""
-                    CREATE OR REPLACE VIEW {view} AS
-                    SELECT
-                      '{lake_version}' AS lake_version,
-                      regexp_extract(filename, 'symbol=([^/]+)', 1) AS hive_symbol,
-                      regexp_extract(filename, 'date=([0-9-]+)', 1) AS hive_date,
-                      * EXCLUDE (filename)
-                    FROM read_parquet('{glob}', filename=true, union_by_name=true)
-                    """
-                )
-                created.append(view)
+        # Derived main_l5 ticks
+        main_l5_root = lake_root / "main_l5" / "ticks"
+        if _any_parquet(main_l5_root):
+            glob = _as_posix(main_l5_root / "symbol=*" / "date=*" / "*.parquet")
+            view = "ticks_main_l5_v2"
+            con.execute(
+                f"""
+                CREATE OR REPLACE VIEW {view} AS
+                SELECT
+                  '{lake_version}' AS lake_version,
+                  regexp_extract(filename, 'symbol=([^/]+)', 1) AS hive_symbol,
+                  regexp_extract(filename, 'date=([0-9-]+)', 1) AS hive_date,
+                  * EXCLUDE (filename)
+                FROM read_parquet('{glob}', filename=true, union_by_name=true)
+                """
+            )
+            created.append(view)
 
         # ---- features / labels ----
         feat_root = data_dir / "features"

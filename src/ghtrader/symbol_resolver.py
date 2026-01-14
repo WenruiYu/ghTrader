@@ -6,8 +6,6 @@ from pathlib import Path
 
 import pandas as pd
 
-from ghtrader.config import get_lake_version
-
 
 def is_continuous_alias(symbol: str) -> bool:
     # ghTrader uses TqSdk continuous main alias naming like: KQ.m@SHFE.cu
@@ -24,18 +22,8 @@ def _candidate_schedule_paths(*, symbol: str, data_dir: Path) -> list[Path]:
     # Preferred: roll schedule built by `main-schedule`
     p_rolls = data_dir / "rolls" / "shfe_main_schedule" / f"var={var}" / "schedule.parquet"
     # Fallback: schedule copied into derived main_l5 ticks root by `main-depth`
-    p_derived_v1 = data_dir / "lake" / "main_l5" / "ticks" / f"symbol={symbol}" / "schedule.parquet"
     p_derived_v2 = data_dir / "lake_v2" / "main_l5" / "ticks" / f"symbol={symbol}" / "schedule.parquet"
-
-    lv = "v1"
-    try:
-        lv = get_lake_version()
-    except Exception:
-        lv = "v1"
-
-    if lv == "v2":
-        return [p_rolls, p_derived_v2, p_derived_v1]
-    return [p_rolls, p_derived_v1, p_derived_v2]
+    return [p_rolls, p_derived_v2]
 
 
 def resolve_trading_symbol(*, symbol: str, data_dir: Path, trading_day: date | None = None) -> str:

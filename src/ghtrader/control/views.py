@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from ghtrader.config import get_artifacts_dir, get_data_dir, get_lake_version, get_runs_dir
+from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
 from ghtrader.control import auth
 from ghtrader.control.coverage import scan_partitioned_store
 from ghtrader.control.jobs import JobSpec, python_module_argv
@@ -51,15 +51,24 @@ def build_router() -> Any:
         store = request.app.state.job_store
         jobs = store.list_jobs(limit=50)
         running = [j for j in jobs if j.status == "running"]
+        queued = [j for j in jobs if j.status == "queued"]
+
+        # Defaults for schedule builder quick actions
+        default_schedule_start = "2015-01-01"
+        default_schedule_end = datetime.now().date().isoformat()
+
         return templates.TemplateResponse(
             "index.html",
             {
                 "request": request,
-                "title": "ghTrader Control",
+                "title": "ghTrader Dashboard",
                 "token_qs": _token_qs(request),
                 "jobs": jobs,
                 "running_count": len(running),
+                "queued_count": len(queued),
                 "recent_count": len(jobs),
+                "default_schedule_start": default_schedule_start,
+                "default_schedule_end": default_schedule_end,
             },
         )
 
@@ -68,6 +77,7 @@ def build_router() -> Any:
         _require_auth(request)
         store = request.app.state.job_store
         jobs = store.list_jobs(limit=200)
+        running = [j for j in jobs if j.status == "running"]
         return templates.TemplateResponse(
             "jobs.html",
             {
@@ -75,6 +85,67 @@ def build_router() -> Any:
                 "title": "Jobs",
                 "token_qs": _token_qs(request),
                 "jobs": jobs,
+                "running_count": len(running),
+            },
+        )
+
+    # ---------------------------------------------------------------------
+    # Models page
+    # ---------------------------------------------------------------------
+
+    @router.get("/models")
+    def models_page(request: Request):
+        _require_auth(request)
+        store = request.app.state.job_store
+        jobs = store.list_jobs(limit=50)
+        running = [j for j in jobs if j.status == "running"]
+        return templates.TemplateResponse(
+            "models.html",
+            {
+                "request": request,
+                "title": "Models",
+                "token_qs": _token_qs(request),
+                "running_count": len(running),
+            },
+        )
+
+    # ---------------------------------------------------------------------
+    # Trading page
+    # ---------------------------------------------------------------------
+
+    @router.get("/trading")
+    def trading_page(request: Request):
+        _require_auth(request)
+        store = request.app.state.job_store
+        jobs = store.list_jobs(limit=50)
+        running = [j for j in jobs if j.status == "running"]
+
+        # Trading runs
+        runs_dir = get_runs_dir()
+        trading_dir = runs_dir / "trading"
+        runs: list[dict[str, Any]] = []
+        try:
+            if trading_dir.exists():
+                for p in sorted([d for d in trading_dir.iterdir() if d.is_dir()], key=lambda x: x.name, reverse=True)[:50]:
+                    last = _read_last_jsonl_line(p / "snapshots.jsonl")
+                    runs.append(
+                        {
+                            "run_id": p.name,
+                            "last_ts": (last or {}).get("ts", ""),
+                            "balance": ((last or {}).get("account") or {}).get("balance", ""),
+                        }
+                    )
+        except Exception:
+            runs = []
+
+        return templates.TemplateResponse(
+            "trading.html",
+            {
+                "request": request,
+                "title": "Trading",
+                "token_qs": _token_qs(request),
+                "running_count": len(running),
+                "runs": runs,
             },
         )
 
@@ -231,17 +302,17 @@ def build_router() -> Any:
     @router.get("/ops/model")
     def ops_model(request: Request):
         _require_auth(request)
-        return RedirectResponse(url=f"/ops{_token_qs(request)}#model", status_code=303)
+        return RedirectResponse(url=f"/models{_token_qs(request)}", status_code=303)
 
     @router.get("/ops/eval")
     def ops_eval(request: Request):
         _require_auth(request)
-        return RedirectResponse(url=f"/ops{_token_qs(request)}#eval", status_code=303)
+        return RedirectResponse(url=f"/models{_token_qs(request)}", status_code=303)
 
     @router.get("/ops/trading")
     def ops_trading(request: Request):
         _require_auth(request)
-        return RedirectResponse(url=f"/ops{_token_qs(request)}#trading", status_code=303)
+        return RedirectResponse(url=f"/trading{_token_qs(request)}", status_code=303)
 
     @router.get("/ops/trading/run/{run_id}")
     def ops_trading_run(request: Request, run_id: str):
@@ -296,7 +367,6 @@ def build_router() -> Any:
         end_date = str(form.get("end_date") or "").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
         chunk_days = str(form.get("chunk_days") or "5").strip()
-        lake_version = str(form.get("lake_version") or "v1").strip()
         if not symbol or not start_date or not end_date:
             raise HTTPException(status_code=400, detail="symbol/start_date/end_date required")
         argv = python_module_argv(
@@ -312,10 +382,8 @@ def build_router() -> Any:
             data_dir,
             "--chunk-days",
             chunk_days,
-            "--lake-version",
-            lake_version,
         )
-        title = f"download {symbol} {start_date}->{end_date} lake={lake_version}"
+        title = f"download {symbol} {start_date}->{end_date}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -332,7 +400,6 @@ def build_router() -> Any:
         end_date = str(form.get("end_date") or "").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
         chunk_days = str(form.get("chunk_days") or "5").strip()
-        lake_version = str(form.get("lake_version") or "v1").strip()
         if not var or not start_contract or not end_contract:
             raise HTTPException(status_code=400, detail="var/start_contract/end_contract required")
         argv = python_module_argv(
@@ -355,13 +422,40 @@ def build_router() -> Any:
             argv += ["--start-date", start_date]
         if end_date:
             argv += ["--end-date", end_date]
-        argv += [
-            "--lake-version",
-            lake_version,
-        ]
-        title = f"download-contract-range {var} {start_contract}->{end_contract} lake={lake_version}"
+        title = f"download-contract-range {var} {start_contract}->{end_contract}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+
+    @router.post("/ops/ingest/update_variety")
+    async def ops_ingest_update_variety(request: Request):
+        _require_auth(request)
+        form = await request.form()
+        exchange = str(form.get("exchange") or "SHFE").strip()
+        var = str(form.get("variety") or "").strip()
+        recent_days = str(form.get("recent_expired_days") or "10").strip()
+        data_dir = str(form.get("data_dir") or "data").strip()
+        runs_dir = str(form.get("runs_dir") or "runs").strip()
+        if not var:
+            raise HTTPException(status_code=400, detail="variety required")
+        argv = python_module_argv(
+            "ghtrader.cli",
+            "update",
+            "--exchange",
+            exchange,
+            "--var",
+            var,
+            "--recent-expired-days",
+            recent_days,
+            "--data-dir",
+            data_dir,
+            "--runs-dir",
+            runs_dir,
+        )
+        title = f"update {exchange}.{var}"
+        jm = request.app.state.job_manager
+        # Update is TqSdk-heavy; enqueue to respect max-parallel scheduler.
+        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
     @router.post("/ops/ingest/record")
@@ -370,15 +464,13 @@ def build_router() -> Any:
         form = await request.form()
         symbols = str(form.get("symbols") or "").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
-        lake_version = str(form.get("lake_version") or "v1").strip()
         if not symbols:
             raise HTTPException(status_code=400, detail="symbols required")
         argv = python_module_argv("ghtrader.cli", "record")
         for s in [s.strip() for s in symbols.split(",") if s.strip()]:
             argv += ["--symbols", s]
         argv += ["--data-dir", data_dir]
-        argv += ["--lake-version", lake_version]
-        title = f"record {symbols} lake={lake_version}"
+        title = f"record {symbols}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -389,7 +481,6 @@ def build_router() -> Any:
         form = await request.form()
         exchange = str(form.get("exchange") or "SHFE").strip()
         variety = str(form.get("variety") or "cu").strip()
-        lake_version = str(form.get("lake_version") or "v2").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
         runs_dir = str(form.get("runs_dir") or "runs").strip()
         host = str(form.get("host") or "127.0.0.1").strip()
@@ -404,8 +495,6 @@ def build_router() -> Any:
             exchange,
             "--var",
             variety,
-            "--lake-version",
-            lake_version,
             "--data-dir",
             data_dir,
             "--runs-dir",
@@ -417,7 +506,7 @@ def build_router() -> Any:
             "--questdb-pg-port",
             questdb_pg_port,
         )
-        title = f"db serve-sync-variety {exchange}.{variety} lake={lake_version}"
+        title = f"db serve-sync-variety {exchange}.{variety}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -428,7 +517,6 @@ def build_router() -> Any:
         form = await request.form()
         symbol = str(form.get("symbol") or "").strip()
         ticks_lake = str(form.get("ticks_lake") or "raw").strip()
-        lake_version = str(form.get("lake_version") or "v2").strip()
         mode = str(form.get("mode") or "incremental").strip()
         start = str(form.get("start") or "").strip()
         end = str(form.get("end") or "").strip()
@@ -450,8 +538,6 @@ def build_router() -> Any:
             symbol,
             "--ticks-lake",
             ticks_lake,
-            "--lake-version",
-            lake_version,
             "--mode",
             mode,
             "--data-dir",
@@ -469,7 +555,7 @@ def build_router() -> Any:
             argv += ["--start", start]
         if end:
             argv += ["--end", end]
-        title = f"db serve-sync {symbol} ticks_lake={ticks_lake} lake={lake_version}"
+        title = f"db serve-sync {symbol} ticks_lake={ticks_lake}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -484,7 +570,6 @@ def build_router() -> Any:
         ticks_lake = str(form.get("ticks_lake") or "raw").strip()
         overwrite = str(form.get("overwrite") or "false").strip().lower() == "true"
         data_dir = str(form.get("data_dir") or "data").strip()
-        lake_version = str(form.get("lake_version") or "v1").strip()
         if not symbol:
             raise HTTPException(status_code=400, detail="symbol required")
         argv = python_module_argv(
@@ -501,10 +586,8 @@ def build_router() -> Any:
             "--ticks-lake",
             ticks_lake,
             "--overwrite" if overwrite else "--no-overwrite",
-            "--lake-version",
-            lake_version,
         )
-        title = f"build {symbol} ticks_lake={ticks_lake} overwrite={overwrite} lake={lake_version}"
+        title = f"build {symbol} ticks_lake={ticks_lake} overwrite={overwrite}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -548,7 +631,6 @@ def build_router() -> Any:
         schedule_path = str(form.get("schedule_path") or "").strip()
         overwrite = str(form.get("overwrite") or "false").strip().lower() == "true"
         data_dir = str(form.get("data_dir") or "data").strip()
-        lake_version = str(form.get("lake_version") or "v2").strip()
         if not var or not derived_symbol:
             raise HTTPException(status_code=400, detail="variety/derived_symbol required")
         argv = python_module_argv(
@@ -561,12 +643,10 @@ def build_router() -> Any:
             "--data-dir",
             data_dir,
             "--overwrite" if overwrite else "--no-overwrite",
-            "--lake-version",
-            lake_version,
         )
         if schedule_path:
             argv += ["--schedule-path", schedule_path]
-        title = f"main-l5 {var} {derived_symbol} lake={lake_version}"
+        title = f"main-l5 {var} {derived_symbol}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -579,7 +659,6 @@ def build_router() -> Any:
         schedule_path = str(form.get("schedule_path") or "").strip()
         overwrite = str(form.get("overwrite") or "false").strip().lower() == "true"
         data_dir = str(form.get("data_dir") or "data").strip()
-        lake_version = str(form.get("lake_version") or "v1").strip()
         if not derived_symbol or not schedule_path:
             raise HTTPException(status_code=400, detail="derived_symbol/schedule_path required")
         argv = python_module_argv(
@@ -592,10 +671,8 @@ def build_router() -> Any:
             "--data-dir",
             data_dir,
             "--overwrite" if overwrite else "--no-overwrite",
-            "--lake-version",
-            lake_version,
         )
-        title = f"main-depth {derived_symbol} lake={lake_version}"
+        title = f"main-depth {derived_symbol}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -937,7 +1014,9 @@ def build_router() -> Any:
         scopes = form.getlist("scopes")
         data_dir = str(form.get("data_dir") or "data").strip()
         runs_dir = str(form.get("runs_dir") or "runs").strip()
-        lake_version = str(form.get("lake_version") or "v1").strip()
+        exchange = str(form.get("exchange") or "").strip()
+        variety = str(form.get("variety") or "").strip()
+        refresh_catalog = str(form.get("refresh_catalog") or "").strip().lower() in {"true", "1", "yes", "on"}
         scopes = [s for s in scopes if s]
         if not scopes:
             scopes = ["all"]
@@ -949,10 +1028,14 @@ def build_router() -> Any:
             data_dir,
             "--runs-dir",
             runs_dir,
-            "--lake-version",
-            lake_version,
         )
-        title = f"audit {','.join(scopes)} lake={lake_version}"
+        if exchange:
+            argv += ["--exchange", exchange]
+        if variety:
+            argv += ["--var", variety]
+        if refresh_catalog:
+            argv += ["--refresh-catalog"]
+        title = f"audit {','.join(scopes)}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -965,7 +1048,6 @@ def build_router() -> Any:
         job_type = str(form.get("job_type") or "").strip()
         symbol_or_var = str(form.get("symbol_or_var") or "").strip()
         data_dir = Path(str(form.get("data_dir") or "data"))
-        lake_version = str(form.get("lake_version") or "v1").strip()
 
         # Build argv for a known-safe set of job types (no shell).
         if job_type == "download_contract_range":
@@ -988,43 +1070,8 @@ def build_router() -> Any:
                 str(data_dir),
                 "--chunk-days",
                 chunk_days,
-                "--lake-version",
-                lake_version,
             )
-            title = f"download-contract-range {var} {start_contract}->{end_contract} lake={lake_version}"
-        elif job_type == "lake_convert_v1_to_v2":
-            # Offline repack: lake_v1 -> lake_v2 (trading-day partitioning)
-            sym_raw = symbol_or_var
-            syms: list[str] = []
-            if sym_raw:
-                # Allow comma-separated list.
-                syms = [s.strip() for s in str(sym_raw).replace(" ", ",").split(",") if s.strip()]
-
-            start_date = str(form.get("convert_start_date") or "").strip()
-            end_date = str(form.get("convert_end_date") or "").strip()
-            dry_run = str(form.get("convert_dry_run") or "").strip().lower() in {"true", "1", "yes", "on"}
-            copy_no_data = str(form.get("convert_copy_no_data") or "").strip().lower() in {"true", "1", "yes", "on"}
-
-            argv_args: list[str] = ["lake-convert-v1-to-v2", "--data-dir", str(data_dir)]
-            for s in syms:
-                argv_args += ["--symbol", s]
-            if start_date:
-                argv_args += ["--start", start_date]
-            if end_date:
-                argv_args += ["--end", end_date]
-            if dry_run:
-                argv_args += ["--dry-run"]
-            if copy_no_data:
-                argv_args += ["--copy-no-data"]
-
-            argv = python_module_argv("ghtrader.cli", *argv_args)
-            title = "lake-convert-v1-to-v2"
-            if syms:
-                title += f" symbols={len(syms)}"
-            if start_date or end_date:
-                title += f" {start_date or '*'}->{end_date or '*'}"
-            if dry_run:
-                title += " (dry-run)"
+            title = f"download-contract-range {var} {start_contract}->{end_contract}"
         elif job_type == "build":
             symbol = symbol_or_var
             if not symbol:
@@ -1036,10 +1083,8 @@ def build_router() -> Any:
                 symbol,
                 "--data-dir",
                 str(data_dir),
-                "--lake-version",
-                lake_version,
             )
-            title = f"build {symbol} lake={lake_version}"
+            title = f"build {symbol}"
         elif job_type == "train":
             symbol = symbol_or_var
             if not symbol:
@@ -1123,10 +1168,8 @@ def build_router() -> Any:
                 schedule_path,
                 "--data-dir",
                 str(data_dir),
-                "--lake-version",
-                lake_version,
             )
-            title = f"main-depth {derived_symbol} lake={lake_version}"
+            title = f"main-depth {derived_symbol}"
         else:
             raise HTTPException(status_code=400, detail=f"Unknown job_type: {job_type}")
 
@@ -1162,44 +1205,84 @@ def build_router() -> Any:
         return RedirectResponse(url=f"/jobs/{job_id}{_token_qs(request)}", status_code=303)
 
     @router.get("/data")
-    def data_page(request: Request, lake_version: str | None = None):
+    def data_page(request: Request):
         _require_auth(request)
+        store = request.app.state.job_store
+        jobs = store.list_jobs(limit=50)
+        running = [j for j in jobs if j.status == "running"]
+
         data_dir = get_data_dir()
-        lv = str(lake_version or "").strip().lower()
-        if lv not in {"v1", "v2", "both"}:
-            lv = get_lake_version()
+        lv = "v2"
+        show_v1 = False
+        show_v2 = True
 
-        show_v1 = lv in {"v1", "both"}
-        show_v2 = lv in {"v2", "both"}
-
-        ticks_root_v1 = data_dir / "lake" / "ticks"
         ticks_root_v2 = data_dir / "lake_v2" / "ticks"
-        main_l5_root_v1 = data_dir / "lake" / "main_l5" / "ticks"
         main_l5_root_v2 = data_dir / "lake_v2" / "main_l5" / "ticks"
         features_root = data_dir / "features"
         labels_root = data_dir / "labels"
+
+        # QuestDB reachability (best-effort) for sync tab
+        questdb: dict[str, Any] = {"ok": False}
+        try:
+            from ghtrader.config import (
+                get_questdb_host,
+                get_questdb_ilp_port,
+                get_questdb_pg_dbname,
+                get_questdb_pg_password,
+                get_questdb_pg_port,
+                get_questdb_pg_user,
+            )
+
+            host = get_questdb_host()
+            pg_port = int(get_questdb_pg_port())
+            ilp_port = int(get_questdb_ilp_port())
+            questdb.update({"host": host, "pg_port": pg_port, "ilp_port": ilp_port})
+            try:
+                import psycopg  # type: ignore
+
+                with psycopg.connect(
+                    user=str(get_questdb_pg_user()),
+                    password=str(get_questdb_pg_password()),
+                    host=str(host),
+                    port=int(pg_port),
+                    dbname=str(get_questdb_pg_dbname()),
+                ) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                questdb["ok"] = True
+            except Exception as e:
+                questdb["ok"] = False
+                questdb["error"] = str(e)
+        except Exception as e:
+            questdb["ok"] = False
+            questdb["error"] = str(e)
 
         return templates.TemplateResponse(
             "data.html",
             {
                 "request": request,
-                "title": "Data coverage",
+                "title": "Data Hub",
                 "token_qs": _token_qs(request),
+                "running_count": len(running),
                 "lake_version": lv,
                 "show_v1": show_v1,
                 "show_v2": show_v2,
-                "ticks_v1": scan_partitioned_store(ticks_root_v1) if show_v1 else [],
                 "ticks_v2": scan_partitioned_store(ticks_root_v2) if show_v2 else [],
-                "main_l5_v1": scan_partitioned_store(main_l5_root_v1) if show_v1 else [],
                 "main_l5_v2": scan_partitioned_store(main_l5_root_v2) if show_v2 else [],
                 "features": scan_partitioned_store(features_root),
                 "labels": scan_partitioned_store(labels_root),
+                "questdb": questdb,
             },
         )
 
     @router.get("/explorer")
     def explorer_page(request: Request):
         _require_auth(request)
+        store = request.app.state.job_store
+        jobs = store.list_jobs(limit=50)
+        running = [j for j in jobs if j.status == "running"]
+
         q = "SELECT COUNT(*) AS n_ticks FROM ticks_raw_v2"
         return templates.TemplateResponse(
             "explorer.html",
@@ -1207,6 +1290,7 @@ def build_router() -> Any:
                 "request": request,
                 "title": "SQL Explorer",
                 "token_qs": _token_qs(request),
+                "running_count": len(running),
                 "query": q,
                 "limit": 200,
                 "include_metrics": False,
@@ -1294,6 +1378,10 @@ def build_router() -> Any:
     @router.get("/system")
     def system_page(request: Request):
         _require_auth(request)
+        store = request.app.state.job_store
+        jobs = store.list_jobs(limit=50)
+        running = [j for j in jobs if j.status == "running"]
+
         data_dir = get_data_dir()
         runs_dir = get_runs_dir()
         artifacts_dir = get_artifacts_dir()
@@ -1304,6 +1392,7 @@ def build_router() -> Any:
                 "request": request,
                 "title": "System",
                 "token_qs": _token_qs(request),
+                "running_count": len(running),
                 # Render fast and fetch live metrics via /api/system (JS).
                 "paths": [
                     {"key": "data", "path": str(data_dir), "exists": bool(data_dir.exists())},

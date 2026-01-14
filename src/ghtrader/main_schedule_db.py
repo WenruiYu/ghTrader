@@ -35,9 +35,8 @@ def _schedule_dir(data_dir: Path, var: str) -> Path:
 
 
 def _default_ticks_table(*, lake_version: str) -> str:
-    lv = str(lake_version).lower().strip()
-    lv = "v2" if lv == "v2" else "v1"
-    return f"ghtrader_ticks_raw_{lv}"
+    _ = lake_version  # v2-only
+    return "ghtrader_ticks_raw_v2"
 
 
 def _connect(cfg: QuestDBQueryConfig):
@@ -149,7 +148,8 @@ def build_shfe_main_schedule_from_questdb(
     if end < start:
         raise ValueError("end must be >= start")
 
-    lv = str(lake_version).lower().strip()
+    _ = lake_version  # v2-only
+    lv = "v2"
     tbl = str(table).strip() if table is not None and str(table).strip() else _default_ticks_table(lake_version=lv)
 
     cfg = QuestDBQueryConfig(

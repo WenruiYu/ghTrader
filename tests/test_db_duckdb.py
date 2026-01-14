@@ -20,12 +20,12 @@ def test_duckdb_views_and_simple_join(synthetic_lake, tmp_path: Path) -> None:
     backend = DuckDBBackend(config=DuckDBConfig(db_path=None, read_only=False))
     with backend.connect() as con:
         views = backend.init_views(con=con, data_dir=data_dir)
-        assert "ticks_raw_v1" in views
+        assert "ticks_raw_v2" in views
         assert "features_all" in views
         assert "labels_all" in views
 
         # Basic tick count is stable.
-        n_ticks = con.execute("SELECT COUNT(*) FROM ticks_raw_v1").fetchone()[0]
+        n_ticks = con.execute("SELECT COUNT(*) FROM ticks_raw_v2").fetchone()[0]
         assert int(n_ticks) > 0
 
         # Join features + labels by datetime; should align 1:1 for built ranges.

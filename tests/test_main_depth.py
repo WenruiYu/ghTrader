@@ -34,8 +34,8 @@ def test_materialize_main_with_depth_writes_partitions(synthetic_lake, tmp_path:
     assert res.rows_total > 0
 
     # Verify output layout exists
-    out0 = data_dir / "lake" / "main_l5" / "ticks" / f"symbol={derived_symbol}" / f"date={dates[0].isoformat()}"
-    out1 = data_dir / "lake" / "main_l5" / "ticks" / f"symbol={derived_symbol}" / f"date={dates[1].isoformat()}"
+    out0 = data_dir / "lake_v2" / "main_l5" / "ticks" / f"symbol={derived_symbol}" / f"date={dates[0].isoformat()}"
+    out1 = data_dir / "lake_v2" / "main_l5" / "ticks" / f"symbol={derived_symbol}" / f"date={dates[1].isoformat()}"
     assert any(out0.glob("*.parquet"))
     assert any(out1.glob("*.parquet"))
 

@@ -5,7 +5,7 @@
 - **Product**: ghTrader (research-only AI-centric SHFE tick system)
 - **Scope**: SHFE CU/AU/AG directional micro-alpha research at tick/HFT granularity
 - **Status**: Active (canonical)
-- **Last updated**: 2026-01-12
+- **Last updated**: 2026-01-14
 - **Owner**: ghTrader maintainers
 
 ---
@@ -117,7 +117,7 @@ Requirements:
   - Trading day rule: weekday AND not in holiday list (best-effort; cache locally).
 - **No-data markers**:
   - For each symbol, persist a set of trading dates that were attempted but returned **zero ticks**, so ingest completion is idempotent.
-  - Store at: `data/lake/ticks/symbol=<SYMBOL>/_no_data_dates.json` (ISO dates).
+  - Store at: `data/lake_v2/ticks/symbol=<SYMBOL>/_no_data_dates.json` (ISO dates).
   - Missing-date computation must exclude both existing partitions and no-data dates.
 - **Chunk behavior**:
   - If a requested chunk yields no ticks, mark all dates in that chunk as no-data (unless already present on disk).
@@ -135,11 +135,10 @@ Implementation:
 ### 5.3 Tick storage (QuestDB canonical + Parquet mirror)
 
 - **Canonical tick store**: QuestDB (daemon time-series DB) stores raw ticks for all contracts.
-- **Parquet mirror**: Parquet lake is retained as a durable mirror and for training/export (rebuildable from QuestDB or double-written at ingest time).
-- Partitioning for the Parquet mirror (two lake roots are supported):
-  - **lake_v1 (legacy)**: `data/lake/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet`
+- **Parquet mirror**: Parquet lake is retained as a durable mirror and for training/export. It is written **alongside QuestDB** at ingest time (write-first/double-write), and can be repaired from QuestDB if needed.
+- Partitioning for the Parquet mirror (single lake root; v2 only):
   - **lake_v2 (trading-day)**: `data/lake_v2/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet`
-    - For **lake_v2**, `date=YYYY-MM-DD` is the **trading day**, not necessarily the wall-clock calendar date of the tick (night session must map to the correct trading day).
+    - `date=YYYY-MM-DD` is the **trading day**, not necessarily the wall-clock calendar date of the tick (night session must map to the correct trading day).
 - Compression: ZSTD.
 - Schema: locked and hashable.
 - Schema includes **L5 columns** even for L1-only sources; for `KQ.m@...` deeper levels are expected to be null.
@@ -148,28 +147,16 @@ Implementation:
 - `src/ghtrader/lake.py`
 - `src/ghtrader/serving_db.py` (QuestDB schema + sync)
 
-#### 5.3.0.0 Lake versioning and selection
+#### 5.3.0.0 Lake selection (v2 only)
 
-ghTrader maintains two tick lake roots:
+ghTrader uses a **single Parquet tick mirror**:
 
-- **lake_v1** (`data/lake/...`): legacy layout kept for backwards compatibility.
-- **lake_v2** (`data/lake_v2/...`): the preferred layout where partitions are keyed by **trading day**.
+- **lake_v2** (`data/lake_v2/...`): partitions are keyed by **trading day**.
 
 Selection rules:
 
-- Default selection is controlled by env var:
-  - `GHTRADER_LAKE_VERSION={v1|v2}` (default: `v1`)
-- CLI commands must support an explicit override:
-  - `--lake-version {v1|v2}`
-- Features/labels manifests must record which lake version they were built against and must refuse to mix outputs across lake versions unless `--overwrite` is set.
-
-Offline conversion (v1 → v2):
-
-- The system should provide an **offline conversion** command that can populate `lake_v2` from an existing `lake_v1` without network re-download.
-- Conversion must be **idempotent** and **resumable**:
-  - safe to rerun after interruption
-  - must not duplicate data when rerun
-- Conversion must coordinate with other writers using the same cross-session lock system (so it does not corrupt concurrently running ingest/record jobs).
+- There is no lake version toggle; all ingestion and downstream builds use **v2**.
+- Features/labels manifests must still record `lake_version: "v2"` for reproducibility, but mixing across versions is no longer supported.
 
 #### 5.3.0 Contract coverage + L5 availability index (QuestDB-backed)
 
@@ -189,22 +176,22 @@ Checksums (write-time):
 - Every Parquet file written by ghTrader for **core datasets** must write a sibling checksum file at write time:
   - `*.parquet.sha256` (hex digest; computed over the Parquet file bytes)
 - Applies to:
-  - raw ticks (`data/lake{,_v2}/ticks/...`)
-  - derived main-with-depth ticks (`data/lake{,_v2}/main_l5/ticks/...`)
+  - raw ticks (`data/lake_v2/ticks/...`)
+  - derived main-with-depth ticks (`data/lake_v2/main_l5/ticks/...`)
   - features (`data/features/...`)
   - labels (`data/labels/...`)
 
 Manifests (formal, audit-friendly):
 - Raw ticks: each `(symbol,date)` partition directory must include a date manifest:
-  - `data/lake{,_v2}/ticks/symbol=<SYM>/date=<YYYY-MM-DD>/_manifest.json`
+  - `data/lake_v2/ticks/symbol=<SYM>/date=<YYYY-MM-DD>/_manifest.json`
   - includes: file list, per-file row counts, per-file sha256, rows_total.
 - Derived main_l5 ticks: each `(derived_symbol,date)` partition directory must include:
-  - `data/lake{,_v2}/main_l5/ticks/symbol=<DERIVED>/date=<YYYY-MM-DD>/_manifest.json`
+  - `data/lake_v2/main_l5/ticks/symbol=<DERIVED>/date=<YYYY-MM-DD>/_manifest.json`
   - includes: file list, per-file row counts, per-file sha256, rows_total.
 - Features and labels: each `symbol=...` directory must include `manifest.json`:
   - `data/features/symbol=<SYM>/manifest.json`
   - `data/labels/symbol=<SYM>/manifest.json`
-  - includes: build parameters (factors/horizons/ticks_lake/**lake_version**), schema hash, per-date row counts, and per-file sha256.
+  - includes: build parameters (factors/horizons/ticks_lake, **lake_version=\"v2\"**), schema hash, per-date row counts, and per-file sha256.
 
 Audit command:
 - Must provide `ghtrader audit` which scans one or more datasets and produces:
@@ -238,8 +225,8 @@ Default (Stage A): embedded analytics DB (DuckDB)
 - DuckDB is the default embedded query engine for **SQL over Parquet** (lakehouse-style), without changing the canonical Parquet storage model.
 - Default DB path (if persisted): `data/ghtrader.duckdb` (rebuildable cache/index).
 - Views (Parquet-backed; created/refreshed by CLI init):
-  - `ticks_raw_v1`, `ticks_raw_v2` over `data/lake{,_v2}/ticks/...`
-  - `ticks_main_l5_v1`, `ticks_main_l5_v2` over `data/lake{,_v2}/main_l5/ticks/...`
+  - `ticks_raw_v2` over `data/lake_v2/ticks/...`
+  - `ticks_main_l5_v2` over `data/lake_v2/main_l5/ticks/...`
   - `features_all` over `data/features/...`
   - `labels_all` over `data/labels/...`
   - `run_metrics` (when metrics are indexed from `runs/`)
@@ -251,6 +238,14 @@ Default (Stage A): embedded analytics DB (DuckDB)
   - HTML: `/explorer`
   - JSON: `POST /api/db/query`
   - Guardrails: read-only (SELECT/WITH only + disallowed keyword blocklist), capped row limits, and intended for local-only access via SSH forwarding.
+- Dashboard API endpoints (JSON):
+  - `GET /api/dashboard/summary` - aggregated KPIs for dashboard home (running/queued jobs, QuestDB status, data symbols, model count, trading status, pipeline status)
+  - `GET /api/models/inventory` - list trained model artifacts from `artifacts/` directory
+  - `GET /api/trading/status` - current trading run status from `runs/trading/`
+  - `GET /api/jobs` - list jobs with optional limit
+  - `GET /api/system` - system metrics (CPU, memory, GPU, disk)
+  - `GET /api/contracts` - contract catalog with coverage status
+  - `GET /api/ingest/status` - ingest job progress
 - ghTrader should optionally index **experiment/evaluation outputs** into DuckDB tables for easy comparisons:
   - Backtests under `runs/<symbol>/<model>/<run_id>/...`
   - Benchmarks under `runs/benchmarks/...`
@@ -270,7 +265,7 @@ Definition:
 
 - The derived symbol is named like the continuous series (e.g. `KQ.m@SHFE.cu`), but it is **materialized** from L5 ticks of the underlying contract selected by the roll schedule (§5.3.2).
 - Output is written to a separate lake to avoid mixing raw vs derived data:
-  - `data/lake{,_v2}/main_l5/ticks/symbol=KQ.m@SHFE.cu/date=YYYY-MM-DD/part-....parquet`
+  - `data/lake_v2/main_l5/ticks/symbol=KQ.m@SHFE.cu/date=YYYY-MM-DD/part-....parquet`
 - Provenance must be recorded (schedule hash, underlying contracts used, row counts per day).
 
 Segment metadata contract (required for correctness):
@@ -289,9 +284,9 @@ Sequence semantics (critical for ML correctness):
   - Default behavior is to **exclude cross-boundary windows** rather than attempting price-splice or boundary token hacks.
 
 Builder semantics for derived ticks (critical):
-- When building features on `data/lake/main_l5/ticks/symbol=KQ.m@...`:
+- When building features on `data/lake_v2/main_l5/ticks/symbol=KQ.m@...`:
   - rolling-window state (lookback tail) must be **reset** when the underlying contract changes between adjacent trading days.
-- When building labels on `data/lake/main_l5/ticks/symbol=KQ.m@...`:
+- When building labels on `data/lake_v2/main_l5/ticks/symbol=KQ.m@...`:
   - cross-day lookahead must be **disabled** when the underlying changes between adjacent trading days (end-of-day labels become NaN rather than leaking).
 - Materialization must persist schedule provenance under the derived symbol root:
   - `schedule.parquet` (copy)
@@ -412,23 +407,47 @@ Requirements:
   - Dashboard must bind to `127.0.0.1` by default (no public exposure).
   - Operator accesses via SSH port-forward: `ssh -L 8000:127.0.0.1:8000 ops@server`.
   - Optional shared token (defense-in-depth) may be supported.
-- **Information architecture (single Ops page)**:
-  - The dashboard should provide a **single Operations page**: `GET /ops`
-    - This page consolidates the most-used operational controls and status into one place.
-    - It must be usable without hopping across many sub-pages.
-  - `/ops` must include clearly separated sections (accordion or tabs are fine):
-    - Ingest
-    - QuestDB sync
-    - Schedule
-    - main_l5
-    - Build (features/labels)
-    - Model/Train
-    - Eval
-    - Trading
-    - Integrity
-    - Locks
-  - Existing legacy routes like `/ops/ingest`, `/ops/build`, etc. may remain for compatibility, but should be treated as:
-    - thin wrappers for `/ops` sections, or redirects to `/ops#<section>`.
+- **Information architecture (role-based pages)**:
+  - The dashboard provides a **command center** home page and **role-focused pages** for major workflows:
+    - **Dashboard** (`/`): Command center with KPIs, pipeline status, quick actions
+    - **Jobs** (`/jobs`): Job listing and management
+    - **Data** (`/data`): Data coverage, contract explorer, DB sync
+    - **Models** (`/models`): Model inventory, training, benchmarks
+    - **Trading** (`/trading`): Trading console, positions, run history
+    - **Ops** (`/ops`): Pipeline operations, ingest, schedule/build, integrity, locks
+    - **SQL** (`/explorer`): DuckDB SQL explorer
+    - **System** (`/system`): CPU/memory/disk/GPU monitoring
+  - Each page uses **tabbed layouts** to organize related functionality without excessive scrolling.
+  - Navigation includes:
+    - Status indicators (QuestDB, GPU) in the topbar
+    - Running jobs badge on the Jobs nav item
+    - Toast notifications for async feedback
+- **Page-specific requirements**:
+  - **Dashboard home** (`/`):
+    - System status bar (QuestDB, GPU, CPU, Memory)
+    - KPI grid (running jobs, data symbols, models, trading status)
+    - Pipeline status visualization (Ingest → Sync → Schedule → main_l5 → Build → Train)
+    - Quick action buttons for common workflows
+    - Running and recent jobs tables
+  - **Data hub** (`/data`):
+    - Tab 1: Coverage overview (ticks, main_l5, features, labels tables)
+    - Tab 2: Contract explorer (TqSdk catalog + local + QuestDB status)
+    - Tab 3: DB sync (QuestDB sync forms, status, convert v1→v2)
+  - **Models** (`/models`):
+    - Tab 1: Model inventory (list trained artifacts with search/filter)
+    - Tab 2: Training (train form + sweep form + active training jobs)
+    - Tab 3: Benchmarks (benchmark/compare/backtest forms, results table)
+  - **Trading** (`/trading`):
+    - Tab 1: Live status (KPIs, positions, signals, risk metrics, orders)
+    - Tab 2: Start trading (full form with safety warnings, presets)
+    - Tab 3: Run history (historical trading runs table)
+  - **Ops** (`/ops`):
+    - Tab 1: Pipeline (happy path buttons, running ingest jobs)
+    - Tab 2: Ingest (download, download-contract-range, record forms)
+    - Tab 3: Schedule & Build (schedule, main_l5, features/labels forms)
+    - Tab 4: Integrity (audit forms, recent reports)
+    - Tab 5: Locks (active locks table with key reference)
+  - Legacy routes (`/ops/ingest`, `/ops/build`, etc.) may remain for API compatibility.
 - **Job execution model**:
   - Long-running operations must run as **subprocess jobs** (not in-process), so they are cancellable and resilient to UI restarts.
   - Job history must **persist across dashboard restarts**.
@@ -462,24 +481,25 @@ Requirements:
     - Each button must clearly indicate preconditions (e.g. “QuestDB not reachable”, “schedule missing”, “main_l5 not built”).
 - **Observability**:
   - Must display data coverage (lake partitions by symbol/date, features/labels coverage).
-    - Coverage UI must support both tick lake roots:
-      - `lake_v1` (`data/lake/...`)
-      - `lake_v2` (`data/lake_v2/...`)
-    - The operator must be able to view coverage for `v1`, `v2`, or both (defaulting to `GHTRADER_LAKE_VERSION`).
+    - Coverage UI is **v2-only** (`data/lake_v2/...`).
   - Must display **ingest progress** for running/queued ingest jobs:
     - `download`: % complete over requested trading-day range (includes no-data markers)
     - `download-contract-range`: per-contract and overall % complete using trading calendar + no-data markers (no akshare active-ranges)
   - Must display a **contract explorer** (TqSdk-backed catalog + local status):
-    - Operator chooses `exchange` + `variety` (e.g. `SHFE` + `cu`) and a lake root (`v1`/`v2`).
-    - The system lists **all contracts available in TqSdk** for that variety (including expired).
+    - Operator chooses `exchange` + `variety` (e.g. `SHFE` + `cu`). (v2-only)
+    - The system lists **all contracts** for that variety (including expired) by merging multiple sources:
       - Important: TqSdk’s contract-service queries may not include older (pre-2020-09) instruments. The catalog must merge:
         - `TqApi.query_quotes(...)` results (contract service)
         - TqSdk’s bundled pre-2020 cache (`tqsdk/expired_quotes.json.lzma`, used internally as `_pre20_ins_info`)
+      - Additionally, the UI must include **local-lake-only symbols** discovered on disk under:
+        - `data/lake_v2/ticks/symbol=...`
+        - so that contracts already present locally are never “invisible” even if TqSdk does not list them.
     - For each contract, show:
-      - **Local download status**: `not-downloaded` / `incomplete` / `complete` / `stale` (active and behind today).
-      - **Coverage (QuestDB canonical)**:
+      - **Local download status (Parquet mirror)**: `not-downloaded` / `incomplete` / `complete` / `stale` (active and behind today).
+      - **Coverage (QuestDB canonical)** (separate from local status):
         - first/last tick day present
         - first/last L5 day present
+        - distinct trading-day counts (tick days; L5 days) when available
         - freshness for active contracts (behind latest trading day → `stale`)
       - **L5 availability**:
         - **Local L5 present** means depth levels 2–5 have *non-NaN* values in local Parquet (not just columns existing).
@@ -488,7 +508,8 @@ Requirements:
       - **Fill**: enqueue per-contract `download` jobs (subprocess).
       - **Probe L5**: enqueue per-contract probe jobs (subprocess).
       - Optional integrity checks: quick checks + ability to run `audit`.
-      - **Sync to QuestDB**: enqueue a DB sync job for the selected symbol/range (from Parquet mirror).
+      - **Sync to QuestDB**: enqueue a DB sync job for the selected symbol/range (repair/backfill when QuestDB was down).
+      - **Update**: check remote availability and fill forward (active + recently expired) and refresh QuestDB + Parquet mirror.
     - Bulk Fill/Probe must be **throttled** to avoid starting hundreds of TqSdk-heavy processes:
       - Use a queue/scheduler that runs at most `GHTRADER_MAX_PARALLEL_TQSDK_JOBS` (default **4**) concurrently.
   - Progress UI must work for **already-running jobs** (no restart required) by using job logs + lake state.
@@ -611,9 +632,7 @@ Schedule resolution sources (in priority order):
 - Preferred: the canonical roll schedule produced by `main-schedule`:
   - `data/rolls/shfe_main_schedule/var=<var>/schedule.parquet`
 - Fallback: a `schedule.parquet` copy stored alongside the derived `main_l5` dataset (written by `main-depth`), under either lake root:
-  - `data/lake/main_l5/ticks/symbol=<KQ.m@...>/schedule.parquet`
   - `data/lake_v2/main_l5/ticks/symbol=<KQ.m@...>/schedule.parquet`
-- If both derived schedule copies exist, the system should prefer the selected `GHTRADER_LAKE_VERSION`.
 
 #### 5.12.6 Observability + persistence
 

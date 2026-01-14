@@ -67,18 +67,14 @@ cp env.example .env
 export TQSDK_USER="your_username"
 export TQSDK_PASSWORD="your_password"
 
-# Recommended: use the trading-day partitioned lake (lake_v2) by default
-# (alternative: pass --lake-version v2 on relevant commands)
-export GHTRADER_LAKE_VERSION=v2
-
 # Optional: override trading calendar holiday list (no akshare)
 export TQ_CHINESE_HOLIDAY_URL="https://files.shinnytech.com/shinny_chinese_holiday.json"
 
 # Download historical L5 ticks for a symbol and date range
-ghtrader download --symbol SHFE.cu2502 --start 2024-01-01 --end 2024-01-31 --lake-version v2
+ghtrader download --symbol SHFE.cu2502 --start 2024-01-01 --end 2024-01-31
 
 # Build features and labels
-ghtrader build --symbol SHFE.cu2502 --lake-version v2
+ghtrader build --symbol SHFE.cu2502
 
 # Train baseline model
 ghtrader train --model xgboost --symbol SHFE.cu2502
@@ -95,7 +91,7 @@ ghtrader backtest --model xgboost --symbol SHFE.cu2502
 
 ## SSH-only web dashboard (control plane)
 
-The server is headless (no GUI OS). ghTrader includes an **SSH-only web dashboard** to manage long-running jobs and view logs/data coverage without manually running every CLI command.
+The server is headless (no GUI OS). ghTrader includes an **SSH-only web dashboard** to manage long-running jobs, view data coverage, train models, and monitor trading—all without manually running CLI commands.
 
 Start the dashboard on the server (binds to `127.0.0.1` by default):
 
@@ -111,10 +107,30 @@ ssh -L 8000:127.0.0.1:8000 ops@<server>
 
 Then open `http://127.0.0.1:8000` locally.
 
-Explorer:
-- SQL Explorer page: `http://127.0.0.1:8000/explorer`
+### Dashboard pages
 
-Operational notes:
+| Page | URL | Description |
+|------|-----|-------------|
+| **Dashboard** | `/` | Command center with KPIs, pipeline status, quick actions |
+| **Jobs** | `/jobs` | Job listing, status, logs, cancellation |
+| **Data** | `/data` | Data coverage, contract explorer, DB sync |
+| **Models** | `/models` | Model inventory, training forms, benchmarks |
+| **Trading** | `/trading` | Trading console, positions, run history |
+| **Ops** | `/ops` | Pipeline operations, ingest, schedule/build, integrity, locks |
+| **SQL** | `/explorer` | DuckDB SQL explorer for ad-hoc queries |
+| **System** | `/system` | CPU, memory, disk, GPU monitoring |
+
+### Key features
+
+- **Status indicators**: QuestDB and GPU status shown in the topbar
+- **Running jobs badge**: See at-a-glance how many jobs are running
+- **Tabbed layouts**: Each page organizes related functionality into tabs
+- **Toast notifications**: Async feedback for job submissions and actions
+- **Auto-refresh**: Live data updates without manual page reload
+- **Quick actions**: One-click pipeline operations from the dashboard
+
+### Operational notes
+
 - Job metadata: `runs/control/jobs.db`
 - Logs: `runs/control/logs/job-<id>.log`
 - Optional token (defense-in-depth): `ghtrader dashboard --token <TOKEN>` and access with `?token=<TOKEN>`
@@ -151,14 +167,13 @@ ghTrader/
 
 ## Data lake schema (L5 ticks)
 
-Partitioning (two lake roots are supported):
-- **lake_v1 (legacy)**: `data/lake/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet`
+Partitioning (v2 only):
 - **lake_v2 (trading-day)**: `data/lake_v2/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet`
-  - For **lake_v2**, `date=YYYY-MM-DD` is the **trading day** (night session after ~18:00 local maps to the next trading day).
+  - `date=YYYY-MM-DD` is the **trading day** (night session after ~18:00 local maps to the next trading day).
 
 Derived main-with-depth ticks (optional, for continuous series + L5 depth):
-- `data/lake{,_v2}/main_l5/ticks/symbol=KQ.m@SHFE.cu/date=YYYY-MM-DD/part-....parquet`
-  - `lake_v2` main_l5 includes `underlying_contract` and `segment_id` to prevent cross-roll leakage in sequence models.
+- `data/lake_v2/main_l5/ticks/symbol=KQ.m@SHFE.cu/date=YYYY-MM-DD/part-....parquet`
+  - `main_l5` includes `underlying_contract` and `segment_id` to prevent cross-roll leakage in sequence models.
 
 Columns:
 - `symbol` (string): instrument code (e.g., `SHFE.cu2502`)
@@ -207,6 +222,19 @@ Install the QuestDB extras:
 pip install -e ".[questdb]"
 ```
 
+Start QuestDB (docker compose):
+
+```bash
+docker compose -f infra/questdb/docker-compose.yml up -d
+```
+
+Verify connectivity and initialize required tables:
+
+```bash
+ghtrader db questdb-health
+ghtrader db questdb-init
+```
+
 Configure connection (see `env.example`):
 - `GHTRADER_QUESTDB_HOST`
 - `GHTRADER_QUESTDB_ILP_PORT` (default `9009`)
@@ -217,16 +245,16 @@ Common flows:
 
 ```bash
 # Sync locally-downloaded Parquet ticks to QuestDB (per symbol)
-ghtrader db serve-sync --backend questdb --symbol SHFE.cu2602 --ticks-lake raw --lake-version v2
+ghtrader db serve-sync --backend questdb --symbol SHFE.cu2602 --ticks-lake raw
 
 # Sync all locally-downloaded contracts for a variety
-ghtrader db serve-sync-variety --exchange SHFE --var cu --lake-version v2
+ghtrader db serve-sync-variety --exchange SHFE --var cu
 
 # Build the SHFE-style OI roll schedule from QuestDB (required before main_l5)
 ghtrader main-schedule --var cu --start 2015-01-01 --end 2026-01-01
 
 # Build derived main_l5 ticks for the L5 era only (writes to data/lake_v2/main_l5/...)
-ghtrader main-l5 --var cu --lake-version v2
+ghtrader main-l5 --var cu
 ```
 
 ## Labels (event-time, multi-horizon)

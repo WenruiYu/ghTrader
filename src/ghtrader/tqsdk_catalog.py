@@ -99,6 +99,49 @@ def _maybe_epoch_seconds_to_iso(v: Any) -> str | None:
             return None
 
 
+def _maybe_any_to_date_iso(v: Any) -> str | None:
+    """
+    Best-effort convert a value to an ISO date string (YYYY-MM-DD).
+
+    TqSdk metadata may use:
+    - ISO strings (YYYY-MM-DD or full datetimes)
+    - YYYYMMDD strings
+    - epoch seconds / ms / ns
+    """
+    if v in (None, ""):
+        return None
+    # String-ish
+    try:
+        s = str(v).strip()
+    except Exception:
+        s = ""
+    if s:
+        try:
+            if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+                # YYYY-MM-DD... (maybe datetime)
+                return s[:10]
+            if len(s) == 8 and s.isdigit():
+                return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+        except Exception:
+            pass
+
+    # Numeric-ish epoch: seconds / ms / ns
+    try:
+        x = float(v)
+        if x <= 0:
+            return None
+        # Heuristics by magnitude.
+        if x >= 1e14:
+            dt = datetime.fromtimestamp(x / 1e9, tz=timezone.utc)
+        elif x >= 1e12:
+            dt = datetime.fromtimestamp(x / 1e3, tz=timezone.utc)
+        else:
+            dt = datetime.fromtimestamp(x, tz=timezone.utc)
+        return dt.date().isoformat()
+    except Exception:
+        return None
+
+
 def _tqsdk_pre20_cache_path() -> Path | None:
     """
     Locate TqSdk's bundled pre-2020 instrument cache (expired_quotes.json.lzma).
@@ -172,6 +215,7 @@ def _pre20_contracts(*, exchange: str, var: str) -> dict[str, dict[str, Any]]:
                 "instrument_id": sym,
                 "expired": bool(expired) if expired is not None else None,
                 "expire_datetime": exp_dt,
+                "open_date": None,
                 "catalog_source": "pre20_cache",
             }
         except Exception:
@@ -187,6 +231,7 @@ class ContractInfo:
     instrument_id: str
     expired: bool | None
     expire_datetime: str | None
+    open_date: str | None
     catalog_source: str
 
 
@@ -252,11 +297,18 @@ def fetch_tqsdk_contracts(
             r = info_map.get(ins_id, {})
             expired = r.get("expired")
             exp_dt = _maybe_epoch_seconds_to_iso(r.get("expire_datetime"))
+            open_dt: str | None = None
+            for k in ("open_date", "open_datetime", "start_date", "start_datetime", "listed_date", "listing_date"):
+                if k in r and r.get(k) not in (None, ""):
+                    open_dt = _maybe_any_to_date_iso(r.get(k))
+                    if open_dt:
+                        break
             merged[sym] = {
                 "symbol": sym,
                 "instrument_id": ins_id,
                 "expired": bool(expired) if expired is not None else None,
                 "expire_datetime": exp_dt,
+                "open_date": open_dt,
                 "catalog_source": "contract_service",
             }
 
@@ -271,6 +323,7 @@ def fetch_tqsdk_contracts(
                     instrument_id=str(r.get("instrument_id") or sym),
                     expired=(r.get("expired") if r.get("expired") is None else bool(r.get("expired"))),
                     expire_datetime=str(r.get("expire_datetime")) if r.get("expire_datetime") not in (None, "") else None,
+                    open_date=str(r.get("open_date")) if r.get("open_date") not in (None, "") else None,
                     catalog_source=str(r.get("catalog_source") or "unknown"),
                 )
             )
@@ -343,6 +396,7 @@ def get_contract_catalog(
                 "instrument_id": c.instrument_id,
                 "expired": c.expired,
                 "expire_datetime": c.expire_datetime,
+                "open_date": c.open_date,
                 "catalog_source": c.catalog_source,
             }
             for c in contracts

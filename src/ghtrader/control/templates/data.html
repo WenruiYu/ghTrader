@@ -1,382 +1,560 @@
 {% extends "base.html" %}
 {% block content %}
-  <h2>Data coverage</h2>
+  <div class="section-header">
+    <h2>Data Hub</h2>
+    <div class="section-header-actions">
+      <span class="pill">lake_v2</span>
+    </div>
+  </div>
 
-  <div class="card">
-    <form class="form" method="get" action="/data{{ token_qs }}">
-      <div class="grid2">
-        <div>
-          <label>Tick lake version</label>
-          <select name="lake_version">
-            <option value="v1" {% if lake_version == "v1" %}selected{% endif %}>v1 (data/lake)</option>
-            <option value="v2" {% if lake_version == "v2" %}selected{% endif %}>v2 (data/lake_v2)</option>
-            <option value="both" {% if lake_version == "both" %}selected{% endif %}>both</option>
-          </select>
-        </div>
-        <div style="display:flex; align-items:flex-end;">
-          <button type="submit">Apply</button>
-        </div>
+  <!-- Tab Navigation -->
+  <div class="tab-nav">
+    <button class="tab-nav-item active" data-tab="coverage">Coverage</button>
+    <button class="tab-nav-item" data-tab="contracts">
+      Contracts
+      <span class="badge" id="contractsBadge">--</span>
+    </button>
+    <button class="tab-nav-item" data-tab="sync">DB Sync</button>
+  </div>
+
+  <!-- Tab: Coverage -->
+  <div class="tab-content active" id="tab-coverage">
+    <div class="kpi-grid mb-3">
+      <div class="kpi-card">
+        <div class="kpiLabel">Raw Tick Symbols</div>
+        <div class="kpiValue">{{ ticks_v2|length }}</div>
+        <div class="kpiSubtext">lake_v2</div>
       </div>
-    </form>
-  </div>
-
-  {% if show_v1 %}
-  <h3>Ticks (raw) — lake_v1</h3>
-  <div class="tableWrap">
-    <table class="table">
-      <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-      <tbody>
-      {% for r in ticks_v1 %}
-        <tr>
-          <td class="mono">{{ r.symbol }}</td>
-          <td>{{ r.n_dates }}</td>
-          <td class="mono">{{ r.min_date or "" }}</td>
-          <td class="mono">{{ r.max_date or "" }}</td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  {% endif %}
-
-  {% if show_v2 %}
-  <h3>Ticks (raw) — lake_v2</h3>
-  <div class="tableWrap">
-    <table class="table">
-      <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-      <tbody>
-      {% for r in ticks_v2 %}
-        <tr>
-          <td class="mono">{{ r.symbol }}</td>
-          <td>{{ r.n_dates }}</td>
-          <td class="mono">{{ r.min_date or "" }}</td>
-          <td class="mono">{{ r.max_date or "" }}</td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  {% endif %}
-
-  {% if show_v1 %}
-  <h3>Ticks (main-with-depth) — lake_v1</h3>
-  <div class="tableWrap">
-    <table class="table">
-      <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-      <tbody>
-      {% for r in main_l5_v1 %}
-        <tr>
-          <td class="mono">{{ r.symbol }}</td>
-          <td>{{ r.n_dates }}</td>
-          <td class="mono">{{ r.min_date or "" }}</td>
-          <td class="mono">{{ r.max_date or "" }}</td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  {% endif %}
-
-  {% if show_v2 %}
-  <h3>Ticks (main-with-depth) — lake_v2</h3>
-  <div class="tableWrap">
-    <table class="table">
-      <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-      <tbody>
-      {% for r in main_l5_v2 %}
-        <tr>
-          <td class="mono">{{ r.symbol }}</td>
-          <td>{{ r.n_dates }}</td>
-          <td class="mono">{{ r.min_date or "" }}</td>
-          <td class="mono">{{ r.max_date or "" }}</td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  {% endif %}
-
-  <h3>Features</h3>
-  <div class="tableWrap">
-    <table class="table">
-      <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-      <tbody>
-      {% for r in features %}
-        <tr>
-          <td class="mono">{{ r.symbol }}</td>
-          <td>{{ r.n_dates }}</td>
-          <td class="mono">{{ r.min_date or "" }}</td>
-          <td class="mono">{{ r.max_date or "" }}</td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-
-  <h3>Labels</h3>
-  <div class="tableWrap">
-    <table class="table">
-      <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-      <tbody>
-      {% for r in labels %}
-        <tr>
-          <td class="mono">{{ r.symbol }}</td>
-          <td>{{ r.n_dates }}</td>
-          <td class="mono">{{ r.min_date or "" }}</td>
-          <td class="mono">{{ r.max_date or "" }}</td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-
-  <h3>Contracts (TqSdk + local coverage)</h3>
-  <div class="card">
-    <div class="grid2">
-      <div>
-        <label>Exchange</label>
-        <select id="contractsExchange">
-          <option value="SHFE" selected>SHFE</option>
-        </select>
+      <div class="kpi-card">
+        <div class="kpiLabel">main_l5 Symbols</div>
+        <div class="kpiValue">{{ main_l5_v2|length }}</div>
+        <div class="kpiSubtext">Derived with L5 depth</div>
       </div>
-      <div>
-        <label>Variety</label>
-        <select id="contractsVar">
-          <option value="cu" selected>cu</option>
-          <option value="au">au</option>
-          <option value="ag">ag</option>
-        </select>
+      <div class="kpi-card">
+        <div class="kpiLabel">Features Built</div>
+        <div class="kpiValue">{{ features|length }}</div>
+        <div class="kpiSubtext">{% if features|length > 0 %}{{ features[0].min_date }} - {{ features[0].max_date }}{% else %}No features{% endif %}</div>
       </div>
-      <div>
-        <label>Lake version</label>
-        <select id="contractsLake">
-          <option value="v1" {% if lake_version == "v1" %}selected{% endif %}>v1</option>
-          <option value="v2" {% if lake_version == "v2" %}selected{% endif %}>v2</option>
-        </select>
-      </div>
-      <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap;">
-        <button type="button" id="contractsRefreshBtn" class="btn" style="margin-top:0;">Refresh</button>
-        <button type="button" id="contractsProbeAllBtn" class="btn btn-secondary" style="margin-top:0;">Probe L5 (all)</button>
-        <button type="button" id="contractsFillAllBtn" class="btn btn-secondary" style="margin-top:0;">Fill missing (all)</button>
+      <div class="kpi-card">
+        <div class="kpiLabel">Labels Built</div>
+        <div class="kpiValue">{{ labels|length }}</div>
+        <div class="kpiSubtext">{% if labels|length > 0 %}{{ labels[0].min_date }} - {{ labels[0].max_date }}{% else %}No labels{% endif %}</div>
       </div>
     </div>
-    <div id="contractsStatus" class="muted" style="margin-top:10px;">Idle.</div>
+
+    <div class="split-pane">
+      <div>
+        <div class="card">
+          <h3 class="mb-2">Raw Ticks (lake_v2)</h3>
+          {% if ticks_v2 and ticks_v2|length > 0 %}
+          <div class="tableWrap">
+            <table class="table table-compact">
+              <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+              <tbody>
+              {% for r in ticks_v2 %}
+                <tr>
+                  <td class="mono">{{ r.symbol }}</td>
+                  <td>{{ r.n_dates }}</td>
+                  <td class="mono">{{ r.min_date or "" }}</td>
+                  <td class="mono">{{ r.max_date or "" }}</td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% else %}
+          <div class="muted">No data in lake_v2</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <div>
+        <div class="card">
+          <h3 class="mb-2">main_l5 (lake_v2)</h3>
+          {% if main_l5_v2 and main_l5_v2|length > 0 %}
+          <div class="tableWrap">
+            <table class="table table-compact">
+              <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+              <tbody>
+              {% for r in main_l5_v2 %}
+                <tr>
+                  <td class="mono">{{ r.symbol }}</td>
+                  <td>{{ r.n_dates }}</td>
+                  <td class="mono">{{ r.min_date or "" }}</td>
+                  <td class="mono">{{ r.max_date or "" }}</td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% else %}
+          <div class="muted">No main_l5 data in v2</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <div class="split-pane">
+      <div class="card">
+        <h3 class="mb-2">Features</h3>
+        {% if features and features|length > 0 %}
+        <div class="tableWrap">
+          <table class="table table-compact">
+            <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+            <tbody>
+            {% for r in features %}
+              <tr>
+                <td class="mono">{{ r.symbol }}</td>
+                <td>{{ r.n_dates }}</td>
+                <td class="mono">{{ r.min_date or "" }}</td>
+                <td class="mono">{{ r.max_date or "" }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <div class="muted">No features built yet. Use Ops > Build to create features.</div>
+        {% endif %}
+      </div>
+
+      <div class="card">
+        <h3 class="mb-2">Labels</h3>
+        {% if labels and labels|length > 0 %}
+        <div class="tableWrap">
+          <table class="table table-compact">
+            <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+            <tbody>
+            {% for r in labels %}
+              <tr>
+                <td class="mono">{{ r.symbol }}</td>
+                <td>{{ r.n_dates }}</td>
+                <td class="mono">{{ r.min_date or "" }}</td>
+                <td class="mono">{{ r.max_date or "" }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <div class="muted">No labels built yet. Use Ops > Build to create labels.</div>
+        {% endif %}
+      </div>
+    </div>
   </div>
 
-  <div class="tableWrap">
-    <table class="table" id="contractsTable">
-      <thead>
-        <tr>
-          <th>Contract</th>
-          <th>Active</th>
-          <th>Status</th>
-          <th>Local days</th>
-          <th>Local min</th>
-          <th>Local max</th>
-          <th>DB tick</th>
-          <th>DB L5</th>
-          <th>Completeness</th>
-          <th>Local L5</th>
-          <th>TqSdk L5 probe</th>
-          <th>Actions</th>
-        </tr>
-      </thead>
-      <tbody id="contractsTbody">
-        <tr><td colspan="10" class="muted">Click Refresh to load.</td></tr>
-      </tbody>
-    </table>
+  <!-- Tab: Contracts -->
+  <div class="tab-content" id="tab-contracts">
+    <div class="card">
+      <div class="section-header mb-2">
+        <h3 class="mb-0">Contract Explorer</h3>
+        <div class="muted text-sm">TqSdk catalog + local coverage + QuestDB status</div>
+      </div>
+      
+      <div class="grid2 mb-3">
+        <div>
+          <label class="text-sm">Exchange</label>
+          <select id="contractsExchange" class="form-control">
+            <option value="SHFE" selected>SHFE</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-sm">Variety</label>
+          <select id="contractsVar" class="form-control">
+            <option value="cu" selected>cu (Copper)</option>
+            <option value="au">au (Gold)</option>
+            <option value="ag">ag (Silver)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid3 mb-3">
+        <div>
+          <label class="text-sm">Search</label>
+          <input id="contractsSearch" placeholder="e.g. cu1601, 2602" />
+        </div>
+        <div>
+          <label class="text-sm">Filter</label>
+          <select id="contractsActiveFilter" class="form-control">
+            <option value="all" selected>all contracts</option>
+            <option value="active">active only</option>
+            <option value="expired">expired only</option>
+          </select>
+        </div>
+        <div style="display:flex; align-items:flex-end; gap:8px;">
+          <label style="margin:0; display:flex; align-items:center; gap:8px;">
+            <input type="checkbox" id="contractsOnlyMissing" />
+            <span class="text-sm">missing/stale only</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="action-bar card-no-margin" style="margin-bottom:12px;">
+        <span class="action-bar-title" id="contractsStatus">Click Refresh to load contracts.</span>
+        <button type="button" id="contractsRefreshBtn" class="btn btn-sm">Refresh</button>
+        <button type="button" id="contractsProbeAllBtn" class="btn btn-sm btn-secondary">Probe L5 (all)</button>
+        <button type="button" id="contractsFillAllBtn" class="btn btn-sm btn-secondary">Fill missing</button>
+        <button type="button" id="contractsUpdateAllBtn" class="btn btn-sm btn-secondary">Update</button>
+      </div>
+    </div>
+
+    <div class="tableWrap">
+      <table class="table table-compact" id="contractsTable">
+        <thead>
+          <tr>
+            <th>Contract</th>
+            <th>Source</th>
+            <th>Active</th>
+            <th>Local</th>
+            <th>Days</th>
+            <th>Local range</th>
+            <th>DB</th>
+            <th>DB range</th>
+            <th>DB L5</th>
+            <th>%</th>
+            <th>Local L5</th>
+            <th>Probe</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="contractsTbody">
+          <tr><td colspan="13" class="muted">Click Refresh to load.</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 
-  <script>
-    (function() {
-      const qs = new URLSearchParams(window.location.search);
-      const token = qs.get("token");
-      function withToken(url) {
-        if (!token) return url;
-        const u = new URL(url, window.location.origin);
-        u.searchParams.set("token", token);
-        return u.toString();
-      }
+  <!-- Tab: DB Sync -->
+  <div class="tab-content" id="tab-sync">
+    <div class="split-pane-2-1">
+      <div class="card">
+        <h3 class="mb-2">QuestDB Sync</h3>
+        <p class="muted text-sm mb-3">Sync Parquet data to QuestDB for fast queries and schedule building.</p>
+        
+        <h4>Sync entire variety</h4>
+        <form class="form" method="post" action="/ops/db/serve_sync_variety{{ token_qs }}">
+          <div class="grid3">
+            <div><label>Exchange</label><input name="exchange" value="SHFE"/></div>
+            <div><label>Variety</label><input name="variety" value="cu"/></div>
+            <div></div>
+          </div>
+          <div class="grid2">
+            <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+            <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
+          </div>
+          <div class="grid3">
+            <div><label>Host</label><input name="host" value="{{ questdb.host | default('127.0.0.1') }}"/></div>
+            <div><label>ILP port</label><input name="questdb_ilp_port" value="{{ questdb.ilp_port | default(9009) }}"/></div>
+            <div><label>PG port</label><input name="questdb_pg_port" value="{{ questdb.pg_port | default(8812) }}"/></div>
+          </div>
+          <button type="submit">Sync variety to QuestDB</button>
+        </form>
 
-      const elExchange = document.getElementById("contractsExchange");
-      const elVar = document.getElementById("contractsVar");
-      const elLake = document.getElementById("contractsLake");
-      const elStatus = document.getElementById("contractsStatus");
-      const elTbody = document.getElementById("contractsTbody");
-      const btnRefresh = document.getElementById("contractsRefreshBtn");
-      const btnProbeAll = document.getElementById("contractsProbeAllBtn");
-      const btnFillAll = document.getElementById("contractsFillAllBtn");
+        <h4 style="margin-top:20px;">Sync single symbol</h4>
+        <form class="form" method="post" action="/ops/db/serve_sync{{ token_qs }}">
+          <div class="grid3">
+            <div><label>Symbol</label><input name="symbol" placeholder="SHFE.cu2602"/></div>
+            <div><label>Ticks lake</label>
+              <select name="ticks_lake"><option value="raw" selected>raw</option><option value="main_l5">main_l5</option></select>
+            </div>
+            <div></div>
+          </div>
+          <div class="grid3">
+            <div><label>Mode</label>
+              <select name="mode"><option value="incremental" selected>incremental</option><option value="backfill">backfill</option></select>
+            </div>
+            <div><label>Start (optional)</label><input name="start" type="date"/></div>
+            <div><label>End (optional)</label><input name="end" type="date"/></div>
+          </div>
+          <div class="grid3">
+            <div><label>Host</label><input name="host" value="{{ questdb.host | default('127.0.0.1') }}"/></div>
+            <div><label>ILP port</label><input name="questdb_ilp_port" value="{{ questdb.ilp_port | default(9009) }}"/></div>
+            <div><label>PG port</label><input name="questdb_pg_port" value="{{ questdb.pg_port | default(8812) }}"/></div>
+          </div>
+          <div class="grid2">
+            <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+            <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
+          </div>
+          <button type="submit">Sync symbol to QuestDB</button>
+        </form>
+      </div>
 
-      function setStatus(msg) {
-        elStatus.textContent = msg;
-      }
+      <div>
+        <div class="card">
+          <h3 class="mb-2">QuestDB Status</h3>
+          {% if questdb and questdb.ok %}
+            <div class="status-indicator status-indicator-ok mb-2">
+              <span class="status-dot status-dot-ok"></span>
+              <span>Connected</span>
+            </div>
+            <div class="muted text-sm">
+              Host: <span class="mono">{{ questdb.host }}</span><br>
+              PG port: <span class="mono">{{ questdb.pg_port }}</span><br>
+              ILP port: <span class="mono">{{ questdb.ilp_port }}</span>
+            </div>
+          {% else %}
+            <div class="status-indicator status-indicator-error mb-2">
+              <span class="status-dot status-dot-error"></span>
+              <span>Not reachable</span>
+            </div>
+            {% if questdb and questdb.error %}
+              <div class="muted text-sm mono">{{ questdb.error }}</div>
+            {% endif %}
+          {% endif %}
+        </div>
 
-      function fmtPct(p) {
-        if (p === null || p === undefined) return "";
-        const x = Math.max(0, Math.min(1, Number(p)));
-        return (x * 100).toFixed(1) + "%";
-      }
-
-      function fmtProbeCell(p) {
-        if (!p) return "<span class=\"muted\">unknown</span>";
-        const day = p.probed_day ? (" <span class=\"mono muted\">" + p.probed_day + "</span>") : "";
-        if (p.l5_present === true) return "<span class=\"pill pill-succeeded\">yes</span>" + day;
-        if (p.l5_present === false) return "<span class=\"pill pill-failed\">no</span>" + day;
-        return "<span class=\"muted\">unknown</span>";
-      }
-
-      function rowHtml(r) {
-        const active = (r.expired === false);
-        const activeCell = active ? "<span class=\"pill pill-succeeded\">active</span>" : "<span class=\"pill\">expired</span>";
-        let statusCell = "<span class=\"pill pill-queued\">unknown</span>";
-        const st = String(r.status || "");
-        if (st === "complete") statusCell = "<span class=\"pill pill-succeeded\">complete</span>";
-        else if (st === "stale") statusCell = "<span class=\"pill pill-running\">stale</span>";
-        else if (st === "incomplete") statusCell = "<span class=\"pill pill-running\">incomplete</span>";
-        else if (st === "not-downloaded") statusCell = "<span class=\"pill\">not-downloaded</span>";
-        const l5 = r.local_l5 || {};
-        let l5Text = "";
-        if (l5.status === "ready") {
-          l5Text = String(l5.l5_days || 0) + " day(s)";
-          if (l5.l5_min && l5.l5_max) l5Text += " (" + l5.l5_min + " → " + l5.l5_max + ")";
-        } else if (l5.status === "missing_pyarrow") {
-          l5Text = "missing pyarrow";
-        } else if (l5.status === "no_local_data") {
-          l5Text = "";
-        } else {
-          l5Text = "scanning " + String(l5.scanned_days || 0) + "/" + String(l5.total_days || 0);
-        }
-
-        const qc = r.questdb_coverage || null;
-        const dbTick = qc && (qc.first_tick_day || qc.last_tick_day) ? ((qc.first_tick_day || "") + " → " + (qc.last_tick_day || "")) : "";
-        const dbL5 = qc && (qc.first_l5_day || qc.last_l5_day) ? ((qc.first_l5_day || "") + " → " + (qc.last_l5_day || "")) : "";
-
-        const actions = [
-          "<button type=\"button\" class=\"btn btn-secondary\" style=\"margin-top:0; padding:6px 10px; font-size:12px;\" data-action=\"probe\" data-symbol=\"" + r.symbol + "\">Probe</button>",
-          "<button type=\"button\" class=\"btn btn-secondary\" style=\"margin-top:0; padding:6px 10px; font-size:12px;\" data-action=\"fill\" data-symbol=\"" + r.symbol + "\">Fill</button>",
-          "<button type=\"button\" class=\"btn btn-secondary\" style=\"margin-top:0; padding:6px 10px; font-size:12px;\" data-action=\"audit\" data-symbol=\"" + r.symbol + "\">Audit</button>",
-        ].join(" ");
-
-        return [
-          "<tr data-symbol=\"" + r.symbol + "\">",
-            "<td class=\"mono\">" + r.symbol + "</td>",
-            "<td>" + activeCell + "</td>",
-            "<td>" + statusCell + "</td>",
-            "<td>" + String(r.local_days_downloaded || 0) + "</td>",
-            "<td class=\"mono\">" + (r.local_min || "") + "</td>",
-            "<td class=\"mono\">" + (r.local_max || "") + "</td>",
-            "<td class=\"mono\">" + dbTick + "</td>",
-            "<td class=\"mono\">" + dbL5 + "</td>",
-            "<td>" + fmtPct(r.pct) + "</td>",
-            "<td>" + l5Text + "</td>",
-            "<td>" + fmtProbeCell(r.tqsdk_probe) + "</td>",
-            "<td>" + actions + "</td>",
-          "</tr>"
-        ].join("");
-      }
-
-      async function fetchContracts(opts) {
-        opts = opts || {};
-        const ex = elExchange.value;
-        const v = elVar.value;
-        const lv = elLake.value;
-        const refresh = opts.refresh ? "1" : "0";
-        const refreshL5 = opts.refreshL5 ? "1" : "0";
-        const url = withToken("/api/contracts?exchange=" + encodeURIComponent(ex) + "&var=" + encodeURIComponent(v) + "&lake_version=" + encodeURIComponent(lv) + "&refresh=" + refresh + "&refresh_l5=" + refreshL5);
-        setStatus("Loading contracts from TqSdk + local...");
-        const resp = await fetch(url, { headers: token ? { "x-auth-token": token } : {} });
-        const body = await resp.json();
-        if (!resp.ok || !body.ok) {
-          const err = (body && (body.error || body.detail)) ? (body.error || body.detail) : ("HTTP " + resp.status);
-          throw new Error(err);
-        }
-        return body;
-      }
-
-      async function refreshTable(opts) {
-        try {
-          const body = await fetchContracts(opts);
-          const rows = body.contracts || [];
-          if (!rows.length) {
-            elTbody.innerHTML = "<tr><td colspan=\"10\" class=\"muted\">No contracts returned.</td></tr>";
-            setStatus("No contracts returned.");
-            return;
-          }
-          elTbody.innerHTML = rows.map(rowHtml).join("");
-          setStatus("Loaded " + rows.length + " contracts.");
-        } catch (e) {
-          elTbody.innerHTML = "<tr><td colspan=\"10\" class=\"muted\">Failed to load contracts.</td></tr>";
-          setStatus("Error: " + String(e && e.message ? e.message : e));
-        }
-      }
-
-      async function postJson(path, payload) {
-        const url = withToken(path);
-        const resp = await fetch(url, {
-          method: "POST",
-          headers: Object.assign({ "Content-Type": "application/json" }, token ? { "x-auth-token": token } : {}),
-          body: JSON.stringify(payload || {})
-        });
-        const body = await resp.json().catch(() => ({}));
-        if (!resp.ok || !body.ok) {
-          const err = (body && (body.error || body.detail)) ? (body.error || body.detail) : ("HTTP " + resp.status);
-          throw new Error(err);
-        }
-        return body;
-      }
-
-      btnRefresh.addEventListener("click", () => refreshTable({ refresh: true }));
-      btnProbeAll.addEventListener("click", async () => {
-        try {
-          setStatus("Enqueuing probe jobs...");
-          const ex = elExchange.value;
-          const v = elVar.value;
-          const lv = elLake.value;
-          await postJson("/api/contracts/enqueue-probe-l5", { exchange: ex, var: v, lake_version: lv, scope: "all" });
-          setStatus("Probe jobs enqueued. Check Jobs tab.");
-        } catch (e) {
-          setStatus("Error: " + String(e && e.message ? e.message : e));
-        }
-      });
-      btnFillAll.addEventListener("click", async () => {
-        try {
-          setStatus("Enqueuing fill jobs...");
-          const ex = elExchange.value;
-          const v = elVar.value;
-          const lv = elLake.value;
-          await postJson("/api/contracts/enqueue-fill", { exchange: ex, var: v, lake_version: lv, scope: "missing" });
-          setStatus("Fill jobs enqueued. Check Jobs tab.");
-        } catch (e) {
-          setStatus("Error: " + String(e && e.message ? e.message : e));
-        }
-      });
-
-      document.getElementById("contractsTable").addEventListener("click", async (ev) => {
-        const t = ev.target;
-        if (!t || !t.dataset) return;
-        const action = t.dataset.action;
-        const sym = t.dataset.symbol;
-        if (!action || !sym) return;
-        try {
-          if (action === "probe") {
-            setStatus("Enqueuing probe for " + sym + "...");
-            await postJson("/api/contracts/enqueue-probe-l5", { exchange: elExchange.value, var: elVar.value, lake_version: elLake.value, symbols: [sym] });
-            setStatus("Probe enqueued for " + sym + ".");
-          } else if (action === "fill") {
-            setStatus("Enqueuing fill for " + sym + "...");
-            await postJson("/api/contracts/enqueue-fill", { exchange: elExchange.value, var: elVar.value, lake_version: elLake.value, symbols: [sym] });
-            setStatus("Fill enqueued for " + sym + ".");
-          } else if (action === "audit") {
-            setStatus("Starting audit for " + sym + "...");
-            const r = await postJson("/api/contracts/enqueue-audit", { lake_version: elLake.value, symbols: [sym] });
-            const jobId = (r.started && r.started.length) ? r.started[0] : "";
-            setStatus("Audit started for " + sym + (jobId ? (" (job " + jobId + ")") : "") + ". Check Jobs tab.");
-          }
-        } catch (e) {
-          setStatus("Error: " + String(e && e.message ? e.message : e));
-        }
-      });
-    })();
-  </script>
+      </div>
+    </div>
+  </div>
 {% endblock %}
 
+{% block scripts %}
+<script>
+(function() {
+  // Contract explorer logic
+  const elExchange = document.getElementById("contractsExchange");
+  const elVar = document.getElementById("contractsVar");
+  const elSearch = document.getElementById("contractsSearch");
+  const elActiveFilter = document.getElementById("contractsActiveFilter");
+  const elOnlyMissing = document.getElementById("contractsOnlyMissing");
+  const elStatus = document.getElementById("contractsStatus");
+  const elTbody = document.getElementById("contractsTbody");
+  const btnRefresh = document.getElementById("contractsRefreshBtn");
+  const btnProbeAll = document.getElementById("contractsProbeAllBtn");
+  const btnFillAll = document.getElementById("contractsFillAllBtn");
+  const btnUpdateAll = document.getElementById("contractsUpdateAllBtn");
+
+  let lastRows = [];
+  let lastQuestdbOk = false;
+  window._contractsLoaded = false;
+
+  // Tabs (supports /data#sync etc)
+  window.ghTrader.initTabs({
+    updateHash: true,
+    onTab: (tabId) => {
+      if (tabId === "contracts" && !window._contractsLoaded) {
+        refreshTable({ refresh: true });
+      }
+    },
+  });
+
+  function setStatus(msg) {
+    elStatus.textContent = msg;
+  }
+
+  function fmtPct(p) {
+    if (p === null || p === undefined) return "";
+    return (Math.max(0, Math.min(1, Number(p))) * 100).toFixed(0) + "%";
+  }
+
+  function fmtProbeCell(p) {
+    if (!p) return "<span class=\"muted\">-</span>";
+    if (p.l5_present === true) return "<span class=\"pill pill-succeeded\">yes</span>";
+    if (p.l5_present === false) return "<span class=\"pill pill-failed\">no</span>";
+    return "<span class=\"muted\">-</span>";
+  }
+
+  function rowHtml(r) {
+    const active = (r.expired === false);
+    const activeCell = active ? "<span class=\"pill pill-succeeded\">active</span>" : "<span class=\"pill\">expired</span>";
+    let statusCell = "<span class=\"pill\">-</span>";
+    const st = String(r.status || "");
+    if (st === "complete") statusCell = "<span class=\"pill pill-succeeded\">complete</span>";
+    else if (st === "stale") statusCell = "<span class=\"pill pill-running\">stale</span>";
+    else if (st === "incomplete") statusCell = "<span class=\"pill pill-running\">incomplete</span>";
+    else if (st === "not-downloaded") statusCell = "<span class=\"pill\">none</span>";
+
+    const source = String(r.catalog_source || "").substring(0, 6) || "-";
+    const localRange = (r.local_min || r.local_max) ? ((r.local_min || "") + " - " + (r.local_max || "")) : "-";
+    
+    const qc = r.questdb_coverage || null;
+    const dbRange = qc && (qc.first_tick_day || qc.last_tick_day) ? ((qc.first_tick_day || "") + " - " + (qc.last_tick_day || "")) : "-";
+    const dbL5 = qc && (qc.first_l5_day || qc.last_l5_day) ? ((qc.first_l5_day || "") + " - " + (qc.last_l5_day || "")) : "-";
+
+    let dbStatusCell = "<span class=\"muted\">-</span>";
+    const ds = String(r.db_status || "");
+    if (ds === "ok") dbStatusCell = "<span class=\"pill pill-succeeded\">ok</span>";
+    else if (ds === "stale") dbStatusCell = "<span class=\"pill pill-running\">stale</span>";
+    else if (ds === "empty") dbStatusCell = "<span class=\"pill\">empty</span>";
+    else if (ds === "error") dbStatusCell = "<span class=\"pill pill-failed\">err</span>";
+
+    const l5 = r.local_l5 || {};
+    let l5Text = "-";
+    if (l5.status === "ready" && l5.l5_days > 0) l5Text = String(l5.l5_days) + "d";
+    
+    const actions = [
+      "<button type=\"button\" class=\"btn-sm btn-secondary\" data-action=\"update\" data-symbol=\"" + r.symbol + "\">Update</button>",
+      "<button type=\"button\" class=\"btn-sm btn-secondary\" data-action=\"audit\" data-symbol=\"" + r.symbol + "\">Audit</button>",
+      "<button type=\"button\" class=\"btn-sm btn-secondary\" data-action=\"fill\" data-symbol=\"" + r.symbol + "\">Fill</button>",
+      "<button type=\"button\" class=\"btn-sm btn-secondary\" data-action=\"sync\" data-symbol=\"" + r.symbol + "\" " + (lastQuestdbOk ? "" : "disabled") + ">Sync</button>",
+    ].join(" ");
+
+    const probeCell = [
+      fmtProbeCell(r.tqsdk_probe),
+      "<div style=\"margin-top:6px;\"><button type=\"button\" class=\"btn-sm btn-secondary\" data-action=\"probe\" data-symbol=\"" + r.symbol + "\">Probe</button></div>",
+    ].join("");
+
+    return [
+      "<tr data-symbol=\"" + r.symbol + "\">",
+        "<td class=\"mono\">" + r.symbol + "</td>",
+        "<td class=\"mono\">" + source + "</td>",
+        "<td>" + activeCell + "</td>",
+        "<td>" + statusCell + "</td>",
+        "<td>" + String(r.local_days_downloaded || 0) + "</td>",
+        "<td class=\"mono text-xs\">" + localRange + "</td>",
+        "<td>" + dbStatusCell + "</td>",
+        "<td class=\"mono text-xs\">" + dbRange + "</td>",
+        "<td class=\"mono text-xs\">" + dbL5 + "</td>",
+        "<td>" + fmtPct(r.pct) + "</td>",
+        "<td>" + l5Text + "</td>",
+        "<td>" + probeCell + "</td>",
+        "<td>" + actions + "</td>",
+      "</tr>"
+    ].join("");
+  }
+
+  async function fetchContracts(opts) {
+    opts = opts || {};
+    const ex = elExchange.value;
+    const v = elVar.value;
+    const refresh = opts.refresh ? "1" : "0";
+    const url = window.ghTrader.withToken("/api/contracts?exchange=" + encodeURIComponent(ex) + "&var=" + encodeURIComponent(v) + "&refresh=" + refresh);
+    setStatus("Loading contracts...");
+    const resp = await window.ghTrader.fetchApi(url);
+    const body = await resp.json();
+    if (!resp.ok || !body.ok) {
+      throw new Error(body.error || body.detail || "HTTP " + resp.status);
+    }
+    return body;
+  }
+
+  function renderRows() {
+    const q = String(elSearch.value || "").trim().toLowerCase();
+    const activeMode = String(elActiveFilter.value || "all");
+    const missingOnly = !!elOnlyMissing.checked;
+    const rows = (lastRows || []).filter((r) => {
+      const sym = String((r && r.symbol) || "").toLowerCase();
+      if (q && sym.indexOf(q) < 0) return false;
+      const isActive = (r && r.expired === false);
+      if (activeMode === "active" && !isActive) return false;
+      if (activeMode === "expired" && isActive) return false;
+      if (missingOnly) {
+        const st = String((r && r.status) || "");
+        if (["not-downloaded", "incomplete", "stale"].indexOf(st) < 0) return false;
+      }
+      return true;
+    });
+    if (!rows.length) {
+      elTbody.innerHTML = "<tr><td colspan=\"13\" class=\"muted\">No matching contracts.</td></tr>";
+      return;
+    }
+    elTbody.innerHTML = rows.map(rowHtml).join("");
+  }
+
+  async function refreshTable(opts) {
+    try {
+      const body = await fetchContracts(opts);
+      const rows = body.contracts || [];
+      window._contractsLoaded = true;
+      document.getElementById("contractsBadge").textContent = rows.length;
+      if (!rows.length) {
+        elTbody.innerHTML = "<tr><td colspan=\"13\" class=\"muted\">No contracts returned.</td></tr>";
+        setStatus("No contracts returned.");
+        return;
+      }
+      lastRows = rows;
+      lastQuestdbOk = !!(body.questdb && body.questdb.ok);
+      renderRows();
+      setStatus("Loaded " + rows.length + " contracts" + (lastQuestdbOk ? "" : " (QuestDB offline)"));
+    } catch (e) {
+      elTbody.innerHTML = "<tr><td colspan=\"13\" class=\"muted\">Failed to load contracts.</td></tr>";
+      setStatus("Error: " + String(e.message || e));
+      window.ghTrader.toast("Failed to load contracts: " + String(e.message || e), "error");
+    }
+  }
+
+  btnRefresh.addEventListener("click", () => refreshTable({ refresh: true }));
+  const renderRowsDebounced = window.ghTrader.debounce(renderRows, 120);
+  elSearch.addEventListener("input", () => renderRowsDebounced());
+  elActiveFilter.addEventListener("change", () => renderRows());
+  elOnlyMissing.addEventListener("change", () => renderRows());
+  
+  btnProbeAll.addEventListener("click", async () => {
+    try {
+      setStatus("Enqueuing probe jobs...");
+      await window.ghTrader.postJson("/api/contracts/enqueue-probe-l5", { exchange: elExchange.value, var: elVar.value, scope: "all" });
+      setStatus("Probe jobs enqueued. Check Jobs.");
+      window.ghTrader.toast("Probe jobs enqueued", "success");
+    } catch (e) {
+      setStatus("Error: " + String(e.message || e));
+      window.ghTrader.toast("Failed: " + e.message, "error");
+    }
+  });
+  
+  btnFillAll.addEventListener("click", async () => {
+    try {
+      setStatus("Enqueuing fill jobs...");
+      await window.ghTrader.postJson("/api/contracts/enqueue-fill", { exchange: elExchange.value, var: elVar.value, scope: "missing" });
+      setStatus("Fill jobs enqueued. Check Jobs.");
+      window.ghTrader.toast("Fill jobs enqueued", "success");
+    } catch (e) {
+      setStatus("Error: " + String(e.message || e));
+      window.ghTrader.toast("Failed: " + e.message, "error");
+    }
+  });
+
+  btnUpdateAll.addEventListener("click", async () => {
+    try {
+      setStatus("Enqueuing update job...");
+      const body = await window.ghTrader.postJson("/api/contracts/enqueue-update", { exchange: elExchange.value, var: elVar.value, recent_expired_days: 10, refresh_catalog: true });
+      const jobId = (body.enqueued && body.enqueued[0]) ? body.enqueued[0] : null;
+      setStatus("Update job enqueued" + (jobId ? (" (" + jobId + ")") : "") + ". Check Jobs.");
+      window.ghTrader.toast("Update job enqueued", "success");
+    } catch (e) {
+      setStatus("Error: " + String(e.message || e));
+      window.ghTrader.toast("Failed: " + e.message, "error");
+    }
+  });
+
+  document.getElementById("contractsTable").addEventListener("click", async (ev) => {
+    const t = ev.target;
+    if (!t || !t.dataset) return;
+    const action = t.dataset.action;
+    const sym = t.dataset.symbol;
+    if (!action || !sym) return;
+    try {
+      if (action === "probe") {
+        setStatus("Enqueuing probe for " + sym + "...");
+        await window.ghTrader.postJson("/api/contracts/enqueue-probe-l5", { exchange: elExchange.value, var: elVar.value, symbols: [sym] });
+        setStatus("Probe enqueued for " + sym);
+        window.ghTrader.toast("Probe enqueued for " + sym, "success");
+      } else if (action === "update") {
+        setStatus("Enqueuing update for " + sym + "...");
+        const body = await window.ghTrader.postJson("/api/contracts/enqueue-update", { exchange: elExchange.value, var: elVar.value, symbols: [sym], recent_expired_days: 10, refresh_catalog: true });
+        const jobId = (body.enqueued && body.enqueued[0]) ? body.enqueued[0] : null;
+        setStatus("Update enqueued for " + sym + (jobId ? (" (" + jobId + ")") : ""));
+        window.ghTrader.toast("Update enqueued for " + sym, "success");
+      } else if (action === "fill") {
+        setStatus("Enqueuing fill for " + sym + "...");
+        await window.ghTrader.postJson("/api/contracts/enqueue-fill", { exchange: elExchange.value, var: elVar.value, symbols: [sym] });
+        setStatus("Fill enqueued for " + sym);
+        window.ghTrader.toast("Fill enqueued for " + sym, "success");
+      } else if (action === "sync") {
+        setStatus("Starting QuestDB sync for " + sym + "...");
+        await window.ghTrader.postJson("/api/contracts/enqueue-sync-questdb", { symbols: [sym] });
+        setStatus("Sync started for " + sym);
+        window.ghTrader.toast("Sync started for " + sym, "success");
+      } else if (action === "audit") {
+        setStatus("Starting audit for " + sym + "...");
+        await window.ghTrader.postJson("/api/contracts/enqueue-audit", { symbols: [sym] });
+        setStatus("Audit started for " + sym);
+        window.ghTrader.toast("Audit started for " + sym, "success");
+      }
+    } catch (e) {
+      setStatus("Error: " + String(e.message || e));
+      window.ghTrader.toast("Failed: " + e.message, "error");
+    }
+  });
+})();
+</script>
+{% endblock %}

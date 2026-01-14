@@ -56,7 +56,7 @@ def query_symbol_day_bounds(
     l5_only: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """
-    Return {symbol: {first_day, last_day}} using QuestDB canonical ticks.
+    Return {symbol: {first_day, last_day, n_days}} using QuestDB canonical ticks.
 
     Notes:
     - Uses `trading_day` column (ISO YYYY-MM-DD strings, stored as SYMBOL).
@@ -79,7 +79,8 @@ def query_symbol_day_bounds(
     sql = (
         "SELECT symbol, "
         "min(cast(trading_day as string)) AS first_day, "
-        "max(cast(trading_day as string)) AS last_day "
+        "max(cast(trading_day as string)) AS last_day, "
+        "count(DISTINCT cast(trading_day as string)) AS n_days "
         f"FROM {table} "
         f"WHERE {' AND '.join(where)} "
         "GROUP BY symbol"
@@ -92,7 +93,7 @@ def query_symbol_day_bounds(
             for row in cur.fetchall():
                 try:
                     sym = str(row[0])
-                    out[sym] = {"first_day": row[1], "last_day": row[2]}
+                    out[sym] = {"first_day": row[1], "last_day": row[2], "n_days": row[3]}
                 except Exception:
                     continue
     return out
@@ -131,8 +132,10 @@ def query_contract_coverage(
         out[sym] = {
             "first_tick_day": b.get("first_day"),
             "last_tick_day": b.get("last_day"),
+            "tick_days": b.get("n_days"),
             "first_l5_day": l.get("first_day"),
             "last_l5_day": l.get("last_day"),
+            "l5_days": l.get("n_days"),
         }
     return out
 

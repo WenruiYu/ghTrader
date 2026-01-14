@@ -100,9 +100,8 @@ def build_main_l5_l5_era_only(
     if data_dir is None:
         data_dir = get_data_dir()
 
-    lv = str(lake_version).lower().strip()
-    if lv not in {"v1", "v2"}:
-        raise ValueError(f"Invalid lake_version={lake_version!r}")
+    _ = lake_version  # v2-only
+    lv = "v2"
 
     schedule_full_path = schedule_path or _roll_schedule_path(data_dir, var)
     if not schedule_full_path.exists():

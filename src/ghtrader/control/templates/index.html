@@ -1,63 +1,412 @@
 {% extends "base.html" %}
+{% block alerts %}
+  <div id="dashboardAlerts"></div>
+{% endblock %}
 {% block content %}
-  <h2>Overview</h2>
-
-  <div class="grid">
-    <div class="card">
-      <div class="kpiLabel">Running jobs</div>
-      <div class="kpiValue">{{ running_count }}</div>
-    </div>
-    <div class="card">
-      <div class="kpiLabel">Recent jobs</div>
-      <div class="kpiValue">{{ recent_count }}</div>
+  <div class="section-header">
+    <h2>Dashboard</h2>
+    <div class="section-header-actions">
+      <button class="btn btn-secondary btn-sm" id="refreshDashboard">Refresh</button>
     </div>
   </div>
 
-  {% set running_jobs = jobs | selectattr("status", "equalto", "running") | list %}
-  {% if running_jobs and running_jobs|length > 0 %}
-    <h3>Running</h3>
-    <div class="tableWrap">
-      <table class="table">
-        <thead>
-          <tr>
-            <th>ID</th><th>Status</th><th>Title</th><th>Started</th><th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for j in running_jobs %}
-          <tr>
-            <td class="mono">{{ j.id }}</td>
-            <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
-            <td>{{ j.title }}</td>
-            <td class="mono">{{ j.started_at or "" }}</td>
-            <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+  <!-- System Status Bar -->
+  <div class="card card-compact flex items-center gap-4 flex-wrap" id="systemStatusBar">
+    <div class="status-indicator" id="statusQuestDBIndicator">
+      <span class="status-dot status-dot-unknown"></span>
+      <span>QuestDB: checking...</span>
     </div>
-  {% endif %}
+    <div class="status-indicator" id="statusGPUIndicator">
+      <span class="status-dot status-dot-unknown"></span>
+      <span>GPU: checking...</span>
+    </div>
+    <div class="status-indicator" id="statusCPUIndicator">
+      <span class="status-dot status-dot-idle"></span>
+      <span>CPU: --%</span>
+    </div>
+    <div class="status-indicator" id="statusMemIndicator">
+      <span class="status-dot status-dot-idle"></span>
+      <span>Mem: --%</span>
+    </div>
+  </div>
 
-  <h3>Recent</h3>
-  <div class="tableWrap">
-    <table class="table">
-      <thead>
-        <tr>
-          <th>ID</th><th>Status</th><th>Title</th><th>Created</th><th></th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for j in jobs %}
-        <tr>
-          <td class="mono">{{ j.id }}</td>
-          <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
-          <td>{{ j.title }}</td>
-          <td class="mono">{{ j.created_at }}</td>
-          <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+  <!-- KPI Grid -->
+  <div class="kpi-grid" id="kpiGrid">
+    <a href="/jobs{{ token_qs }}" class="kpi-card kpi-card-clickable">
+      <div class="kpiLabel">Running Jobs</div>
+      <div class="kpiValue" id="kpiRunning">{{ running_count }}</div>
+      <div class="kpiSubtext"><span id="kpiQueued">{{ queued_count }}</span> queued</div>
+    </a>
+    <a href="/data{{ token_qs }}" class="kpi-card kpi-card-clickable">
+      <div class="kpiLabel">Data Symbols</div>
+      <div class="kpiValue" id="kpiSymbols">--</div>
+      <div class="kpiSubtext" id="kpiDataStatus">Loading...</div>
+    </a>
+    <a href="/models{{ token_qs }}" class="kpi-card kpi-card-clickable">
+      <div class="kpiLabel">Trained Models</div>
+      <div class="kpiValue" id="kpiModels">--</div>
+      <div class="kpiSubtext" id="kpiModelsStatus">Loading...</div>
+    </a>
+    <a href="/trading{{ token_qs }}" class="kpi-card kpi-card-clickable">
+      <div class="kpiLabel">Trading</div>
+      <div class="kpiValue" id="kpiTrading">Idle</div>
+      <div class="kpiSubtext" id="kpiTradingStatus">No active runs</div>
+    </a>
+  </div>
+
+  <!-- Pipeline Status -->
+  <div class="card">
+    <div class="section-header mb-2">
+      <h3 class="mb-0">Pipeline Status</h3>
+      <div class="muted text-sm">Data flow for primary symbol</div>
+    </div>
+    <div class="pipeline-flow" id="pipelineFlow">
+      <div class="pipeline-step" id="stepIngest">
+        <div class="pipeline-step-icon">1</div>
+        <div class="pipeline-step-label">Ingest</div>
+        <div class="pipeline-step-status">--</div>
+      </div>
+      <div class="pipeline-arrow"></div>
+      <div class="pipeline-step" id="stepSync">
+        <div class="pipeline-step-icon">2</div>
+        <div class="pipeline-step-label">QuestDB</div>
+        <div class="pipeline-step-status">--</div>
+      </div>
+      <div class="pipeline-arrow"></div>
+      <div class="pipeline-step" id="stepSchedule">
+        <div class="pipeline-step-icon">3</div>
+        <div class="pipeline-step-label">Schedule</div>
+        <div class="pipeline-step-status">--</div>
+      </div>
+      <div class="pipeline-arrow"></div>
+      <div class="pipeline-step" id="stepMainL5">
+        <div class="pipeline-step-icon">4</div>
+        <div class="pipeline-step-label">main_l5</div>
+        <div class="pipeline-step-status">--</div>
+      </div>
+      <div class="pipeline-arrow"></div>
+      <div class="pipeline-step" id="stepBuild">
+        <div class="pipeline-step-icon">5</div>
+        <div class="pipeline-step-label">Features</div>
+        <div class="pipeline-step-status">--</div>
+      </div>
+      <div class="pipeline-arrow"></div>
+      <div class="pipeline-step" id="stepTrain">
+        <div class="pipeline-step-icon">6</div>
+        <div class="pipeline-step-label">Train</div>
+        <div class="pipeline-step-status">--</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Quick Actions -->
+  <div class="card">
+    <h3 class="mb-3">Quick Actions</h3>
+    <div class="grid4">
+      <form method="post" action="/ops/db/serve_sync_variety{{ token_qs }}">
+        <input type="hidden" name="exchange" value="SHFE"/>
+        <input type="hidden" name="variety" value="cu"/>
+        <input type="hidden" name="data_dir" value="data"/>
+        <input type="hidden" name="runs_dir" value="runs"/>
+        <button type="submit" class="btn btn-secondary" style="width:100%;">Sync cu to QuestDB</button>
+      </form>
+      <form method="post" action="/ops/build/main_schedule{{ token_qs }}">
+        <input type="hidden" name="variety" value="cu"/>
+        <input type="hidden" name="start_date" value="{{ default_schedule_start }}"/>
+        <input type="hidden" name="end_date" value="{{ default_schedule_end }}"/>
+        <input type="hidden" name="threshold" value="1.1"/>
+        <input type="hidden" name="data_dir" value="data"/>
+        <button type="submit" class="btn btn-secondary" style="width:100%;">Build Schedule (cu)</button>
+      </form>
+      <form method="post" action="/ops/build/main_l5{{ token_qs }}">
+        <input type="hidden" name="variety" value="cu"/>
+        <input type="hidden" name="derived_symbol" value="KQ.m@SHFE.cu"/>
+        <input type="hidden" name="data_dir" value="data"/>
+        <input type="hidden" name="overwrite" value="false"/>
+        <button type="submit" class="btn btn-secondary" style="width:100%;">Build main_l5 (cu)</button>
+      </form>
+      <form method="post" action="/ops/build/build{{ token_qs }}">
+        <input type="hidden" name="symbol" value="KQ.m@SHFE.cu"/>
+        <input type="hidden" name="horizons" value="10,50,200"/>
+        <input type="hidden" name="threshold_k" value="1"/>
+        <input type="hidden" name="ticks_lake" value="main_l5"/>
+        <input type="hidden" name="overwrite" value="false"/>
+        <input type="hidden" name="data_dir" value="data"/>
+        <button type="submit" class="btn btn-secondary" style="width:100%;">Build Features</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Active Jobs -->
+  <div class="split-pane">
+    <div class="card">
+      <div class="section-header">
+        <h3 class="mb-0">Running Jobs</h3>
+        <a href="/jobs{{ token_qs }}" class="text-sm">View all</a>
+      </div>
+      {% set running_jobs = jobs | selectattr("status", "equalto", "running") | list %}
+      {% if running_jobs and running_jobs|length > 0 %}
+        <div class="tableWrap">
+          <table class="table table-compact">
+            <thead>
+              <tr>
+                <th>Title</th>
+                <th>Started</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for j in running_jobs[:5] %}
+              <tr>
+                <td class="truncate" style="max-width:200px;" title="{{ j.title }}">{{ j.title }}</td>
+                <td class="mono">{{ j.started_at or "" }}</td>
+                <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% if running_jobs|length > 5 %}
+          <div class="muted text-sm" style="margin-top:8px;">+ {{ running_jobs|length - 5 }} more</div>
+        {% endif %}
+      {% else %}
+        <div class="empty-state" style="padding:20px;">
+          <div class="empty-state-text">No jobs currently running</div>
+        </div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <div class="section-header">
+        <h3 class="mb-0">Recent Jobs</h3>
+        <a href="/jobs{{ token_qs }}" class="text-sm">View all</a>
+      </div>
+      {% if jobs and jobs|length > 0 %}
+        <div class="tableWrap">
+          <table class="table table-compact">
+            <thead>
+              <tr>
+                <th>Title</th>
+                <th>Status</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for j in jobs[:8] %}
+              <tr>
+                <td class="truncate" style="max-width:200px;" title="{{ j.title }}">{{ j.title }}</td>
+                <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
+                <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state" style="padding:20px;">
+          <div class="empty-state-text">No recent jobs</div>
+        </div>
+      {% endif %}
+    </div>
   </div>
 {% endblock %}
 
+{% block scripts %}
+<script>
+(function() {
+  const tokenQs = "{{ token_qs }}";
+  
+  async function refreshSystemStatus() {
+    try {
+      const resp = await window.ghTrader.fetchApi("/api/system?include_dir_sizes=false&refresh=none");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      
+      // CPU
+      const cpuEl = document.getElementById("statusCPUIndicator");
+      if (cpuEl && data.cpu_mem) {
+        const cpu = data.cpu_mem.cpu_percent;
+        const cpuDot = cpuEl.querySelector(".status-dot");
+        if (cpu !== null && cpu !== undefined) {
+          cpuEl.querySelector("span:last-child").textContent = "CPU: " + cpu.toFixed(0) + "%";
+          cpuDot.className = "status-dot " + (cpu > 95 ? "status-dot-error" : cpu > 80 ? "status-dot-warn" : "status-dot-ok");
+        }
+      }
+      
+      // Memory
+      const memEl = document.getElementById("statusMemIndicator");
+      if (memEl && data.cpu_mem) {
+        const mem = data.cpu_mem.mem_percent;
+        const memDot = memEl.querySelector(".status-dot");
+        if (mem !== null && mem !== undefined) {
+          memEl.querySelector("span:last-child").textContent = "Mem: " + mem.toFixed(0) + "%";
+          memDot.className = "status-dot " + (mem > 95 ? "status-dot-error" : mem > 85 ? "status-dot-warn" : "status-dot-ok");
+        }
+      }
+      
+      // GPU
+      const gpuEl = document.getElementById("statusGPUIndicator");
+      if (gpuEl && data.gpu) {
+        const gpuDot = gpuEl.querySelector(".status-dot");
+        const status = data.gpu.status;
+        gpuEl.querySelector("span:last-child").textContent = "GPU: " + (status || "unknown");
+        gpuDot.className = "status-dot " + (
+          status === "ready" ? "status-dot-ok" :
+          status === "running" ? "status-dot-warn" : "status-dot-idle"
+        );
+      }
+    } catch (e) {
+      // Silently ignore
+    }
+  }
+  
+  async function refreshDashboardSummary() {
+    try {
+      const resp = await window.ghTrader.fetchApi("/api/dashboard/summary");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      
+      // QuestDB status
+      const qdbEl = document.getElementById("statusQuestDBIndicator");
+      if (qdbEl) {
+        const qdbDot = qdbEl.querySelector(".status-dot");
+        if (data.questdb_ok) {
+          qdbEl.querySelector("span:last-child").textContent = "QuestDB: connected";
+          qdbDot.className = "status-dot status-dot-ok";
+          qdbEl.className = "status-indicator status-indicator-ok";
+        } else {
+          qdbEl.querySelector("span:last-child").textContent = "QuestDB: offline";
+          qdbDot.className = "status-dot status-dot-error";
+          qdbEl.className = "status-indicator status-indicator-error";
+        }
+      }
+      
+      // Jobs
+      if (data.running_count !== undefined) {
+        document.getElementById("kpiRunning").textContent = data.running_count;
+      }
+      if (data.queued_count !== undefined) {
+        document.getElementById("kpiQueued").textContent = data.queued_count;
+      }
+      
+      // Data symbols
+      if (data.data_symbols !== undefined) {
+        document.getElementById("kpiSymbols").textContent = data.data_symbols;
+        document.getElementById("kpiDataStatus").textContent = data.data_status || "";
+      }
+      
+      // Models
+      if (data.model_count !== undefined) {
+        document.getElementById("kpiModels").textContent = data.model_count;
+        document.getElementById("kpiModelsStatus").textContent = data.model_status || "";
+      }
+      
+      // Trading
+      if (data.trading_status) {
+        document.getElementById("kpiTrading").textContent = data.trading_mode || "Idle";
+        document.getElementById("kpiTradingStatus").textContent = data.trading_status || "";
+      }
+      
+      // Pipeline status
+      updatePipelineStep("stepIngest", data.pipeline?.ingest);
+      updatePipelineStep("stepSync", data.pipeline?.sync);
+      updatePipelineStep("stepSchedule", data.pipeline?.schedule);
+      updatePipelineStep("stepMainL5", data.pipeline?.main_l5);
+      updatePipelineStep("stepBuild", data.pipeline?.build);
+      updatePipelineStep("stepTrain", data.pipeline?.train);
+
+      renderDashboardAlerts(data);
+      
+    } catch (e) {
+      // API may not exist yet, that's okay
+    }
+  }
+  
+  function updatePipelineStep(stepId, status) {
+    const el = document.getElementById(stepId);
+    if (!el || !status) return;
+    
+    const statusText = el.querySelector(".pipeline-step-status");
+    if (statusText) statusText.textContent = status.text || "--";
+    
+    el.className = "pipeline-step";
+    if (status.state === "ok") el.classList.add("pipeline-step-ok");
+    else if (status.state === "warn") el.classList.add("pipeline-step-warn");
+    else if (status.state === "error") el.classList.add("pipeline-step-error");
+  }
+
+  function _bannerHtml(kind, title, text, ctaHref, ctaText) {
+    const klass = kind === "error" ? "alert-error" : (kind === "warn" ? "alert-warn" : "alert-info");
+    const cta = ctaHref ? `<div style="margin-top:6px;"><a class="btn btn-secondary btn-sm" href="${ctaHref}">${ctaText || "Open"}</a></div>` : "";
+    return `
+      <div class="alert-banner ${klass}">
+        <div class="alert-banner-content">
+          <div class="alert-banner-title">${title}</div>
+          <div>${text}</div>
+          ${cta}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderDashboardAlerts(data) {
+    const el = document.getElementById("dashboardAlerts");
+    if (!el) return;
+    const pipe = data.pipeline || {};
+    const alerts = [];
+    if (data.questdb_ok === false) {
+      alerts.push(_bannerHtml("error", "QuestDB is offline", "DB-backed pages will be degraded. Check the QuestDB container/service and credentials.", `/ops${tokenQs}`, "Open Ops"));
+    }
+    if (pipe.schedule && pipe.schedule.state !== "ok") {
+      alerts.push(_bannerHtml("warn", "Main schedule is missing", "Build the main-contract schedule before running main_l5 / features.", `/ops${tokenQs}#build`, "Build Schedule"));
+    }
+    if (pipe.main_l5 && pipe.main_l5.state !== "ok") {
+      alerts.push(_bannerHtml("warn", "main_l5 ticks are missing", "Build the derived main_l5 ticks before feature engineering.", `/ops${tokenQs}#build`, "Build main_l5"));
+    }
+    if (pipe.build && pipe.build.state !== "ok") {
+      alerts.push(_bannerHtml("warn", "Features / labels are missing", "Build features/labels before training models.", `/ops${tokenQs}#build`, "Build Features"));
+    }
+    el.innerHTML = alerts.join("");
+  }
+
+  function setupPipelineNavigation() {
+    const map = {
+      stepIngest: `/ops${tokenQs}#ingest`,
+      stepSync: `/data${tokenQs}#sync`,
+      stepSchedule: `/ops${tokenQs}#build`,
+      stepMainL5: `/ops${tokenQs}#build`,
+      stepBuild: `/ops${tokenQs}#build`,
+      stepTrain: `/models${tokenQs}#train`
+    };
+    Object.entries(map).forEach(([id, href]) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.style.cursor = "pointer";
+      el.addEventListener("click", () => { window.location.href = href; });
+      el.addEventListener("keypress", (e) => {
+        if (e.key === "Enter" || e.key === " ") window.location.href = href;
+      });
+      el.setAttribute("role", "link");
+      el.setAttribute("tabindex", "0");
+      el.setAttribute("title", "Open");
+    });
+  }
+  
+  // Refresh button
+  document.getElementById("refreshDashboard").addEventListener("click", function() {
+    refreshSystemStatus();
+    refreshDashboardSummary();
+    window.ghTrader.toast("Dashboard refreshed", "info");
+  });
+  
+  // Initial load
+  setupPipelineNavigation();
+  refreshSystemStatus();
+  refreshDashboardSummary();
+  
+  // Auto-refresh
+  setInterval(refreshSystemStatus, 10000);
+  setInterval(refreshDashboardSummary, 15000);
+})();
+</script>
+{% endblock %}

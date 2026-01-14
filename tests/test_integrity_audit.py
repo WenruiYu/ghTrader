@@ -18,7 +18,7 @@ from ghtrader.main_depth import materialize_main_with_depth
 def test_ticks_write_has_sha_and_manifest(synthetic_lake):
     data_dir, symbol, dates = synthetic_lake
     d0 = dates[0]
-    part_dir = data_dir / "lake" / "ticks" / f"symbol={symbol}" / f"date={d0.isoformat()}"
+    part_dir = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / f"date={d0.isoformat()}"
     parquet_files = list(part_dir.glob("*.parquet"))
     assert parquet_files, "expected parquet partition file"
     assert (part_dir / "_manifest.json").exists()
@@ -40,7 +40,7 @@ def test_audit_passes_on_clean_synthetic_lake(synthetic_lake, tmp_path: Path):
 def test_audit_fails_on_tampered_checksum(synthetic_lake, tmp_path: Path):
     data_dir, symbol, dates = synthetic_lake
     d0 = dates[0]
-    part_dir = data_dir / "lake" / "ticks" / f"symbol={symbol}" / f"date={d0.isoformat()}"
+    part_dir = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / f"date={d0.isoformat()}"
     p = sorted(part_dir.glob("*.parquet"))[0]
     sidecar = p.with_suffix(p.suffix + ".sha256")
     sidecar.write_text("deadbeef\n", encoding="utf-8")
@@ -62,12 +62,13 @@ def test_audit_detects_derived_vs_raw_mismatch(synthetic_lake_two_symbols, tmp_p
     materialize_main_with_depth(derived_symbol=derived, schedule_path=schedule_path, data_dir=data_dir, overwrite=True)
 
     # Tamper one derived parquet value but keep checksum consistent
-    der_dir = data_dir / "lake" / "main_l5" / "ticks" / f"symbol={derived}" / f"date={d0.isoformat()}"
+    der_dir = data_dir / "lake_v2" / "main_l5" / "ticks" / f"symbol={derived}" / f"date={d0.isoformat()}"
     p_der = sorted(der_dir.glob("*.parquet"))[0]
-    t = pq.read_table(p_der, schema=TICK_ARROW_SCHEMA)
+    # Read a single parquet file (avoid dataset schema-merge issues with dictionary encoding).
+    t = pq.ParquetFile(p_der).read()  # keep full schema (includes v2 metadata columns)
     df = t.to_pandas()
     df.loc[df.index[0], "last_price"] = float(df.loc[df.index[0], "last_price"]) + 1.0
-    t2 = pa.Table.from_pandas(df[TICK_ARROW_SCHEMA.names], schema=TICK_ARROW_SCHEMA, preserve_index=False)
+    t2 = pa.Table.from_pandas(df, schema=t.schema, preserve_index=False)
     pq.write_table(t2, p_der, compression="zstd")
     write_sha256_sidecar(p_der)
 

@@ -14,9 +14,7 @@ def _write_schedule(path: Path, rows: list[dict]) -> None:
     pd.DataFrame(rows).to_parquet(path, index=False)
 
 
-def test_resolve_trading_symbol_falls_back_to_lake_v2_schedule_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GHTRADER_LAKE_VERSION", "v2")
-
+def test_resolve_trading_symbol_falls_back_to_lake_v2_schedule_copy(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     alias = "KQ.m@SHFE.cu"
     p_v2 = data_dir / "lake_v2" / "main_l5" / "ticks" / f"symbol={alias}" / "schedule.parquet"
@@ -33,7 +31,7 @@ def test_resolve_trading_symbol_falls_back_to_lake_v2_schedule_copy(tmp_path: Pa
     assert resolved == "SHFE.cu2502"
 
 
-def test_resolve_trading_symbol_prefers_selected_lake_version_when_both_exist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_trading_symbol_prefers_v2_when_both_schedule_copies_exist(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     alias = "KQ.m@SHFE.cu"
     p_v1 = data_dir / "lake" / "main_l5" / "ticks" / f"symbol={alias}" / "schedule.parquet"
@@ -42,9 +40,5 @@ def test_resolve_trading_symbol_prefers_selected_lake_version_when_both_exist(tm
     _write_schedule(p_v1, rows=[{"date": date(2025, 1, 1), "main_contract": "SHFE.cu2501"}])
     _write_schedule(p_v2, rows=[{"date": date(2025, 1, 1), "main_contract": "SHFE.cu9999"}])
 
-    monkeypatch.setenv("GHTRADER_LAKE_VERSION", "v2")
     assert resolve_trading_symbol(symbol=alias, data_dir=data_dir, trading_day=date(2025, 1, 1)) == "SHFE.cu9999"
-
-    monkeypatch.setenv("GHTRADER_LAKE_VERSION", "v1")
-    assert resolve_trading_symbol(symbol=alias, data_dir=data_dir, trading_day=date(2025, 1, 1)) == "SHFE.cu2501"
 

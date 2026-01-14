@@ -35,7 +35,7 @@ def test_contract_status_completeness_includes_no_data(tmp_path: Path):
     data_dir = tmp_path / "data"
     runs_dir = tmp_path / "runs"
 
-    sym_dir = data_dir / "lake" / "ticks" / "symbol=SHFE.cu2001"
+    sym_dir = data_dir / "lake_v2" / "ticks" / "symbol=SHFE.cu2001"
     (sym_dir / "date=2020-01-06").mkdir(parents=True, exist_ok=True)
     (sym_dir / "date=2020-01-07").mkdir(parents=True, exist_ok=True)
     (sym_dir / "date=2020-01-10").mkdir(parents=True, exist_ok=True)
@@ -44,7 +44,7 @@ def test_contract_status_completeness_includes_no_data(tmp_path: Path):
     res = compute_contract_statuses(
         exchange="SHFE",
         var="cu",
-        lake_version="v1",
+        lake_version="v2",
         data_dir=data_dir,
         runs_dir=runs_dir,
         contracts=[{"symbol": "SHFE.cu2001", "expired": True, "expire_datetime": None}],
@@ -57,6 +57,39 @@ def test_contract_status_completeness_includes_no_data(tmp_path: Path):
     assert row["days_expected"] == 5  # weekday fallback
     assert row["days_done"] == 4  # 3 downloaded + 1 no-data marker
     assert abs(float(row["pct"]) - 0.8) < 1e-9
+    assert row["status"] == "incomplete"
+
+
+def test_contract_status_prefers_questdb_bounds_for_expected_range(tmp_path: Path):
+    from ghtrader.control.contract_status import compute_contract_statuses
+
+    data_dir = tmp_path / "data"
+    runs_dir = tmp_path / "runs"
+
+    # Local has only 2 days.
+    sym_dir = data_dir / "lake_v2" / "ticks" / "symbol=SHFE.cu2001"
+    (sym_dir / "date=2020-01-06").mkdir(parents=True, exist_ok=True)
+    (sym_dir / "date=2020-01-07").mkdir(parents=True, exist_ok=True)
+
+    # QuestDB says contract spans a longer range (5 weekdays).
+    cov = {"SHFE.cu2001": {"first_tick_day": "2020-01-06", "last_tick_day": "2020-01-10"}}
+
+    res = compute_contract_statuses(
+        exchange="SHFE",
+        var="cu",
+        lake_version="v2",
+        data_dir=data_dir,
+        runs_dir=runs_dir,
+        contracts=[{"symbol": "SHFE.cu2001", "expired": True, "expire_datetime": None}],
+        refresh_l5=False,
+        max_l5_scan_per_symbol=0,
+        questdb_cov_by_symbol=cov,
+    )
+    row = res["contracts"][0]
+    assert row["expected_first"] == "2020-01-06"
+    assert row["expected_last"] == "2020-01-10"
+    assert row["days_expected"] == 5
+    assert row["days_done"] == 2
     assert row["status"] == "incomplete"
 
 

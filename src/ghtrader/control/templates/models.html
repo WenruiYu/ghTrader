@@ -1,0 +1,504 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="section-header">
+    <h2>Models</h2>
+    <div class="section-header-actions">
+      <button class="btn btn-sm btn-secondary" id="refreshModels">Refresh</button>
+    </div>
+  </div>
+
+  <!-- Tab Navigation -->
+  <div class="tab-nav">
+    <button class="tab-nav-item active" data-tab="inventory">
+      Inventory
+      <span class="badge" id="modelCountBadge">--</span>
+    </button>
+    <button class="tab-nav-item" data-tab="train">Train</button>
+    <button class="tab-nav-item" data-tab="benchmarks">Benchmarks</button>
+  </div>
+
+  <!-- Tab: Inventory -->
+  <div class="tab-content active" id="tab-inventory">
+    <div class="kpi-grid mb-3">
+      <div class="kpi-card">
+        <div class="kpiLabel">Total Models</div>
+        <div class="kpiValue" id="kpiTotalModels">--</div>
+        <div class="kpiSubtext">Trained artifacts</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpiLabel">Model Types</div>
+        <div class="kpiValue" id="kpiModelTypes">--</div>
+        <div class="kpiSubtext" id="kpiModelTypesList">Loading...</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpiLabel">Symbols</div>
+        <div class="kpiValue" id="kpiSymbols">--</div>
+        <div class="kpiSubtext" id="kpiSymbolsList">Loading...</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpiLabel">Last Trained</div>
+        <div class="kpiValue mono" style="font-size:18px;" id="kpiLastTrained">--</div>
+        <div class="kpiSubtext" id="kpiLastTrainedModel">--</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-header mb-2">
+        <h3 class="mb-0">Model Artifacts</h3>
+        <div class="flex gap-2">
+          <input type="text" id="modelSearch" placeholder="Search models..." style="width:200px; padding:6px 10px; margin:0;"/>
+          <select id="modelTypeFilter" style="width:auto; padding:6px 10px; margin:0;">
+            <option value="all">All types</option>
+            <option value="xgboost">xgboost</option>
+            <option value="lightgbm">lightgbm</option>
+            <option value="logistic">logistic</option>
+            <option value="deeplob">deeplob</option>
+            <option value="transformer">transformer</option>
+            <option value="tcn">tcn</option>
+            <option value="tlob">tlob</option>
+            <option value="ssm">ssm</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="tableWrap">
+        <table class="table table-compact" id="modelsTable">
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>Symbol</th>
+              <th>Horizon</th>
+              <th>Type</th>
+              <th>Created</th>
+              <th>Size</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="modelsTbody">
+            <tr><td colspan="7" class="muted">Loading models...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab: Train -->
+  <div class="tab-content" id="tab-train">
+    <div class="split-pane-2-1">
+      <div class="card">
+        <h3 class="mb-2">Train New Model</h3>
+        <form class="form" method="post" action="/ops/model/train{{ token_qs }}">
+          <div class="grid3">
+            <div>
+              <label>Model type</label>
+              <select name="model">
+                <option value="xgboost" selected>xgboost</option>
+                <option value="lightgbm">lightgbm</option>
+                <option value="logistic">logistic</option>
+                <option value="deeplob">deeplob</option>
+                <option value="transformer">transformer</option>
+                <option value="tcn">tcn</option>
+                <option value="tlob">tlob</option>
+                <option value="ssm">ssm</option>
+              </select>
+            </div>
+            <div>
+              <label>Symbol</label>
+              <input name="symbol" placeholder="KQ.m@SHFE.cu" value="KQ.m@SHFE.cu"/>
+            </div>
+            <div>
+              <label>Horizon</label>
+              <select name="horizon">
+                <option value="10">10 ticks</option>
+                <option value="50" selected>50 ticks</option>
+                <option value="200">200 ticks</option>
+              </select>
+            </div>
+          </div>
+          
+          <h4>Training Parameters</h4>
+          <div class="grid3">
+            <div><label>Epochs</label><input name="epochs" type="number" value="50"/></div>
+            <div><label>Batch size</label><input name="batch_size" type="number" value="256"/></div>
+            <div><label>Sequence length</label><input name="seq_len" type="number" value="100"/></div>
+          </div>
+          <div class="grid3">
+            <div><label>Learning rate</label><input name="lr" value="0.001"/></div>
+            <div><label>GPUs</label><input name="gpus" type="number" value="1" min="1" max="4"/></div>
+            <div>
+              <label>DDP (multi-GPU)</label>
+              <select name="ddp"><option value="true" selected>true</option><option value="false">false</option></select>
+            </div>
+          </div>
+          
+          <h4>Paths</h4>
+          <div class="grid2">
+            <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+            <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
+          </div>
+          
+          <button type="submit">Start Training</button>
+        </form>
+      </div>
+
+      <div>
+        <div class="card">
+          <h3 class="mb-2">Active Training Jobs</h3>
+          <div id="trainingJobsList">
+            <div class="muted">Loading...</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3 class="mb-2">Hyperparameter Sweep</h3>
+          <form class="form" method="post" action="/ops/model/sweep{{ token_qs }}">
+            <div class="grid2">
+              <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu" value="KQ.m@SHFE.cu"/></div>
+              <div><label>Model</label><input name="model" value="deeplob"/></div>
+            </div>
+            <div class="grid3">
+              <div><label>N trials</label><input name="n_trials" type="number" value="20"/></div>
+              <div><label>N CPUs</label><input name="n_cpus" type="number" value="8"/></div>
+              <div><label>N GPUs</label><input name="n_gpus" type="number" value="1"/></div>
+            </div>
+            <div class="grid3">
+              <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+              <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
+              <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
+            </div>
+            <button type="submit">Start Sweep</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab: Benchmarks -->
+  <div class="tab-content" id="tab-benchmarks">
+    <div class="split-pane-2-1">
+      <div>
+        <div class="card">
+          <h3 class="mb-2">Run Benchmark</h3>
+          <form class="form" method="post" action="/ops/eval/benchmark{{ token_qs }}">
+            <div class="grid3">
+              <div>
+                <label>Model</label>
+                <select name="model">
+                  <option value="xgboost" selected>xgboost</option>
+                  <option value="lightgbm">lightgbm</option>
+                  <option value="logistic">logistic</option>
+                  <option value="deeplob">deeplob</option>
+                  <option value="transformer">transformer</option>
+                  <option value="tcn">tcn</option>
+                </select>
+              </div>
+              <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu" value="KQ.m@SHFE.cu"/></div>
+              <div>
+                <label>Horizon</label>
+                <select name="horizon">
+                  <option value="10">10</option>
+                  <option value="50" selected>50</option>
+                  <option value="200">200</option>
+                </select>
+              </div>
+            </div>
+            <div class="grid3">
+              <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+              <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
+              <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
+            </div>
+            <button type="submit">Run Benchmark</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h3 class="mb-2">Compare Models</h3>
+          <form class="form" method="post" action="/ops/eval/compare{{ token_qs }}">
+            <div class="grid2">
+              <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu" value="KQ.m@SHFE.cu"/></div>
+              <div><label>Models (comma-separated)</label><input name="models" value="logistic,xgboost,deeplob"/></div>
+            </div>
+            <div class="grid3">
+              <div><label>Horizon</label><input name="horizon" value="50"/></div>
+              <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+              <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
+            </div>
+            <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
+            <button type="submit">Run Comparison</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h3 class="mb-2">Recent Benchmark Results</h3>
+          <div class="tableWrap">
+            <table class="table table-compact" id="benchmarkResultsTable">
+              <thead>
+                <tr>
+                  <th>Run ID</th>
+                  <th>Model</th>
+                  <th>Symbol</th>
+                  <th>Accuracy</th>
+                  <th>F1</th>
+                  <th>Date</th>
+                  <th>Path</th>
+                </tr>
+              </thead>
+              <tbody id="benchmarkResultsTbody">
+                <tr><td colspan="7" class="muted">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card">
+          <h3 class="mb-2">Backtest</h3>
+          <form class="form" method="post" action="/ops/eval/backtest{{ token_qs }}">
+            <div class="grid2">
+              <div><label>Model</label><input name="model" value="xgboost"/></div>
+              <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu"/></div>
+            </div>
+            <div class="grid2">
+              <div><label>Start date</label><input name="start_date" type="date"/></div>
+              <div><label>End date</label><input name="end_date" type="date"/></div>
+            </div>
+            <div class="grid3">
+              <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+              <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
+              <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
+            </div>
+            <button type="submit">Run Backtest</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h3 class="mb-2">Daily Train</h3>
+          <form class="form" method="post" action="/ops/eval/daily_train{{ token_qs }}">
+            <div><label>Symbols (comma-separated)</label><input name="symbols" placeholder="KQ.m@SHFE.cu"/></div>
+            <div class="grid3">
+              <div><label>Model</label><input name="model" value="deeplob"/></div>
+              <div><label>Horizon</label><input name="horizon" value="50"/></div>
+              <div><label>Lookback days</label><input name="lookback_days" value="30"/></div>
+            </div>
+            <div class="grid3">
+              <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+              <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
+              <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
+            </div>
+            <button type="submit">Run Daily Train</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+  window.ghTrader.initTabs({ updateHash: true });
+
+  let allModels = [];
+
+  async function loadModels() {
+    try {
+      const resp = await window.ghTrader.fetchApi("/api/models/inventory");
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        throw new Error(data.detail || "Failed to load models");
+      }
+      const data = await resp.json();
+      if (data && data.ok === false) {
+        throw new Error(data.error || "Failed to load models");
+      }
+      allModels = data.models || [];
+      
+      // Update KPIs
+      document.getElementById("modelCountBadge").textContent = allModels.length;
+      document.getElementById("kpiTotalModels").textContent = allModels.length;
+      
+      const types = [...new Set(allModels.map(m => m.model_type))];
+      document.getElementById("kpiModelTypes").textContent = types.length;
+      document.getElementById("kpiModelTypesList").textContent = types.slice(0, 3).join(", ") + (types.length > 3 ? "..." : "");
+      
+      const symbols = [...new Set(allModels.map(m => m.symbol))];
+      document.getElementById("kpiSymbols").textContent = symbols.length;
+      document.getElementById("kpiSymbolsList").textContent = symbols.slice(0, 2).join(", ") + (symbols.length > 2 ? "..." : "");
+      
+      if (allModels.length > 0) {
+        const sorted = [...allModels].sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+        const latest = sorted[0];
+        document.getElementById("kpiLastTrained").textContent = latest.created_at ? latest.created_at.split("T")[0] : "--";
+        document.getElementById("kpiLastTrainedModel").textContent = (latest.model_type || "") + " / " + (latest.symbol || "") + " h" + (latest.horizon || "");
+      }
+      
+      renderModels();
+    } catch (e) {
+      document.getElementById("modelsTbody").innerHTML = '<tr><td colspan="7" class="muted">Error: ' + e.message + '</td></tr>';
+    }
+  }
+
+  function renderModels() {
+    const search = document.getElementById("modelSearch").value.toLowerCase();
+    const typeFilter = document.getElementById("modelTypeFilter").value;
+    
+    let filtered = allModels;
+    if (search) {
+      filtered = filtered.filter(m => 
+        (m.name || "").toLowerCase().includes(search) ||
+        (m.symbol || "").toLowerCase().includes(search) ||
+        (m.model_type || "").toLowerCase().includes(search)
+      );
+    }
+    if (typeFilter !== "all") {
+      filtered = filtered.filter(m => m.model_type === typeFilter);
+    }
+    
+    if (filtered.length === 0) {
+      document.getElementById("modelsTbody").innerHTML = '<tr><td colspan="7" class="muted">No models found</td></tr>';
+      return;
+    }
+    
+    const rows = filtered.map(m => {
+      const actions = [
+        '<button class="btn-sm btn-secondary" data-action="benchmark" data-model="' + (m.model_type || "") + '" data-symbol="' + (m.symbol || "") + '" data-horizon="' + (m.horizon || "") + '">Benchmark</button>',
+      ].join(" ");
+      
+      return [
+        '<tr>',
+        '<td class="mono">' + (m.name || "--") + '</td>',
+        '<td class="mono">' + (m.symbol || "--") + '</td>',
+        '<td>' + (m.horizon || "--") + '</td>',
+        '<td><span class="pill">' + (m.model_type || "--") + '</span></td>',
+        '<td class="mono text-xs">' + (m.created_at ? m.created_at.split("T")[0] : "--") + '</td>',
+        '<td class="mono">' + (m.size_human || "--") + '</td>',
+        '<td>' + actions + '</td>',
+        '</tr>'
+      ].join("");
+    });
+    
+    document.getElementById("modelsTbody").innerHTML = rows.join("");
+  }
+
+  async function loadTrainingJobs() {
+    try {
+      const resp = await window.ghTrader.fetchApi("/api/jobs?limit=50");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const jobs = (data.jobs || []).filter(j => 
+        j.status === "running" && 
+        (j.title || "").toLowerCase().includes("train")
+      );
+      
+      const container = document.getElementById("trainingJobsList");
+      if (jobs.length === 0) {
+        container.innerHTML = '<div class="muted">No training jobs running</div>';
+        return;
+      }
+      
+      container.innerHTML = jobs.map(j => [
+        '<div class="metric-card" style="margin-bottom:8px;">',
+        '<div class="metric-content">',
+        '<div class="metric-label">' + j.title + '</div>',
+        '<div class="metric-value text-sm"><span class="pill pill-running">running</span></div>',
+        '</div>',
+        '<a href="/jobs/' + j.id + '{{ token_qs }}" class="btn-sm btn-secondary">View</a>',
+        '</div>'
+      ].join("")).join("");
+    } catch (e) {
+      // Ignore
+    }
+  }
+
+  async function loadBenchmarkResults() {
+    try {
+      const resp = await window.ghTrader.fetchApi("/api/models/benchmarks?limit=10");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data && data.ok === false) return;
+      const rows = (data.benchmarks || []).slice(0, 10);
+      
+      const tbody = document.getElementById("benchmarkResultsTbody");
+      if (rows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" class="muted">No benchmark results yet</td></tr>';
+        return;
+      }
+      
+      function fmtNum(x) {
+        const v = Number(x);
+        if (!Number.isFinite(v)) return "--";
+        return v.toFixed(3);
+      }
+
+      tbody.innerHTML = rows.map(r => [
+        '<tr>',
+        '<td class="mono text-xs">' + String(r.run_id || "").substring(0, 12) + '</td>',
+        '<td>' + (r.model_type || "--") + '</td>',
+        '<td class="mono">' + (r.symbol || "--") + '</td>',
+        '<td>' + fmtNum(r.accuracy) + '</td>',
+        '<td>' + fmtNum(r.f1_macro) + '</td>',
+        '<td class="mono text-xs">' + (String(r.created_at || "").split("T")[0] || "--") + '</td>',
+        '<td class="mono text-xs">' + (r.path || "--") + '</td>',
+        '</tr>'
+      ].join("")).join("");
+    } catch (e) {
+      // Ignore
+    }
+  }
+
+  function extractFromTitle(title, field) {
+    // Parse "benchmark xgboost KQ.m@SHFE.cu" format
+    const parts = (title || "").split(" ");
+    if (field === "model" && parts.length > 1) return parts[1];
+    if (field === "symbol" && parts.length > 2) return parts[2];
+    return "--";
+  }
+
+  const renderModelsDebounced = window.ghTrader.debounce(renderModels, 120);
+  document.getElementById("modelSearch").addEventListener("input", renderModelsDebounced);
+  document.getElementById("modelTypeFilter").addEventListener("change", renderModels);
+  document.getElementById("refreshModels").addEventListener("click", () => {
+    loadModels();
+    loadTrainingJobs();
+    loadBenchmarkResults();
+    window.ghTrader.toast("Models refreshed", "info");
+  });
+
+  document.getElementById("modelsTable").addEventListener("click", async (ev) => {
+    const t = ev.target;
+    if (!t || !t.dataset || !t.dataset.action) return;
+    const action = t.dataset.action;
+    const model = t.dataset.model;
+    const symbol = t.dataset.symbol;
+    const horizon = t.dataset.horizon;
+    
+    if (action === "benchmark" && model && symbol) {
+      // Navigate to benchmarks tab with prefilled values.
+      document.querySelector('[data-tab="benchmarks"]').click();
+      try {
+        const form = document.querySelector('#tab-benchmarks form[action^="/ops/eval/benchmark"]');
+        if (form) {
+          const mSel = form.querySelector('select[name="model"]');
+          const sIn = form.querySelector('input[name="symbol"]');
+          const hSel = form.querySelector('select[name="horizon"]');
+          if (mSel) mSel.value = model;
+          if (sIn) sIn.value = symbol;
+          if (hSel && horizon) hSel.value = String(horizon);
+          form.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      } catch (e) {}
+      window.ghTrader.toast("Benchmark form prefilled", "success");
+    }
+  });
+
+  // Initial load
+  loadModels();
+  loadTrainingJobs();
+  loadBenchmarkResults();
+  
+  // Auto-refresh training jobs
+  setInterval(loadTrainingJobs, 10000);
+})();
+</script>
+{% endblock %}

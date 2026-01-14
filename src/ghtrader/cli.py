@@ -128,19 +128,12 @@ def main(ctx: click.Context, verbose: bool) -> None:
     show_default=True,
     help="After download, sync written partitions into QuestDB (requires QuestDB running + questdb extras).",
 )
-@click.option(
-    "--lake-version",
-    default=None,
-    type=click.Choice(["v1", "v2"]),
-    help="Tick lake version to use (default: env GHTRADER_LAKE_VERSION or v1)",
-)
 @click.pass_context
 def download(ctx: click.Context, symbol: str, start: datetime, end: datetime,
-             data_dir: str, chunk_days: int, sync_questdb: bool, lake_version: str | None) -> None:
+             data_dir: str, chunk_days: int, sync_questdb: bool) -> None:
     """Download historical L5 ticks for a symbol and write to Parquet lake."""
     from ghtrader.tq_ingest import download_historical_ticks
     from ghtrader.config import (
-        get_lake_version,
         get_questdb_host,
         get_questdb_ilp_port,
         get_questdb_pg_dbname,
@@ -153,14 +146,13 @@ def download(ctx: click.Context, symbol: str, start: datetime, end: datetime,
     log = structlog.get_logger()
     _acquire_locks([f"ticks:symbol={symbol}"])
     log.info("download.start", symbol=symbol, start=start.date(), end=end.date())
-    lv = lake_version or get_lake_version()
+    lv = "v2"
     download_historical_ticks(
         symbol=symbol,
         start_date=start.date(),
         end_date=end.date(),
         data_dir=Path(data_dir),
         chunk_days=int(chunk_days),
-        lake_version=lv,  # type: ignore[arg-type]
     )
     if bool(sync_questdb):
         from ghtrader.serving_db import ServingDBConfig, make_serving_backend, sync_ticks_to_serving_db
@@ -213,12 +205,6 @@ def download(ctx: click.Context, symbol: str, start: datetime, end: datetime,
 @click.option("--end-date", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Backfill end date (YYYY-MM-DD). Default: today.")
 @click.option("--data-dir", default="data", help="Data directory root")
 @click.option("--chunk-days", default=5, type=int, help="Days per download chunk")
-@click.option(
-    "--lake-version",
-    default=None,
-    type=click.Choice(["v1", "v2"]),
-    help="Tick lake version to use (default: env GHTRADER_LAKE_VERSION or v1)",
-)
 @click.pass_context
 def download_contract_range(
     ctx: click.Context,
@@ -230,11 +216,9 @@ def download_contract_range(
     end_date: datetime | None,
     data_dir: str,
     chunk_days: int,
-    lake_version: str | None,
 ) -> None:
     """Exhaustively backfill L5 ticks for a YYMM contract range (no akshare)."""
     from ghtrader.tq_ingest import download_contract_range as _download_contract_range
-    from ghtrader.config import get_lake_version
 
     log = structlog.get_logger()
     _acquire_locks([f"ticks_range:exchange={exchange},var={variety.lower()}"])
@@ -258,13 +242,71 @@ def download_contract_range(
         chunk_days=chunk_days,
         start_date=start_date.date() if start_date else None,
         end_date=end_date.date() if end_date else None,
-        lake_version=(lake_version or get_lake_version()),  # type: ignore[arg-type]
+        lake_version="v2",
     )
     log.info("download_contract_range.done")
 
 
-    
+# ---------------------------------------------------------------------------
+# update (remote-aware daily forward fill)
+# ---------------------------------------------------------------------------
 
+
+@main.command("update")
+@click.option("--exchange", required=True, type=click.Choice(["SHFE"]), help="Exchange (currently SHFE only)")
+@click.option("--var", "variety", required=True, type=str, help="Variety code (e.g., cu, au, ag)")
+@click.option("--symbols", "-s", multiple=True, help="Optional symbol filter(s) (e.g., SHFE.cu2602)")
+@click.option(
+    "--recent-expired-days",
+    default=10,
+    type=int,
+    show_default=True,
+    help="Include contracts expired within last N trading days",
+)
+@click.option(
+    "--refresh-catalog/--no-refresh-catalog",
+    default=True,
+    show_default=True,
+    help="Refresh TqSdk contract catalog (network)",
+)
+@click.option("--data-dir", default="data", help="Data directory root")
+@click.option("--runs-dir", default="runs", help="Runs directory root")
+@click.option("--chunk-days", default=5, type=int, show_default=True, help="Days per download chunk")
+@click.pass_context
+def update(
+    ctx: click.Context,
+    exchange: str,
+    variety: str,
+    symbols: tuple[str, ...],
+    recent_expired_days: int,
+    refresh_catalog: bool,
+    data_dir: str,
+    runs_dir: str,
+    chunk_days: int,
+) -> None:
+    """Check remote contract updates and fill forward (active + recently expired)."""
+    import json
+
+    from ghtrader.update import run_update as _run_update
+
+    _ = ctx
+    log = structlog.get_logger()
+    _acquire_locks([f"ticks_range:exchange={exchange},var={variety.lower()}"])
+    log.info("update.start", exchange=exchange, var=variety, symbols=list(symbols), recent_expired_days=recent_expired_days)
+
+    out_path, report = _run_update(
+        exchange=exchange,
+        var=variety,
+        data_dir=Path(data_dir),
+        runs_dir=Path(runs_dir),
+        symbols=list(symbols) if symbols else None,
+        recent_expired_trading_days=int(recent_expired_days),
+        refresh_catalog=bool(refresh_catalog),
+        chunk_days=int(chunk_days),
+    )
+    click.echo(json.dumps({"ok": bool(report.get("ok", False)), "report_path": str(out_path), "run_id": str(report.get("run_id") or "")}))
+    if not bool(report.get("ok", False)):
+        raise SystemExit(1)
 
 # ---------------------------------------------------------------------------
 # probe-l5 (sample-based TqSdk L5 availability probe)
@@ -336,18 +378,11 @@ def probe_l5(ctx: click.Context, symbols: tuple[str, ...], data_dir: str, probe_
     show_default=True,
     help="On exit, sync recorded partitions into QuestDB (requires QuestDB running + questdb extras).",
 )
-@click.option(
-    "--lake-version",
-    default=None,
-    type=click.Choice(["v1", "v2"]),
-    help="Tick lake version to use (default: env GHTRADER_LAKE_VERSION or v1)",
-)
 @click.pass_context
-def record(ctx: click.Context, symbols: tuple[str, ...], data_dir: str, sync_questdb: bool, lake_version: str | None) -> None:
+def record(ctx: click.Context, symbols: tuple[str, ...], data_dir: str, sync_questdb: bool) -> None:
     """Run live tick recorder (subscribes and appends to Parquet lake)."""
     from ghtrader.tq_ingest import run_live_recorder
     from ghtrader.config import (
-        get_lake_version,
         get_questdb_host,
         get_questdb_ilp_port,
         get_questdb_pg_dbname,
@@ -360,7 +395,7 @@ def record(ctx: click.Context, symbols: tuple[str, ...], data_dir: str, sync_que
     log = structlog.get_logger()
     _acquire_locks([f"ticks:symbol={s}" for s in symbols])
     log.info("record.start", symbols=symbols)
-    lv = lake_version or get_lake_version()
+    lv = "v2"
     run_live_recorder(symbols=list(symbols), data_dir=Path(data_dir), lake_version=lv)  # type: ignore[arg-type]
     if bool(sync_questdb):
         from ghtrader.serving_db import ServingDBConfig, make_serving_backend, sync_ticks_to_serving_db
@@ -402,57 +437,6 @@ def record(ctx: click.Context, symbols: tuple[str, ...], data_dir: str, sync_que
 
 
 # ---------------------------------------------------------------------------
-# lake-convert-v1-to-v2 (offline repack into trading-day partitions)
-# ---------------------------------------------------------------------------
-
-@main.command("lake-convert-v1-to-v2")
-@click.option("--data-dir", default="data", help="Data directory root (reads lake_v1, writes lake_v2)")
-@click.option("--symbol", "-s", "symbols", multiple=True, help="Symbol(s) to convert (default: all symbols in lake_v1)")
-@click.option("--start", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Start date filter (YYYY-MM-DD)")
-@click.option("--end", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="End date filter (YYYY-MM-DD)")
-@click.option("--dry-run", is_flag=True, help="Scan and report what would be written, but do not write outputs")
-@click.option(
-    "--copy-no-data/--no-copy-no-data",
-    default=False,
-    show_default=True,
-    help="Copy _no_data_dates.json from lake_v1 to lake_v2 per symbol (best-effort; optional).",
-)
-@click.pass_context
-def lake_convert_v1_to_v2(
-    ctx: click.Context,
-    data_dir: str,
-    symbols: tuple[str, ...],
-    start: datetime | None,
-    end: datetime | None,
-    dry_run: bool,
-    copy_no_data: bool,
-) -> None:
-    """
-    Offline conversion: repack lake_v1 raw ticks into lake_v2 trading-day partitions.
-
-    This is a local I/O job (no network).
-    """
-    from ghtrader.lake_convert import convert_lake_v1_to_v2
-
-    log = structlog.get_logger()
-    lock_keys = ["lake_convert:v1_to_v2"]
-    if symbols:
-        # Optional additional exclusivity per symbol (prevents concurrent v2 writers that use ticks:symbol locks).
-        lock_keys += [f"ticks:symbol={s}" for s in symbols]
-    _acquire_locks(lock_keys)
-
-    stats = convert_lake_v1_to_v2(
-        data_dir=Path(data_dir),
-        symbols=list(symbols) if symbols else None,
-        start=start.date() if start else None,
-        end=end.date() if end else None,
-        dry_run=bool(dry_run),
-        copy_no_data=bool(copy_no_data),
-    )
-    log.info("lake_convert.done", **stats.__dict__)
-
-
-# ---------------------------------------------------------------------------
 # build
 # ---------------------------------------------------------------------------
 
@@ -474,19 +458,12 @@ def lake_convert_v1_to_v2(
     show_default=True,
     help="Overwrite existing features/labels outputs for this symbol (full rebuild). Default is incremental/resume.",
 )
-@click.option(
-    "--lake-version",
-    default=None,
-    type=click.Choice(["v1", "v2"]),
-    help="Tick lake version to use (default: env GHTRADER_LAKE_VERSION or v1)",
-)
 @click.pass_context
 def build(ctx: click.Context, symbol: str, data_dir: str, horizons: str,
-          threshold_k: int, ticks_lake: str, overwrite: bool, lake_version: str | None) -> None:
+          threshold_k: int, ticks_lake: str, overwrite: bool) -> None:
     """Build features and labels from Parquet lake."""
     from ghtrader.features import FactorEngine
     from ghtrader.labels import build_labels_for_symbol
-    from ghtrader.config import get_lake_version
 
     log = structlog.get_logger()
     if str(symbol).startswith("KQ.m@") and str(ticks_lake) != "main_l5":
@@ -514,7 +491,6 @@ def build(ctx: click.Context, symbol: str, data_dir: str, horizons: str,
         threshold_k=threshold_k,
         ticks_lake=ticks_lake,  # type: ignore[arg-type]
         overwrite=overwrite,
-        lake_version=(lake_version or get_lake_version()),  # type: ignore[arg-type]
     )
 
     # Build features
@@ -524,7 +500,6 @@ def build(ctx: click.Context, symbol: str, data_dir: str, horizons: str,
         data_dir=Path(data_dir),
         ticks_lake=ticks_lake,  # type: ignore[arg-type]
         overwrite=overwrite,
-        lake_version=(lake_version or get_lake_version()),  # type: ignore[arg-type]
     )
 
     log.info("build.done", symbol=symbol)
@@ -1049,13 +1024,6 @@ def main_schedule(
 @click.option("--schedule-path", default="", type=str, help="Path to schedule.parquet (default: data/rolls/.../schedule.parquet)")
 @click.option("--data-dir", default="data", help="Data directory root")
 @click.option("--overwrite/--no-overwrite", default=False, show_default=True, help="Overwrite existing derived dataset")
-@click.option(
-    "--lake-version",
-    default="v2",
-    type=click.Choice(["v1", "v2"]),
-    show_default=True,
-    help="Which lake root to write (v1=data/lake, v2=data/lake_v2).",
-)
 @click.pass_context
 def main_l5(
     ctx: click.Context,
@@ -1064,7 +1032,6 @@ def main_l5(
     schedule_path: str,
     data_dir: str,
     overwrite: bool,
-    lake_version: str,
 ) -> None:
     """Build derived main_l5 ticks for the L5 era only (QuestDB-backed detection)."""
     from ghtrader.main_l5 import build_main_l5_l5_era_only
@@ -1079,7 +1046,7 @@ def main_l5(
         schedule_path=(Path(schedule_path) if str(schedule_path).strip() else None),
         data_dir=Path(data_dir),
         overwrite=bool(overwrite),
-        lake_version=lake_version,
+        lake_version="v2",
     )
     log.info(
         "main_l5.done",
@@ -1098,12 +1065,6 @@ def main_l5(
 @click.option("--schedule-path", required=True, type=str, help="Path to schedule.parquet")
 @click.option("--data-dir", default="data", help="Data directory root")
 @click.option("--overwrite/--no-overwrite", default=False, show_default=True, help="Overwrite existing derived dataset")
-@click.option(
-    "--lake-version",
-    default=None,
-    type=click.Choice(["v1", "v2"]),
-    help="Tick lake version to use (default: env GHTRADER_LAKE_VERSION or v1)",
-)
 @click.pass_context
 def main_depth(
     ctx: click.Context,
@@ -1111,11 +1072,9 @@ def main_depth(
     schedule_path: str,
     data_dir: str,
     overwrite: bool,
-    lake_version: str | None,
 ) -> None:
     """Materialize a derived main-with-depth dataset from a schedule and raw contract ticks."""
     from ghtrader.main_depth import materialize_main_with_depth
-    from ghtrader.config import get_lake_version
 
     log = structlog.get_logger()
     _acquire_locks([f"main_depth:symbol={derived_symbol}"])
@@ -1124,7 +1083,7 @@ def main_depth(
         schedule_path=Path(schedule_path),
         data_dir=Path(data_dir),
         overwrite=overwrite,
-        lake_version=(lake_version or get_lake_version()),  # type: ignore[arg-type]
+        lake_version="v2",
     )
     log.info(
         "main_depth.done",
@@ -1146,38 +1105,39 @@ def main_depth(
     multiple=True,
     default=["all"],
     show_default=True,
-    type=click.Choice(["all", "ticks", "main_l5", "features", "labels"]),
+    type=click.Choice(["all", "ticks", "main_l5", "features", "labels", "completeness"]),
     help="What to audit (can pass multiple).",
 )
 @click.option("--symbol", "symbols", multiple=True, help="Optional symbol filter (ticks/main_l5 only). Can pass multiple.")
+@click.option("--exchange", default="", help="(completeness) Exchange filter, e.g. SHFE")
+@click.option("--var", "variety", default="", help="(completeness) Variety filter, e.g. cu")
+@click.option("--refresh-catalog/--no-refresh-catalog", default=False, show_default=True, help="(completeness) Refresh TqSdk catalog (network)")
 @click.option("--data-dir", default="data", help="Data directory root")
 @click.option("--runs-dir", default="runs", help="Runs output directory")
-@click.option(
-    "--lake-version",
-    default=None,
-    type=click.Choice(["v1", "v2"]),
-    help="Tick lake version to audit (default: env GHTRADER_LAKE_VERSION or v1)",
-)
 @click.pass_context
 def audit(
     ctx: click.Context,
     scopes: tuple[str, ...],
     symbols: tuple[str, ...],
+    exchange: str,
+    variety: str,
+    refresh_catalog: bool,
     data_dir: str,
     runs_dir: str,
-    lake_version: str | None,
 ) -> None:
     """Audit data integrity and write a JSON report under runs/audit/."""
     from ghtrader.audit import run_audit
-    from ghtrader.config import get_lake_version
 
     log = structlog.get_logger()
     out_path, report = run_audit(
         data_dir=Path(data_dir),
         runs_dir=Path(runs_dir),
         scopes=list(scopes),
-        lake_version=(lake_version or get_lake_version()),  # type: ignore[arg-type]
+        lake_version="v2",
         symbols=[str(s).strip() for s in symbols if str(s).strip()] or None,
+        exchange=str(exchange).strip() or None,
+        var=str(variety).strip() or None,
+        refresh_catalog=bool(refresh_catalog),
     )
     log.info("audit.done", report_path=str(out_path), summary=report.get("summary", {}))
 
@@ -1196,6 +1156,141 @@ def audit(
 def db_group(ctx: click.Context) -> None:
     """Database/query-layer utilities (DuckDB-backed lakehouse)."""
     _ = ctx
+
+
+@db_group.command("questdb-health")
+@click.option("--host", default="", help="QuestDB host (default: env/config)")
+@click.option("--pg-port", default=0, type=int, help="QuestDB PGWire port (default: env/config)")
+@click.option("--pg-user", default="", help="QuestDB PGWire user (default: env/config)")
+@click.option("--pg-password", default="", help="QuestDB PGWire password (default: env/config)")
+@click.option("--pg-dbname", default="", help="QuestDB PGWire dbname (default: env/config)")
+@click.option("--connect-timeout", default=1, type=int, show_default=True, help="Connect timeout seconds")
+def db_questdb_health(
+    host: str,
+    pg_port: int,
+    pg_user: str,
+    pg_password: str,
+    pg_dbname: str,
+    connect_timeout: int,
+) -> None:
+    """Check QuestDB reachability via PGWire (SELECT 1)."""
+    import json
+    import time
+
+    from ghtrader.config import (
+        get_questdb_host,
+        get_questdb_pg_dbname,
+        get_questdb_pg_password,
+        get_questdb_pg_port,
+        get_questdb_pg_user,
+    )
+
+    h = str(host).strip() or str(get_questdb_host())
+    p = int(pg_port) if int(pg_port) > 0 else int(get_questdb_pg_port())
+    u = str(pg_user).strip() or str(get_questdb_pg_user())
+    pw = str(pg_password).strip() or str(get_questdb_pg_password())
+    dbn = str(pg_dbname).strip() or str(get_questdb_pg_dbname())
+
+    t0 = time.time()
+    try:
+        import psycopg  # type: ignore
+
+        with psycopg.connect(user=u, password=pw, host=h, port=int(p), dbname=dbn, connect_timeout=int(connect_timeout)) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        dt_ms = int((time.time() - t0) * 1000.0)
+        click.echo(json.dumps({"ok": True, "host": h, "pg_port": int(p), "pg_user": u, "pg_dbname": dbn, "latency_ms": dt_ms}))
+    except Exception as e:
+        dt_ms = int((time.time() - t0) * 1000.0)
+        click.echo(
+            json.dumps(
+                {"ok": False, "host": h, "pg_port": int(p), "pg_user": u, "pg_dbname": dbn, "latency_ms": dt_ms, "error": str(e)}
+            )
+        )
+        raise SystemExit(1)
+
+
+@db_group.command("questdb-init")
+@click.option("--host", default="", help="QuestDB host (default: env/config)")
+@click.option("--ilp-port", default=0, type=int, help="QuestDB ILP port (default: env/config)")
+@click.option("--pg-port", default=0, type=int, help="QuestDB PGWire port (default: env/config)")
+@click.option("--pg-user", default="", help="QuestDB PGWire user (default: env/config)")
+@click.option("--pg-password", default="", help="QuestDB PGWire password (default: env/config)")
+@click.option("--pg-dbname", default="", help="QuestDB PGWire dbname (default: env/config)")
+@click.option("--raw-table", default="ghtrader_ticks_raw_v2", show_default=True, help="Raw ticks table name")
+@click.option("--main-l5-table", default="ghtrader_ticks_main_l5_v2", show_default=True, help="Derived main_l5 ticks table name")
+def db_questdb_init(
+    host: str,
+    ilp_port: int,
+    pg_port: int,
+    pg_user: str,
+    pg_password: str,
+    pg_dbname: str,
+    raw_table: str,
+    main_l5_table: str,
+) -> None:
+    """Ensure required ghTrader tables exist in QuestDB (DDL via PGWire)."""
+    import json
+
+    from ghtrader.config import (
+        get_questdb_host,
+        get_questdb_ilp_port,
+        get_questdb_pg_dbname,
+        get_questdb_pg_password,
+        get_questdb_pg_port,
+        get_questdb_pg_user,
+    )
+    from ghtrader.serving_db import ServingDBConfig, make_serving_backend
+
+    h = str(host).strip() or str(get_questdb_host())
+    ilp = int(ilp_port) if int(ilp_port) > 0 else int(get_questdb_ilp_port())
+    p = int(pg_port) if int(pg_port) > 0 else int(get_questdb_pg_port())
+    u = str(pg_user).strip() or str(get_questdb_pg_user())
+    pw = str(pg_password).strip() or str(get_questdb_pg_password())
+    dbn = str(pg_dbname).strip() or str(get_questdb_pg_dbname())
+
+    cfg = ServingDBConfig(
+        backend="questdb",
+        host=h,
+        questdb_ilp_port=int(ilp),
+        questdb_pg_port=int(p),
+        questdb_pg_user=u,
+        questdb_pg_password=pw,
+        questdb_pg_dbname=dbn,
+    )
+    backend = make_serving_backend(cfg)
+
+    # Ensure both table schemas exist (best-effort idempotent DDL).
+    backend.ensure_table(table=str(raw_table), include_segment_metadata=False)
+    backend.ensure_table(table=str(main_l5_table), include_segment_metadata=True)
+
+    # Validate tables are queryable (so failures are surfaced loudly).
+    try:
+        import psycopg  # type: ignore
+
+        with psycopg.connect(user=u, password=pw, host=h, port=int(p), dbname=dbn, connect_timeout=2) as conn:
+            with conn.cursor() as cur:
+                for tbl in [str(raw_table), str(main_l5_table)]:
+                    cur.execute(f"SELECT 1 FROM {tbl} LIMIT 1")
+                    cur.fetchone()
+    except Exception as e:
+        click.echo(json.dumps({"ok": False, "error": str(e)}))
+        raise SystemExit(1)
+
+    click.echo(
+        json.dumps(
+            {
+                "ok": True,
+                "host": h,
+                "pg_port": int(p),
+                "ilp_port": int(ilp),
+                "pg_user": u,
+                "pg_dbname": dbn,
+                "tables": {"raw": str(raw_table), "main_l5": str(main_l5_table)},
+            }
+        )
+    )
 
 
 @db_group.command("init")
@@ -1270,13 +1365,6 @@ def db_ingest_metrics(ctx: click.Context, runs_dir: str, data_dir: str, db_path:
     show_default=True,
     help="Which ticks lake to benchmark (raw vs main_l5).",
 )
-@click.option(
-    "--lake-version",
-    default="v2",
-    type=click.Choice(["v1", "v2"]),
-    show_default=True,
-    help="Which lake root to benchmark (v1=data/lake, v2=data/lake_v2).",
-)
 @click.option("--max-rows", default=200000, type=int, show_default=True, help="Max rows to load/ingest for the benchmark")
 @click.option("--host", default="127.0.0.1", show_default=True, help="DB host (QuestDB/ClickHouse)")
 @click.option("--questdb/--no-questdb", default=True, show_default=True, help="Run QuestDB benchmark (requires QuestDB running)")
@@ -1290,7 +1378,6 @@ def db_benchmark(
     data_dir: str,
     runs_dir: str,
     ticks_lake: str,
-    lake_version: str,
     max_rows: int,
     host: str,
     questdb: bool,
@@ -1307,7 +1394,7 @@ def db_benchmark(
         start_date=start.date(),
         end_date=end.date(),
         ticks_lake=ticks_lake,  # type: ignore[arg-type]
-        lake_version=lake_version,  # type: ignore[arg-type]
+        lake_version="v2",
         max_rows=int(max_rows),
         questdb=bool(questdb),
         clickhouse=bool(clickhouse),
@@ -1326,13 +1413,6 @@ def db_benchmark(
     type=click.Choice(["raw", "main_l5"]),
     show_default=True,
     help="Which ticks lake to sync (raw vs main_l5).",
-)
-@click.option(
-    "--lake-version",
-    default="v2",
-    type=click.Choice(["v1", "v2"]),
-    show_default=True,
-    help="Which lake root to sync (v1=data/lake, v2=data/lake_v2).",
 )
 @click.option("--mode", default="incremental", type=click.Choice(["incremental", "backfill"]), show_default=True, help="Sync mode")
 @click.option("--start", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Start date (YYYY-MM-DD)")
@@ -1359,7 +1439,6 @@ def db_serve_sync(
     table: str,
     symbol: str,
     ticks_lake: str,
-    lake_version: str,
     mode: str,
     start: datetime | None,
     end: datetime | None,
@@ -1381,6 +1460,7 @@ def db_serve_sync(
     from ghtrader.serving_db import ServingDBConfig, make_serving_backend, sync_ticks_to_serving_db
 
     log = structlog.get_logger()
+    lake_version = "v2"
     tbl = str(table).strip() or f"ghtrader_ticks_{ticks_lake}_{lake_version}"
     runs_root = Path(runs_dir)
     st_root = Path(state_dir) if str(state_dir).strip() else (runs_root / "db_sync")
@@ -1432,14 +1512,7 @@ def db_serve_sync(
 @db_group.command("serve-sync-variety")
 @click.option("--exchange", required=True, type=click.Choice(["SHFE"]), help="Exchange (currently SHFE only)")
 @click.option("--var", "variety", required=True, type=str, help="Variety code (e.g., cu, au, ag)")
-@click.option("--table", default="", help="Destination table name (default: ghtrader_ticks_raw_<lake_version>)")
-@click.option(
-    "--lake-version",
-    default="v2",
-    type=click.Choice(["v1", "v2"]),
-    show_default=True,
-    help="Which lake root to sync (v1=data/lake, v2=data/lake_v2).",
-)
+@click.option("--table", default="", help="Destination table name (default: ghtrader_ticks_raw_v2)")
 @click.option("--data-dir", default="data", help="Data directory root")
 @click.option("--runs-dir", default="runs", help="Runs directory root (for state files)")
 @click.option("--state-dir", default="", help="State directory (default: <runs-dir>/db_sync)")
@@ -1458,7 +1531,6 @@ def db_serve_sync_variety(
     exchange: str,
     variety: str,
     table: str,
-    lake_version: str,
     data_dir: str,
     runs_dir: str,
     state_dir: str,
@@ -1486,7 +1558,7 @@ def db_serve_sync_variety(
     log = structlog.get_logger()
     ex = str(exchange).upper().strip()
     var = str(variety).lower().strip()
-    lv = str(lake_version).lower().strip()
+    lv = "v2"
 
     data_root = Path(data_dir)
     runs_root = Path(runs_dir)
@@ -1508,7 +1580,7 @@ def db_serve_sync_variety(
             syms.append(sym)
 
     if not syms:
-        log.warning("db.serve_sync_variety.no_symbols", exchange=ex, var=var, lake_version=lv, root=str(root))
+        log.warning("db.serve_sync_variety.no_symbols", exchange=ex, var=var, root=str(root))
         return
 
     cfg = ServingDBConfig(

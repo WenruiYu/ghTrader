@@ -1,790 +1,466 @@
 {% extends "base.html" %}
 {% block content %}
-  <h2>Operations</h2>
+  <div class="section-header">
+    <h2>Operations</h2>
+    <div class="section-header-actions">
+      <a href="/jobs{{ token_qs }}" class="btn btn-sm btn-secondary">View All Jobs</a>
+    </div>
+  </div>
 
-  <div class="card">
+  <!-- Status Bar -->
+  <div class="card card-compact">
     <div class="grid3">
-      <div>
+      <div class="flex items-center gap-2">
         <div class="kpiLabel">Running</div>
-        <div class="kpiValue">{{ running_count }}</div>
+        <div class="kpiValue" style="font-size:24px;">{{ running_count }}</div>
       </div>
-      <div>
+      <div class="flex items-center gap-2">
         <div class="kpiLabel">Queued</div>
-        <div class="kpiValue">{{ queued_count }}</div>
+        <div class="kpiValue" style="font-size:24px;">{{ queued_count }}</div>
       </div>
-      <div>
-        <div class="kpiLabel">Recent</div>
-        <div class="kpiValue">{{ recent_count }}</div>
-        <div class="muted" style="margin-top:6px;"><a href="/jobs{{ token_qs }}">Open Jobs</a></div>
+      <div class="flex items-center gap-2">
+        <div class="status-indicator {% if questdb and questdb.ok %}status-indicator-ok{% else %}status-indicator-error{% endif %}">
+          <span class="status-dot {% if questdb and questdb.ok %}status-dot-ok{% else %}status-dot-error{% endif %}"></span>
+          <span>QuestDB: {% if questdb and questdb.ok %}connected{% else %}offline{% endif %}</span>
+        </div>
       </div>
     </div>
   </div>
 
-  <div class="card">
-    <h3>Quick links</h3>
-    <p class="muted">Jump to a section:</p>
-    <div class="nav" style="justify-content:flex-start;">
-      <a href="#ingest">Ingest</a>
-      <a href="#dbsync">DB Sync</a>
-      <a href="#schedule">Schedule</a>
-      <a href="#mainl5">main_l5</a>
-      <a href="#build">Build</a>
-      <a href="#model">Model/Train</a>
-      <a href="#eval">Eval</a>
-      <a href="#trading">Trading</a>
-      <a href="#integrity">Integrity</a>
-      <a href="#locks">Locks</a>
-    </div>
+  <!-- Tab Navigation -->
+  <div class="tab-nav">
+    <button class="tab-nav-item active" data-tab="pipeline">Pipeline</button>
+    <button class="tab-nav-item" data-tab="ingest">Ingest</button>
+    <button class="tab-nav-item" data-tab="build">Schedule & Build</button>
+    <button class="tab-nav-item" data-tab="integrity">Integrity</button>
+    <button class="tab-nav-item" data-tab="locks">
+      Locks
+      {% if locks and locks|length > 0 %}<span class="badge">{{ locks|length }}</span>{% endif %}
+    </button>
   </div>
 
-  <div class="card" id="pipeline">
-    <h3>Pipeline (happy path)</h3>
-    <p class="muted">Sync → Schedule → main_l5 → Features/Labels → Train</p>
-    <div class="grid3">
-      <form method="post" action="/ops/db/serve_sync_variety{{ token_qs }}">
+  <!-- Tab: Pipeline -->
+  <div class="tab-content active" id="tab-pipeline">
+    <div class="card">
+      <h3 class="mb-2">Happy Path Pipeline</h3>
+      <p class="muted text-sm mb-3">Execute the canonical workflow: Update (remote-aware), sync (repair/backfill), compute schedule, build main_l5, then features/labels.</p>
+
+      <form method="post" action="/ops/ingest/update_variety{{ token_qs }}" class="mb-3">
         <input type="hidden" name="exchange" value="SHFE"/>
         <input type="hidden" name="variety" value="cu"/>
-        <input type="hidden" name="lake_version" value="v2"/>
+        <input type="hidden" name="recent_expired_days" value="10"/>
         <input type="hidden" name="data_dir" value="data"/>
         <input type="hidden" name="runs_dir" value="runs"/>
-        <button type="submit">1) Sync (cu → QuestDB)</button>
+        <button type="submit" class="btn" style="width:100%;">0) Update cu (active + recent expired)</button>
       </form>
-      <form method="post" action="/ops/build/main_schedule{{ token_qs }}">
-        <input type="hidden" name="variety" value="cu"/>
-        <input type="hidden" name="start_date" value="{{ default_schedule_start }}"/>
-        <input type="hidden" name="end_date" value="{{ default_schedule_end }}"/>
-        <input type="hidden" name="threshold" value="1.1"/>
-        <input type="hidden" name="data_dir" value="data"/>
-        <button type="submit">2) Schedule (cu)</button>
-      </form>
-      <form method="post" action="/ops/build/main_l5{{ token_qs }}">
-        <input type="hidden" name="variety" value="cu"/>
-        <input type="hidden" name="derived_symbol" value="KQ.m@SHFE.cu"/>
-        <input type="hidden" name="data_dir" value="data"/>
-        <input type="hidden" name="lake_version" value="v2"/>
-        <input type="hidden" name="overwrite" value="false"/>
-        <button type="submit">3) main_l5 (cu)</button>
-      </form>
-    </div>
-    <div class="grid3" style="margin-top: 10px;">
-      <form method="post" action="/ops/build/build{{ token_qs }}">
-        <input type="hidden" name="symbol" value="KQ.m@SHFE.cu"/>
-        <input type="hidden" name="horizons" value="10,50,200"/>
-        <input type="hidden" name="threshold_k" value="1"/>
-        <input type="hidden" name="ticks_lake" value="main_l5"/>
-        <input type="hidden" name="overwrite" value="false"/>
-        <input type="hidden" name="lake_version" value="v2"/>
-        <input type="hidden" name="data_dir" value="data"/>
-        <button type="submit">4) Build (KQ.m@SHFE.cu)</button>
-      </form>
-      <form method="post" action="/ops/model/train{{ token_qs }}">
-        <input type="hidden" name="model" value="xgboost"/>
-        <input type="hidden" name="symbol" value="KQ.m@SHFE.cu"/>
-        <input type="hidden" name="horizon" value="50"/>
-        <input type="hidden" name="epochs" value="50"/>
-        <input type="hidden" name="batch_size" value="256"/>
-        <input type="hidden" name="seq_len" value="100"/>
-        <input type="hidden" name="lr" value="0.001"/>
-        <input type="hidden" name="ddp" value="true"/>
-        <input type="hidden" name="gpus" value="1"/>
-        <input type="hidden" name="data_dir" value="data"/>
-        <input type="hidden" name="artifacts_dir" value="artifacts"/>
-        <button type="submit">5) Train (xgboost, h=50)</button>
-      </form>
-      <div></div>
-    </div>
-  </div>
+      
+      <div class="pipeline-flow mb-3">
+        <div class="pipeline-step">
+          <div class="pipeline-step-icon">1</div>
+          <div class="pipeline-step-label">Sync</div>
+        </div>
+        <div class="pipeline-arrow"></div>
+        <div class="pipeline-step">
+          <div class="pipeline-step-icon">2</div>
+          <div class="pipeline-step-label">Schedule</div>
+        </div>
+        <div class="pipeline-arrow"></div>
+        <div class="pipeline-step">
+          <div class="pipeline-step-icon">3</div>
+          <div class="pipeline-step-label">main_l5</div>
+        </div>
+        <div class="pipeline-arrow"></div>
+        <div class="pipeline-step">
+          <div class="pipeline-step-icon">4</div>
+          <div class="pipeline-step-label">Build</div>
+        </div>
+        <div class="pipeline-arrow"></div>
+        <div class="pipeline-step">
+          <div class="pipeline-step-icon">5</div>
+          <div class="pipeline-step-label">Train</div>
+        </div>
+      </div>
 
-  <div class="card" id="questdb">
-    <h3>QuestDB status</h3>
-    {% if questdb and questdb.ok %}
-      <p class="muted">Connected (host={{ questdb.host }}, pg={{ questdb.pg_port }}, ilp={{ questdb.ilp_port }}).</p>
-    {% else %}
-      <p class="muted">Not reachable. {% if questdb and questdb.error %}<span class="mono">{{ questdb.error }}</span>{% endif %}</p>
-    {% endif %}
-  </div>
-
-  <div class="card" id="ingest">
-    <h3>Ingest</h3>
-
-    <h4>Running ingest jobs</h4>
-    <p class="muted">
-      Auto-refreshes every ~15s. Progress is computed from lake partitions + no-data markers.
-    </p>
-    <div class="tableWrap">
-      <table class="table" id="ingestJobsTable">
-        <thead>
-          <tr>
-            <th>ID</th><th>Status</th><th>Kind</th><th>Lake</th><th>Source</th><th>Current</th><th>Progress</th><th>Title</th><th></th>
-          </tr>
-        </thead>
-        <tbody id="ingestJobsBody">
-          {% for s in ingest_statuses %}
-            <tr>
-              <td class="mono">{{ s.job_id }}</td>
-              <td><span class="pill pill-{{ s.job_status }}">{{ s.job_status }}</span></td>
-              <td class="mono">{{ s.kind }}</td>
-              <td class="mono">{{ s.lake_version or "" }}</td>
-              <td class="mono">{{ s.source or "" }}</td>
-              <td class="mono">
-                {% if s.kind == "download_contract_range" %}
-                  {{ s.current_symbol or "" }}
-                {% elif s.kind == "download" %}
-                  {{ s.symbol or "" }}
-                {% else %}
-                  {{ s.current_symbol or "" }}
-                {% endif %}
-              </td>
-              <td>
-                {% if s.summary and s.summary.pct is not none %}
-                  <div class="progressBar"><div style="width: {{ (s.summary.pct * 100) | round(1) }}%;"></div></div>
-                  <div class="mono" style="margin-top:6px;">
-                    {% if s.kind == "download_contract_range" %}
-                      {{ (s.summary.pct * 100) | round(1) }}%
-                      ({{ s.summary.days_done_total }}/{{ s.summary.days_expected_total }})
-                      contracts {{ s.summary.contracts_done }}/{{ s.summary.contracts_total }}
-                    {% elif s.kind == "download" %}
-                      {{ (s.summary.pct * 100) | round(1) }}%
-                      ({{ s.summary.days_done }}/{{ s.summary.days_expected }})
-                    {% else %}
-                      {{ (s.summary.pct * 100) | round(1) }}%
-                    {% endif %}
-                  </div>
-                {% else %}
-                  <span class="mono">-</span>
-                {% endif %}
-              </td>
-              <td>{{ s.title or "" }}</td>
-              <td><a href="/jobs/{{ s.job_id }}{{ token_qs }}">View</a></td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+      <div class="grid3 mb-2">
+        <form method="post" action="/ops/db/serve_sync_variety{{ token_qs }}">
+          <input type="hidden" name="exchange" value="SHFE"/>
+          <input type="hidden" name="variety" value="cu"/>
+          <input type="hidden" name="data_dir" value="data"/>
+          <input type="hidden" name="runs_dir" value="runs"/>
+          <button type="submit" class="btn" style="width:100%;">1) Sync cu to QuestDB</button>
+        </form>
+        <form method="post" action="/ops/build/main_schedule{{ token_qs }}">
+          <input type="hidden" name="variety" value="cu"/>
+          <input type="hidden" name="start_date" value="{{ default_schedule_start }}"/>
+          <input type="hidden" name="end_date" value="{{ default_schedule_end }}"/>
+          <input type="hidden" name="threshold" value="1.1"/>
+          <input type="hidden" name="data_dir" value="data"/>
+          <button type="submit" class="btn btn-secondary" style="width:100%;">2) Build Schedule (cu)</button>
+        </form>
+        <form method="post" action="/ops/build/main_l5{{ token_qs }}">
+          <input type="hidden" name="variety" value="cu"/>
+          <input type="hidden" name="derived_symbol" value="KQ.m@SHFE.cu"/>
+          <input type="hidden" name="data_dir" value="data"/>
+          <input type="hidden" name="overwrite" value="false"/>
+          <button type="submit" class="btn btn-secondary" style="width:100%;">3) Build main_l5 (cu)</button>
+        </form>
+      </div>
+      <div class="grid3">
+        <form method="post" action="/ops/build/build{{ token_qs }}">
+          <input type="hidden" name="symbol" value="KQ.m@SHFE.cu"/>
+          <input type="hidden" name="horizons" value="10,50,200"/>
+          <input type="hidden" name="threshold_k" value="1"/>
+          <input type="hidden" name="ticks_lake" value="main_l5"/>
+          <input type="hidden" name="overwrite" value="false"/>
+          <input type="hidden" name="data_dir" value="data"/>
+          <button type="submit" class="btn btn-secondary" style="width:100%;">4) Build Features/Labels</button>
+        </form>
+        <a href="/models{{ token_qs }}" class="btn btn-secondary" style="width:100%; text-align:center; display:block; text-decoration:none;">5) Train Model</a>
+        <a href="/trading{{ token_qs }}" class="btn btn-secondary" style="width:100%; text-align:center; display:block; text-decoration:none;">6) Start Trading</a>
+      </div>
     </div>
 
-    <div class="card" id="rangeDetailsCard" style="display:none;">
-      <h4>Range details</h4>
-      <div id="rangeDetailsMeta" class="muted"></div>
+    <div class="card">
+      <h3 class="mb-2">Running Ingest Jobs</h3>
       <div class="tableWrap">
-        <table class="table">
+        <table class="table table-compact" id="ingestJobsTable">
           <thead>
             <tr>
-              <th>Contract</th><th>Status</th><th>Current</th><th>Expected</th><th>Done</th><th>%</th><th>min</th><th>max</th>
+              <th>ID</th><th>Status</th><th>Kind</th><th>Current</th><th>Progress</th><th></th>
             </tr>
           </thead>
-          <tbody id="rangeDetailsBody"></tbody>
+          <tbody id="ingestJobsBody">
+            {% for s in ingest_statuses %}
+              <tr>
+                <td class="mono text-xs">{{ s.job_id[:8] }}</td>
+                <td><span class="pill pill-{{ s.job_status }}">{{ s.job_status }}</span></td>
+                <td class="mono">{{ s.kind }}</td>
+                <td class="mono">
+                  {% if s.kind == "download_contract_range" %}{{ s.current_symbol or "" }}
+                  {% elif s.kind == "download" %}{{ s.symbol or "" }}
+                  {% else %}{{ s.current_symbol or "" }}{% endif %}
+                </td>
+                <td>
+                  {% if s.summary and s.summary.pct is not none %}
+                    <div class="progressBar"><div style="width: {{ (s.summary.pct * 100) | round(1) }}%;"></div></div>
+                    <div class="mono text-xs" style="margin-top:4px;">{{ (s.summary.pct * 100) | round(1) }}%</div>
+                  {% else %}<span class="mono">-</span>{% endif %}
+                </td>
+                <td><a href="/jobs/{{ s.job_id }}{{ token_qs }}">View</a></td>
+              </tr>
+            {% else %}
+              <tr><td colspan="6" class="muted">No ingest jobs running</td></tr>
+            {% endfor %}
+          </tbody>
         </table>
       </div>
     </div>
-
-    <h4>download</h4>
-    <form class="form" method="post" action="/ops/ingest/download{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Symbol</label><input name="symbol" placeholder="SHFE.cu2602"/></div>
-        <div><label>Start (YYYY-MM-DD)</label><input name="start_date" type="date"/></div>
-        <div><label>End (YYYY-MM-DD)</label><input name="end_date" type="date"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Chunk days</label><input name="chunk_days" type="number" min="1" step="1" value="5"/></div>
-        <div><label>Lake version</label>
-          <select name="lake_version"><option value="v1">v1</option><option value="v2" selected>v2</option></select>
-        </div>
-      </div>
-      <button type="submit">Start download</button>
-    </form>
-
-    <h4>download-contract-range</h4>
-    <form class="form" method="post" action="/ops/ingest/download_contract_range{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Exchange</label><input name="exchange" value="SHFE"/></div>
-        <div><label>Var (cu/au/ag)</label><input name="variety" value="cu"/></div>
-        <div><label>Chunk days</label><input name="chunk_days" type="number" min="1" step="1" value="5"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>Start contract (YYMM)</label><input name="start_contract" value="1601"/></div>
-        <div><label>End contract</label><input name="end_contract" value="auto"/></div>
-        <div><label>Start date (YYYY-MM-DD)</label><input name="start_date" type="date" value="2015-01-01"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>End date (YYYY-MM-DD)</label><input name="end_date" type="date"/></div>
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Lake version</label>
-          <select name="lake_version"><option value="v1">v1</option><option value="v2" selected>v2</option></select>
-        </div>
-      </div>
-      <button type="submit">Start range backfill</button>
-    </form>
-
-    <h4>record (live)</h4>
-    <form class="form" method="post" action="/ops/ingest/record{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Symbols (comma-separated)</label><input name="symbols" placeholder="SHFE.cu2602,SHFE.au2602"/></div>
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Lake version</label>
-          <select name="lake_version"><option value="v1">v1</option><option value="v2" selected>v2</option></select>
-        </div>
-      </div>
-      <button type="submit">Start recorder</button>
-    </form>
   </div>
 
-  <div class="card" id="dbsync">
-    <h3>DB Sync (Parquet → QuestDB)</h3>
+  <!-- Tab: Ingest -->
+  <div class="tab-content" id="tab-ingest">
+    <div class="split-pane-2-1">
+      <div>
+        <div class="card">
+          <h3 class="mb-2">Download Historical Data</h3>
+          <form class="form" method="post" action="/ops/ingest/download{{ token_qs }}">
+            <div class="grid3">
+              <div><label>Symbol</label><input name="symbol" placeholder="SHFE.cu2602"/></div>
+              <div><label>Start date</label><input name="start_date" type="date"/></div>
+              <div><label>End date</label><input name="end_date" type="date"/></div>
+            </div>
+            <div class="grid2">
+              <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+              <div><label>Chunk days</label><input name="chunk_days" type="number" min="1" value="5"/></div>
+            </div>
+            <button type="submit">Start Download</button>
+          </form>
+        </div>
 
-    <h4>serve-sync-variety</h4>
-    <form class="form" method="post" action="/ops/db/serve_sync_variety{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Exchange</label><input name="exchange" value="SHFE"/></div>
-        <div><label>Var (cu/au/ag)</label><input name="variety" value="cu"/></div>
-        <div><label>Lake version</label>
-          <select name="lake_version"><option value="v1">v1</option><option value="v2" selected>v2</option></select>
+        <div class="card">
+          <h3 class="mb-2">Download Contract Range</h3>
+          <form class="form" method="post" action="/ops/ingest/download_contract_range{{ token_qs }}">
+            <div class="grid3">
+              <div><label>Exchange</label><input name="exchange" value="SHFE"/></div>
+              <div><label>Variety</label><input name="variety" value="cu"/></div>
+              <div><label>Chunk days</label><input name="chunk_days" type="number" min="1" value="5"/></div>
+            </div>
+            <div class="grid2">
+              <div><label>Start contract (YYMM)</label><input name="start_contract" value="1601"/></div>
+              <div><label>End contract</label><input name="end_contract" value="auto"/></div>
+            </div>
+            <div class="grid3">
+              <div><label>Start date</label><input name="start_date" type="date" value="2015-01-01"/></div>
+              <div><label>End date</label><input name="end_date" type="date"/></div>
+              <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+            </div>
+            <button type="submit">Start Range Backfill</button>
+          </form>
         </div>
-      </div>
-      <div class="grid2">
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>Host</label><input name="host" value="{{ questdb.host | default('127.0.0.1') }}"/></div>
-        <div><label>ILP port</label><input name="questdb_ilp_port" value="{{ questdb.ilp_port | default(9009) }}"/></div>
-        <div><label>PG port</label><input name="questdb_pg_port" value="{{ questdb.pg_port | default(8812) }}"/></div>
-      </div>
-      <button type="submit">Start variety sync</button>
-    </form>
 
-    <h4>serve-sync (single symbol)</h4>
-    <form class="form" method="post" action="/ops/db/serve_sync{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Symbol</label><input name="symbol" placeholder="SHFE.cu2602"/></div>
-        <div><label>Ticks lake</label>
-          <select name="ticks_lake"><option value="raw" selected>raw</option><option value="main_l5">main_l5</option></select>
+        <div class="card">
+          <h3 class="mb-2">Live Recorder</h3>
+          <form class="form" method="post" action="/ops/ingest/record{{ token_qs }}">
+            <div class="grid2">
+              <div><label>Symbols (comma-separated)</label><input name="symbols" placeholder="SHFE.cu2602,SHFE.au2602"/></div>
+              <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+            </div>
+            <button type="submit">Start Recorder</button>
+          </form>
         </div>
-        <div><label>Lake version</label>
-          <select name="lake_version"><option value="v1">v1</option><option value="v2" selected>v2</option></select>
-        </div>
       </div>
-      <div class="grid3">
-        <div><label>Mode</label>
-          <select name="mode"><option value="incremental" selected>incremental</option><option value="backfill">backfill</option></select>
-        </div>
-        <div><label>Start (optional)</label><input name="start" type="date"/></div>
-        <div><label>End (optional)</label><input name="end" type="date"/></div>
+
+      <div class="card">
+        <h3 class="mb-2">Ingest Tips</h3>
+        <ul class="muted text-sm" style="padding-left:18px; margin:0;">
+          <li style="margin-bottom:8px;"><strong>Symbol format:</strong> <code class="mono">EXCHANGE.instrumentYYMM</code> (e.g., SHFE.cu2602)</li>
+          <li style="margin-bottom:8px;"><strong>Contract range:</strong> Use for bulk backfill of a variety (all cu contracts)</li>
+          <li style="margin-bottom:8px;"><strong>Lake:</strong> v2-only (trading-day partitioning)</li>
+          <li style="margin-bottom:8px;"><strong>Chunk days:</strong> Smaller chunks = more resilient to interrupts</li>
+          <li><strong>Live recorder:</strong> Subscribes to ticks and appends to lake in real-time</li>
+        </ul>
       </div>
-      <div class="grid2">
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>Host</label><input name="host" value="{{ questdb.host | default('127.0.0.1') }}"/></div>
-        <div><label>ILP port</label><input name="questdb_ilp_port" value="{{ questdb.ilp_port | default(9009) }}"/></div>
-        <div><label>PG port</label><input name="questdb_pg_port" value="{{ questdb.pg_port | default(8812) }}"/></div>
-      </div>
-      <button type="submit">Start symbol sync</button>
-    </form>
+    </div>
   </div>
 
-  <div class="card" id="schedule">
-    <h3>Schedule</h3>
-    <h4>main-schedule (QuestDB-backed)</h4>
-    <form class="form" method="post" action="/ops/build/main_schedule{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Var</label><input name="variety" value="cu"/></div>
-        <div><label>Start (YYYY-MM-DD)</label><input name="start_date" value="{{ default_schedule_start }}"/></div>
-        <div><label>End (YYYY-MM-DD)</label><input name="end_date" value="{{ default_schedule_end }}"/></div>
-      </div>
-      <div class="grid2">
-        <div><label>Threshold</label><input name="threshold" value="1.1"/></div>
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-      </div>
-      <button type="submit">Build schedule</button>
-    </form>
-  </div>
-
-  <div class="card" id="mainl5">
-    <h3>main_l5</h3>
-    <p class="muted">Build derived <span class="mono">main_l5</span> ticks for the L5 era only (uses QuestDB L5 coverage).</p>
-    <form class="form" method="post" action="/ops/build/main_l5{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Var</label><input name="variety" value="cu"/></div>
-        <div><label>Derived symbol</label><input name="derived_symbol" value="KQ.m@SHFE.cu"/></div>
-        <div><label>Schedule path (optional)</label><input name="schedule_path" placeholder="data/rolls/shfe_main_schedule/var=cu/schedule.parquet"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>Overwrite</label>
-          <select name="overwrite"><option value="false" selected>false</option><option value="true">true</option></select>
+  <!-- Tab: Schedule & Build -->
+  <div class="tab-content" id="tab-build">
+    <div class="split-pane">
+      <div>
+        <div class="card">
+          <h3 class="mb-2">Build Main Schedule</h3>
+          <p class="muted text-sm mb-2">Compute roll schedule from QuestDB end-of-day OI data.</p>
+          <form class="form" method="post" action="/ops/build/main_schedule{{ token_qs }}">
+            <div class="grid3">
+              <div><label>Variety</label><input name="variety" value="cu"/></div>
+              <div><label>Start date</label><input name="start_date" value="{{ default_schedule_start }}"/></div>
+              <div><label>End date</label><input name="end_date" value="{{ default_schedule_end }}"/></div>
+            </div>
+            <div class="grid2">
+              <div><label>Threshold</label><input name="threshold" value="1.1"/></div>
+              <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+            </div>
+            <button type="submit">Build Schedule</button>
+          </form>
         </div>
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Lake version</label>
-          <select name="lake_version"><option value="v1">v1</option><option value="v2" selected>v2</option></select>
+
+        <div class="card">
+          <h3 class="mb-2">Build main_l5</h3>
+          <p class="muted text-sm mb-2">Materialize continuous main contract with L5 depth from underlying specific contracts.</p>
+          <form class="form" method="post" action="/ops/build/main_l5{{ token_qs }}">
+            <div class="grid3">
+              <div><label>Variety</label><input name="variety" value="cu"/></div>
+              <div><label>Derived symbol</label><input name="derived_symbol" value="KQ.m@SHFE.cu"/></div>
+              <div><label>Schedule path (optional)</label><input name="schedule_path" placeholder="auto"/></div>
+            </div>
+            <div class="grid2">
+              <div><label>Overwrite</label>
+                <select name="overwrite"><option value="false" selected>false</option><option value="true">true</option></select>
+              </div>
+              <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+            </div>
+            <button type="submit">Build main_l5</button>
+          </form>
         </div>
-      </div>
-      <button type="submit">Build main_l5</button>
-    </form>
-  </div>
-
-  <div class="card" id="build">
-    <h3>Build (features + labels)</h3>
-    <form class="form" method="post" action="/ops/build/build{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu"/></div>
-        <div><label>Horizons (comma)</label><input name="horizons" value="10,50,200"/></div>
-        <div><label>Threshold k</label><input name="threshold_k" value="1"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>Ticks lake</label>
-          <select name="ticks_lake"><option value="raw">raw</option><option value="main_l5" selected>main_l5</option></select>
-        </div>
-        <div><label>Overwrite</label>
-          <select name="overwrite"><option value="false" selected>false</option><option value="true">true</option></select>
-        </div>
-        <div><label>Lake version</label>
-          <select name="lake_version"><option value="v1">v1</option><option value="v2" selected>v2</option></select>
-        </div>
-      </div>
-      <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-      <button type="submit">Start build</button>
-    </form>
-  </div>
-
-  <div class="card" id="model">
-    <h3>Model / Train</h3>
-
-    <h4>train</h4>
-    <form class="form" method="post" action="/ops/model/train{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Model</label><input name="model" value="xgboost"/></div>
-        <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu"/></div>
-        <div><label>Horizon</label><input name="horizon" value="50"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>Epochs</label><input name="epochs" value="50"/></div>
-        <div><label>Batch size</label><input name="batch_size" value="256"/></div>
-        <div><label>Seq len</label><input name="seq_len" value="100"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>LR</label><input name="lr" value="0.001"/></div>
-        <div><label>DDP</label>
-          <select name="ddp"><option value="true" selected>true</option><option value="false">false</option></select>
-        </div>
-        <div><label>GPUs</label><input name="gpus" value="1"/></div>
-      </div>
-      <div class="grid2">
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
-      </div>
-      <button type="submit">Start train</button>
-    </form>
-
-    <h4>sweep</h4>
-    <form class="form" method="post" action="/ops/model/sweep{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu"/></div>
-        <div><label>Model</label><input name="model" value="deeplob"/></div>
-        <div><label>N trials</label><input name="n_trials" value="20"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>N CPUs</label><input name="n_cpus" value="8"/></div>
-        <div><label>N GPUs</label><input name="n_gpus" value="1"/></div>
-        <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
-      </div>
-      <div class="grid2">
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
-      </div>
-      <button type="submit">Start sweep</button>
-    </form>
-  </div>
-
-  <div class="card" id="eval">
-    <h3>Eval</h3>
-
-    <h4>benchmark</h4>
-    <form class="form" method="post" action="/ops/eval/benchmark{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Model</label><input name="model" value="xgboost"/></div>
-        <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu"/></div>
-        <div><label>Horizon</label><input name="horizon" value="50"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
-        <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
-      </div>
-      <button type="submit">Run benchmark</button>
-    </form>
-
-    <h4>compare</h4>
-    <form class="form" method="post" action="/ops/eval/compare{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu"/></div>
-        <div><label>Models (comma)</label><input name="models" value="logistic,xgboost,deeplob"/></div>
-        <div><label>Horizon</label><input name="horizon" value="50"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
-        <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
-      </div>
-      <button type="submit">Run compare</button>
-    </form>
-
-    <h4>backtest</h4>
-    <form class="form" method="post" action="/ops/eval/backtest{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Model</label><input name="model" value="xgboost"/></div>
-        <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu"/></div>
-        <div><label>Horizon</label><input name="horizon" value="50"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>Start (YYYY-MM-DD)</label><input name="start_date"/></div>
-        <div><label>End (YYYY-MM-DD)</label><input name="end_date"/></div>
-        <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
-      </div>
-      <div class="grid2">
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
-      </div>
-      <button type="submit">Run backtest</button>
-    </form>
-
-    <h4>paper</h4>
-    <form class="form" method="post" action="/ops/eval/paper{{ token_qs }}">
-      <div class="grid2">
-        <div><label>Model</label><input name="model" value="xgboost"/></div>
-        <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
-      </div>
-      <div><label>Symbols (comma)</label><input name="symbols" placeholder="KQ.m@SHFE.cu"/></div>
-      <button type="submit">Start paper trading</button>
-    </form>
-
-    <h4>daily-train</h4>
-    <form class="form" method="post" action="/ops/eval/daily_train{{ token_qs }}">
-      <div><label>Symbols (comma)</label><input name="symbols" placeholder="KQ.m@SHFE.cu"/></div>
-      <div class="grid3">
-        <div><label>Model</label><input name="model" value="deeplob"/></div>
-        <div><label>Horizon</label><input name="horizon" value="50"/></div>
-        <div><label>Lookback days</label><input name="lookback_days" value="30"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
-        <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
-      </div>
-      <button type="submit">Run daily-train</button>
-    </form>
-  </div>
-
-  <div class="card" id="trading">
-    <h3>Trading</h3>
-
-    <h4>trade</h4>
-    <form class="form" method="post" action="/ops/trading/trade{{ token_qs }}">
-      <div class="grid3">
-        <div>
-          <label>Mode</label>
-          <select name="mode" id="tradeMode">
-            <option value="paper" selected>paper</option>
-            <option value="sim">sim</option>
-            <option value="live">live</option>
-          </select>
-        </div>
-        <div>
-          <label>Sim account</label>
-          <select name="sim_account">
-            <option value="tqsim" selected>tqsim</option>
-            <option value="tqkq">tqkq</option>
-          </select>
-        </div>
-        <div>
-          <label>Executor</label>
-          <select name="executor">
-            <option value="targetpos" selected>targetpos</option>
-            <option value="direct">direct</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="card" style="margin:12px 0;">
-        <div class="inlineControls">
-          <label><input type="checkbox" id="monitorOnly" name="monitor_only" checked/> monitor-only (no orders)</label>
-          <span class="muted">Recommended for first real-account testing.</span>
-        </div>
-      </div>
-
-      <div class="grid3">
-        <div><label>Model</label><input name="model" value="xgboost"/></div>
-        <div><label>Horizon</label><input name="horizon" value="50"/></div>
-        <div><label>Position size</label><input name="position_size" value="1"/></div>
-      </div>
-
-      <div class="grid3">
-        <div><label>Threshold up</label><input name="threshold_up" value="0.6"/></div>
-        <div><label>Threshold down</label><input name="threshold_down" value="0.6"/></div>
-        <div><label>Snapshot interval (sec)</label><input name="snapshot_interval_sec" value="10"/></div>
       </div>
 
       <div>
-        <label>Symbols (comma-separated)</label>
-        <input name="symbols" placeholder="KQ.m@SHFE.cu"/>
-      </div>
-
-      <h4>Risk</h4>
-      <div class="grid3">
-        <div><label>Max position</label><input name="max_position" value="1"/></div>
-        <div><label>Max order size</label><input name="max_order_size" value="1"/></div>
-        <div><label>Max ops/sec</label><input name="max_ops_per_sec" value="10"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>Max daily loss</label><input name="max_daily_loss" placeholder="(optional)"/></div>
-        <div>
-          <label>Enforce trading time</label>
-          <select name="enforce_trading_time"><option value="true" selected>true</option><option value="false">false</option></select>
+        <div class="card">
+          <h3 class="mb-2">Build Features & Labels</h3>
+          <p class="muted text-sm mb-2">Compute causal features and multi-horizon labels from tick data.</p>
+          <form class="form" method="post" action="/ops/build/build{{ token_qs }}">
+            <div class="grid2">
+              <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu"/></div>
+              <div><label>Ticks lake</label>
+                <select name="ticks_lake"><option value="raw">raw</option><option value="main_l5" selected>main_l5</option></select>
+              </div>
+            </div>
+            <div class="grid2">
+              <div><label>Horizons (comma)</label><input name="horizons" value="10,50,200"/></div>
+              <div><label>Threshold k</label><input name="threshold_k" value="1"/></div>
+            </div>
+            <div class="grid2">
+              <div><label>Overwrite</label>
+                <select name="overwrite"><option value="false" selected>false</option><option value="true">true</option></select>
+              </div>
+              <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+            </div>
+            <button type="submit">Start Build</button>
+          </form>
         </div>
-        <div id="confirmLiveWrap"><label>Confirm live</label><input name="confirm_live" placeholder="I_UNDERSTAND"/></div>
-      </div>
 
-      <h4>TargetPosTask</h4>
-      <div class="grid2">
-        <div>
-          <label>tp price</label>
-          <select name="tp_price"><option value="ACTIVE" selected>ACTIVE</option><option value="PASSIVE">PASSIVE</option></select>
-        </div>
-        <div><label>tp offset priority</label><input name="tp_offset_priority" value="今昨,开"/></div>
-      </div>
-
-      <h4>Direct orders</h4>
-      <div class="grid2">
-        <div>
-          <label>direct price mode</label>
-          <select name="direct_price_mode"><option value="ACTIVE" selected>ACTIVE</option><option value="PASSIVE">PASSIVE</option></select>
-        </div>
-        <div>
-          <label>direct advanced</label>
-          <select name="direct_advanced"><option value="" selected>(none)</option><option value="FAK">FAK</option><option value="FOK">FOK</option></select>
+        <div class="card">
+          <h3 class="mb-2">Build Sequence</h3>
+          <ol class="muted text-sm" style="padding-left:18px; margin:0;">
+            <li style="margin-bottom:6px;">Sync raw ticks to QuestDB</li>
+            <li style="margin-bottom:6px;">Compute main schedule (OI-based roll)</li>
+            <li style="margin-bottom:6px;">Build main_l5 (continuous + L5 depth)</li>
+            <li style="margin-bottom:6px;">Build features & labels</li>
+            <li>Train models (see Models page)</li>
+          </ol>
         </div>
       </div>
+    </div>
+  </div>
 
-      <div class="grid3">
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
-        <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
-        <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
+  <!-- Tab: Integrity -->
+  <div class="tab-content" id="tab-integrity">
+    <div class="split-pane-2-1">
+      <div class="card">
+        <h3 class="mb-2">Run Audit</h3>
+        <p class="muted text-sm mb-2">Verify checksums, schema conformity, and data integrity across datasets.</p>
+        <form class="form" method="post" action="/ops/integrity/audit{{ token_qs }}">
+          <div class="grid2">
+            <div>
+              <label>Scopes</label>
+              <select name="scopes" multiple size="6">
+                <option value="all" selected>all</option>
+                <option value="ticks">ticks</option>
+                <option value="main_l5">main_l5</option>
+                <option value="features">features</option>
+                <option value="labels">labels</option>
+                <option value="completeness">completeness</option>
+              </select>
+            </div>
+            <div>
+              <label>Data dir</label><input name="data_dir" value="data"/>
+              <label>Runs dir</label><input name="runs_dir" value="runs"/>
+              <div class="grid2" style="margin-top:10px;">
+                <div>
+                  <label class="text-sm">(completeness) Exchange</label>
+                  <input name="exchange" value="SHFE"/>
+                </div>
+                <div>
+                  <label class="text-sm">(completeness) Variety</label>
+                  <input name="variety" value="cu"/>
+                </div>
+              </div>
+              <label style="margin-top:8px; display:flex; align-items:center; gap:8px;">
+                <input type="checkbox" name="refresh_catalog" value="true"/>
+                <span class="text-sm">(completeness) Refresh catalog (network)</span>
+              </label>
+            </div>
+          </div>
+          <button type="submit">Run Audit</button>
+        </form>
       </div>
 
-      <button type="submit">Start trade job</button>
-    </form>
+      <div class="card">
+        <h3 class="mb-2">Recent Audit Reports</h3>
+        {% if reports and reports|length > 0 %}
+          <ul style="list-style:none; padding:0; margin:0;">
+            {% for r in reports[:10] %}
+              <li style="margin-bottom:6px;"><a href="/ops/integrity/report/{{ r }}{{ token_qs }}" class="mono text-sm">{{ r }}</a></li>
+            {% endfor %}
+          </ul>
+          {% if reports|length > 10 %}
+            <div class="muted text-sm" style="margin-top:8px;">+ {{ reports|length - 10 }} more</div>
+          {% endif %}
+        {% else %}
+          <div class="muted">No audit reports found</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
 
-    <h4>Recent trading runs</h4>
-    {% if runs and runs|length > 0 %}
+  <!-- Tab: Locks -->
+  <div class="tab-content" id="tab-locks">
+    <div class="card">
+      <h3 class="mb-2">Active Locks</h3>
+      <p class="muted text-sm mb-2">Resource locks held across all sessions. Stale locks are reaped automatically on acquisition.</p>
       <div class="tableWrap">
-        <table class="table">
-          <thead><tr><th>run_id</th><th>last_ts</th><th>balance</th><th></th></tr></thead>
+        <table class="table table-compact">
+          <thead>
+            <tr><th>Key</th><th>Job</th><th>PID</th><th>Created</th><th>Updated</th></tr>
+          </thead>
           <tbody>
-          {% for r in runs %}
+          {% for l in locks %}
             <tr>
-              <td class="mono">{{ r.run_id }}</td>
-              <td class="mono">{{ r.last_ts }}</td>
-              <td class="mono">{{ r.balance }}</td>
-              <td><a href="/ops/trading/run/{{ r.run_id }}{{ token_qs }}">view</a></td>
+              <td class="mono">{{ l.key }}</td>
+              <td class="mono"><a href="/jobs/{{ l.job_id }}{{ token_qs }}">{{ l.job_id[:8] }}</a></td>
+              <td class="mono">{{ l.pid }}</td>
+              <td class="mono text-xs">{{ l.created_at }}</td>
+              <td class="mono text-xs">{{ l.updated_at }}</td>
             </tr>
+          {% else %}
+            <tr><td colspan="5" class="muted">No active locks</td></tr>
           {% endfor %}
           </tbody>
         </table>
       </div>
-    {% else %}
-      <p class="muted">No runs found under runs/trading/</p>
-    {% endif %}
-  </div>
+    </div>
 
-  <div class="card" id="integrity">
-    <h3>Integrity</h3>
-
-    <h4>audit</h4>
-    <form class="form" method="post" action="/ops/integrity/audit{{ token_qs }}">
-      <div class="grid2">
-        <div><label>Scopes</label>
-          <select name="scopes" multiple size="5">
-            <option value="all" selected>all</option>
-            <option value="ticks">ticks</option>
-            <option value="main_l5">main_l5</option>
-            <option value="features">features</option>
-            <option value="labels">labels</option>
-          </select>
-        </div>
-        <div>
-          <label>Data dir</label><input name="data_dir" value="data"/>
-          <label>Runs dir</label><input name="runs_dir" value="runs"/>
-          <label>Lake version</label>
-          <select name="lake_version"><option value="v1">v1</option><option value="v2" selected>v2</option></select>
-        </div>
+    <div class="card">
+      <h3 class="mb-2">Lock Keys Reference</h3>
+      <div class="tableWrap">
+        <table class="table table-compact">
+          <thead><tr><th>Pattern</th><th>Command</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">ticks:symbol=X</td><td>download, record</td><td>Per-symbol tick ingest</td></tr>
+            <tr><td class="mono">ticks_range:exchange=X,var=Y</td><td>download-contract-range</td><td>Variety-wide backfill</td></tr>
+            <tr><td class="mono">build:symbol=X,ticks_lake=Y</td><td>build</td><td>Feature/label build</td></tr>
+            <tr><td class="mono">train:symbol=X,model=M,h=H</td><td>train</td><td>Model training</td></tr>
+            <tr><td class="mono">main_schedule:var=X</td><td>main-schedule</td><td>Schedule computation</td></tr>
+            <tr><td class="mono">main_depth:symbol=X</td><td>main-depth, main-l5</td><td>Derived dataset build</td></tr>
+            <tr><td class="mono">trade:mode=X</td><td>trade</td><td>Trading execution</td></tr>
+          </tbody>
+        </table>
       </div>
-      <button type="submit">Run audit</button>
-    </form>
-
-    <h4>Recent audit reports</h4>
-    {% if reports and reports|length > 0 %}
-      <ul>
-        {% for r in reports %}
-          <li><a href="/ops/integrity/report/{{ r }}{{ token_qs }}">{{ r }}</a></li>
-        {% endfor %}
-      </ul>
-    {% else %}
-      <p class="muted">No reports found under runs/audit/</p>
-    {% endif %}
-  </div>
-
-  <div class="card" id="locks">
-    <h3>Locks</h3>
-    <p class="muted">Active strict locks held across all sessions. Stale locks are reaped on acquisition.</p>
-    <div class="tableWrap">
-      <table class="table">
-        <thead><tr><th>Key</th><th>Job</th><th>PID</th><th>Created</th><th>Updated</th></tr></thead>
-        <tbody>
-        {% for l in locks %}
-          <tr>
-            <td class="mono">{{ l.key }}</td>
-            <td class="mono"><a href="/jobs/{{ l.job_id }}{{ token_qs }}">{{ l.job_id }}</a></td>
-            <td class="mono">{{ l.pid }}</td>
-            <td class="mono">{{ l.created_at }}</td>
-            <td class="mono">{{ l.updated_at }}</td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
     </div>
   </div>
-
-  <script>
-    // Ingest auto-refresh (copied from /ops/ingest).
-    (function() {
-      const tokenQs = "{{ token_qs }}";
-      const url = "/api/ingest/status" + tokenQs;
-
-      function pillClass(status) {
-        return "pill pill-" + (status || "queued");
-      }
-
-      function fmtPct(x) {
-        if (x === null || x === undefined) return "-";
-        return (Math.round(x * 1000) / 10).toFixed(1) + "%";
-      }
-
-      function renderJobs(rows) {
-        const body = document.getElementById("ingestJobsBody");
-        if (!body) return;
-        body.innerHTML = "";
-        for (const s of rows) {
-          const tr = document.createElement("tr");
-
-          const current = (s.kind === "download_contract_range") ? (s.current_symbol || "") :
-                          (s.kind === "download") ? (s.symbol || "") :
-                          (s.current_symbol || "");
-
-          let pct = null;
-          let progress = "-";
-          if (s.kind === "download_contract_range" && s.summary) {
-            pct = s.summary.pct;
-            progress = fmtPct(s.summary.pct) +
-              " (" + s.summary.days_done_total + "/" + s.summary.days_expected_total + ")" +
-              " contracts " + s.summary.contracts_done + "/" + s.summary.contracts_total;
-          } else if (s.kind === "download" && s.summary) {
-            pct = s.summary.pct;
-            progress = fmtPct(s.summary.pct) + " (" + s.summary.days_done + "/" + s.summary.days_expected + ")";
-          }
-
-          const bar = (pct !== null && pct !== undefined) ?
-            ('<div class="progressBar"><div style="width:' + (Math.max(0, Math.min(1, pct)) * 100).toFixed(1) + '%"></div></div>') :
-            '';
-
-          tr.innerHTML =
-            '<td class="mono">' + (s.job_id || "") + '</td>' +
-            '<td><span class="' + pillClass(s.job_status) + '">' + (s.job_status || "") + '</span></td>' +
-            '<td class="mono">' + (s.kind || "") + '</td>' +
-            '<td class="mono">' + (s.lake_version || "") + '</td>' +
-            '<td class="mono">' + (s.source || "") + '</td>' +
-            '<td class="mono">' + current + '</td>' +
-            '<td>' + bar + '<div class="mono" style="margin-top:6px;">' + progress + '</div></td>' +
-            '<td>' + (s.title || "") + '</td>' +
-            '<td><a href="/jobs/' + (s.job_id || "") + tokenQs + '">View</a></td>';
-
-          body.appendChild(tr);
-        }
-      }
-
-      function renderFirstRange(rows) {
-        const card = document.getElementById("rangeDetailsCard");
-        const meta = document.getElementById("rangeDetailsMeta");
-        const body = document.getElementById("rangeDetailsBody");
-        if (!card || !meta || !body) return;
-
-        const s = rows.find(r => r.kind === "download_contract_range" && r.contracts && r.contracts.length);
-        if (!s) {
-          card.style.display = "none";
-          return;
-        }
-
-        card.style.display = "block";
-        meta.textContent =
-          "Job " + (s.job_id || "") + " / " + (s.var || "") + " " +
-          (s.start_contract || "") + " -> " + (s.resolved_end_contract || s.end_contract || "") +
-          (s.lake_version ? (" | lake: " + s.lake_version) : "") +
-          (s.current_symbol ? (" | current: " + s.current_symbol) : "");
-
-        body.innerHTML = "";
-        for (const c of s.contracts) {
-          const tr = document.createElement("tr");
-          tr.innerHTML =
-            '<td class="mono">' + (c.raw_contract || "") + '</td>' +
-            '<td class="mono">' + (c.status || "") + '</td>' +
-            '<td class="mono">' + (c.is_current ? "yes" : "") + '</td>' +
-            '<td class="mono">' + (c.days_expected ?? "") + '</td>' +
-            '<td class="mono">' + (c.days_done ?? "") + '</td>' +
-            '<td class="mono">' + fmtPct(c.pct) + '</td>' +
-            '<td class="mono">' + (c.min_downloaded || "") + '</td>' +
-            '<td class="mono">' + (c.max_downloaded || "") + '</td>';
-          if (c.is_current) tr.classList.add("rowCurrent");
-          body.appendChild(tr);
-        }
-      }
-
-      async function refresh() {
-        try {
-          const resp = await fetch(url);
-          if (!resp.ok) return;
-          const data = await resp.json();
-          const rows = data.jobs || [];
-          renderJobs(rows);
-          renderFirstRange(rows);
-        } catch (e) {}
-      }
-
-      refresh();
-      setInterval(refresh, 15000);
-    })();
-
-    // Trading safety UI (copied from /ops/trading).
-    (function() {
-      const mode = document.getElementById("tradeMode");
-      const mo = document.getElementById("monitorOnly");
-      const confirmWrap = document.getElementById("confirmLiveWrap");
-
-      function sync() {
-        const m = (mode && mode.value) ? mode.value : "paper";
-        const monitor = !!(mo && mo.checked);
-        if (confirmWrap) {
-          confirmWrap.style.display = (m === "live" && !monitor) ? "block" : "none";
-        }
-        if (m === "live" && mo && !mo.checked) {
-          mo.checked = true;
-        }
-        const simSelect = document.querySelector('select[name="sim_account"]');
-        if (simSelect) simSelect.disabled = (m !== "sim");
-      }
-
-      if (mode) mode.addEventListener("change", sync);
-      if (mo) mo.addEventListener("change", sync);
-      sync();
-    })();
-  </script>
 {% endblock %}
 
+{% block scripts %}
+<script>
+(function() {
+  window.ghTrader.initTabs({ updateHash: true });
+
+  // Ingest jobs auto-refresh
+  const tokenQs = "{{ token_qs }}";
+  
+  async function refreshIngestJobs() {
+    try {
+      const resp = await window.ghTrader.fetchApi("/api/ingest/status?limit=50");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const jobs = data.jobs || [];
+      
+      const tbody = document.getElementById("ingestJobsBody");
+      if (!tbody) return;
+      
+      if (jobs.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="muted">No ingest jobs running</td></tr>';
+        return;
+      }
+      
+      tbody.innerHTML = jobs.map(s => {
+        const current = s.kind === "download_contract_range" ? (s.current_symbol || "") :
+                        s.kind === "download" ? (s.symbol || "") : (s.current_symbol || "");
+        const pct = s.summary && s.summary.pct !== null ? s.summary.pct : null;
+        const pctText = pct !== null ? (pct * 100).toFixed(1) + "%" : "-";
+        const pctBar = pct !== null ? 
+          '<div class="progressBar"><div style="width:' + (pct * 100).toFixed(1) + '%"></div></div>' +
+          '<div class="mono text-xs" style="margin-top:4px;">' + pctText + '</div>' : '-';
+        
+        return [
+          '<tr>',
+          '<td class="mono text-xs">' + (s.job_id || "").substring(0, 8) + '</td>',
+          '<td><span class="pill pill-' + (s.job_status || "queued") + '">' + (s.job_status || "") + '</span></td>',
+          '<td class="mono">' + (s.kind || "") + '</td>',
+          '<td class="mono">' + current + '</td>',
+          '<td>' + pctBar + '</td>',
+          '<td><a href="/jobs/' + (s.job_id || "") + tokenQs + '">View</a></td>',
+          '</tr>'
+        ].join("");
+      }).join("");
+    } catch (e) {
+      // Ignore errors
+    }
+  }
+  
+  // Initial refresh and auto-refresh every 10s
+  refreshIngestJobs();
+  setInterval(refreshIngestJobs, 10000);
+})();
+</script>
+{% endblock %}

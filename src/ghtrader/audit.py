@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -33,6 +33,343 @@ class Finding:
     message: str
     path: str | None = None
     extra: dict[str, Any] | None = None
+
+
+def _parse_exchange_var(symbol: str) -> tuple[str | None, str | None]:
+    """
+    Best-effort parse:
+      "SHFE.cu2602" -> ("SHFE", "cu")
+    """
+    s = str(symbol).strip()
+    if "." not in s:
+        return None, None
+    ex, tail = s.split(".", 1)
+    ex = ex.upper().strip() or None
+    var = ""
+    for ch in tail:
+        if ch.isalpha():
+            var += ch
+        else:
+            break
+    var = var.lower().strip() or None
+    return ex, var
+
+
+def _last_trading_day_leq(cal: list[date], today: date) -> date:
+    if not cal:
+        d = today
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d
+    # calendar sorted
+    lo = 0
+    hi = len(cal)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cal[mid] <= today:
+            lo = mid + 1
+        else:
+            hi = mid
+    idx = lo - 1
+    return cal[idx] if idx >= 0 else today
+
+
+def _count_trading_days_between(*, cal: list[date], start: date, end: date) -> int:
+    if end < start:
+        return 0
+    if cal:
+        from bisect import bisect_left, bisect_right
+
+        i0 = bisect_left(cal, start)
+        i1 = bisect_right(cal, end)
+        return int(max(0, i1 - i0))
+    # weekday fallback
+    cur = start
+    n = 0
+    while cur <= end:
+        if cur.weekday() < 5:
+            n += 1
+        cur += timedelta(days=1)
+    return int(n)
+
+
+def _iter_local_tick_symbols(*, data_dir: Path, lake_version: LakeVersion) -> set[str]:
+    """
+    List symbols present on disk under: data/lake_v2/ticks/symbol=...
+    """
+    out: set[str] = set()
+    root = lake_root_dir(data_dir, lake_version) / "ticks"
+    try:
+        if not root.exists():
+            return out
+        for p in root.iterdir():
+            if not p.is_dir() or not p.name.startswith("symbol="):
+                continue
+            sym = p.name.split("=", 1)[-1].strip()
+            if sym:
+                out.add(sym)
+    except Exception:
+        return out
+    return out
+
+
+def audit_completeness(
+    *,
+    data_dir: Path,
+    runs_dir: Path,
+    lake_version: LakeVersion,
+    symbols: list[str] | None = None,
+    exchange: str | None = None,
+    var: str | None = None,
+    refresh_catalog: bool = False,
+) -> list[Finding]:
+    """
+    Completeness audit (best-effort):
+    - Uses TqSdk catalog metadata (open_date / expire_datetime) when available.
+    - Computes expected trading days and compares local Parquet mirror vs expected.
+    - When QuestDB is reachable, also checks coarse DB coverage (first/last day + tick_days).
+    """
+    from ghtrader.lake import list_available_dates
+    from ghtrader.tq_ingest import _load_no_data_dates  # type: ignore
+    from ghtrader.tqsdk_catalog import get_contract_catalog
+    from ghtrader.trading_calendar import get_trading_calendar
+
+    ex_filter = str(exchange).upper().strip() if exchange else None
+    v_filter = str(var).lower().strip() if var else None
+
+    cal = get_trading_calendar(data_dir=data_dir, refresh=False)
+    today = datetime.now(timezone.utc).date()
+    today_trading = _last_trading_day_leq(cal, today)
+
+    # Determine symbols to check.
+    only = {str(s).strip() for s in (symbols or []) if str(s).strip()} or None
+    local_syms = _iter_local_tick_symbols(data_dir=data_dir, lake_version=lake_version)
+    target_syms: set[str] = set()
+    if only is not None:
+        target_syms = set(only)
+    else:
+        # If exchange/var filters are set, pull from catalog + local.
+        if ex_filter and v_filter:
+            cat = get_contract_catalog(exchange=ex_filter, var=v_filter, runs_dir=runs_dir, ttl_s=10**9, refresh=bool(refresh_catalog))
+            cat_syms = {str(r.get("symbol") or "").strip() for r in (cat.get("contracts") or [])}
+            target_syms = {s for s in cat_syms | local_syms if s}
+        else:
+            target_syms = {s for s in local_syms if s}
+
+    # Build catalog metadata mapping for target symbols (best-effort, cached by var).
+    by_sym: dict[str, dict[str, Any]] = {}
+    if ex_filter and v_filter:
+        cat = get_contract_catalog(exchange=ex_filter, var=v_filter, runs_dir=runs_dir, ttl_s=10**9, refresh=bool(refresh_catalog))
+        for r in cat.get("contracts") or []:
+            sym = str(r.get("symbol") or "").strip()
+            if sym:
+                by_sym[sym] = dict(r)
+    else:
+        # Group by (exchange,var) inferred from symbol.
+        groups: dict[tuple[str, str], set[str]] = {}
+        for s in sorted(target_syms):
+            ex, vv = _parse_exchange_var(s)
+            if not ex or not vv:
+                continue
+            if ex_filter and ex != ex_filter:
+                continue
+            if v_filter and vv != v_filter:
+                continue
+            groups.setdefault((ex, vv), set()).add(s)
+        for (ex, vv), _syms in groups.items():
+            cat = get_contract_catalog(exchange=ex, var=vv, runs_dir=runs_dir, ttl_s=10**9, refresh=bool(refresh_catalog))
+            for r in cat.get("contracts") or []:
+                sym = str(r.get("symbol") or "").strip()
+                if sym:
+                    by_sym[sym] = dict(r)
+
+    findings: list[Finding] = []
+
+    # Optional: QuestDB coverage for coarse DB completeness.
+    questdb_cov: dict[str, dict[str, Any]] | None = None
+    questdb_err: str | None = None
+    try:
+        from ghtrader.config import (
+            get_questdb_host,
+            get_questdb_pg_dbname,
+            get_questdb_pg_password,
+            get_questdb_pg_port,
+            get_questdb_pg_user,
+        )
+        from ghtrader.questdb_queries import QuestDBQueryConfig, query_contract_coverage
+
+        cfg = QuestDBQueryConfig(
+            host=get_questdb_host(),
+            pg_port=int(get_questdb_pg_port()),
+            pg_user=str(get_questdb_pg_user()),
+            pg_password=str(get_questdb_pg_password()),
+            pg_dbname=str(get_questdb_pg_dbname()),
+        )
+        questdb_cov = query_contract_coverage(
+            cfg=cfg,
+            table="ghtrader_ticks_raw_v2",
+            symbols=sorted(target_syms),
+            lake_version="v2",
+            ticks_lake="raw",
+        )
+    except Exception as e:
+        questdb_cov = None
+        questdb_err = str(e)
+
+    if questdb_cov is None and questdb_err:
+        findings.append(Finding("warning", "questdb_unreachable", "QuestDB coverage check skipped", extra={"error": questdb_err}))
+
+    for sym in sorted(target_syms):
+        meta = by_sym.get(sym) or {"symbol": sym, "expired": None, "expire_datetime": None, "open_date": None, "catalog_source": "unknown"}
+        expired = meta.get("expired")
+        expired_b = bool(expired) if expired is not None else None
+        open_date_s = str(meta.get("open_date") or "").strip() or None
+        exp_dt_s = str(meta.get("expire_datetime") or "").strip() or None
+
+        # Local done days
+        local_dates = {d.isoformat() for d in list_available_dates(data_dir, sym, lake_version=lake_version)}
+        no_data_dates = {d.isoformat() for d in _load_no_data_dates(data_dir, sym, lake_version=lake_version)}
+
+        local_min = min(local_dates) if local_dates else None
+        local_max = max(local_dates) if local_dates else None
+
+        expected_first: date | None = None
+        if open_date_s:
+            try:
+                expected_first = date.fromisoformat(open_date_s[:10])
+            except Exception:
+                expected_first = None
+        if expected_first is None and local_min:
+            try:
+                expected_first = date.fromisoformat(local_min)
+            except Exception:
+                expected_first = None
+
+        expire_trading: date | None = None
+        if exp_dt_s:
+            try:
+                expire_day = date.fromisoformat(exp_dt_s[:10])
+                expire_trading = _last_trading_day_leq(cal, expire_day)
+            except Exception:
+                expire_trading = None
+
+        expected_last: date | None = None
+        if expired_b is False:
+            expected_last = today_trading if expected_first else None
+        else:
+            expected_last = expire_trading if (expire_trading and expected_first) else None
+            if expected_last is None and local_max:
+                try:
+                    expected_last = date.fromisoformat(local_max) if expected_first else None
+                except Exception:
+                    expected_last = None
+
+        if expected_first is None or expected_last is None or expected_last < expected_first:
+            findings.append(
+                Finding(
+                    "warning",
+                    "completeness_unknown",
+                    "Could not determine expected trading-day window",
+                    path=sym,
+                    extra={"symbol": sym, "open_date": open_date_s, "expire_datetime": exp_dt_s, "local_min": local_min, "local_max": local_max},
+                )
+            )
+            continue
+
+        days_expected = _count_trading_days_between(cal=cal, start=expected_first, end=expected_last)
+        done = {ds for ds in (local_dates | no_data_dates) if expected_first.isoformat() <= ds <= expected_last.isoformat()}
+        days_done = int(len(done))
+        missing_count = int(max(0, days_expected - days_done))
+
+        if missing_count > 0:
+            # Produce a small sample of missing days (bounded).
+            if cal:
+                from bisect import bisect_left, bisect_right
+
+                i0 = bisect_left(cal, expected_first)
+                i1 = bisect_right(cal, expected_last)
+                exp_days = [d.isoformat() for d in cal[i0:i1]]
+            else:
+                exp_days = []
+                cur = expected_first
+                while cur <= expected_last:
+                    if cur.weekday() < 5:
+                        exp_days.append(cur.isoformat())
+                    cur += timedelta(days=1)
+            missing = [d for d in exp_days if d not in done]
+            findings.append(
+                Finding(
+                    "error",
+                    "completeness_missing_trading_days",
+                    "Missing expected trading days in local Parquet mirror",
+                    path=sym,
+                    extra={
+                        "symbol": sym,
+                        "expected_first": expected_first.isoformat(),
+                        "expected_last": expected_last.isoformat(),
+                        "days_expected": int(days_expected),
+                        "days_done": int(days_done),
+                        "missing_count": int(len(missing)),
+                        "missing_sample": missing[:10],
+                        "catalog_source": str(meta.get("catalog_source") or ""),
+                    },
+                )
+            )
+
+        # Coarse QuestDB coverage checks (when available)
+        if questdb_cov is not None:
+            qc = questdb_cov.get(sym) or {}
+            db_first = str(qc.get("first_tick_day") or "").strip() or None
+            db_last = str(qc.get("last_tick_day") or "").strip() or None
+            db_days = qc.get("tick_days")
+            try:
+                db_days_i = int(db_days) if db_days is not None else 0
+            except Exception:
+                db_days_i = 0
+
+            if db_days_i <= 0 and (local_dates or no_data_dates):
+                findings.append(
+                    Finding(
+                        "warning",
+                        "questdb_empty",
+                        "QuestDB has no tick coverage for a symbol that has local data",
+                        path=sym,
+                        extra={"symbol": sym, "expected_days": int(days_expected), "local_days": int(len(local_dates))},
+                    )
+                )
+            else:
+                if db_first and db_first > expected_first.isoformat():
+                    findings.append(
+                        Finding(
+                            "warning",
+                            "questdb_first_day_late",
+                            "QuestDB first_tick_day is later than expected_first",
+                            path=sym,
+                            extra={"symbol": sym, "expected_first": expected_first.isoformat(), "db_first_tick_day": db_first},
+                        )
+                    )
+                if db_last and db_last < expected_last.isoformat():
+                    findings.append(
+                        Finding(
+                            "warning",
+                            "questdb_last_day_early",
+                            "QuestDB last_tick_day is earlier than expected_last",
+                            path=sym,
+                            extra={"symbol": sym, "expected_last": expected_last.isoformat(), "db_last_tick_day": db_last},
+                        )
+                    )
+                if db_days_i > 0 and db_days_i < int(days_expected):
+                    findings.append(
+                        Finding(
+                            "warning",
+                            "questdb_days_missing",
+                            "QuestDB tick_days is smaller than expected trading-day count (coarse)",
+                            path=sym,
+                            extra={"symbol": sym, "expected_days": int(days_expected), "db_tick_days": int(db_days_i)},
+                        )
+                    )
+
+    return findings
 
 
 def _schema_matches(expected: pa.Schema, actual: pa.Schema) -> bool:
@@ -247,7 +584,7 @@ def audit_ticks_root(
     return findings
 
 
-def _audit_main_l5_equivalence(data_dir: Path, *, lake_version: LakeVersion = "v1") -> list[Finding]:
+def _audit_main_l5_equivalence(data_dir: Path, *, lake_version: LakeVersion = "v2") -> list[Finding]:
     """
     Validate derived main_l5 ticks match underlying raw ticks (excluding 'symbol').
     """
@@ -334,37 +671,52 @@ def _audit_main_l5_equivalence(data_dir: Path, *, lake_version: LakeVersion = "v
                         findings.append(Finding("error", "row_count_mismatch", "Derived vs raw row count mismatch", path=str(p_der), extra={"raw_rows": n_raw, "derived_rows": n_der}))
                         continue
 
-                    # For lake_v2 derived ticks we require explicit metadata columns and verify them.
-                    if lake_version == "v2":
-                        der_schema = pf_der.schema_arrow
-                        if "underlying_contract" not in der_schema.names:
-                            findings.append(Finding("error", "missing_metadata", "Missing underlying_contract column in derived ticks", path=str(p_der)))
-                        if "segment_id" not in der_schema.names:
-                            findings.append(Finding("error", "missing_metadata", "Missing segment_id column in derived ticks", path=str(p_der)))
+                    # v2-only: derived ticks must include explicit metadata columns and match the schedule.
+                    der_schema = pf_der.schema_arrow
+                    if "underlying_contract" not in der_schema.names:
+                        findings.append(Finding("error", "missing_metadata", "Missing underlying_contract column in derived ticks", path=str(p_der)))
+                    if "segment_id" not in der_schema.names:
+                        findings.append(Finding("error", "missing_metadata", "Missing segment_id column in derived ticks", path=str(p_der)))
 
-                        # Sample row groups for metadata consistency checks.
-                        groups_meta = list(range(pf_der.num_row_groups))
-                        if groups_meta and n_der > 500_000:
-                            groups_meta = sorted(set([0, groups_meta[-1], groups_meta[len(groups_meta) // 2]]))
-                        for gi in groups_meta:
-                            if "underlying_contract" in der_schema.names:
-                                t_u = pf_der.read_row_group(gi, columns=["underlying_contract"])
-                                arr_u = t_u.column("underlying_contract").combine_chunks()
-                                if arr_u.null_count:
-                                    findings.append(Finding("error", "metadata_null", "Nulls in underlying_contract", path=str(p_der), extra={"row_group": gi}))
-                                else:
-                                    ok_u = pc.all(pc.equal(arr_u, pa.scalar(underlying, type=pa.string()))).as_py()
-                                    if not bool(ok_u):
-                                        findings.append(Finding("error", "metadata_mismatch", "underlying_contract does not match schedule", path=str(p_der), extra={"row_group": gi, "expected": underlying}))
-                            if "segment_id" in der_schema.names:
-                                t_s = pf_der.read_row_group(gi, columns=["segment_id"])
-                                arr_s = t_s.column("segment_id").combine_chunks()
-                                if arr_s.null_count:
-                                    findings.append(Finding("error", "metadata_null", "Nulls in segment_id", path=str(p_der), extra={"row_group": gi}))
-                                else:
-                                    ok_s = pc.all(pc.equal(arr_s, pa.scalar(int(exp_seg_id), type=pa.int64()))).as_py()
-                                    if not bool(ok_s):
-                                        findings.append(Finding("error", "metadata_mismatch", "segment_id does not match schedule", path=str(p_der), extra={"row_group": gi, "expected": int(exp_seg_id)}))
+                    # Sample row groups for metadata consistency checks.
+                    groups_meta = list(range(pf_der.num_row_groups))
+                    if groups_meta and n_der > 500_000:
+                        groups_meta = sorted(set([0, groups_meta[-1], groups_meta[len(groups_meta) // 2]]))
+                    for gi in groups_meta:
+                        if "underlying_contract" in der_schema.names:
+                            t_u = pf_der.read_row_group(gi, columns=["underlying_contract"])
+                            arr_u = t_u.column("underlying_contract").combine_chunks()
+                            if arr_u.null_count:
+                                findings.append(Finding("error", "metadata_null", "Nulls in underlying_contract", path=str(p_der), extra={"row_group": gi}))
+                            else:
+                                ok_u = pc.all(pc.equal(arr_u, pa.scalar(underlying, type=pa.string()))).as_py()
+                                if not bool(ok_u):
+                                    findings.append(
+                                        Finding(
+                                            "error",
+                                            "metadata_mismatch",
+                                            "underlying_contract does not match schedule",
+                                            path=str(p_der),
+                                            extra={"row_group": gi, "expected": underlying},
+                                        )
+                                    )
+                        if "segment_id" in der_schema.names:
+                            t_s = pf_der.read_row_group(gi, columns=["segment_id"])
+                            arr_s = t_s.column("segment_id").combine_chunks()
+                            if arr_s.null_count:
+                                findings.append(Finding("error", "metadata_null", "Nulls in segment_id", path=str(p_der), extra={"row_group": gi}))
+                            else:
+                                ok_s = pc.all(pc.equal(arr_s, pa.scalar(int(exp_seg_id), type=pa.int64()))).as_py()
+                                if not bool(ok_s):
+                                    findings.append(
+                                        Finding(
+                                            "error",
+                                            "metadata_mismatch",
+                                            "segment_id does not match schedule",
+                                            path=str(p_der),
+                                            extra={"row_group": gi, "expected": int(exp_seg_id)},
+                                        )
+                                    )
 
                     # Full compare for small-ish files; sample row groups for large.
                     full = n_raw <= 500_000
@@ -461,8 +813,11 @@ def run_audit(
     data_dir: Path,
     runs_dir: Path,
     scopes: list[str],
-    lake_version: LakeVersion = "v1",
+    lake_version: LakeVersion = "v2",
     symbols: list[str] | None = None,
+    exchange: str | None = None,
+    var: str | None = None,
+    refresh_catalog: bool = False,
 ) -> tuple[Path, dict[str, Any]]:
     run_id = uuid.uuid4().hex[:12]
     findings: list[Finding] = []
@@ -478,10 +833,12 @@ def run_audit(
             audit_ticks_root(lake_root / "ticks", dataset="ticks_raw", expected_schema=TICK_ARROW_SCHEMA, only_symbols=only)
         )
     if "main_l5" in scopes or "all" in scopes:
-        expected = main_l5_schema_v2 if lake_version == "v2" else TICK_ARROW_SCHEMA
         findings.extend(
             audit_ticks_root(
-                lake_root / "main_l5" / "ticks", dataset="ticks_main_l5", expected_schema=expected, only_symbols=only
+                lake_root / "main_l5" / "ticks",
+                dataset="ticks_main_l5",
+                expected_schema=main_l5_schema_v2,
+                only_symbols=only,
             )
         )
         # Equivalence audit is global and can be expensive; skip when symbol-filtered.
@@ -491,6 +848,19 @@ def run_audit(
         findings.extend(audit_features_or_labels_root(data_dir / "features", dataset="features"))
     if "labels" in scopes or "all" in scopes:
         findings.extend(audit_features_or_labels_root(data_dir / "labels", dataset="labels"))
+    # Completeness can require external metadata/DB; keep it opt-in.
+    if "completeness" in scopes:
+        findings.extend(
+            audit_completeness(
+                data_dir=data_dir,
+                runs_dir=runs_dir,
+                lake_version=lake_version,
+                symbols=only and sorted(only) or None,
+                exchange=exchange,
+                var=var,
+                refresh_catalog=bool(refresh_catalog),
+            )
+        )
 
     n_errors = sum(1 for f in findings if f.severity == "error")
     n_warnings = sum(1 for f in findings if f.severity == "warning")
@@ -501,6 +871,9 @@ def run_audit(
         "data_dir": str(data_dir),
         "scopes": scopes,
         "lake_version": lake_version,
+        "completeness_exchange": str(exchange).upper().strip() if exchange else "",
+        "completeness_var": str(var).lower().strip() if var else "",
+        "completeness_refresh_catalog": bool(refresh_catalog),
         "summary": {"errors": int(n_errors), "warnings": int(n_warnings), "total": int(len(findings))},
         "findings": [
             {

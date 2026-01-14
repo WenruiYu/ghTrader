@@ -6,7 +6,7 @@ Given:
 - Raw L5 ticks for underlying contracts in the canonical lake
 
 We build:
-- A derived lake under data/lake/main_l5/ticks/ with symbol=KQ.m@... and per-date partitions.
+- A derived lake under data/lake_v2/main_l5/ticks/ with symbol=KQ.m@... and per-date partitions.
 
 This materialization is optional but convenient for downstream training/eval.
 """
@@ -98,7 +98,7 @@ def materialize_main_with_depth(
     schedule_path: Path,
     data_dir: Path | None = None,
     overwrite: bool = False,
-    lake_version: LakeVersion = "v1",
+    lake_version: LakeVersion = "v2",
 ) -> MainDepthMaterializationResult:
     """
     Materialize a derived main-with-depth lake from a schedule.
@@ -187,12 +187,11 @@ def materialize_main_with_depth(
 
             table = pq.read_table(rf, schema=TICK_ARROW_SCHEMA)
             table = _replace_symbol_in_table(table, derived_symbol)
-            if lake_version == "v2":
-                # Segment metadata (used to prevent cross-roll leakage downstream).
-                u = pa.array([underlying] * table.num_rows, type=pa.string())
-                seg = pa.array([int(seg_id)] * table.num_rows, type=pa.int64())
-                table = table.append_column("underlying_contract", u)
-                table = table.append_column("segment_id", seg)
+            # v2-only: Segment metadata (used to prevent cross-roll leakage downstream).
+            u = pa.array([underlying] * table.num_rows, type=pa.string())
+            seg = pa.array([int(seg_id)] * table.num_rows, type=pa.int64())
+            table = table.append_column("underlying_contract", u)
+            table = table.append_column("segment_id", seg)
             pq.write_table(table, out_path, compression="zstd")
             try:
                 from ghtrader.integrity import write_sha256_sidecar

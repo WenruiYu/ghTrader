@@ -157,7 +157,7 @@ def build_labels_for_symbol(
     ticks_lake: TicksLake = "raw",
     overwrite: bool = False,
     *,
-    lake_version: LakeVersion = "v1",
+    lake_version: LakeVersion = "v2",
 ) -> Path:
     """
     Build multi-horizon labels for a symbol from Parquet lake.
@@ -274,7 +274,7 @@ def build_labels_for_symbol(
                     raise ValueError("symbol mismatch")
                 if str(existing.get("ticks_lake")) != str(ticks_lake):
                     raise ValueError("ticks_lake mismatch")
-                if str(existing.get("lake_version") or "v1") != str(lake_version):
+                if str(existing.get("lake_version") or "v2") != str(lake_version):
                     raise ValueError("lake_version mismatch")
                 if list(existing.get("horizons") or []) != list(horizons):
                     raise ValueError("horizons mismatch")

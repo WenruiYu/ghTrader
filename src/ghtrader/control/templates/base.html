@@ -8,21 +8,183 @@
   </head>
   <body>
     <header class="topbar">
-      <div class="brand">ghTrader Control</div>
+      <div class="brand">ghTrader</div>
+      
+      <div class="topbar-status" id="topbarStatus">
+        <div class="topbar-status-item" id="statusQuestDB" title="QuestDB">
+          <span class="status-dot status-dot-unknown"></span>
+          <span>DB</span>
+        </div>
+        <div class="topbar-status-item" id="statusGPU" title="GPU">
+          <span class="status-dot status-dot-unknown"></span>
+          <span>GPU</span>
+        </div>
+      </div>
+      
       <nav class="nav">
         {% set path = request.url.path %}
-        <a href="/{{ token_qs }}" class="{% if path == '/' %}active{% endif %}">Home</a>
-        <a href="/jobs{{ token_qs }}" class="{% if path.startswith('/jobs') %}active{% endif %}">Jobs</a>
-        <a href="/ops{{ token_qs }}" class="{% if path.startswith('/ops') %}active{% endif %}">Ops</a>
+        <a href="/{{ token_qs }}" class="{% if path == '/' %}active{% endif %}">Dashboard</a>
+        <a href="/jobs{{ token_qs }}" class="{% if path.startswith('/jobs') %}active{% endif %}">
+          Jobs
+          {% if running_count is defined and running_count > 0 %}
+            <span class="nav-badge">{{ running_count }}</span>
+          {% endif %}
+        </a>
         <a href="/data{{ token_qs }}" class="{% if path.startswith('/data') %}active{% endif %}">Data</a>
-        <a href="/explorer{{ token_qs }}" class="{% if path.startswith('/explorer') %}active{% endif %}">Explorer</a>
+        <a href="/models{{ token_qs }}" class="{% if path.startswith('/models') %}active{% endif %}">Models</a>
+        <a href="/trading{{ token_qs }}" class="{% if path.startswith('/trading') %}active{% endif %}">Trading</a>
+        <a href="/ops{{ token_qs }}" class="{% if path.startswith('/ops') %}active{% endif %}">Ops</a>
+        <a href="/explorer{{ token_qs }}" class="{% if path.startswith('/explorer') %}active{% endif %}">SQL</a>
         <a href="/system{{ token_qs }}" class="{% if path.startswith('/system') %}active{% endif %}">System</a>
       </nav>
     </header>
 
     <main class="container">
+      {% block alerts %}{% endblock %}
       {% block content %}{% endblock %}
     </main>
+    
+    <div class="toast-container" id="toastContainer"></div>
+    
+    <script>
+      // Global utilities for all pages
+      window.ghTrader = window.ghTrader || {};
+      
+      // Token handling
+      (function() {
+        const qs = new URLSearchParams(window.location.search);
+        const token = qs.get("token");
+        window.ghTrader.token = token;
+        
+        window.ghTrader.withToken = function(url) {
+          if (!token) return url;
+          const u = new URL(url, window.location.origin);
+          u.searchParams.set("token", token);
+          return u.toString();
+        };
+        
+        window.ghTrader.fetchApi = async function(path, options) {
+          const url = window.ghTrader.withToken(path);
+          const headers = Object.assign({}, options?.headers || {});
+          if (token) headers["x-auth-token"] = token;
+          return fetch(url, Object.assign({}, options, { headers }));
+        };
+        
+        window.ghTrader.postJson = async function(path, payload) {
+          const resp = await window.ghTrader.fetchApi(path, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload || {})
+          });
+          const body = await resp.json().catch(() => ({}));
+          // Standardize error handling: some API endpoints return `{ok:false}` with 200.
+          if (!resp.ok || (body && Object.prototype.hasOwnProperty.call(body, "ok") && body.ok === false)) {
+            throw new Error(body.error || body.detail || `HTTP ${resp.status}`);
+          }
+          return body;
+        };
+      })();
+
+      // Common helpers (vanilla JS)
+      window.ghTrader.debounce = function(fn, delayMs) {
+        let t = null;
+        return function(...args) {
+          if (t) clearTimeout(t);
+          t = setTimeout(() => fn.apply(this, args), delayMs || 0);
+        };
+      };
+
+      // Initialize tabbed layouts using `.tab-nav-item[data-tab]` + `#tab-<id>` convention.
+      window.ghTrader.initTabs = function(options) {
+        const opts = options || {};
+        const navSelector = opts.navSelector || ".tab-nav-item";
+        const contentSelector = opts.contentSelector || ".tab-content";
+        const activeClass = opts.activeClass || "active";
+        const tabIdPrefix = opts.tabIdPrefix || "tab-";
+        const updateHash = !!opts.updateHash;
+        const onTab = (typeof opts.onTab === "function") ? opts.onTab : null;
+
+        const navItems = Array.from(document.querySelectorAll(navSelector));
+        const contents = Array.from(document.querySelectorAll(contentSelector));
+
+        function activate(tabId) {
+          navItems.forEach((t) => t.classList.remove(activeClass));
+          contents.forEach((c) => c.classList.remove(activeClass));
+          const nav = navItems.find((t) => String(t.dataset.tab || "") === String(tabId));
+          const pane = document.getElementById(tabIdPrefix + tabId);
+          if (nav) nav.classList.add(activeClass);
+          if (pane) pane.classList.add(activeClass);
+          if (updateHash) {
+            try { history.replaceState(null, "", "#" + tabId); } catch (e) {}
+          }
+          if (onTab) {
+            try { onTab(tabId); } catch (e) {}
+          }
+        }
+
+        navItems.forEach((item) => {
+          item.addEventListener("click", () => activate(item.dataset.tab));
+        });
+
+        const h = (String(window.location.hash || "").replace("#", "").trim());
+        if (h && navItems.some((t) => String(t.dataset.tab || "") === h)) {
+          activate(h);
+        }
+
+        return { activate, navItems, contents };
+      };
+      
+      // Toast notifications
+      window.ghTrader.toast = function(message, type) {
+        type = type || "info";
+        const container = document.getElementById("toastContainer");
+        if (!container) return;
+        const toast = document.createElement("div");
+        toast.className = "toast toast-" + type;
+        toast.textContent = message;
+        container.appendChild(toast);
+        setTimeout(() => {
+          toast.style.opacity = "0";
+          toast.style.transform = "translateX(100%)";
+          setTimeout(() => toast.remove(), 300);
+        }, 4000);
+      };
+      
+      // Status bar refresh
+      (function() {
+        async function refreshStatus() {
+          try {
+            const resp = await window.ghTrader.fetchApi("/api/ui/status");
+            if (!resp.ok) return;
+            const data = await resp.json();
+            
+            // QuestDB status
+            const qdbEl = document.querySelector("#statusQuestDB .status-dot");
+            if (qdbEl) {
+              qdbEl.className = "status-dot " + (data.questdb_ok ? "status-dot-ok" : "status-dot-error");
+            }
+            
+            // GPU status
+            const gpuEl = document.querySelector("#statusGPU .status-dot");
+            if (gpuEl) {
+              const status = String(data.gpu_status || "");
+              gpuEl.className = "status-dot " + (
+                status === "ready" ? "status-dot-ok" :
+                status === "running" ? "status-dot-warn" :
+                status === "idle" ? "status-dot-idle" : "status-dot-unknown"
+              );
+            }
+          } catch (e) {
+            // Silently ignore status refresh errors
+          }
+        }
+        
+        // Initial refresh and periodic updates
+        refreshStatus();
+        setInterval(refreshStatus, 30000);
+      })();
+    </script>
+    
+    {% block scripts %}{% endblock %}
   </body>
 </html>
-

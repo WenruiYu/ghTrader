@@ -49,11 +49,11 @@ def test_query_contract_coverage_merges_base_and_l5(monkeypatch: pytest.MonkeyPa
     def fake_bounds(*, l5_only: bool, **kwargs):
         if not l5_only:
             return {
-                "SHFE.cu2501": {"first_day": "2025-01-01", "last_day": "2025-01-03"},
-                "SHFE.cu2502": {"first_day": "2025-01-02", "last_day": "2025-01-03"},
+                "SHFE.cu2501": {"first_day": "2025-01-01", "last_day": "2025-01-03", "n_days": 3},
+                "SHFE.cu2502": {"first_day": "2025-01-02", "last_day": "2025-01-03", "n_days": 2},
             }
         return {
-            "SHFE.cu2502": {"first_day": "2025-01-02", "last_day": "2025-01-03"},
+            "SHFE.cu2502": {"first_day": "2025-01-02", "last_day": "2025-01-03", "n_days": 2},
         }
 
     monkeypatch.setattr(qq, "query_symbol_day_bounds", fake_bounds)
@@ -67,6 +67,8 @@ def test_query_contract_coverage_merges_base_and_l5(monkeypatch: pytest.MonkeyPa
     )
 
     assert cov["SHFE.cu2501"]["first_tick_day"] == "2025-01-01"
+    assert cov["SHFE.cu2501"]["tick_days"] == 3
     assert cov["SHFE.cu2501"]["first_l5_day"] is None
     assert cov["SHFE.cu2502"]["first_l5_day"] == "2025-01-02"
+    assert cov["SHFE.cu2502"]["l5_days"] == 2
 

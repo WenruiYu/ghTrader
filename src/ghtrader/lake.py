@@ -2,7 +2,7 @@
 Parquet data lake: schema, partitioning, manifest writing/reading.
 
 The canonical storage for raw L5 ticks uses:
-- Partitioning: data/lake/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet
+- Partitioning: data/lake_v2/ticks/symbol=.../date=YYYY-MM-DD/part-....parquet
 - Compression: ZSTD
 - Schema: locked Arrow schema for reproducibility
 """
@@ -70,24 +70,21 @@ def schema_hash() -> str:
 # Lake paths
 # ---------------------------------------------------------------------------
 
-LakeVersion = Literal["v1", "v2"]
+LakeVersion = Literal["v2"]
 
 
-def lake_root_dir(data_dir: Path, lake_version: LakeVersion = "v1") -> Path:
+def lake_root_dir(data_dir: Path, lake_version: LakeVersion = "v2") -> Path:
     """
     Return the base lake directory.
 
-    - v1: data/lake/ (legacy)
-    - v2: data/lake_v2/ (trading-day partitioning; preferred)
+    v2-only: data/lake_v2/ (trading-day partitioning).
     """
-    if lake_version == "v1":
-        return data_dir / "lake"
     if lake_version == "v2":
         return data_dir / "lake_v2"
     raise ValueError(f"Unknown lake_version: {lake_version!r}")
 
 
-def lake_ticks_dir(data_dir: Path, lake_version: LakeVersion = "v1") -> Path:
+def lake_ticks_dir(data_dir: Path, lake_version: LakeVersion = "v2") -> Path:
     """Return the base path for *raw* tick Parquet partitions."""
     return lake_root_dir(data_dir, lake_version) / "ticks"
 
@@ -99,13 +96,13 @@ def ticks_root_dir(
     data_dir: Path,
     ticks_lake: TicksLake = "raw",
     *,
-    lake_version: LakeVersion = "v1",
+    lake_version: LakeVersion = "v2",
 ) -> Path:
     """
     Return the base path for tick partitions for a given lake.
 
-    - raw:     data/lake{,_v2}/ticks/
-    - main_l5: data/lake{,_v2}/main_l5/ticks/
+    - raw:     data/lake_v2/ticks/
+    - main_l5: data/lake_v2/main_l5/ticks/
     """
     if ticks_lake == "raw":
         return lake_root_dir(data_dir, lake_version) / "ticks"
@@ -119,7 +116,7 @@ def ticks_symbol_dir(
     symbol: str,
     ticks_lake: TicksLake = "raw",
     *,
-    lake_version: LakeVersion = "v1",
+    lake_version: LakeVersion = "v2",
 ) -> Path:
     """Return the root directory for a symbol within a ticks lake."""
     return ticks_root_dir(data_dir, ticks_lake, lake_version=lake_version) / f"symbol={symbol}"
@@ -131,7 +128,7 @@ def ticks_date_dir(
     dt: date,
     ticks_lake: TicksLake = "raw",
     *,
-    lake_version: LakeVersion = "v1",
+    lake_version: LakeVersion = "v2",
 ) -> Path:
     """Return the directory for a symbol+date partition within a ticks lake."""
     return ticks_symbol_dir(data_dir, symbol, ticks_lake, lake_version=lake_version) / f"date={dt.isoformat()}"
@@ -143,7 +140,7 @@ def read_ticks_for_symbol_date(
     dt: date,
     *,
     ticks_lake: TicksLake = "raw",
-    lake_version: LakeVersion = "v1",
+    lake_version: LakeVersion = "v2",
 ) -> pd.DataFrame:
     """
     Read tick partitions for a single symbol+date (fast path).
@@ -169,7 +166,7 @@ def read_ticks_for_symbol_arrow(
     start_date: date | None = None,
     end_date: date | None = None,
     ticks_lake: TicksLake = "raw",
-    lake_version: LakeVersion = "v1",
+    lake_version: LakeVersion = "v2",
 ) -> pa.Table:
     """
     Arrow-first tick reader using pyarrow.dataset scanning.
@@ -215,7 +212,7 @@ def read_ticks_for_symbol_arrow(
 
 def partition_path(data_dir: Path, symbol: str, dt: date) -> Path:
     """Return the partition directory for a symbol and date."""
-    return lake_ticks_dir(data_dir, lake_version="v1") / f"symbol={symbol}" / f"date={dt.isoformat()}"
+    return lake_ticks_dir(data_dir, lake_version="v2") / f"symbol={symbol}" / f"date={dt.isoformat()}"
 
 
 def partition_file(data_dir: Path, symbol: str, dt: date, part_id: str | None = None) -> Path:
@@ -236,7 +233,7 @@ def write_ticks_partition(
     dt: date,
     part_id: str | None = None,
     *,
-    lake_version: LakeVersion = "v1",
+    lake_version: LakeVersion = "v2",
 ) -> Path:
     """
     Write a DataFrame of ticks to a Parquet partition.
@@ -316,7 +313,7 @@ def read_ticks_for_symbol(
     end_date: date | None = None,
     ticks_lake: TicksLake = "raw",
     *,
-    lake_version: LakeVersion = "v1",
+    lake_version: LakeVersion = "v2",
 ) -> pd.DataFrame:
     """
     Read all tick partitions for a symbol within a date range.
@@ -357,7 +354,7 @@ def read_ticks_for_symbol(
     return df
 
 
-def list_available_dates(data_dir: Path, symbol: str, *, lake_version: LakeVersion = "v1") -> list[date]:
+def list_available_dates(data_dir: Path, symbol: str, *, lake_version: LakeVersion = "v2") -> list[date]:
     """Return sorted list of dates that have data for a symbol."""
     base_dir = ticks_root_dir(data_dir, "raw", lake_version=lake_version) / f"symbol={symbol}"
     if not base_dir.exists():
@@ -376,7 +373,7 @@ def list_available_dates_in_lake(
     symbol: str,
     ticks_lake: TicksLake = "raw",
     *,
-    lake_version: LakeVersion = "v1",
+    lake_version: LakeVersion = "v2",
 ) -> list[date]:
     """Return sorted list of dates that have data for a symbol in a specific ticks lake."""
     base_dir = ticks_root_dir(data_dir, ticks_lake, lake_version=lake_version) / f"symbol={symbol}"

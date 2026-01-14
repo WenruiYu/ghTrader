@@ -71,8 +71,8 @@ def _read_json_list(path: Path) -> list[str]:
 
 
 def _lake_root_dir(data_dir: Path, lake_version: str | None) -> Path:
-    lv = str(lake_version or "v1").strip().lower()
-    return data_dir / ("lake_v2" if lv == "v2" else "lake")
+    _ = lake_version  # v2-only
+    return data_dir / "lake_v2"
 
 
 def _ticks_symbol_dir(data_dir: Path, symbol: str, *, lake_version: str | None = None) -> Path:
@@ -464,7 +464,7 @@ def compute_download_contract_range_status(
         "kind": "download_contract_range",
         "exchange": ex,
         "var": var_l,
-        "lake_version": str(lake_version or "v1"),
+        "lake_version": "v2",
         "start_date": start_iso,
         "end_date": end_iso,
         "start_contract": str(start_contract),
@@ -546,7 +546,7 @@ def ingest_status_for_job(
         log_hint = parse_ingest_log_tail(_read_log_tail(Path(log_path)))
 
     if kind == "download_contract_range":
-        lv = str(args.get("lake_version") or "v1")
+        lv = "v2"
         ex = str(args.get("exchange") or "SHFE")
         var = str(args.get("var") or args.get("variety") or "").strip()
         start_c = str(args.get("start_contract") or "").strip()
@@ -584,7 +584,7 @@ def ingest_status_for_job(
         return val
 
     if kind == "download":
-        lv = str(args.get("lake_version") or "v1")
+        lv = "v2"
         symbol = str(args.get("symbol") or "").strip()
         start_s = str(args.get("start_date") or args.get("start") or "").strip()
         end_s = str(args.get("end_date") or args.get("end") or "").strip()
@@ -657,7 +657,7 @@ def ingest_status_for_job(
 
     if kind == "record":
         # Live recorder is unbounded; provide best-effort hints only.
-        lv = str(args.get("lake_version") or "v1")
+        lv = "v2"
         return {
             "kind": "record",
             "job_id": job_id,

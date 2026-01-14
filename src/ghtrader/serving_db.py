@@ -128,16 +128,20 @@ class QuestDBBackend(ServingDBBackend):
         psycopg = self._psycopg()
         # Store the full canonical tick schema (including L5 columns) plus provenance tags.
         tick_numeric_cols = [c for c in TICK_COLUMN_NAMES if c not in {"symbol", "datetime"}]
-        cols = ["symbol SYMBOL", "ts TIMESTAMP", "datetime_ns LONG", "trading_day SYMBOL"]
+        cols = ["symbol SYMBOL", "ts TIMESTAMP", "datetime_ns LONG", "trading_day SYMBOL", "row_hash LONG"]
         cols += [f"{c} DOUBLE" for c in tick_numeric_cols]
         cols += ["lake_version SYMBOL", "ticks_lake SYMBOL"]
         if include_segment_metadata:
             cols += ["underlying_contract SYMBOL", "segment_id LONG"]
 
+        # DEDUP UPSERT KEYS makes Parquet → QuestDB sync idempotent:
+        # - include ts + symbol + provenance tags + row_hash so re-ingest replaces identical rows
+        # - row_hash prevents collapsing legitimate same-timestamp distinct rows
         ddl = f"""
         CREATE TABLE IF NOT EXISTS {table} (
           {", ".join(cols)}
         ) TIMESTAMP(ts) PARTITION BY DAY WAL
+          DEDUP UPSERT KEYS(ts, symbol, ticks_lake, lake_version, row_hash)
         """
         conn_params = {
             "user": self.config.questdb_pg_user,
@@ -152,7 +156,7 @@ class QuestDBBackend(ServingDBBackend):
                     cur.execute(ddl)
                     # Best-effort schema evolution: add any newly-required columns to existing tables.
                     # QuestDB lacks strong IF NOT EXISTS for columns across versions; ignore failures.
-                    for name, typ in [("trading_day", "SYMBOL")] + [(c, "DOUBLE") for c in tick_numeric_cols] + [
+                    for name, typ in [("trading_day", "SYMBOL"), ("row_hash", "LONG")] + [(c, "DOUBLE") for c in tick_numeric_cols] + [
                         ("lake_version", "SYMBOL"),
                         ("ticks_lake", "SYMBOL"),
                     ]:
@@ -166,6 +170,12 @@ class QuestDBBackend(ServingDBBackend):
                                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
                             except Exception:
                                 pass
+
+                    # Best-effort: enable dedup on existing tables (no-op if already enabled).
+                    try:
+                        cur.execute(f"ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS(ts, symbol, ticks_lake, lake_version, row_hash)")
+                    except Exception:
+                        pass
         except Exception as e:
             log.warning("serving_db.questdb_ddl_failed", table=table, error=str(e))
 
@@ -328,6 +338,29 @@ def sync_ticks_to_serving_db(
         if include_seg:
             df2["underlying_contract"] = df.get("underlying_contract", "").astype(str)
             df2["segment_id"] = pd.to_numeric(df.get("segment_id"), errors="coerce").fillna(-1).astype("int64")
+
+        # Deterministic row identity hash for idempotent sync + safe dedup.
+        try:
+            import numpy as np
+
+            prime = np.uint64(1099511628211)
+            h = np.full(len(df2), np.uint64(1469598103934665603))
+
+            # Mix datetime_ns (int64 bits)
+            h ^= dt_ns.to_numpy(dtype="int64", copy=False).view(np.uint64)
+            h *= prime
+
+            # Mix all canonical numeric tick columns (float64 bits)
+            for col in [c for c in TICK_COLUMN_NAMES if c not in {"symbol", "datetime"}]:
+                a = pd.to_numeric(df2.get(col), errors="coerce").to_numpy(dtype="float64", copy=False)
+                h ^= a.view(np.uint64)
+                h *= prime
+
+            # Store as signed int64 (QuestDB LONG); sign does not matter for equality.
+            df2["row_hash"] = h.view(np.int64)
+        except Exception:
+            # If hashing fails for any reason, fall back to timestamp-only (still useful for basic dedup).
+            df2["row_hash"] = dt_ns
 
         backend.ingest_df(table=table, df=df2)
         ingested.append(d.isoformat())

@@ -418,7 +418,7 @@ class FactorEngine:
         *,
         ticks_lake: TicksLake = "raw",
         overwrite: bool = False,
-        lake_version: LakeVersion = "v1",
+        lake_version: LakeVersion = "v2",
     ) -> Path:
         """
         Build features for a symbol from Parquet lake.
@@ -535,7 +535,7 @@ class FactorEngine:
                         raise ValueError("symbol mismatch")
                     if str(existing.get("ticks_lake")) != str(ticks_lake):
                         raise ValueError("ticks_lake mismatch")
-                    if str(existing.get("lake_version") or "v1") != str(lake_version):
+                    if str(existing.get("lake_version") or "v2") != str(lake_version):
                         raise ValueError("lake_version mismatch")
                     if list(existing.get("enabled_factors") or []) != list(self.enabled_factors):
                         raise ValueError("enabled_factors mismatch")

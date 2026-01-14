@@ -142,20 +142,6 @@ def get_runs_dir() -> Path:
     return Path(path_str)
 
 
-def get_lake_version() -> str:
-    """
-    Return the active lake version identifier.
-
-    - v1: data/lake (legacy)
-    - v2: data/lake_v2 (trading-day partitions; preferred)
-    """
-    load_config()
-    v = str(get_env("GHTRADER_LAKE_VERSION", "v1") or "v1").strip().lower()
-    if v in {"v1", "v2"}:
-        return v
-    raise RuntimeError(f"Invalid GHTRADER_LAKE_VERSION={v!r} (expected 'v1' or 'v2')")
-
-
 # ---------------------------------------------------------------------------
 # QuestDB (canonical tick DB) connection defaults
 # ---------------------------------------------------------------------------

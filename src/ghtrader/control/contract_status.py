@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 import json
 import time
 import uuid
@@ -10,7 +11,7 @@ from typing import Any, Iterable
 
 import pandas as pd
 
-from ghtrader.trading_calendar import get_trading_calendar, get_trading_days
+from ghtrader.trading_calendar import get_trading_calendar
 
 
 def _now_iso() -> str:
@@ -29,7 +30,7 @@ def _cache_root(*, runs_dir: Path) -> Path:
 
 
 def _l5_cache_path(*, runs_dir: Path, lake_version: str, symbol: str) -> Path:
-    lv = str(lake_version).strip().lower()
+    lv = "v2"
     sym = str(symbol).strip()
     safe = sym.replace("/", "_")
     return _cache_root(runs_dir=runs_dir) / "local_l5" / f"lake={lv}" / f"symbol={safe}.json"
@@ -55,9 +56,8 @@ def _write_json_atomic(path: Path, obj: dict[str, Any]) -> None:
 
 
 def _ticks_symbol_dir(*, data_dir: Path, symbol: str, lake_version: str) -> Path:
-    lv = str(lake_version).strip().lower()
-    root = data_dir / ("lake_v2" if lv == "v2" else "lake")
-    return root / "ticks" / f"symbol={symbol}"
+    _ = lake_version  # v2-only
+    return data_dir / "lake_v2" / "ticks" / f"symbol={symbol}"
 
 
 def _no_data_dates_path(*, data_dir: Path, symbol: str, lake_version: str) -> Path:
@@ -152,6 +152,35 @@ def _last_trading_day_leq(cal: list[date], today: date) -> date:
             hi = mid
     idx = lo - 1
     return cal[idx] if idx >= 0 else today
+
+
+def _count_weekdays_between(start: date, end: date) -> int:
+    """
+    Count weekdays in [start, end] inclusive (Mon-Fri).
+    """
+    if end < start:
+        return 0
+    n = (end - start).days + 1
+    full_weeks, rem = divmod(n, 7)
+    count = full_weeks * 5
+    for i in range(rem):
+        if (start.weekday() + i) % 7 < 5:
+            count += 1
+    return int(count)
+
+
+def _count_trading_days_between(*, cal: list[date], start: date, end: date) -> int:
+    """
+    Count trading days in [start, end] using cached calendar when available,
+    otherwise fall back to weekday-only.
+    """
+    if end < start:
+        return 0
+    if cal:
+        i0 = bisect_left(cal, start)
+        i1 = bisect_right(cal, end)
+        return int(max(0, i1 - i0))
+    return _count_weekdays_between(start, end)
 
 
 def _parquet_file_has_local_l5(path: Path) -> bool:
@@ -337,6 +366,7 @@ def compute_contract_statuses(
     contracts: list[dict[str, Any]],
     refresh_l5: bool = False,
     max_l5_scan_per_symbol: int = 10,
+    questdb_cov_by_symbol: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Compute per-contract local coverage/completeness + incremental local L5 scan.
@@ -345,8 +375,8 @@ def compute_contract_statuses(
     """
     ex = str(exchange).upper().strip()
     v = str(var).lower().strip()
-    lv = str(lake_version).lower().strip()
-    lv = "v2" if lv == "v2" else "v1"
+    _ = lake_version  # v2-only
+    lv = "v2"
 
     cal = get_trading_calendar(data_dir=data_dir, refresh=False)
     today = datetime.now(timezone.utc).date()
@@ -361,22 +391,78 @@ def compute_contract_statuses(
         expired_b = bool(expired) if expired is not None else None
         exp_dt = c.get("expire_datetime")
         exp_dt_s = str(exp_dt).strip() if exp_dt not in (None, "") else None
+        open_dt = c.get("open_date")
+        open_dt_s = str(open_dt).strip() if open_dt not in (None, "") else None
 
         raw = _raw_contract_from_symbol(symbol=sym, var=v)
 
         sym_dir = _ticks_symbol_dir(data_dir=data_dir, symbol=sym, lake_version=lv)
         downloaded_set, local_min, local_max = _scan_date_dirs(sym_dir)
 
-        # Without akshare active-ranges, we compute a best-effort completeness over the
-        # locally observed window:
-        # - expected_first := local_min (if present)
-        # - expected_last  := today_trading for active contracts, else local_max
-        expected_first = date.fromisoformat(local_min) if local_min else None
-        expected_last = None
+        # Best-effort expected window:
+        # - prefer remote metadata (open_date / expire_datetime when available)
+        # - otherwise fall back to QuestDB canonical bounds (when provided)
+        # - otherwise fall back to locally observed min/max
+        expected_first: date | None = None
+        if open_dt_s:
+            try:
+                expected_first = date.fromisoformat(open_dt_s[:10])
+            except Exception:
+                expected_first = None
+
+        # Compute expected_last from "activeness" + expire_datetime if known.
+        expire_trading: date | None = None
+        if exp_dt_s:
+            try:
+                expire_day = date.fromisoformat(exp_dt_s[:10])
+                expire_trading = _last_trading_day_leq(cal, expire_day)
+            except Exception:
+                expire_trading = None
+
+        expected_last: date | None = None
+        if expired_b is False:
+            # Resolve after expected_first is known.
+            expected_last = None
+        else:
+            expected_last = expire_trading if expire_trading else None
+
+        # Prefer QuestDB canonical coverage bounds (when provided).
+        if questdb_cov_by_symbol is not None:
+            qc = questdb_cov_by_symbol.get(sym) or {}
+            db_first_s = str(qc.get("first_tick_day") or "").strip()
+            db_last_s = str(qc.get("last_tick_day") or "").strip()
+            try:
+                db_first = date.fromisoformat(db_first_s) if db_first_s else None
+            except Exception:
+                db_first = None
+            try:
+                db_last = date.fromisoformat(db_last_s) if db_last_s else None
+            except Exception:
+                db_last = None
+
+            # Use QuestDB bounds when remote metadata is missing:
+            # - open_date missing -> allow db_first to extend expected range backwards
+            # - expire_datetime missing -> allow db_last to extend expected range forwards (expired only)
+            if expected_first is None and db_first is not None:
+                expected_first = db_first
+            if expired_b is not False:
+                if expire_trading is None and db_last is not None:
+                    expected_last = db_last
+
+        # Final local fallbacks.
+        if expected_first is None and local_min:
+            try:
+                expected_first = date.fromisoformat(local_min)
+            except Exception:
+                expected_first = None
         if expired_b is False:
             expected_last = today_trading if expected_first else None
         else:
-            expected_last = date.fromisoformat(local_max) if local_max else None
+            if expected_last is None and local_max:
+                try:
+                    expected_last = date.fromisoformat(local_max) if expected_first else None
+                except Exception:
+                    expected_last = None
 
         # Expected days + done days (downloaded + no-data within expected window).
         days_expected: int | None = None
@@ -384,10 +470,9 @@ def compute_contract_statuses(
         pct: float | None = None
 
         if expected_first and expected_last and expected_last >= expected_first:
-            expected_days = get_trading_days(market=ex, start=expected_first, end=expected_last, data_dir=data_dir, refresh=False)
-            days_expected = int(len(expected_days))
             expected_iso0 = expected_first.isoformat()
             expected_iso1 = expected_last.isoformat()
+            days_expected = _count_trading_days_between(cal=cal, start=expected_first, end=expected_last)
 
             downloaded_in_range = {d for d in downloaded_set if expected_iso0 <= d <= expected_iso1}
 
@@ -458,8 +543,10 @@ def compute_contract_statuses(
             {
                 "symbol": sym,
                 "raw_contract": raw,
+                "catalog_source": str(c.get("catalog_source") or ""),
                 "expired": expired_b,
                 "expire_datetime": exp_dt_s,
+                "open_date": open_dt_s,
                 "local_days_downloaded": int(len(downloaded_set)),
                 "local_min": local_min,
                 "local_max": local_max,

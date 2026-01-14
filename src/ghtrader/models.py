@@ -1957,8 +1957,8 @@ def train_model(
         )
     tl_f = str(feat_manifest.get("ticks_lake") or "")
     tl_l = str(lab_manifest.get("ticks_lake") or "")
-    lv_f = str(feat_manifest.get("lake_version") or "v1")
-    lv_l = str(lab_manifest.get("lake_version") or "v1")
+    lv_f = str(feat_manifest.get("lake_version") or "v2")
+    lv_l = str(lab_manifest.get("lake_version") or "v2")
     if tl_f != tl_l:
         raise ValueError(f"ticks_lake mismatch between features ({tl_f}) and labels ({tl_l}) for symbol={symbol}")
     if lv_f != lv_l:
