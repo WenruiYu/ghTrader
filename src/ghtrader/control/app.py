@@ -24,7 +24,7 @@ from ghtrader.control.views import build_router
 
 log = structlog.get_logger()
 
-_TQSDK_HEAVY_SUBCOMMANDS = {"download", "download-contract-range", "record", "probe-l5", "update"}
+_TQSDK_HEAVY_SUBCOMMANDS = {"download", "download-contract-range", "record", "probe-l5", "update", "account"}
 
 _UI_STATUS_TTL_S = 5.0
 _ui_status_at: float = 0.0
@@ -40,6 +40,12 @@ _BENCHMARKS_TTL_S = 10.0
 _benchmarks_at: float = 0.0
 _benchmarks_payload: dict[str, Any] | None = None
 _benchmarks_lock = threading.Lock()
+
+_DATA_COVERAGE_TTL_S = 10.0
+_data_coverage_at: float = 0.0
+_data_coverage_cache_key: str = ""
+_data_coverage_payload: dict[str, Any] | None = None
+_data_coverage_lock = threading.Lock()
 
 
 def _now_iso() -> str:
@@ -220,6 +226,295 @@ def _write_json_atomic(path: Path, obj: dict[str, Any]) -> None:
     tmp = path.with_suffix(f".tmp-{uuid.uuid4().hex}")
     tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True, default=str), encoding="utf-8")
     tmp.replace(path)
+
+
+def _accounts_env_path(*, runs_dir: Path) -> Path:
+    return runs_dir / "control" / "accounts.env"
+
+
+def _read_accounts_env_values(*, runs_dir: Path) -> dict[str, str]:
+    path = _accounts_env_path(runs_dir=runs_dir)
+    if not path.exists():
+        return {}
+    try:
+        from dotenv import dotenv_values
+
+        raw = dotenv_values(path)
+        out: dict[str, str] = {}
+        for k, v in raw.items():
+            if not k:
+                continue
+            out[str(k)] = "" if v is None else str(v)
+        return out
+    except Exception:
+        # Fall back to an empty mapping; callers should handle "no accounts" gracefully.
+        return {}
+
+
+def _dotenv_quote(value: str) -> str:
+    v = str(value or "")
+    v = v.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "\\r").replace("\n", "\\n")
+    return f'"{v}"'
+
+
+def _write_accounts_env_atomic(*, runs_dir: Path, env: dict[str, str]) -> None:
+    path = _accounts_env_path(runs_dir=runs_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    header = [
+        "# ghTrader dashboard-managed broker accounts",
+        "# WARNING: contains secrets. Do not commit.",
+        "",
+    ]
+
+    # Deterministic-ish ordering for readability.
+    keys: list[str] = []
+    if "GHTRADER_TQ_ACCOUNT_PROFILES" in env:
+        keys.append("GHTRADER_TQ_ACCOUNT_PROFILES")
+    for k in ["TQ_BROKER_ID", "TQ_ACCOUNT_ID", "TQ_ACCOUNT_PASSWORD"]:
+        if k in env:
+            keys.append(k)
+    for k in sorted([k for k in env.keys() if k not in set(keys)]):
+        keys.append(k)
+
+    lines: list[str] = []
+    lines.extend(header)
+    for k in keys:
+        kk = str(k).strip()
+        if not kk:
+            continue
+        vv = env.get(k, "")
+        lines.append(f"{kk}={_dotenv_quote(vv)}")
+    lines.append("")  # trailing newline
+    content = "\n".join(lines)
+
+    tmp = path.with_suffix(f".tmp-{uuid.uuid4().hex}")
+    tmp.write_text(content, encoding="utf-8")
+    try:
+        tmp.chmod(0o600)
+    except Exception:
+        pass
+    tmp.replace(path)
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+
+
+def _canonical_profile(p: str) -> str:
+    try:
+        from ghtrader.tq_runtime import canonical_account_profile
+
+        return canonical_account_profile(p)
+    except Exception:
+        return str(p or "").strip().lower() or "default"
+
+
+def _profile_env_suffixes(profile: str) -> list[str]:
+    p = _canonical_profile(profile)
+    if p == "default":
+        return [""]
+    up = "".join([ch.upper() if ch.isalnum() else "_" for ch in p]).strip("_")
+    lo = "".join([ch.lower() if ch.isalnum() else "_" for ch in p]).strip("_")
+    out: list[str] = []
+    for s in [up, lo]:
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def _parse_profiles_csv(raw: str) -> list[str]:
+    out: list[str] = []
+    for part in [p.strip() for p in str(raw or "").split(",") if p.strip()]:
+        p = _canonical_profile(part)
+        if p and p != "default" and p not in out:
+            out.append(p)
+    return out
+
+
+def _set_profiles_csv(env: dict[str, str], profiles: list[str]) -> None:
+    ps = [p for p in profiles if p and p != "default"]
+    if ps:
+        env["GHTRADER_TQ_ACCOUNT_PROFILES"] = ",".join(ps)
+    else:
+        env.pop("GHTRADER_TQ_ACCOUNT_PROFILES", None)
+
+
+def _accounts_env_upsert_profile(
+    *,
+    runs_dir: Path,
+    profile: str,
+    broker_id: str,
+    account_id: str,
+    password: str,
+) -> None:
+    p = _canonical_profile(profile)
+    env = _read_accounts_env_values(runs_dir=runs_dir)
+
+    # Maintain profile registry (excluding default).
+    profiles = _parse_profiles_csv(env.get("GHTRADER_TQ_ACCOUNT_PROFILES", ""))
+    if p != "default" and p not in profiles:
+        profiles.append(p)
+    _set_profiles_csv(env, profiles)
+
+    b = str(broker_id or "").strip()
+    a = str(account_id or "").strip()
+    pw = str(password or "").strip()
+
+    if p == "default":
+        env["TQ_BROKER_ID"] = b
+        env["TQ_ACCOUNT_ID"] = a
+        env["TQ_ACCOUNT_PASSWORD"] = pw
+    else:
+        suf = _profile_env_suffixes(p)[0]  # uppercase preferred
+        env[f"TQ_BROKER_ID_{suf}"] = b
+        env[f"TQ_ACCOUNT_ID_{suf}"] = a
+        env[f"TQ_ACCOUNT_PASSWORD_{suf}"] = pw
+
+    _write_accounts_env_atomic(runs_dir=runs_dir, env=env)
+
+
+def _accounts_env_delete_profile(*, runs_dir: Path, profile: str) -> None:
+    p = _canonical_profile(profile)
+    env = _read_accounts_env_values(runs_dir=runs_dir)
+
+    if p == "default":
+        env.pop("TQ_BROKER_ID", None)
+        env.pop("TQ_ACCOUNT_ID", None)
+        env.pop("TQ_ACCOUNT_PASSWORD", None)
+    else:
+        for suf in _profile_env_suffixes(p):
+            if not suf:
+                continue
+            env.pop(f"TQ_BROKER_ID_{suf}", None)
+            env.pop(f"TQ_ACCOUNT_ID_{suf}", None)
+            env.pop(f"TQ_ACCOUNT_PASSWORD_{suf}", None)
+
+        profiles = _parse_profiles_csv(env.get("GHTRADER_TQ_ACCOUNT_PROFILES", ""))
+        profiles = [x for x in profiles if x != p]
+        _set_profiles_csv(env, profiles)
+
+    _write_accounts_env_atomic(runs_dir=runs_dir, env=env)
+
+
+def _accounts_env_get_profile_values(*, env: dict[str, str], profile: str) -> dict[str, str]:
+    p = _canonical_profile(profile)
+    if p == "default":
+        return {
+            "broker_id": str(env.get("TQ_BROKER_ID", "") or "").strip(),
+            "account_id": str(env.get("TQ_ACCOUNT_ID", "") or "").strip(),
+        }
+
+    for suf in _profile_env_suffixes(p):
+        if not suf:
+            continue
+        broker = str(env.get(f"TQ_BROKER_ID_{suf}", "") or "").strip()
+        acc = str(env.get(f"TQ_ACCOUNT_ID_{suf}", "") or "").strip()
+        if broker or acc:
+            return {"broker_id": broker, "account_id": acc}
+    return {"broker_id": "", "account_id": ""}
+
+
+def _accounts_env_is_configured(*, env: dict[str, str], profile: str) -> bool:
+    p = _canonical_profile(profile)
+    if p == "default":
+        broker = str(env.get("TQ_BROKER_ID", "") or "").strip()
+        acc = str(env.get("TQ_ACCOUNT_ID", "") or "").strip()
+        pwd = str(env.get("TQ_ACCOUNT_PASSWORD", "") or "").strip()
+        return bool(broker and acc and pwd)
+    for suf in _profile_env_suffixes(p):
+        if not suf:
+            continue
+        broker = str(env.get(f"TQ_BROKER_ID_{suf}", "") or "").strip()
+        acc = str(env.get(f"TQ_ACCOUNT_ID_{suf}", "") or "").strip()
+        pwd = str(env.get(f"TQ_ACCOUNT_PASSWORD_{suf}", "") or "").strip()
+        if broker and acc and pwd:
+            return True
+    return False
+
+
+def _mask_account_id(aid: str) -> str:
+    s = str(aid or "")
+    return (s[:2] + "***" + s[-2:]) if len(s) >= 6 else "***"
+
+
+def _brokers_cache_path(*, runs_dir: Path) -> Path:
+    return runs_dir / "control" / "cache" / "brokers.json"
+
+
+def _fallback_brokers() -> list[str]:
+    # Keep this list tiny; it is only a UX fallback when network is unavailable.
+    return ["T铜冠金源"]
+
+
+def _parse_brokers_from_shinny_html(html: str) -> list[str]:
+    try:
+        import html as html_mod
+        import re
+
+        # Quick-and-dirty tag strip to get searchable text.
+        text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", "\n", str(html))
+        text = re.sub(r"(?s)<[^>]+>", "\n", text)
+        text = html_mod.unescape(text)
+
+        # Broker IDs are typically like: "T铜冠金源", "H海通期货", "SIMNOW", etc.
+        # We only extract the ones containing at least one CJK character.
+        pat = re.compile(r"(?<![A-Za-z0-9_])([A-Z][A-Za-z0-9_]*[\u4e00-\u9fff][\u4e00-\u9fffA-Za-z0-9_]*)(?![A-Za-z0-9_])")
+        found = pat.findall(text)
+
+        out: list[str] = []
+        for s in found:
+            s = str(s).strip()
+            if not s or len(s) > 32:
+                continue
+            if s not in out:
+                out.append(s)
+        return out
+    except Exception:
+        return []
+
+
+def _fetch_shinny_brokers(*, timeout_s: float = 5.0) -> list[str]:
+    url = "https://www.shinnytech.com/articles/reference/tqsdk-brokers"
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(url, timeout=float(timeout_s)) as resp:  # nosec - expected public doc URL
+            raw = resp.read()
+        html = raw.decode("utf-8", errors="ignore")
+        return _parse_brokers_from_shinny_html(html)
+    except Exception:
+        return []
+
+
+def _get_supported_brokers(*, runs_dir: Path) -> tuple[list[str], str]:
+    """
+    Return (brokers, source) where source is one of: cache|fetched|fallback.
+    """
+    cache = _brokers_cache_path(runs_dir=runs_dir)
+    cached = _read_json(cache) if cache.exists() else None
+    if isinstance(cached, dict) and isinstance(cached.get("brokers"), list) and cached.get("brokers"):
+        brokers = [str(x) for x in cached["brokers"] if str(x).strip()]
+        if brokers:
+            return brokers, "cache"
+
+    # Avoid network in tests.
+    if os.environ.get("PYTEST_CURRENT_TEST") or "pytest" in sys.modules:
+        return _fallback_brokers(), "fallback"
+
+    brokers = _fetch_shinny_brokers()
+    if brokers:
+        _write_json_atomic(
+            cache,
+            {
+                "brokers": brokers,
+                "fetched_at": _now_iso(),
+                "source_url": "https://www.shinnytech.com/articles/reference/tqsdk-brokers",
+            },
+        )
+        return brokers, "fetched"
+
+    return _fallback_brokers(), "fallback"
 
 
 def _argv_opt(argv: list[str], name: str) -> str | None:
@@ -440,6 +735,59 @@ def create_app() -> Any:
             refresh=str(refresh or "none"),
         )
 
+    @app.get("/api/data/coverage", response_class=JSONResponse)
+    def api_data_coverage(request: Request, kind: str = "ticks", limit: int = 200, search: str = "") -> dict[str, Any]:
+        """
+        Lightweight coverage listing for Data Hub (lazy-loaded).
+
+        kind: ticks|main_l5|features|labels
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        k = str(kind or "ticks").strip().lower()
+        lim = max(1, min(int(limit or 200), 500))
+        q = str(search or "").strip().lower()
+
+        global _data_coverage_at, _data_coverage_cache_key, _data_coverage_payload
+        now = time.time()
+        cache_key = f"{k}|{lim}|{q}"
+        with _data_coverage_lock:
+            if (
+                isinstance(_data_coverage_payload, dict)
+                and _data_coverage_cache_key == cache_key
+                and (now - float(_data_coverage_at)) <= float(_DATA_COVERAGE_TTL_S)
+            ):
+                cached = dict(_data_coverage_payload)
+                return cached
+
+        data_dir = get_data_dir()
+        if k == "ticks":
+            root = data_dir / "lake_v2" / "ticks"
+        elif k == "main_l5":
+            root = data_dir / "lake_v2" / "main_l5" / "ticks"
+        elif k == "features":
+            root = data_dir / "features"
+        elif k == "labels":
+            root = data_dir / "labels"
+        else:
+            raise HTTPException(status_code=400, detail="invalid kind")
+
+        from ghtrader.control.coverage import scan_partitioned_store
+
+        rows = scan_partitioned_store(root)
+        if q:
+            rows = [r for r in rows if q in str(r.symbol).lower()]
+        rows = rows[:lim]
+
+        out = [{"symbol": r.symbol, "n_dates": r.n_dates, "min_date": str(r.min_date or ""), "max_date": str(r.max_date or "")} for r in rows]
+        payload = {"ok": True, "kind": k, "count": len(out), "rows": out, "generated_at": _now_iso()}
+        with _data_coverage_lock:
+            _data_coverage_payload = dict(payload)
+            _data_coverage_cache_key = cache_key
+            _data_coverage_at = time.time()
+        return payload
+
     @app.get("/api/contracts", response_class=JSONResponse)
     def api_contracts(
         request: Request,
@@ -471,19 +819,26 @@ def create_app() -> Any:
         runs_dir = get_runs_dir()
         data_dir = get_data_dir()
 
-        cat = get_contract_catalog(exchange=ex, var=v, runs_dir=runs_dir, refresh=str(refresh).strip() in {"1", "true", "yes"})
-        if not bool(cat.get("ok", False)):
-            return {
-                "ok": False,
-                "exchange": ex,
-                "var": v,
-                "lake_version": lv,
-                "contracts": [],
-                "error": str(cat.get("error") or "tqsdk_catalog_failed"),
-            }
+        t0 = time.time()
+
+        refresh_req = str(refresh).strip() in {"1", "true", "yes"}
+        t_cat0 = time.time()
+        if refresh_req:
+            # Explicit refresh: may hit network.
+            cat = get_contract_catalog(exchange=ex, var=v, runs_dir=runs_dir, refresh=True)
+        else:
+            # Initial load should never block on network: prefer any cached catalog (even stale).
+            cat = get_contract_catalog(exchange=ex, var=v, runs_dir=runs_dir, refresh=False, allow_stale_cache=True, offline=True)
+        t_cat1 = time.time()
+
+        catalog_ok = bool(cat.get("ok", False))
+        catalog_error = str(cat.get("error") or "")
+        catalog_cached_at = cat.get("cached_at")
+        catalog_source = cat.get("source")
+
+        base_contracts = list(cat.get("contracts") or [])
 
         # Union: TqSdk catalog (contract-service + pre-2020 cache) + local lake symbols.
-        base_contracts = list(cat.get("contracts") or [])
         by_sym: dict[str, dict[str, Any]] = {}
         for r in base_contracts:
             sym = str((r or {}).get("symbol") or "").strip()
@@ -510,9 +865,27 @@ def create_app() -> Any:
         merged_contracts = [by_sym[s] for s in sorted(by_sym.keys())]
         syms = list(by_sym.keys())
 
+        # If we have neither catalog nor local symbols, fail with a clear error.
+        if not merged_contracts:
+            err_msg = catalog_error or ("tqsdk_catalog_unavailable" if refresh_req else "catalog_cache_missing_or_stale")
+            return {
+                "ok": False,
+                "exchange": ex,
+                "var": v,
+                "lake_version": lv,
+                "contracts": [],
+                "catalog_ok": False,
+                "catalog_error": err_msg,
+                "catalog_cached_at": catalog_cached_at,
+                "catalog_source": catalog_source,
+                "error": err_msg,
+                "timings_ms": {"catalog": int((t_cat1 - t_cat0) * 1000), "total": int((time.time() - t0) * 1000)},
+            }
+
         # QuestDB canonical coverage (best-effort) is used to improve expected ranges.
         cov: dict[str, dict[str, Any]] = {}
         questdb_info: dict[str, Any] = {"ok": False}
+        t_db0 = time.time()
         try:
             from ghtrader.config import (
                 get_questdb_host,
@@ -536,7 +909,9 @@ def create_app() -> Any:
         except Exception as e:
             cov = {}
             questdb_info = {"ok": False, "error": str(e)}
+        t_db1 = time.time()
 
+        t_local0 = time.time()
         status = compute_contract_statuses(
             exchange=ex,
             var=v,
@@ -545,8 +920,11 @@ def create_app() -> Any:
             runs_dir=runs_dir,
             contracts=merged_contracts,
             refresh_l5=str(refresh_l5).strip() in {"1", "true", "yes"},
+            # Keep the API responsive on first load: incremental local L5 scanning is bounded.
+            max_l5_scan_per_symbol=(10 if str(refresh_l5).strip() in {"1", "true", "yes"} else 2),
             questdb_cov_by_symbol=cov if questdb_info.get("ok") else None,
         )
+        t_local1 = time.time()
 
         # Attach cached probe results per symbol (if present).
         for r in status.get("contracts") or []:
@@ -557,6 +935,7 @@ def create_app() -> Any:
             if pr:
                 r["tqsdk_probe"] = {
                     "probed_day": pr.get("probed_day"),
+                    "probe_day_source": pr.get("probe_day_source"),
                     "ticks_rows": pr.get("ticks_rows"),
                     "l5_present": pr.get("l5_present"),
                     "error": pr.get("error"),
@@ -595,8 +974,16 @@ def create_app() -> Any:
         status["exchange"] = ex
         status["var"] = v
         status["lake_version"] = lv
-        status["catalog_cached_at"] = cat.get("cached_at")
-        status["catalog_source"] = cat.get("source")
+        status["catalog_ok"] = bool(catalog_ok)
+        status["catalog_error"] = catalog_error
+        status["catalog_cached_at"] = catalog_cached_at
+        status["catalog_source"] = catalog_source
+        status["timings_ms"] = {
+            "catalog": int((t_cat1 - t_cat0) * 1000),
+            "questdb": int((t_db1 - t_db0) * 1000),
+            "local": int((t_local1 - t_local0) * 1000),
+            "total": int((time.time() - t0) * 1000),
+        }
         return status
 
     @app.post("/api/contracts/enqueue-probe-l5", response_class=JSONResponse)
@@ -1446,8 +1833,51 @@ def create_app() -> Any:
             _benchmarks_at = time.time()
         return payload2
 
+    # ---------------------------------------------------------------------
+    # Trading artifacts helpers
+    # ---------------------------------------------------------------------
+
+    def _read_json_file(path: Path) -> dict[str, Any] | None:
+        try:
+            if not path.exists():
+                return None
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _read_jsonl_tail(path: Path, *, max_lines: int, max_bytes: int = 256 * 1024) -> list[dict[str, Any]]:
+        """
+        Best-effort tail reader for JSONL artifacts (snapshots/events).
+        Returns parsed objects in chronological order (oldest -> newest).
+        """
+        try:
+            if not path.exists() or int(max_lines) <= 0:
+                return []
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                offset = max(0, size - int(max_bytes))
+                f.seek(offset)
+                chunk = f.read().decode("utf-8", errors="ignore")
+            lines = [ln for ln in chunk.splitlines() if ln.strip()]
+            out: list[dict[str, Any]] = []
+            for ln in lines[-int(max_lines) :]:
+                try:
+                    obj = json.loads(ln)
+                    if isinstance(obj, dict):
+                        out.append(obj)
+                except Exception:
+                    continue
+            return out
+        except Exception:
+            return []
+
+    def _read_last_jsonl_obj(path: Path) -> dict[str, Any] | None:
+        out = _read_jsonl_tail(path, max_lines=1)
+        return out[-1] if out else None
+
     @app.get("/api/trading/status", response_class=JSONResponse)
-    def api_trading_status(request: Request) -> dict[str, Any]:
+    def api_trading_status(request: Request, account_profile: str = "") -> dict[str, Any]:
         """
         Get current trading run status from runs/trading/.
         """
@@ -1456,6 +1886,15 @@ def create_app() -> Any:
 
         runs_dir = get_runs_dir()
         trading_dir = runs_dir / "trading"
+
+        profile_filter = ""
+        try:
+            from ghtrader.tq_runtime import canonical_account_profile
+
+            ap = str(account_profile or "").strip()
+            profile_filter = canonical_account_profile(ap) if ap else ""
+        except Exception:
+            profile_filter = str(account_profile or "").strip() or ""
 
         live_enabled = False
         try:
@@ -1471,6 +1910,7 @@ def create_app() -> Any:
             "live_enabled": bool(live_enabled),
             "mode": "idle",
             "monitor_only": None,
+            "account_profile": None,
             "run_id": None,
             "snapshot_ts": None,
             "executor": None,
@@ -1483,8 +1923,10 @@ def create_app() -> Any:
             "positions": None,
             "position": None,
             "orders_alive": None,
+            "recent_events": [],
             "pnl": None,
             "risk": None,
+            "broker_configured": None,
         }
 
         try:
@@ -1500,11 +1942,24 @@ def create_app() -> Any:
 
             latest = None
             for d in runs:
-                sf = d / "snapshots.jsonl"
+                # Prefer state.json for activity timestamp if present; else snapshots.jsonl.
+                sf = d / "state.json"
                 if not sf.exists():
-                    continue
+                    sf = d / "snapshots.jsonl"
+                    if not sf.exists():
+                        continue
                 try:
                     if (t.time() - float(sf.stat().st_mtime)) < 300.0:
+                        if profile_filter:
+                            cfg0 = _read_json_file(d / "run_config.json") or {}
+                            try:
+                                from ghtrader.tq_runtime import canonical_account_profile
+
+                                p0 = canonical_account_profile(str(cfg0.get("account_profile") or "default"))
+                            except Exception:
+                                p0 = str(cfg0.get("account_profile") or "default")
+                            if p0 != profile_filter:
+                                continue
                         latest = d
                         break
                 except Exception:
@@ -1515,6 +1970,8 @@ def create_app() -> Any:
 
             snapshots_file = latest / "snapshots.jsonl"
             config_file = latest / "run_config.json"
+            events_file = latest / "events.jsonl"
+            state_file = latest / "state.json"
 
             result["active"] = True
             result["run_id"] = latest.name
@@ -1525,6 +1982,12 @@ def create_app() -> Any:
                     config = json.loads(config_file.read_text())
                     result["mode"] = config.get("mode", "unknown") or "unknown"
                     result["monitor_only"] = bool(config.get("monitor_only")) if ("monitor_only" in config) else None
+                    try:
+                        from ghtrader.tq_runtime import canonical_account_profile
+
+                        result["account_profile"] = canonical_account_profile(str(config.get("account_profile") or "default"))
+                    except Exception:
+                        result["account_profile"] = config.get("account_profile") or "default"
                     result["executor"] = config.get("executor") or None
                     result["model_name"] = config.get("model_name") or None
                     # Backwards-compat field for UI
@@ -1541,80 +2004,96 @@ def create_app() -> Any:
                         "max_position": limits.get("max_abs_position"),
                         "max_order_size": limits.get("max_order_size"),
                         "max_ops_per_sec": limits.get("max_ops_per_sec"),
-                        "max_daily_loss": None,
+                        "max_daily_loss": limits.get("max_daily_loss"),
+                        "enforce_trading_time": limits.get("enforce_trading_time"),
                     }
                 except Exception:
                     pass
 
-            # Read latest snapshot
-            if snapshots_file.exists():
-                try:
-                    with open(snapshots_file, "rb") as f:
-                        # Read last 32KB to find last line
-                        f.seek(0, 2)
-                        size = f.tell()
-                        offset = max(0, size - 32 * 1024)
-                        f.seek(offset)
-                        chunk = f.read().decode("utf-8", errors="ignore")
-                    lines = [ln for ln in chunk.splitlines() if ln.strip()]
-                    if lines:
-                        last_snapshot = json.loads(lines[-1])
-                        result["snapshot_ts"] = last_snapshot.get("ts")
-                        acct = last_snapshot.get("account") if isinstance(last_snapshot.get("account"), dict) else None
-                        if acct is not None:
-                            acct2 = dict(acct)
-                            bal = acct2.get("balance")
-                            fp = acct2.get("float_profit")
-                            try:
-                                if bal is not None and fp is not None:
-                                    acct2["equity"] = float(bal) + float(fp)
-                                else:
-                                    acct2["equity"] = None
-                            except Exception:
-                                acct2["equity"] = None
-                            result["account"] = acct2
-                            # Default P&L: float_profit if present else position_profit.
-                            try:
-                                if acct2.get("float_profit") is not None:
-                                    result["pnl"] = float(acct2.get("float_profit"))
-                                elif acct2.get("position_profit") is not None:
-                                    result["pnl"] = float(acct2.get("position_profit"))
-                            except Exception:
-                                pass
+            # Prefer state.json for last snapshot + recent events; fallback to JSONL tails.
+            state = _read_json_file(state_file) if state_file.exists() else None
+            last_snapshot = None
+            if isinstance(state, dict):
+                ls = state.get("last_snapshot")
+                if isinstance(ls, dict):
+                    last_snapshot = ls
+                evs = state.get("recent_events")
+                if isinstance(evs, list):
+                    result["recent_events"] = [e for e in evs if isinstance(e, dict)][-50:]
 
-                        pos = last_snapshot.get("positions") if isinstance(last_snapshot.get("positions"), dict) else None
-                        if pos is not None:
-                            result["positions"] = pos
+            if last_snapshot is None:
+                last_snapshot = _read_last_jsonl_obj(snapshots_file) if snapshots_file.exists() else None
+            if not result.get("recent_events"):
+                result["recent_events"] = _read_jsonl_tail(events_file, max_lines=50) if events_file.exists() else []
 
-                            # Back-compat: a single "position" summary for the primary execution symbol.
-                            primary = None
-                            sy_res = list(result.get("symbols_resolved") or [])
-                            sy_req = list(result.get("symbols_requested") or [])
-                            if sy_res:
-                                primary = sy_res[0]
-                            elif sy_req:
-                                primary = sy_req[0]
+            if isinstance(last_snapshot, dict):
+                result["snapshot_ts"] = last_snapshot.get("ts")
+                meta = last_snapshot.get("account_meta") if isinstance(last_snapshot.get("account_meta"), dict) else {}
+                if isinstance(meta, dict) and ("broker_configured" in meta):
+                    result["broker_configured"] = bool(meta.get("broker_configured"))
+                    if isinstance(meta, dict) and ("account_profile" in meta) and not result.get("account_profile"):
+                        try:
+                            from ghtrader.tq_runtime import canonical_account_profile
+
+                            result["account_profile"] = canonical_account_profile(str(meta.get("account_profile") or "default"))
+                        except Exception:
+                            result["account_profile"] = meta.get("account_profile") or "default"
+
+                acct = last_snapshot.get("account") if isinstance(last_snapshot.get("account"), dict) else None
+                if acct is not None:
+                    acct2 = dict(acct)
+                    # Back-compat: compute equity if missing.
+                    if "equity" not in acct2:
+                        bal = acct2.get("balance")
+                        fp = acct2.get("float_profit")
+                        try:
+                            if bal is not None and fp is not None:
+                                acct2["equity"] = float(bal) + float(fp)
                             else:
-                                sy_snap = last_snapshot.get("symbols")
-                                if isinstance(sy_snap, list) and sy_snap:
-                                    primary = str(sy_snap[0])
-                            if primary and isinstance(pos.get(primary), dict) and ("error" not in pos.get(primary)):
-                                p0 = dict(pos.get(primary) or {})
-                                try:
-                                    vlong = int(p0.get("volume_long", 0) or 0)
-                                    vshort = int(p0.get("volume_short", 0) or 0)
-                                    net = int(vlong) - int(vshort)
-                                except Exception:
-                                    vlong = 0
-                                    vshort = 0
-                                    net = 0
-                                result["position"] = {"symbol": primary, "volume": net, "volume_long": vlong, "volume_short": vshort}
+                                acct2["equity"] = None
+                        except Exception:
+                            acct2["equity"] = None
+                    result["account"] = acct2
+                    # Default P&L: float_profit if present else position_profit.
+                    try:
+                        if acct2.get("float_profit") is not None:
+                            result["pnl"] = float(acct2.get("float_profit"))
+                        elif acct2.get("position_profit") is not None:
+                            result["pnl"] = float(acct2.get("position_profit"))
+                    except Exception:
+                        pass
 
-                        orders = last_snapshot.get("orders_alive")
-                        if isinstance(orders, list):
-                            result["orders_alive"] = orders
-                except Exception:
-                    pass
+                pos = last_snapshot.get("positions") if isinstance(last_snapshot.get("positions"), dict) else None
+                if pos is not None:
+                    result["positions"] = pos
+
+                    # Back-compat: a single "position" summary for the primary execution symbol.
+                    primary = None
+                    sy_res = list(result.get("symbols_resolved") or [])
+                    sy_req = list(result.get("symbols_requested") or [])
+                    if sy_res:
+                        primary = sy_res[0]
+                    elif sy_req:
+                        primary = sy_req[0]
+                    else:
+                        sy_snap = last_snapshot.get("symbols")
+                        if isinstance(sy_snap, list) and sy_snap:
+                            primary = str(sy_snap[0])
+                    if primary and isinstance(pos.get(primary), dict) and ("error" not in pos.get(primary)):
+                        p0 = dict(pos.get(primary) or {})
+                        try:
+                            vlong = int(p0.get("volume_long", 0) or 0)
+                            vshort = int(p0.get("volume_short", 0) or 0)
+                            net = int(vlong) - int(vshort)
+                        except Exception:
+                            vlong = 0
+                            vshort = 0
+                            net = 0
+                        result["position"] = {"symbol": primary, "volume": net, "volume_long": vlong, "volume_short": vshort}
+
+                orders = last_snapshot.get("orders_alive")
+                if isinstance(orders, list):
+                    result["orders_alive"] = orders
 
         except Exception as e:
             log.warning("api_trading_status.error", error=str(e))
@@ -1623,8 +2102,270 @@ def create_app() -> Any:
 
         return result
 
+    @app.get("/api/trading/runs", response_class=JSONResponse)
+    def api_trading_runs(request: Request, limit: int = 50) -> dict[str, Any]:
+        """
+        List recent trading runs under runs/trading/.
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        runs_dir = get_runs_dir()
+        trading_dir = runs_dir / "trading"
+        lim = max(1, min(int(limit or 50), 200))
+        if not trading_dir.exists():
+            return {"ok": True, "runs": []}
+
+        out: list[dict[str, Any]] = []
+        for d in sorted([p for p in trading_dir.iterdir() if p.is_dir()], key=lambda x: x.name, reverse=True)[:lim]:
+            cfg = _read_json_file(d / "run_config.json") or {}
+            st = _read_json_file(d / "state.json") or {}
+            last = st.get("last_snapshot") if isinstance(st.get("last_snapshot"), dict) else _read_last_jsonl_obj(d / "snapshots.jsonl")
+            last = last if isinstance(last, dict) else {}
+            acct = last.get("account") if isinstance(last.get("account"), dict) else {}
+            try:
+                from ghtrader.tq_runtime import canonical_account_profile
+
+                ap = canonical_account_profile(str(cfg.get("account_profile") or "default"))
+            except Exception:
+                ap = str(cfg.get("account_profile") or "default")
+            out.append(
+                {
+                    "run_id": d.name,
+                    "account_profile": ap,
+                    "mode": cfg.get("mode"),
+                    "monitor_only": cfg.get("monitor_only"),
+                    "last_ts": last.get("ts"),
+                    "balance": acct.get("balance"),
+                    "equity": acct.get("equity"),
+                }
+            )
+        return {"ok": True, "runs": out}
+
+    @app.get("/api/accounts", response_class=JSONResponse)
+    def api_accounts(request: Request) -> dict[str, Any]:
+        """
+        List broker account profiles (runs/control/accounts.env) + last verification + active/latest run summary.
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        runs_dir = get_runs_dir()
+        trading_dir = runs_dir / "trading"
+        verify_dir = runs_dir / "control" / "cache" / "accounts"
+
+        env = _read_accounts_env_values(runs_dir=runs_dir)
+        profiles: list[str] = ["default"]
+        for p in _parse_profiles_csv(env.get("GHTRADER_TQ_ACCOUNT_PROFILES", "")):
+            if p not in profiles:
+                profiles.append(p)
+
+        # Pre-scan trading runs once.
+        runs: list[dict[str, Any]] = []
+        try:
+            if trading_dir.exists():
+                for d in [p for p in trading_dir.iterdir() if p.is_dir()]:
+                    cfg = _read_json_file(d / "run_config.json") or {}
+                    ap = _canonical_profile(str(cfg.get("account_profile") or "default"))
+
+                    st = _read_json_file(d / "state.json") or {}
+                    last = st.get("last_snapshot") if isinstance(st.get("last_snapshot"), dict) else _read_last_jsonl_obj(d / "snapshots.jsonl")
+                    last = last if isinstance(last, dict) else {}
+                    acct = last.get("account") if isinstance(last.get("account"), dict) else {}
+
+                    # Active heuristic: state.json (or snapshots.jsonl) touched in last 5 minutes.
+                    active = False
+                    try:
+                        sf = d / "state.json"
+                        if not sf.exists():
+                            sf = d / "snapshots.jsonl"
+                        if sf.exists():
+                            active = (time.time() - float(sf.stat().st_mtime)) < 300.0
+                    except Exception:
+                        active = False
+
+                    runs.append(
+                        {
+                            "run_id": d.name,
+                            "account_profile": ap,
+                            "mode": cfg.get("mode"),
+                            "monitor_only": cfg.get("monitor_only"),
+                            "last_ts": last.get("ts"),
+                            "balance": acct.get("balance"),
+                            "equity": acct.get("equity"),
+                            "active": bool(active),
+                        }
+                    )
+        except Exception:
+            runs = []
+
+        # Index runs by profile (newest first by run_id lexicographic).
+        runs.sort(key=lambda r: str(r.get("run_id") or ""), reverse=True)
+
+        by_profile: dict[str, list[dict[str, Any]]] = {p: [] for p in profiles}
+        for r in runs:
+            p = str(r.get("account_profile") or "default")
+            if p not in by_profile:
+                by_profile[p] = []
+            by_profile[p].append(r)
+
+        out_profiles: list[dict[str, Any]] = []
+        for p in profiles:
+            vals = _accounts_env_get_profile_values(env=env, profile=p)
+            broker_id = str(vals.get("broker_id") or "")
+            acc = str(vals.get("account_id") or "")
+            configured = _accounts_env_is_configured(env=env, profile=p)
+            verify = _read_json_file(verify_dir / f"account={p}.json") if verify_dir.exists() else None
+
+            active_run = None
+            latest_run = None
+            rs = by_profile.get(p) or []
+            for r in rs:
+                if bool(r.get("active")):
+                    active_run = r
+                    break
+            if rs:
+                latest_run = rs[0]
+
+            out_profiles.append(
+                {
+                    "profile": p,
+                    "configured": configured,
+                    "broker_id": broker_id,
+                    "account_id_masked": _mask_account_id(acc) if acc else "",
+                    "verify": verify,
+                    "active_run": active_run,
+                    "latest_run": latest_run,
+                }
+            )
+
+        return {"ok": True, "profiles": out_profiles, "generated_at": _now_iso()}
+
+    @app.post("/api/accounts/upsert", response_class=JSONResponse)
+    async def api_accounts_upsert(request: Request) -> dict[str, Any]:
+        """
+        Upsert a broker account profile into runs/control/accounts.env.
+
+        Payload: {profile, broker_id, account_id, password}
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        payload = await request.json()
+        profile = str(payload.get("profile") or "").strip()
+        broker_id = str(payload.get("broker_id") or "").strip()
+        account_id = str(payload.get("account_id") or "").strip()
+        password = str(payload.get("password") or "").strip()
+        if not profile:
+            raise HTTPException(status_code=400, detail="missing profile")
+        if not broker_id or not account_id or not password:
+            raise HTTPException(status_code=400, detail="missing broker_id/account_id/password")
+
+        runs_dir = get_runs_dir()
+        try:
+            _accounts_env_upsert_profile(
+                runs_dir=runs_dir,
+                profile=profile,
+                broker_id=broker_id,
+                account_id=account_id,
+                password=password,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"accounts_env_upsert_failed: {e}")
+
+        return {"ok": True, "profile": _canonical_profile(profile)}
+
+    @app.post("/api/accounts/delete", response_class=JSONResponse)
+    async def api_accounts_delete(request: Request) -> dict[str, Any]:
+        """
+        Delete a broker account profile from runs/control/accounts.env.
+
+        Payload: {profile}
+        Also removes runs/control/cache/accounts/account=<profile>.json verify cache.
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        payload = await request.json()
+        profile = str(payload.get("profile") or "").strip()
+        if not profile:
+            raise HTTPException(status_code=400, detail="missing profile")
+        p = _canonical_profile(profile)
+
+        runs_dir = get_runs_dir()
+        try:
+            _accounts_env_delete_profile(runs_dir=runs_dir, profile=p)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"accounts_env_delete_failed: {e}")
+
+        # Remove verify cache if present.
+        verify_path = runs_dir / "control" / "cache" / "accounts" / f"account={p}.json"
+        try:
+            if verify_path.exists():
+                verify_path.unlink()
+        except Exception:
+            pass
+
+        return {"ok": True, "profile": p}
+
+    @app.get("/api/brokers", response_class=JSONResponse)
+    def api_brokers(request: Request) -> dict[str, Any]:
+        """
+        Return supported broker IDs for TqSdk (best-effort).
+
+        Implementation: fetch + parse ShinnyTech list, cache to runs/control/cache/brokers.json,
+        and fall back to a small built-in list when unavailable.
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        runs_dir = get_runs_dir()
+        brokers, source = _get_supported_brokers(runs_dir=runs_dir)
+        return {"ok": True, "brokers": brokers, "source": source, "generated_at": _now_iso()}
+
+    @app.post("/api/accounts/enqueue-verify", response_class=JSONResponse)
+    async def api_accounts_enqueue_verify(request: Request) -> dict[str, Any]:
+        """
+        Enqueue a broker account verification job (runs `ghtrader account verify ...`).
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        payload = await request.json()
+        prof = str(payload.get("account_profile") or "default").strip() or "default"
+
+        argv = python_module_argv("ghtrader.cli", "account", "verify", "--account", prof, "--json")
+        title = f"account-verify {prof}"
+        jm = request.app.state.job_manager
+        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        return {"ok": True, "enqueued": [rec.id], "count": 1}
+
+    @app.get("/api/trading/run/{run_id}/tail", response_class=JSONResponse)
+    def api_trading_run_tail(
+        request: Request,
+        run_id: str,
+        events: int = 50,
+        snapshots: int = 5,
+    ) -> dict[str, Any]:
+        """
+        Read-only tail API for a specific run's snapshots/events.
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        if "/" in run_id or "\\" in run_id:
+            raise HTTPException(status_code=400, detail="invalid run id")
+
+        runs_dir = get_runs_dir()
+        root = runs_dir / "trading" / run_id
+        if not root.exists():
+            raise HTTPException(status_code=404, detail="run not found")
+
+        ev_n = max(0, min(int(events or 0), 500))
+        sn_n = max(0, min(int(snapshots or 0), 200))
+
+        cfg = _read_json_file(root / "run_config.json")
+        state = _read_json_file(root / "state.json")
+        evs = _read_jsonl_tail(root / "events.jsonl", max_lines=ev_n) if ev_n > 0 else []
+        snaps = _read_jsonl_tail(root / "snapshots.jsonl", max_lines=sn_n) if sn_n > 0 else []
+        return {"ok": True, "run_id": run_id, "config": cfg, "state": state, "events": evs, "snapshots": snaps}
+
     return app
 
 
 app = create_app()
-

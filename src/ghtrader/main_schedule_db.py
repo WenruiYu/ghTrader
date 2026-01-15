@@ -47,6 +47,7 @@ def _connect(cfg: QuestDBQueryConfig):
         host=cfg.host,
         port=int(cfg.pg_port),
         dbname=cfg.pg_dbname,
+        connect_timeout=2,
     )
 
 

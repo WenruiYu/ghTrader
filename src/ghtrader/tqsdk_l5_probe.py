@@ -92,6 +92,70 @@ def _last_trading_day_leq(cal: list[date], today: date) -> date:
     return cal[idx] if idx >= 0 else today
 
 
+def _parse_date_any(x: object) -> date | None:
+    """
+    Best-effort: parse a date from a TqSdk field which may be a date/datetime/str/int.
+    """
+    try:
+        if x is None:
+            return None
+        if isinstance(x, date) and not isinstance(x, datetime):
+            return x
+        if isinstance(x, datetime):
+            return x.date()
+        if isinstance(x, (int, float)):
+            v = float(x)
+            # Heuristic: interpret as epoch seconds/ms/ns depending on magnitude.
+            if v > 1e15:
+                v = v / 1e9  # ns -> s
+            elif v > 1e12:
+                v = v / 1e3  # ms -> s
+            else:
+                v = v  # s
+            return datetime.fromtimestamp(v, tz=timezone.utc).date()
+        s = str(x).strip()
+        if len(s) >= 10:
+            try:
+                return date.fromisoformat(s[:10])
+            except Exception:
+                return None
+        return None
+    except Exception:
+        return None
+
+
+def _local_last_date_v2(*, data_dir: Path, symbol: str) -> date | None:
+    """
+    Return the maximum local partition date for a symbol (v2 raw ticks),
+    or None if the symbol has no local data.
+    """
+    try:
+        sym = str(symbol).strip()
+        if not sym:
+            return None
+        base = data_dir / "lake_v2" / "ticks" / f"symbol={sym}"
+        if not base.exists():
+            return None
+        out: date | None = None
+        for p in base.iterdir():
+            if not p.is_dir():
+                continue
+            if not p.name.startswith("date="):
+                continue
+            ds = p.name.split("=", 1)[-1].strip()
+            if len(ds) != 10:
+                continue
+            try:
+                d = date.fromisoformat(ds)
+            except Exception:
+                continue
+            if out is None or d > out:
+                out = d
+        return out
+    except Exception:
+        return None
+
+
 def _df_has_l5(df: pd.DataFrame) -> bool:
     """
     TqSdk returns float columns; L1-only data often has NaN for bid/ask levels 2-5.
@@ -139,22 +203,15 @@ def probe_l5_for_symbol(
     cal = get_trading_calendar(data_dir=data_dir, refresh=False)
     today_trading = _last_trading_day_leq(cal, today)
 
+    # Auto probe-day selection: make expired contracts probe a day where ticks likely exist.
+    probe_day_source = "explicit" if probe_day is not None else ""
     if probe_day is None:
-        probe_day = today_trading
-        if probe_day > today_trading:
-            probe_day = today_trading
+        local_last = _local_last_date_v2(data_dir=data_dir, symbol=sym)
+        if local_last is not None:
+            probe_day = local_last
+            probe_day_source = "local_max"
 
-    payload: dict[str, Any] = {
-        "symbol": sym,
-        "exchange": ex,
-        "var": var,
-        "probed_day": probe_day.isoformat(),
-        "ticks_rows": 0,
-        "l5_present": None,
-        "error": "",
-        "updated_at": _now_iso(),
-        "updated_at_unix": float(time.time()),
-    }
+    # If still not decided, we'll try quote metadata once TqApi is available; otherwise fall back.
 
     try:
         from tqsdk import TqApi  # type: ignore
@@ -162,11 +219,57 @@ def probe_l5_for_symbol(
         auth = get_tqsdk_auth()
         api = TqApi(auth=auth, disable_print=True)
     except Exception as e:
+        if probe_day is None:
+            probe_day = today_trading
+            probe_day_source = "today_trading"
+        payload: dict[str, Any] = {
+            "symbol": sym,
+            "exchange": ex,
+            "var": var,
+            "probed_day": probe_day.isoformat(),
+            "probe_day_source": probe_day_source,
+            "ticks_rows": 0,
+            "l5_present": None,
+            "error": f"tqsdk_init_failed: {e}",
+            "updated_at": _now_iso(),
+            "updated_at_unix": float(time.time()),
+        }
         payload["error"] = f"tqsdk_init_failed: {e}"
         _write_json_atomic(probe_cache_path(symbol=sym, runs_dir=runs_dir), payload)
         return payload
 
     try:
+        if probe_day is None:
+            # Try to pick an expired contract's last trading day from quote metadata.
+            try:
+                q = api.get_quote(sym)
+                exp_raw = getattr(q, "expire_datetime", None)
+                if exp_raw is None and isinstance(q, dict):
+                    exp_raw = q.get("expire_datetime")
+                exp_day = _parse_date_any(exp_raw)
+                if exp_day is not None and exp_day < today_trading:
+                    probe_day = _last_trading_day_leq(cal, exp_day)
+                    probe_day_source = "quote_expire"
+            except Exception:
+                pass
+
+        if probe_day is None:
+            probe_day = today_trading
+            probe_day_source = "today_trading"
+
+        payload: dict[str, Any] = {
+            "symbol": sym,
+            "exchange": ex,
+            "var": var,
+            "probed_day": probe_day.isoformat(),
+            "probe_day_source": probe_day_source,
+            "ticks_rows": 0,
+            "l5_present": None,
+            "error": "",
+            "updated_at": _now_iso(),
+            "updated_at_unix": float(time.time()),
+        }
+
         try:
             df = api.get_tick_data_series(symbol=sym, start_dt=probe_day, end_dt=probe_day + timedelta(days=1))
         except Exception as e:

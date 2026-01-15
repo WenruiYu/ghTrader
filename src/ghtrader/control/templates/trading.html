@@ -19,7 +19,11 @@
     </div>
     <div class="status-indicator" id="tradingAccountIndicator">
       <span class="status-dot status-dot-idle"></span>
-      <span>Account: --</span>
+      <span>Account profile:</span>
+      <select id="accountProfileSelect">
+        <option value="default" selected>default</option>
+      </select>
+      <span class="muted text-sm" id="accountProfileConfigured">--</span>
     </div>
     <div class="muted text-sm" id="tradingLastUpdate">Last update: --</div>
   </div>
@@ -32,6 +36,7 @@
       Run History
       <span class="badge" id="runCountBadge">--</span>
     </button>
+    <button class="tab-nav-item" data-tab="accounts">Accounts</button>
   </div>
 
   <!-- Tab: Live Status -->
@@ -207,6 +212,14 @@
             </div>
           </div>
 
+          <div style="margin-top:10px;">
+            <label>Account profile (live)</label>
+            <select name="account_profile" id="tradeAccountProfileSelect">
+              <option value="default" selected>default</option>
+            </select>
+            <div class="muted text-sm" style="margin-top:6px;">Broker credentials are stored in <span class="mono">runs/control/accounts.env</span> (gitignored) and loaded after <span class="mono">.env</span>. This is used only for <span class="mono">mode=live</span>.</div>
+          </div>
+
           <div class="card" style="margin:12px 0; background: var(--warn-bg); border-color: var(--warn-border);">
             <label style="margin:0; display:flex; align-items:center; gap:8px;">
               <input type="checkbox" id="monitorOnlyCheck" name="monitor_only" checked/>
@@ -334,6 +347,7 @@
           <thead>
             <tr>
               <th>Run ID</th>
+              <th>Account</th>
               <th>Last Timestamp</th>
               <th>Balance</th>
               <th>Mode</th>
@@ -345,15 +359,81 @@
               {% for r in runs %}
               <tr>
                 <td class="mono">{{ r.run_id }}</td>
+                <td class="mono">{{ r.account_profile|default("default") }}</td>
                 <td class="mono text-xs">{{ r.last_ts }}</td>
                 <td class="mono">{{ r.balance }}</td>
-                <td>--</td>
+                <td>
+                  {% if r.mode %}
+                    {{ r.mode }}{% if r.monitor_only %} <span class="pill">monitor</span>{% endif %}
+                  {% else %}
+                    --
+                  {% endif %}
+                </td>
                 <td><a href="/ops/trading/run/{{ r.run_id }}{{ token_qs }}">View</a></td>
               </tr>
               {% endfor %}
             {% else %}
-              <tr><td colspan="5" class="muted">No trading runs found</td></tr>
+              <tr><td colspan="6" class="muted">No trading runs found</td></tr>
             {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab: Accounts -->
+  <div class="tab-content" id="tab-accounts">
+    <div class="card">
+      <h3 class="mb-2">Broker Accounts (profiles)</h3>
+      <div class="muted text-sm mb-2">Credentials are stored in <span class="mono">runs/control/accounts.env</span> (gitignored). Add/edit accounts here; the table only displays non-secret info.</div>
+
+      <form class="form" id="accountUpsertForm" style="margin-bottom:12px;">
+        <h4 class="mb-2">Add / Edit Account</h4>
+        <div class="grid3">
+          <div>
+            <label>Profile</label>
+            <input id="accountFormProfile" placeholder="tg_1" autocomplete="off" />
+          </div>
+          <div>
+            <label>Broker ID</label>
+            <input id="accountFormBroker" list="brokerIdList" placeholder="T铜冠金源" autocomplete="off" />
+            <datalist id="brokerIdList"></datalist>
+          </div>
+          <div>
+            <label>Account ID</label>
+            <input id="accountFormAccountId" autocomplete="off" />
+          </div>
+        </div>
+        <div class="grid2">
+          <div>
+            <label>Password</label>
+            <input id="accountFormPassword" type="password" autocomplete="new-password" />
+          </div>
+          <div style="display:flex; gap:8px; align-items:flex-end;">
+            <button type="submit" class="btn btn-primary">Save</button>
+            <button type="button" class="btn btn-secondary" id="accountFormClear">Clear</button>
+          </div>
+        </div>
+        <div class="muted text-sm">Tip: profile names are normalized to <span class="mono">[a-z0-9_]</span>. Passwords are never displayed back.</div>
+      </form>
+
+      <div class="tableWrap">
+        <table class="table table-compact">
+          <thead>
+            <tr>
+              <th>Profile</th>
+              <th>Broker</th>
+              <th>Account</th>
+              <th>Configured</th>
+              <th>Active</th>
+              <th>Last snapshot</th>
+              <th>Latest run</th>
+              <th>Last verify</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="accountsTbody">
+            <tr><td colspan="9" class="muted">Loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -364,7 +444,8 @@
 {% block scripts %}
 <script>
 (function() {
-  window.ghTrader.initTabs({ updateHash: true });
+  const tabs = window.ghTrader.initTabs({ updateHash: true });
+  const tokenQs = "{{ token_qs }}";
 
   // Mode/monitor-only logic
   const modeSelect = document.getElementById("tradeModeSelect");
@@ -373,6 +454,29 @@
   const liveEnabledBanner = document.getElementById("liveEnabledDisabledBanner");
   const submitBtn = document.getElementById("tradeStartSubmit");
   let liveEnabled = null;
+
+  // Account profiles
+  let accountsByProfile = {};
+  let selectedAccountProfile = (localStorage.getItem("ghtrader_account_profile") || "default");
+  const accountProfileSelect = document.getElementById("accountProfileSelect");
+  const tradeAccountProfileSelect = document.getElementById("tradeAccountProfileSelect");
+
+  const accountUpsertForm = document.getElementById("accountUpsertForm");
+  const accountFormProfile = document.getElementById("accountFormProfile");
+  const accountFormBroker = document.getElementById("accountFormBroker");
+  const accountFormAccountId = document.getElementById("accountFormAccountId");
+  const accountFormPassword = document.getElementById("accountFormPassword");
+  const accountFormClear = document.getElementById("accountFormClear");
+  const brokerIdList = document.getElementById("brokerIdList");
+
+  function esc(s) {
+    return String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
 
   function updateModeUI() {
     const mode = modeSelect.value;
@@ -391,6 +495,44 @@
     if (mode === "live" && !monitor) {
       // User explicitly unchecked, that's okay
     }
+  }
+
+  function setSelectedAccountProfile(p) {
+    selectedAccountProfile = String(p || "default").trim() || "default";
+    try { localStorage.setItem("ghtrader_account_profile", selectedAccountProfile); } catch (e) {}
+    if (accountProfileSelect) accountProfileSelect.value = selectedAccountProfile;
+    if (tradeAccountProfileSelect) tradeAccountProfileSelect.value = selectedAccountProfile;
+  }
+
+  function updateAccountProfileStatus() {
+    const row = accountsByProfile[selectedAccountProfile];
+    const cfg = row ? (row.configured === true) : null;
+    const el = document.getElementById("accountProfileConfigured");
+    if (el) {
+      if (cfg === null) el.textContent = "--";
+      else el.textContent = cfg ? "configured" : "missing creds";
+    }
+    const acctEl = document.getElementById("tradingAccountIndicator");
+    if (acctEl) {
+      const dot = acctEl.querySelector(".status-dot");
+      if (dot) {
+        dot.className = "status-dot " + (cfg === false ? "status-dot-error" : (cfg === true ? "status-dot-ok" : "status-dot-unknown"));
+      }
+    }
+  }
+
+  if (accountProfileSelect) {
+    accountProfileSelect.addEventListener("change", () => {
+      setSelectedAccountProfile(accountProfileSelect.value);
+      updateAccountProfileStatus();
+      loadTradingStatus();
+    });
+  }
+  if (tradeAccountProfileSelect) {
+    tradeAccountProfileSelect.addEventListener("change", () => {
+      setSelectedAccountProfile(tradeAccountProfileSelect.value);
+      updateAccountProfileStatus();
+    });
   }
 
   modeSelect.addEventListener("change", updateModeUI);
@@ -419,10 +561,16 @@
   // Load trading status
   async function loadTradingStatus() {
     try {
-      const resp = await window.ghTrader.fetchApi("/api/trading/status");
+      const u = "/api/trading/status?account_profile=" + encodeURIComponent(selectedAccountProfile);
+      const resp = await window.ghTrader.fetchApi(u);
       if (!resp.ok) return;
       const data = await resp.json();
       if (data && data.ok === false) return;
+
+      if (data && data.account_profile) {
+        setSelectedAccountProfile(data.account_profile);
+      }
+      updateAccountProfileStatus();
 
       liveEnabled = (data.live_enabled === true);
       updateModeUI();
@@ -452,14 +600,6 @@
       if (data.account) {
         document.getElementById("kpiBalance").textContent = formatNumber(data.account.balance);
         document.getElementById("kpiEquity").textContent = "Equity: " + formatNumber(data.account.equity);
-
-        const acctEl = document.getElementById("tradingAccountIndicator");
-        if (acctEl) {
-          const dot = acctEl.querySelector(".status-dot");
-          const txt = acctEl.querySelector("span:last-child");
-          if (txt) txt.textContent = "Account: " + formatNumber(data.account.balance);
-          if (dot) dot.className = "status-dot " + (mode === "live" ? "status-dot-warn" : "status-dot-ok");
-        }
       }
       
       if (data.position) {
@@ -493,6 +633,7 @@
           '</div>',
           '<div class="grid2">',
           '<div class="text-sm"><span class="muted">Mode:</span> ' + (data.mode || "--") + '</div>',
+          '<div class="text-sm"><span class="muted">Account:</span> ' + (data.account_profile || selectedAccountProfile || "--") + '</div>',
           '<div class="text-sm"><span class="muted">Executor:</span> ' + (data.executor || "--") + '</div>',
           '<div class="text-sm"><span class="muted">Model:</span> ' + (data.model || "--") + '</div>',
           '<div class="text-sm"><span class="muted">Symbols:</span> ' + ((data.symbols || []).join(", ") || "--") + '</div>',
@@ -545,10 +686,316 @@
         document.getElementById("riskMaxOps").textContent = data.risk.max_ops_per_sec || "--";
         document.getElementById("riskDailyLoss").textContent = data.risk.max_daily_loss || "--";
       }
+
+      // Recent signals + orders from recent_events (best-effort)
+      const events = Array.isArray(data.recent_events) ? data.recent_events : [];
+
+      // Signals table
+      const sigTbody = document.getElementById("signalsTbody");
+      if (sigTbody) {
+        const sigRows = [];
+        const sigEvents = events.filter(e => e && (e.type === "target_change" || e.type === "signals_disabled")).slice(-50).reverse();
+        for (const e of sigEvents) {
+          const ts = e.ts || "";
+          const sym = e.symbol || "--";
+          let sig = "--";
+          let conf = "--";
+          if (e.type === "signals_disabled") {
+            sig = "disabled";
+            conf = String(e.reason || "");
+          } else {
+            const t = Number(e.new);
+            sig = (t > 0) ? ("LONG " + t) : (t < 0 ? ("SHORT " + Math.abs(t)) : "FLAT");
+            if (Array.isArray(e.probs) && e.probs.length === 3) {
+              try { conf = Math.max(Number(e.probs[0]), Number(e.probs[1]), Number(e.probs[2])).toFixed(2); } catch (_) {}
+            }
+          }
+          sigRows.push([
+            "<tr>",
+            '<td class="mono text-xs">', fmtTs(ts), "</td>",
+            '<td class="mono text-xs">', String(sym), "</td>",
+            "<td>", String(sig), "</td>",
+            '<td class="mono">', String(conf), "</td>",
+            "</tr>",
+          ].join(""));
+        }
+        sigTbody.innerHTML = sigRows.length ? sigRows.join("") : '<tr><td colspan="4" class="muted">No signals</td></tr>';
+      }
+
+      // Orders table
+      const ordTbody = document.getElementById("ordersTbody");
+      if (ordTbody) {
+        const ordRows = [];
+        const ordEvents = events.filter(e => e && ["order_new", "order_update", "order_done", "trade_fill"].includes(e.type)).slice(-50).reverse();
+        for (const e of ordEvents) {
+          const ts = e.ts || "";
+          const sym = e.symbol || (e.new && e.new.symbol) || (e.old && e.old.symbol) || "--";
+          const side = e.direction || (e.new && e.new.direction) || (e.old && e.old.direction) || "--";
+          let vol = "--";
+          if (e.type === "trade_fill") vol = String(e.volume ?? "--");
+          else if (e.type === "order_new") vol = String(e.volume_orign ?? e.volume_left ?? "--");
+          else if (e.type === "order_done") vol = String(e.volume_orign ?? "--");
+          else if (e.type === "order_update") vol = String((e.new && e.new.volume_left) ?? "--");
+          const status = e.type;
+          ordRows.push([
+            "<tr>",
+            '<td class="mono text-xs">', fmtTs(ts), "</td>",
+            '<td class="mono text-xs">', String(sym), "</td>",
+            "<td>", String(side), "</td>",
+            '<td class="mono">', String(vol), "</td>",
+            '<td class="mono text-xs">', String(status), "</td>",
+            "</tr>",
+          ].join(""));
+        }
+        // Fallback: if no events, show current alive orders if present.
+        if (!ordRows.length && Array.isArray(data.orders_alive)) {
+          for (const o of data.orders_alive.slice(0, 20)) {
+            ordRows.push([
+              "<tr>",
+              '<td class="mono text-xs">', "--", "</td>",
+              '<td class="mono text-xs">', String(o.symbol || "--"), "</td>",
+              "<td>", String(o.direction || "--"), "</td>",
+              '<td class="mono">', String(o.volume_left ?? o.volume_orign ?? "--"), "</td>",
+              '<td class="mono text-xs">ALIVE</td>',
+              "</tr>",
+            ].join(""));
+          }
+        }
+        ordTbody.innerHTML = ordRows.length ? ordRows.join("") : '<tr><td colspan="5" class="muted">No orders</td></tr>';
+      }
       
     } catch (e) {
       // API may not exist yet
     }
+  }
+
+  async function loadRunHistory() {
+    try {
+      const resp = await window.ghTrader.fetchApi("/api/trading/runs?limit=50");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (!data || data.ok === false) return;
+      const runs = Array.isArray(data.runs) ? data.runs : [];
+      const tbody = document.getElementById("runHistoryTbody");
+      const badge = document.getElementById("runCountBadge");
+      if (badge) badge.textContent = runs.length ? runs.length : "--";
+      if (!tbody) return;
+      if (!runs.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="muted">No trading runs found</td></tr>';
+        return;
+      }
+      tbody.innerHTML = runs.map((r) => {
+        const rid = String(r.run_id || "");
+        const ap = String(r.account_profile || "default");
+        const mode = String(r.mode || "--");
+        const mon = (r.monitor_only === true) ? " (monitor)" : "";
+        return [
+          "<tr>",
+          '<td class="mono">', rid, "</td>",
+          '<td class="mono">', ap, "</td>",
+          '<td class="mono text-xs">', fmtTs(r.last_ts || ""), "</td>",
+          '<td class="mono">', formatNumber(r.balance), "</td>",
+          "<td>", mode + mon, "</td>",
+          '<td><a href="/ops/trading/run/', encodeURIComponent(rid), tokenQs, '">View</a></td>',
+          "</tr>",
+        ].join("");
+      }).join("");
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  async function loadBrokers() {
+    if (!brokerIdList) return;
+    try {
+      const resp = await window.ghTrader.fetchApi("/api/brokers");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (!data || data.ok === false) return;
+      const brokers = Array.isArray(data.brokers) ? data.brokers : [];
+      brokerIdList.innerHTML = brokers.map((b) => '<option value="' + esc(b) + '"></option>').join("");
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  async function loadAccounts() {
+    try {
+      const resp = await window.ghTrader.fetchApi("/api/accounts");
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (!data || data.ok === false) return;
+
+      const rows = Array.isArray(data.profiles) ? data.profiles : [];
+      accountsByProfile = {};
+      const profiles = [];
+      for (const r of rows) {
+        if (!r || !r.profile) continue;
+        const p = String(r.profile);
+        profiles.push(p);
+        accountsByProfile[p] = r;
+      }
+
+      if (profiles.length && profiles.indexOf(selectedAccountProfile) === -1) {
+        setSelectedAccountProfile(profiles[0]);
+      } else {
+        setSelectedAccountProfile(selectedAccountProfile);
+      }
+
+      function profileLabel(p) {
+        const r = accountsByProfile[p] || {};
+        const parts = [String(p)];
+        if (r.broker_id) parts.push(String(r.broker_id));
+        if (r.account_id_masked) parts.push(String(r.account_id_masked));
+        return parts.join(" — ");
+      }
+
+      if (accountProfileSelect) {
+        accountProfileSelect.innerHTML = profiles.map((p) => '<option value=\"' + esc(p) + '\">' + esc(profileLabel(p)) + "</option>").join("");
+        accountProfileSelect.value = selectedAccountProfile;
+      }
+      if (tradeAccountProfileSelect) {
+        tradeAccountProfileSelect.innerHTML = profiles.map((p) => '<option value=\"' + esc(p) + '\">' + esc(profileLabel(p)) + "</option>").join("");
+        tradeAccountProfileSelect.value = selectedAccountProfile;
+      }
+      updateAccountProfileStatus();
+
+      const tbody = document.getElementById("accountsTbody");
+      if (!tbody) return;
+      if (!profiles.length) {
+        tbody.innerHTML = '<tr><td colspan=\"9\" class=\"muted\">No profiles found</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = profiles.map((p) => {
+        const r = accountsByProfile[p] || {};
+        const cfg = (r.configured === true);
+        const brokerId = r.broker_id ? String(r.broker_id) : "--";
+        const accMasked = r.account_id_masked ? String(r.account_id_masked) : "--";
+        const activeRun = r.active_run || null;
+        const latestRun = r.latest_run || null;
+        const lastTs = (activeRun && activeRun.last_ts) ? activeRun.last_ts : (latestRun ? latestRun.last_ts : "");
+        const latestRunId = latestRun && latestRun.run_id ? String(latestRun.run_id) : "";
+        const verifyAt = r.verify && r.verify.verified_at ? String(r.verify.verified_at) : "";
+        const verifyOk = (r.verify && r.verify.ok === true);
+        const verifyErr = (r.verify && r.verify.error) ? String(r.verify.error) : "";
+        const verifyPill = verifyAt ? (verifyOk ? '<span class="pill pill-succeeded" title="verified">ok</span>' : (verifyErr ? ('<span class="pill pill-failed" title="' + esc(verifyErr) + '">error</span>') : '<span class="pill">--</span>')) : '<span class="pill">--</span>';
+
+        const latestLink = latestRunId ? ('<a href=\"/ops/trading/run/' + encodeURIComponent(latestRunId) + tokenQs + '\">' + latestRunId + '</a>') : "--";
+        const activePill = activeRun && activeRun.run_id ? '<span class=\"pill pill-running\">active</span>' : '<span class=\"pill\">--</span>';
+
+        return [
+          "<tr>",
+          '<td class=\"mono\">', esc(p), "</td>",
+          '<td class=\"mono\">', esc(brokerId), "</td>",
+          '<td class=\"mono\">', esc(accMasked), "</td>",
+          "<td>", (cfg ? '<span class=\"pill pill-succeeded\">yes</span>' : '<span class=\"pill pill-failed\">no</span>'), "</td>",
+          "<td>", activePill, "</td>",
+          '<td class=\"mono text-xs\">', fmtTs(lastTs), "</td>",
+          "<td>", latestLink, "</td>",
+          '<td class=\"mono text-xs\">', (verifyAt ? fmtTs(verifyAt) : "--"), " ", verifyPill, "</td>",
+          '<td style=\"white-space:nowrap;\">',
+          '<button type=\"button\" class=\"btn btn-sm btn-secondary\" data-action=\"select-account\" data-profile=\"', esc(p), '\">Select</button> ',
+          '<button type=\"button\" class=\"btn btn-sm btn-secondary\" data-action=\"verify-account\" data-profile=\"', esc(p), '\">Verify</button> ',
+          '<button type=\"button\" class=\"btn btn-sm btn-danger\" data-action=\"remove-account\" data-profile=\"', esc(p), '\">Remove</button>',
+          "</td>",
+          "</tr>",
+        ].join("");
+      }).join("");
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  // Accounts table actions
+  const accountsTbody = document.getElementById("accountsTbody");
+  if (accountsTbody) {
+    accountsTbody.addEventListener("click", async (ev) => {
+      const t = ev.target;
+      if (!t || !t.dataset) return;
+      const action = String(t.dataset.action || "");
+      const prof = String(t.dataset.profile || "");
+      if (!action || !prof) return;
+
+      if (action === "select-account") {
+        setSelectedAccountProfile(prof);
+        updateAccountProfileStatus();
+        tabs.activate("status");
+        loadTradingStatus();
+        return;
+      }
+
+      if (action === "verify-account") {
+        try {
+          const out = await window.ghTrader.postJson("/api/accounts/enqueue-verify", { account_profile: prof });
+          const jobId = (out.enqueued && out.enqueued[0]) ? out.enqueued[0] : "";
+          window.ghTrader.toast(jobId ? ("Enqueued verify job: " + jobId) : "Enqueued verify job", "success");
+          loadTradingJobs();
+        } catch (e) {
+          window.ghTrader.toast("Failed to enqueue verify: " + (e.message || e), "error");
+        }
+        return;
+      }
+
+      if (action === "remove-account") {
+        if (!confirm("Remove account profile '" + prof + "'? This deletes it from runs/control/accounts.env.")) return;
+        try {
+          await window.ghTrader.postJson("/api/accounts/delete", { profile: prof });
+          window.ghTrader.toast("Removed: " + prof, "success");
+          if (selectedAccountProfile === prof) setSelectedAccountProfile("default");
+          loadAccounts();
+        } catch (e) {
+          window.ghTrader.toast("Failed to remove: " + (e.message || e), "error");
+        }
+        return;
+      }
+    });
+  }
+
+  function clearAccountForm() {
+    if (accountFormProfile) accountFormProfile.value = "";
+    if (accountFormBroker) accountFormBroker.value = "";
+    if (accountFormAccountId) accountFormAccountId.value = "";
+    if (accountFormPassword) accountFormPassword.value = "";
+  }
+
+  if (accountFormClear) {
+    accountFormClear.addEventListener("click", () => {
+      clearAccountForm();
+    });
+  }
+
+  if (accountUpsertForm) {
+    accountUpsertForm.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const profile = accountFormProfile ? String(accountFormProfile.value || "").trim() : "";
+      const brokerId = accountFormBroker ? String(accountFormBroker.value || "").trim() : "";
+      const accountId = accountFormAccountId ? String(accountFormAccountId.value || "").trim() : "";
+      const password = accountFormPassword ? String(accountFormPassword.value || "").trim() : "";
+
+      if (!profile) {
+        window.ghTrader.toast("Profile is required", "error");
+        return;
+      }
+      if (!brokerId || !accountId || !password) {
+        window.ghTrader.toast("Broker ID, account ID, and password are required", "error");
+        return;
+      }
+
+      try {
+        await window.ghTrader.postJson("/api/accounts/upsert", {
+          profile: profile,
+          broker_id: brokerId,
+          account_id: accountId,
+          password: password
+        });
+        window.ghTrader.toast("Saved: " + profile, "success");
+        if (accountFormPassword) accountFormPassword.value = "";
+        loadAccounts();
+      } catch (e) {
+        window.ghTrader.toast("Failed to save: " + (e.message || e), "error");
+      }
+    });
   }
 
   async function loadTradingJobs() {
@@ -604,23 +1051,32 @@
     return Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
 
+  function fmtTs(ts) {
+    if (!ts) return "--";
+    try { return new Date(ts).toLocaleString(); } catch (e) { return String(ts); }
+  }
+
   document.getElementById("refreshTrading").addEventListener("click", () => {
+    loadBrokers();
+    loadAccounts();
     loadTradingStatus();
     loadTradingJobs();
+    loadRunHistory();
     window.ghTrader.toast("Trading status refreshed", "info");
   });
 
-  // Update run count badge
-  const runRows = document.querySelectorAll("#runHistoryTbody tr:not(.muted)");
-  document.getElementById("runCountBadge").textContent = runRows.length > 0 ? runRows.length : "--";
-
   // Initial load
+  loadBrokers();
+  loadAccounts();
   loadTradingStatus();
   loadTradingJobs();
+  loadRunHistory();
   
   // Auto-refresh
   setInterval(loadTradingStatus, 10000);
   setInterval(loadTradingJobs, 15000);
+  setInterval(loadRunHistory, 30000);
+  setInterval(loadAccounts, 30000);
 })();
 </script>
 {% endblock %}

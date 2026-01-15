@@ -320,7 +320,7 @@ def update(
     "--probe-date",
     default=None,
     type=click.DateTime(formats=["%Y-%m-%d"]),
-    help="Optional probe date (YYYY-MM-DD). If omitted, uses active-ranges last_active or today.",
+    help="Optional probe date (YYYY-MM-DD). If omitted, uses local last day if available; else quote expire (expired contracts); else latest trading day.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Print JSON results to stdout")
 @click.pass_context
@@ -362,6 +362,163 @@ def probe_l5(ctx: click.Context, symbols: tuple[str, ...], data_dir: str, probe_
 
     if as_json:
         click.echo(json.dumps({"results": results}, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+# ---------------------------------------------------------------------------
+# account (broker account profiles; env-only)
+# ---------------------------------------------------------------------------
+
+
+@main.group("account")
+@click.pass_context
+def account_group(ctx: click.Context) -> None:
+    """Broker account profiles (env-based): list and verify (read-only)."""
+    _ = ctx
+
+
+@account_group.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Print JSON results to stdout")
+def account_list(as_json: bool) -> None:
+    import json
+
+    from ghtrader.tq_runtime import is_trade_account_configured, list_account_profiles_from_env
+
+    profiles = list_account_profiles_from_env()
+    out = [{"profile": p, "configured": bool(is_trade_account_configured(profile=p))} for p in profiles]
+    if as_json:
+        click.echo(json.dumps({"ok": True, "profiles": out}, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        for r in out:
+            click.echo(f"{r['profile']}\tconfigured={r['configured']}")
+
+
+@account_group.command("verify")
+@click.option("--account", "account_profile", default="default", show_default=True, type=str, help="Account profile to verify")
+@click.option("--timeout-sec", default=20.0, show_default=True, type=float, help="Timeout for connect + snapshot")
+@click.option("--json", "as_json", is_flag=True, help="Print JSON results to stdout")
+@click.pass_context
+def account_verify(ctx: click.Context, account_profile: str, timeout_sec: float, as_json: bool) -> None:
+    """
+    Verify a broker account profile (read-only): connect and capture a single snapshot.
+
+    Writes a non-secret cache file under runs/control/cache/accounts/.
+    """
+    import json
+    import signal
+    import threading
+    import time
+    from datetime import timezone
+
+    from ghtrader.config import get_runs_dir
+    from ghtrader.tq_runtime import (
+        canonical_account_profile,
+        create_tq_account,
+        create_tq_api,
+        is_trade_account_configured,
+        load_trade_account_config_from_env,
+        now_utc_iso,
+        snapshot_account_state,
+    )
+
+    _ = ctx
+    prof = canonical_account_profile(account_profile)
+    # Serialize by account profile.
+    _acquire_locks([f"trade:account={prof}"])
+
+    runs_dir = get_runs_dir()
+    cache_dir = runs_dir / "control" / "cache" / "accounts"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"account={prof}.json"
+
+    payload: dict[str, Any] = {
+        "profile": prof,
+        "ok": False,
+        "configured": bool(is_trade_account_configured(profile=prof)),
+        "verified_at": now_utc_iso(),
+        "timeout_sec": float(timeout_sec or 0.0),
+        "error": "",
+    }
+
+    try:
+        cfg = load_trade_account_config_from_env(profile=prof)
+        # Mask: never write full ids.
+        payload["broker_id"] = str(cfg.broker_id)
+        aid = str(cfg.account_id)
+        payload["account_id_masked"] = (aid[:2] + "***" + aid[-2:]) if len(aid) >= 6 else "***"
+
+        # Some broker endpoints can hang (eg. market closed / login denied). Enforce a hard timeout so
+        # the dashboard doesn't wedge on verify jobs and locks.
+        timeout_s = float(timeout_sec or 0.0)
+        api = None
+
+        class _Timeout:
+            def __init__(self, seconds: float):
+                self.seconds = float(seconds or 0.0)
+                self._old = None
+
+            def __enter__(self):
+                if self.seconds <= 0:
+                    return self
+
+                def _handler(_signum, _frame):  # type: ignore[no-untyped-def]
+                    raise TimeoutError(f"timeout after {self.seconds:.1f}s")
+
+                self._old = signal.signal(signal.SIGALRM, _handler)
+                signal.setitimer(signal.ITIMER_REAL, self.seconds)
+                return self
+
+            def __exit__(self, _exc_type, _exc, _tb):  # type: ignore[no-untyped-def]
+                if self.seconds > 0:
+                    try:
+                        signal.setitimer(signal.ITIMER_REAL, 0.0)
+                    except Exception:
+                        pass
+                    try:
+                        if self._old is not None:
+                            signal.signal(signal.SIGALRM, self._old)
+                    except Exception:
+                        pass
+                return False
+
+        def _safe_close(a) -> None:  # type: ignore[no-untyped-def]
+            try:
+                a.close()
+            except Exception:
+                return
+
+        account = create_tq_account(mode="live", monitor_only=True, account_profile=prof)  # type: ignore[arg-type]
+        with _Timeout(timeout_s):
+            api = create_tq_api(account=account)
+            # Wait for at least one update so account data is populated (best-effort).
+            try:
+                ok_update = bool(api.wait_update(deadline=time.time() + min(5.0, max(0.0, timeout_s))))
+                if not ok_update:
+                    raise TimeoutError("timeout waiting for first update")
+            except Exception:
+                # If wait_update fails, still attempt a snapshot (it may include useful error fields).
+                pass
+
+            # We don't know symbols yet; snapshot_account_state supports empty symbols.
+            snap = snapshot_account_state(api=api, symbols=[], account=account, account_meta={"account_profile": prof})
+            payload["snapshot"] = snap
+            # Consider verified "ok" if we could produce a snapshot object.
+            payload["ok"] = True
+
+        if api is not None:
+            t = threading.Thread(target=_safe_close, args=(api,), daemon=True)
+            t.start()
+            t.join(timeout=2.0)
+    except Exception as e:
+        payload["ok"] = False
+        payload["error"] = str(e)
+
+    # Atomic-ish write.
+    tmp = cache_path.with_suffix(f".tmp-{int(time.time()*1000)}")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    tmp.replace(cache_path)
+
+    if as_json:
+        click.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str, sort_keys=True))
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +852,14 @@ def paper(ctx: click.Context, model: str, symbols: tuple[str, ...],
     help="Connect and record snapshots/events but never send orders (safe for real-account validation).",
 )
 @click.option(
+    "--account",
+    "account_profile",
+    default="default",
+    show_default=True,
+    type=str,
+    help="Broker account profile (env-based). Use `default` for TQ_BROKER_ID/TQ_ACCOUNT_ID/TQ_ACCOUNT_PASSWORD, or a named profile from GHTRADER_TQ_ACCOUNT_PROFILES.",
+)
+@click.option(
     "--require-no-alive-orders",
     default="auto",
     show_default=True,
@@ -724,6 +889,7 @@ def trade(
     executor: str,
     model: str,
     symbols: tuple[str, ...],
+    account_profile: str,
     data_dir: str,
     artifacts_dir: str,
     runs_dir: str,
@@ -749,8 +915,12 @@ def trade(
     """Run a trading job (paper/sim/live) suitable for dashboard subprocess execution."""
     from ghtrader.execution import RiskLimits
     from ghtrader.trade import TradeConfig, run_trade
+    from ghtrader.tq_runtime import canonical_account_profile
 
-    lock_keys = [f"trade:mode={mode}"] + [f"trade:symbol={s}" for s in symbols]
+    prof = canonical_account_profile(account_profile)
+    # Lock by broker account profile so multiple accounts can run in parallel.
+    # (Symbol-level locks are intentionally not used here.)
+    lock_keys = [f"trade:account={prof}"]
     _acquire_locks(lock_keys)
 
     limits = RiskLimits(
@@ -776,6 +946,7 @@ def trade(
         monitor_only=bool(monitor_only),
         sim_account=sim_account,  # type: ignore[arg-type]
         executor=executor,  # type: ignore[arg-type]
+        account_profile=prof,
         model_name=model,
         symbols=list(symbols),
         horizon=int(horizon),
@@ -1339,6 +1510,13 @@ def db_benchmark(
 
 
 @db_group.command("serve-sync")
+@click.option(
+    "--backend",
+    default="questdb",
+    type=click.Choice(["questdb"], case_sensitive=False),
+    show_default=True,
+    help="(deprecated) Serving DB backend. ghTrader is QuestDB-only; this option is ignored.",
+)
 @click.option("--table", default="", help="Destination table name (default: ghtrader_ticks_<ticks_lake>_<lake_version>)")
 @click.option("--symbol", required=True, help="Symbol to sync (specific or derived)")
 @click.option(
@@ -1363,6 +1541,7 @@ def db_benchmark(
 @click.pass_context
 def db_serve_sync(
     ctx: click.Context,
+    backend: str,
     table: str,
     symbol: str,
     ticks_lake: str,
@@ -1383,6 +1562,9 @@ def db_serve_sync(
     from ghtrader.serving_db import ServingDBConfig, make_serving_backend, sync_ticks_to_serving_db
 
     log = structlog.get_logger()
+    b = str(backend or "").strip().lower()
+    if b and b != "questdb":
+        raise click.ClickException(f"Unsupported backend={backend!r}. ghTrader is QuestDB-only.")
     lake_version = "v2"
     tbl = str(table).strip() or f"ghtrader_ticks_{ticks_lake}_{lake_version}"
     runs_root = Path(runs_dir)

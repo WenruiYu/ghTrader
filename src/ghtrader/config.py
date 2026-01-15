@@ -4,6 +4,7 @@ Configuration: centralized settings and credential management.
 Loads configuration from:
 1. Environment variables
 2. .env file (if present, via python-dotenv)
+3. runs/control/accounts.env (if present; dashboard-managed; loaded after .env)
 
 Usage:
     from ghtrader.config import load_config, get_tqsdk_auth
@@ -60,16 +61,33 @@ def load_config() -> None:
     global _config_loaded
     if _config_loaded:
         return
+
+    # Tests should control environment explicitly. Avoid auto-loading a local `.env`
+    # (which may exist on developer machines and would make tests flaky).
+    if os.environ.get("PYTEST_CURRENT_TEST") or str(os.environ.get("GHTRADER_DISABLE_DOTENV", "")).lower() in {"1", "true", "yes"}:
+        log.debug("config.skip_dotenv", reason="pytest_or_disabled")
+        _config_loaded = True
+        return
     
     try:
         from dotenv import load_dotenv
-        
+
         env_file = find_dotenv()
         if env_file:
             load_dotenv(env_file, override=False)
             log.debug("config.loaded_dotenv", path=str(env_file))
         else:
             log.debug("config.no_dotenv_found")
+
+        runs_dir = os.environ.get("GHTRADER_RUNS_DIR", "runs")
+        accounts_env = Path(runs_dir) / "control" / "accounts.env"
+        if accounts_env.exists():
+            # Dashboard-managed broker account profiles (contains secrets).
+            # Loaded after `.env` and may override account keys.
+            load_dotenv(accounts_env, override=True)
+            log.debug("config.loaded_accounts_env", path=str(accounts_env))
+        else:
+            log.debug("config.no_accounts_env", path=str(accounts_env))
     except ImportError:
         log.debug("config.dotenv_not_installed")
     

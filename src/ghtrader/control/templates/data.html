@@ -9,146 +9,104 @@
 
   <!-- Tab Navigation -->
   <div class="tab-nav">
-    <button class="tab-nav-item active" data-tab="coverage">Coverage</button>
-    <button class="tab-nav-item" data-tab="contracts">
+    <button class="tab-nav-item active" data-tab="contracts">
       Contracts
       <span class="badge" id="contractsBadge">--</span>
     </button>
     <button class="tab-nav-item" data-tab="sync">DB Sync</button>
   </div>
 
-  <!-- Tab: Coverage -->
-  <div class="tab-content active" id="tab-coverage">
-    <div class="kpi-grid mb-3">
-      <div class="kpi-card">
-        <div class="kpiLabel">Raw Tick Symbols</div>
-        <div class="kpiValue">{{ ticks_v2|length }}</div>
-        <div class="kpiSubtext">lake_v2</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpiLabel">main_l5 Symbols</div>
-        <div class="kpiValue">{{ main_l5_v2|length }}</div>
-        <div class="kpiSubtext">Derived with L5 depth</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpiLabel">Features Built</div>
-        <div class="kpiValue">{{ features|length }}</div>
-        <div class="kpiSubtext">{% if features|length > 0 %}{{ features[0].min_date }} - {{ features[0].max_date }}{% else %}No features{% endif %}</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpiLabel">Labels Built</div>
-        <div class="kpiValue">{{ labels|length }}</div>
-        <div class="kpiSubtext">{% if labels|length > 0 %}{{ labels[0].min_date }} - {{ labels[0].max_date }}{% else %}No labels{% endif %}</div>
-      </div>
-    </div>
-
-    <div class="split-pane">
-      <div>
-        <div class="card">
-          <h3 class="mb-2">Raw Ticks (lake_v2)</h3>
-          {% if ticks_v2 and ticks_v2|length > 0 %}
-          <div class="tableWrap">
-            <table class="table table-compact">
-              <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-              <tbody>
-              {% for r in ticks_v2 %}
-                <tr>
-                  <td class="mono">{{ r.symbol }}</td>
-                  <td>{{ r.n_dates }}</td>
-                  <td class="mono">{{ r.min_date or "" }}</td>
-                  <td class="mono">{{ r.max_date or "" }}</td>
-                </tr>
-              {% endfor %}
-              </tbody>
-            </table>
-          </div>
-          {% else %}
-          <div class="muted">No data in lake_v2</div>
-          {% endif %}
-        </div>
-      </div>
-
-      <div>
-        <div class="card">
-          <h3 class="mb-2">main_l5 (lake_v2)</h3>
-          {% if main_l5_v2 and main_l5_v2|length > 0 %}
-          <div class="tableWrap">
-            <table class="table table-compact">
-              <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-              <tbody>
-              {% for r in main_l5_v2 %}
-                <tr>
-                  <td class="mono">{{ r.symbol }}</td>
-                  <td>{{ r.n_dates }}</td>
-                  <td class="mono">{{ r.min_date or "" }}</td>
-                  <td class="mono">{{ r.max_date or "" }}</td>
-                </tr>
-              {% endfor %}
-              </tbody>
-            </table>
-          </div>
-          {% else %}
-          <div class="muted">No main_l5 data in v2</div>
-          {% endif %}
-        </div>
-      </div>
-    </div>
-
-    <div class="split-pane">
-      <div class="card">
-        <h3 class="mb-2">Features</h3>
-        {% if features and features|length > 0 %}
-        <div class="tableWrap">
-          <table class="table table-compact">
-            <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-            <tbody>
-            {% for r in features %}
-              <tr>
-                <td class="mono">{{ r.symbol }}</td>
-                <td>{{ r.n_dates }}</td>
-                <td class="mono">{{ r.min_date or "" }}</td>
-                <td class="mono">{{ r.max_date or "" }}</td>
-              </tr>
-            {% endfor %}
-            </tbody>
-          </table>
-        </div>
-        {% else %}
-        <div class="muted">No features built yet. Use Ops > Build to create features.</div>
-        {% endif %}
-      </div>
-
-      <div class="card">
-        <h3 class="mb-2">Labels</h3>
-        {% if labels and labels|length > 0 %}
-        <div class="tableWrap">
-          <table class="table table-compact">
-            <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
-            <tbody>
-            {% for r in labels %}
-              <tr>
-                <td class="mono">{{ r.symbol }}</td>
-                <td>{{ r.n_dates }}</td>
-                <td class="mono">{{ r.min_date or "" }}</td>
-                <td class="mono">{{ r.max_date or "" }}</td>
-              </tr>
-            {% endfor %}
-            </tbody>
-          </table>
-        </div>
-        {% else %}
-        <div class="muted">No labels built yet. Use Ops > Build to create labels.</div>
-        {% endif %}
-      </div>
-    </div>
-  </div>
-
   <!-- Tab: Contracts -->
-  <div class="tab-content" id="tab-contracts">
+  <div class="tab-content active" id="tab-contracts">
     <div class="card">
       <div class="section-header mb-2">
         <h3 class="mb-0">Contract Explorer</h3>
         <div class="muted text-sm">TqSdk catalog + local coverage + QuestDB status</div>
+      </div>
+
+      <div class="alert-banner alert-warn mb-3" id="contractsQuestdbBanner" style="display:none;">
+        <div class="alert-banner-icon">!</div>
+        <div class="alert-banner-content">
+          <div class="alert-banner-title">QuestDB unreachable</div>
+          <div class="muted text-sm" id="contractsQuestdbBannerText">--</div>
+          <div class="muted text-sm">DB-dependent actions are disabled until QuestDB is reachable.</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:12px;">
+        <div class="section-header mb-2" style="margin-bottom:8px;">
+          <h4 class="mb-0">Overview (coverage)</h4>
+          <div style="display:flex; gap:8px;">
+            <button type="button" class="btn btn-sm btn-secondary" id="coverageToggleBtn">Show</button>
+            <button type="button" class="btn btn-sm btn-secondary" id="coverageRefreshBtn" style="display:none;">Refresh</button>
+          </div>
+        </div>
+        <div id="coveragePanel" style="display:none;">
+          <div class="kpi-grid mb-3">
+            <div class="kpi-card">
+              <div class="kpiLabel">Raw Tick Symbols</div>
+              <div class="kpiValue" id="covTicksCount">--</div>
+              <div class="kpiSubtext mono text-xs" id="covTicksRange">--</div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpiLabel">main_l5 Symbols</div>
+              <div class="kpiValue" id="covMainL5Count">--</div>
+              <div class="kpiSubtext mono text-xs" id="covMainL5Range">--</div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpiLabel">Features Built</div>
+              <div class="kpiValue" id="covFeaturesCount">--</div>
+              <div class="kpiSubtext mono text-xs" id="covFeaturesRange">--</div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpiLabel">Labels Built</div>
+              <div class="kpiValue" id="covLabelsCount">--</div>
+              <div class="kpiSubtext mono text-xs" id="covLabelsRange">--</div>
+            </div>
+          </div>
+
+          <div class="split-pane">
+            <div class="card">
+              <h4 class="mb-2">Raw ticks (sample)</h4>
+              <div class="tableWrap">
+                <table class="table table-compact">
+                  <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+                  <tbody id="covTicksTbody"><tr><td colspan="4" class="muted">Not loaded.</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="card">
+              <h4 class="mb-2">main_l5 (sample)</h4>
+              <div class="tableWrap">
+                <table class="table table-compact">
+                  <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+                  <tbody id="covMainL5Tbody"><tr><td colspan="4" class="muted">Not loaded.</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div class="split-pane">
+            <div class="card">
+              <h4 class="mb-2">Features (sample)</h4>
+              <div class="tableWrap">
+                <table class="table table-compact">
+                  <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+                  <tbody id="covFeaturesTbody"><tr><td colspan="4" class="muted">Not loaded.</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="card">
+              <h4 class="mb-2">Labels (sample)</h4>
+              <div class="tableWrap">
+                <table class="table table-compact">
+                  <thead><tr><th>Symbol</th><th>#days</th><th>min</th><th>max</th></tr></thead>
+                  <tbody id="covLabelsTbody"><tr><td colspan="4" class="muted">Not loaded.</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
       
       <div class="grid2 mb-3">
@@ -327,6 +285,11 @@
   const btnProbeAll = document.getElementById("contractsProbeAllBtn");
   const btnFillAll = document.getElementById("contractsFillAllBtn");
   const btnUpdateAll = document.getElementById("contractsUpdateAllBtn");
+  const covToggleBtn = document.getElementById("coverageToggleBtn");
+  const covRefreshBtn = document.getElementById("coverageRefreshBtn");
+  const covPanel = document.getElementById("coveragePanel");
+  const questdbBanner = document.getElementById("contractsQuestdbBanner");
+  const questdbBannerText = document.getElementById("contractsQuestdbBannerText");
 
   let lastRows = [];
   let lastQuestdbOk = false;
@@ -337,13 +300,109 @@
     updateHash: true,
     onTab: (tabId) => {
       if (tabId === "contracts" && !window._contractsLoaded) {
-        refreshTable({ refresh: true });
+        loadContractsCacheFirst();
       }
     },
   });
 
   function setStatus(msg) {
     elStatus.textContent = msg;
+  }
+
+  function esc(s) {
+    return String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/\"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function row4(r) {
+    const sym = esc(r.symbol || "");
+    const n = String(r.n_dates || 0);
+    const min = esc(r.min_date || "");
+    const max = esc(r.max_date || "");
+    return "<tr><td class=\"mono\">" + sym + "</td><td>" + n + "</td><td class=\"mono\">" + min + "</td><td class=\"mono\">" + max + "</td></tr>";
+  }
+
+  async function loadCoverageKind(kind, tbodyId, countId, rangeId) {
+    const tbody = document.getElementById(tbodyId);
+    const countEl = document.getElementById(countId);
+    const rangeEl = document.getElementById(rangeId);
+    if (tbody) tbody.innerHTML = '<tr><td colspan="4" class="muted">Loading...</td></tr>';
+    try {
+      const url = "/api/data/coverage?kind=" + encodeURIComponent(kind) + "&limit=50";
+      const resp = await window.ghTrader.fetchApi(url);
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const body = await resp.json();
+      if (!body || body.ok === false) throw new Error(body.error || body.detail || "failed");
+      const rows = Array.isArray(body.rows) ? body.rows : [];
+      if (countEl) countEl.textContent = String(body.count || rows.length || 0);
+      // best-effort global range from returned sample
+      let gmin = "";
+      let gmax = "";
+      for (const r of rows) {
+        const a = String(r.min_date || "");
+        const b = String(r.max_date || "");
+        if (a && (!gmin || a < gmin)) gmin = a;
+        if (b && (!gmax || b > gmax)) gmax = b;
+      }
+      if (rangeEl) rangeEl.textContent = (gmin || gmax) ? (gmin + " - " + gmax) : "--";
+      if (tbody) tbody.innerHTML = rows.length ? rows.map(row4).join("") : '<tr><td colspan="4" class="muted">No data.</td></tr>';
+    } catch (e) {
+      if (tbody) tbody.innerHTML = '<tr><td colspan="4" class="muted">Failed to load.</td></tr>';
+      if (countEl) countEl.textContent = "--";
+      if (rangeEl) rangeEl.textContent = "--";
+    }
+  }
+
+  let _coverageLoaded = false;
+  async function loadCoverageOverview(force) {
+    if (_coverageLoaded && !force) return;
+    _coverageLoaded = true;
+    if (covRefreshBtn) covRefreshBtn.style.display = "inline-block";
+    await Promise.all([
+      loadCoverageKind("ticks", "covTicksTbody", "covTicksCount", "covTicksRange"),
+      loadCoverageKind("main_l5", "covMainL5Tbody", "covMainL5Count", "covMainL5Range"),
+      loadCoverageKind("features", "covFeaturesTbody", "covFeaturesCount", "covFeaturesRange"),
+      loadCoverageKind("labels", "covLabelsTbody", "covLabelsCount", "covLabelsRange"),
+    ]);
+  }
+
+  if (covToggleBtn && covPanel) {
+    covToggleBtn.addEventListener("click", () => {
+      const open = covPanel.style.display !== "none";
+      covPanel.style.display = open ? "none" : "block";
+      covToggleBtn.textContent = open ? "Show" : "Hide";
+      if (!open) loadCoverageOverview(false);
+    });
+  }
+  if (covRefreshBtn) {
+    covRefreshBtn.addEventListener("click", () => loadCoverageOverview(true));
+  }
+
+  function fmtAgeSec(sec) {
+    if (sec === null || sec === undefined) return "";
+    const s = Math.max(0, Number(sec));
+    if (!isFinite(s)) return "";
+    const m = Math.round(s / 60);
+    if (m < 60) return m + "m";
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    if (h < 24) return h + "h" + (mm ? (mm + "m") : "");
+    const d = Math.floor(h / 24);
+    const hh = h % 24;
+    return d + "d" + (hh ? (hh + "h") : "");
+  }
+
+  function fmtTime(ts) {
+    if (!ts) return "";
+    try {
+      return new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    } catch (e) {
+      return String(ts);
+    }
   }
 
   function fmtPct(p) {
@@ -369,11 +428,36 @@
     else if (st === "not-downloaded") statusCell = "<span class=\"pill\">none</span>";
 
     const source = String(r.catalog_source || "").substring(0, 6) || "-";
-    const localRange = (r.local_min || r.local_max) ? ((r.local_min || "") + " - " + (r.local_max || "")) : "-";
+    const localRangeDay = (r.local_min || r.local_max) ? ((r.local_min || "") + " - " + (r.local_max || "")) : "-";
+    const localLast = r.local_last_tick_ts ? fmtTime(r.local_last_tick_ts) : "";
+    const localLag = fmtAgeSec(r.local_last_tick_age_sec);
+    const localRange = [
+      '<div class="mono text-xs">' + esc(localRangeDay) + "</div>",
+      localLast ? ('<div class="muted text-xs">last tick: ' + esc(localLast) + (localLag ? (" (lag " + esc(localLag) + ")") : "") + "</div>") : '<div class="muted text-xs">--</div>',
+    ].join("");
     
     const qc = r.questdb_coverage || null;
-    const dbRange = qc && (qc.first_tick_day || qc.last_tick_day) ? ((qc.first_tick_day || "") + " - " + (qc.last_tick_day || "")) : "-";
-    const dbL5 = qc && (qc.first_l5_day || qc.last_l5_day) ? ((qc.first_l5_day || "") + " - " + (qc.last_l5_day || "")) : "-";
+    const dbRangeDay = qc && (qc.first_tick_day || qc.last_tick_day) ? ((qc.first_tick_day || "") + " - " + (qc.last_tick_day || "")) : "-";
+    const dbLast = qc && qc.last_tick_ts ? fmtTime(qc.last_tick_ts) : "";
+    let dbLag = "";
+    try {
+      if (qc && qc.last_tick_ts) dbLag = fmtAgeSec((Date.now() - Date.parse(qc.last_tick_ts)) / 1000.0);
+    } catch (e) {}
+    const dbRange = [
+      '<div class="mono text-xs">' + esc(dbRangeDay) + "</div>",
+      dbLast ? ('<div class="muted text-xs">last tick: ' + esc(dbLast) + (dbLag ? (" (lag " + esc(dbLag) + ")") : "") + "</div>") : '<div class="muted text-xs">--</div>',
+    ].join("");
+
+    const dbL5Day = qc && (qc.first_l5_day || qc.last_l5_day) ? ((qc.first_l5_day || "") + " - " + (qc.last_l5_day || "")) : "-";
+    const dbL5Last = qc && qc.last_l5_ts ? fmtTime(qc.last_l5_ts) : "";
+    let dbL5Lag = "";
+    try {
+      if (qc && qc.last_l5_ts) dbL5Lag = fmtAgeSec((Date.now() - Date.parse(qc.last_l5_ts)) / 1000.0);
+    } catch (e) {}
+    const dbL5 = [
+      '<div class="mono text-xs">' + esc(dbL5Day) + "</div>",
+      dbL5Last ? ('<div class="muted text-xs">last L5: ' + esc(dbL5Last) + (dbL5Lag ? (" (lag " + esc(dbL5Lag) + ")") : "") + "</div>") : '<div class="muted text-xs">--</div>',
+    ].join("");
 
     let dbStatusCell = "<span class=\"muted\">-</span>";
     const ds = String(r.db_status || "");
@@ -400,8 +484,8 @@
 
     return [
       "<tr data-symbol=\"" + r.symbol + "\">",
-        "<td class=\"mono\">" + r.symbol + "</td>",
-        "<td class=\"mono\">" + source + "</td>",
+        "<td class=\"mono\">" + esc(r.symbol) + "</td>",
+        "<td class=\"mono\">" + esc(source) + "</td>",
         "<td>" + activeCell + "</td>",
         "<td>" + statusCell + "</td>",
         "<td>" + String(r.local_days_downloaded || 0) + "</td>",
@@ -417,19 +501,40 @@
     ].join("");
   }
 
+  let _contractsReqSeq = 0;
+
   async function fetchContracts(opts) {
     opts = opts || {};
     const ex = elExchange.value;
     const v = elVar.value;
     const refresh = opts.refresh ? "1" : "0";
     const url = window.ghTrader.withToken("/api/contracts?exchange=" + encodeURIComponent(ex) + "&var=" + encodeURIComponent(v) + "&refresh=" + refresh);
-    setStatus("Loading contracts...");
-    const resp = await window.ghTrader.fetchApi(url);
-    const body = await resp.json();
-    if (!resp.ok || !body.ok) {
-      throw new Error(body.error || body.detail || "HTTP " + resp.status);
+    const label = String(opts.label || (opts.refresh ? "Refreshing contracts..." : "Loading contracts..."));
+    const timeoutMs = Number(opts.timeoutMs || 30000);
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    const tick = setInterval(() => {
+      const s = Math.floor((Date.now() - startedAt) / 1000);
+      setStatus(label + " (" + s + "s)");
+    }, 1000);
+    const to = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      setStatus(label + " (0s)");
+      const resp = await window.ghTrader.fetchApi(url, { signal: controller.signal });
+      const body = await resp.json();
+      if (!resp.ok || !body.ok) {
+        throw new Error(body.error || body.detail || "HTTP " + resp.status);
+      }
+      return body;
+    } catch (e) {
+      if (String(e && e.name) === "AbortError") {
+        throw new Error("Timed out after " + Math.round(timeoutMs / 1000) + "s");
+      }
+      throw e;
+    } finally {
+      clearInterval(tick);
+      clearTimeout(to);
     }
-    return body;
   }
 
   function renderRows() {
@@ -456,8 +561,10 @@
   }
 
   async function refreshTable(opts) {
+    const reqId = ++_contractsReqSeq;
     try {
       const body = await fetchContracts(opts);
+      if (reqId !== _contractsReqSeq) return;
       const rows = body.contracts || [];
       window._contractsLoaded = true;
       document.getElementById("contractsBadge").textContent = rows.length;
@@ -468,16 +575,49 @@
       }
       lastRows = rows;
       lastQuestdbOk = !!(body.questdb && body.questdb.ok);
+      if (questdbBanner) {
+        if (body.questdb && body.questdb.ok === false) {
+          questdbBanner.style.display = "flex";
+          const err = (body.questdb && body.questdb.error) ? String(body.questdb.error) : "";
+          if (questdbBannerText) questdbBannerText.textContent = err ? err : "QuestDB connection failed";
+        } else {
+          questdbBanner.style.display = "none";
+        }
+      }
       renderRows();
-      setStatus("Loaded " + rows.length + " contracts" + (lastQuestdbOk ? "" : " (QuestDB offline)"));
+      const meta = [];
+      const catSrc = (body.catalog_source || body.catalog_source === "") ? String(body.catalog_source) : "";
+      const catAt = body.catalog_cached_at ? String(body.catalog_cached_at) : "";
+      const catOk = (body.catalog_ok === true);
+      if (catSrc || catAt) meta.push("catalog " + (catSrc || "--") + (catAt ? (" @" + catAt) : "") + (catOk ? "" : " (stale)"));
+      if (body.questdb && body.questdb.ok === true) meta.push("QuestDB ok");
+      else meta.push("QuestDB offline");
+      if (body.local_checked_at || body.generated_at) meta.push("checked " + String(body.local_checked_at || body.generated_at));
+      if (body.timings_ms && body.timings_ms.total !== undefined) meta.push("t=" + String(body.timings_ms.total) + "ms");
+      setStatus("Loaded " + rows.length + " contracts" + (meta.length ? (" — " + meta.join(" • ")) : ""));
     } catch (e) {
-      elTbody.innerHTML = "<tr><td colspan=\"13\" class=\"muted\">Failed to load contracts.</td></tr>";
-      setStatus("Error: " + String(e.message || e));
-      window.ghTrader.toast("Failed to load contracts: " + String(e.message || e), "error");
+      if (reqId !== _contractsReqSeq) return;
+      const msg = String(e.message || e);
+      const hasTable = Array.isArray(lastRows) && lastRows.length > 0;
+      if (!hasTable) {
+        elTbody.innerHTML = "<tr><td colspan=\"13\" class=\"muted\">Failed to load contracts.</td></tr>";
+      }
+      if (questdbBanner) questdbBanner.style.display = "none";
+      setStatus("Error: " + msg + (hasTable ? " — still showing cached results" : ""));
+      window.ghTrader.toast("Failed to load contracts: " + msg, "error");
     }
   }
 
-  btnRefresh.addEventListener("click", () => refreshTable({ refresh: true }));
+  async function loadContractsCacheFirst() {
+    await refreshTable({ refresh: false, timeoutMs: 15000, label: "Loading contracts..." });
+    // Background refresh (non-blocking): keep cached table if it fails.
+    refreshTable({ refresh: true, timeoutMs: 30000, label: "Refreshing contracts...", background: true });
+  }
+
+  btnRefresh.addEventListener("click", () => {
+    // Re-render quickly from cache, then refresh in background.
+    loadContractsCacheFirst();
+  });
   const renderRowsDebounced = window.ghTrader.debounce(renderRows, 120);
   elSearch.addEventListener("input", () => renderRowsDebounced());
   elActiveFilter.addEventListener("change", () => renderRows());
@@ -559,6 +699,9 @@
       window.ghTrader.toast("Failed: " + e.message, "error");
     }
   });
+
+  // Contracts is the primary workflow: load immediately (cache-first) on page load.
+  setTimeout(loadContractsCacheFirst, 0);
 })();
 </script>
 {% endblock %}

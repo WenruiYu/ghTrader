@@ -9,6 +9,8 @@ from typing import Any, Literal
 import numpy as np
 import structlog
 
+import os
+
 from ghtrader.execution import (
     DirectOrderExecutor,
     OrderRateLimiter,
@@ -21,8 +23,10 @@ from ghtrader.symbol_resolver import is_continuous_alias, resolve_trading_symbol
 from ghtrader.tq_runtime import (
     GracefulShutdown,
     TradeRunWriter,
+    canonical_account_profile,
     create_tq_account,
     create_tq_api,
+    is_trade_account_configured,
     snapshot_account_state,
     trading_day_from_ts_ns,
 )
@@ -40,6 +44,8 @@ class TradeConfig:
     monitor_only: bool = False
     sim_account: Literal["tqsim", "tqkq"] = "tqsim"
     executor: ExecutorType = "targetpos"
+    # Broker account profile (env-based). Used only for mode=live.
+    account_profile: str = "default"
 
     model_name: str = "xgboost"
     symbols: list[str] = None  # type: ignore[assignment]
@@ -131,6 +137,78 @@ def online_history_required(*, model_name: str, model: Any) -> int:
     return online_model_seq_len(model_name=model_name, model=model) + 1
 
 
+def _orders_alive_by_id(orders_alive: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for o in orders_alive:
+        try:
+            oid = str((o or {}).get("order_id") or "").strip()
+            if not oid:
+                continue
+            out[oid] = dict(o)
+        except Exception:
+            continue
+    return out
+
+
+def _diff_orders_alive(
+    *,
+    prev: dict[str, dict[str, Any]],
+    cur: dict[str, dict[str, Any]],
+    ts: str,
+) -> list[dict[str, Any]]:
+    """
+    Best-effort diff of ALIVE orders to produce UI-friendly lifecycle events.
+
+    This intentionally works off the `orders_alive` snapshot subset (no dependency on TqSdk internals),
+    so it remains testable without network/credentials.
+    """
+    events: list[dict[str, Any]] = []
+
+    prev_ids = set(prev.keys())
+    cur_ids = set(cur.keys())
+
+    for oid in sorted(cur_ids - prev_ids):
+        o = cur.get(oid) or {}
+        events.append({"ts": ts, "type": "order_new", **o})
+
+    # Updates + inferred fills (volume_left decreases)
+    for oid in sorted(cur_ids & prev_ids):
+        a = prev.get(oid) or {}
+        b = cur.get(oid) or {}
+
+        # Compare a small stable subset for update detection.
+        keys = ["symbol", "direction", "offset", "price_type", "limit_price", "volume_orign", "volume_left", "last_msg"]
+        changed = any((a.get(k) != b.get(k)) for k in keys)
+        if not changed:
+            continue
+        events.append({"ts": ts, "type": "order_update", "order_id": oid, "old": a, "new": b})
+
+        try:
+            old_left = int(a.get("volume_left") or 0)
+            new_left = int(b.get("volume_left") or 0)
+            filled = int(old_left) - int(new_left)
+            if filled > 0:
+                events.append(
+                    {
+                        "ts": ts,
+                        "type": "trade_fill",
+                        "order_id": oid,
+                        "symbol": str(b.get("symbol") or a.get("symbol") or ""),
+                        "volume": int(filled),
+                        "direction": str(b.get("direction") or a.get("direction") or ""),
+                        "offset": str(b.get("offset") or a.get("offset") or ""),
+                    }
+                )
+        except Exception:
+            pass
+
+    for oid in sorted(prev_ids - cur_ids):
+        o = prev.get(oid) or {}
+        events.append({"ts": ts, "type": "order_done", **o})
+
+    return events
+
+
 def maybe_roll_execution_symbol(
     *,
     requested_symbol: str,
@@ -205,8 +283,38 @@ def run_trade(cfg: TradeConfig, *, confirm_live: str | None = None) -> None:
     execution_symbols = current_execution_symbols()
 
     # Create api + account
-    account = create_tq_account(mode=cfg.mode, sim_account=cfg.sim_account, monitor_only=bool(cfg.monitor_only))
+    account_profile = canonical_account_profile(getattr(cfg, "account_profile", "default") or "default")
+    account = create_tq_account(
+        mode=cfg.mode,
+        sim_account=cfg.sim_account,
+        monitor_only=bool(cfg.monitor_only),
+        account_profile=account_profile,
+    )
     api = create_tq_api(account=account)
+
+    broker_configured = bool(is_trade_account_configured(profile=account_profile))
+    account_meta = {
+        "mode": cfg.mode,
+        "monitor_only": bool(cfg.monitor_only),
+        "account_profile": account_profile,
+        "broker_configured": bool(broker_configured),
+    }
+
+    # Run writer (create early so we can log startup failures / degraded modes).
+    base_run_id = time.strftime("%Y%m%d_%H%M%S")
+    run_id = base_run_id if account_profile == "default" else f"{base_run_id}_{account_profile}"
+    # Ensure run_id is unique to avoid mixing runs when started within the same second.
+    try:
+        base_dir = cfg.runs_dir / "trading"
+        cand = run_id
+        i = 1
+        while (base_dir / cand).exists():
+            cand = f"{run_id}_{i}"
+            i += 1
+        run_id = cand
+    except Exception:
+        pass
+    writer = TradeRunWriter(run_id=run_id, runs_dir=cfg.runs_dir)
 
     # Subscriptions
     quotes = {s: api.get_quote(bindings[s].execution_symbol) for s in strategy_symbols}
@@ -215,13 +323,45 @@ def run_trade(cfg: TradeConfig, *, confirm_live: str | None = None) -> None:
     local_time_record: dict[str, float] = {s: time.time() - 0.005 for s in strategy_symbols}
 
     # Models
-    models = _load_models(cfg.model_name, strategy_symbols, cfg.artifacts_dir, cfg.horizon)
+    # - Required for order-enabled modes.
+    # - Best-effort in monitor-only mode (live monitoring should not be blocked by missing models).
+    models: dict[str, Any] = {}
+    signals_enabled: dict[str, bool] = {s: True for s in strategy_symbols}
+    for s in strategy_symbols:
+        model_dir = cfg.artifacts_dir / s / cfg.model_name
+        model_files = list(model_dir.glob(f"model_h{cfg.horizon}.*"))
+        if not model_files:
+            if bool(cfg.monitor_only):
+                signals_enabled[s] = False
+                writer.append_event(
+                    {
+                        "ts": now_utc(),
+                        "type": "signals_disabled",
+                        "symbol": s,
+                        "reason": "missing_model",
+                        "expected_dir": str(model_dir),
+                        "expected_glob": f"model_h{cfg.horizon}.*",
+                    }
+                )
+                log.warning(
+                    "trade.signals_disabled",
+                    symbol=s,
+                    reason="missing_model",
+                    expected_dir=str(model_dir),
+                    expected_glob=f"model_h{cfg.horizon}.*",
+                )
+                continue
+            raise FileNotFoundError(f"No model found for {s} {cfg.model_name} horizon={cfg.horizon} under {model_dir}")
+        models[s] = load_model(cfg.model_name, model_files[0])
 
     # Feature state
     from ghtrader.features import DEFAULT_FACTORS, FactorEngine, read_features_manifest
 
     enabled_factors: dict[str, list[str]] = {}
     for s in strategy_symbols:
+        if not signals_enabled.get(s, True):
+            enabled_factors[s] = []
+            continue
         manifest = read_features_manifest(cfg.data_dir, s)
         ef = manifest.get("enabled_factors")
         if isinstance(ef, list) and ef and all(isinstance(x, str) and x for x in ef):
@@ -237,21 +377,34 @@ def run_trade(cfg: TradeConfig, *, confirm_live: str | None = None) -> None:
 
     # Validate online factor dimension against the trained model artifact (best-effort).
     for s in strategy_symbols:
+        if not signals_enabled.get(s, True):
+            continue
         exp = _expected_n_features(models[s])
         if exp is not None and int(exp) != len(enabled_factors[s]):
             raise RuntimeError(
                 f"Feature count mismatch for {s}: model expects n_features={int(exp)} but enabled_factors has {len(enabled_factors[s])}"
             )
 
-    engines = {s: FactorEngine(enabled_factors=enabled_factors[s]) for s in strategy_symbols}
-    feature_buffers: dict[str, list[dict]] = {s: [] for s in strategy_symbols}
+    engines: dict[str, Any] = {}
+    feature_buffers: dict[str, list[dict]] = {}
+    for s in strategy_symbols:
+        if signals_enabled.get(s, True):
+            engines[s] = FactorEngine(enabled_factors=enabled_factors[s])
+            feature_buffers[s] = []
+        else:
+            engines[s] = None
+            feature_buffers[s] = []
 
     is_tabular_model = cfg.model_name in {"logistic", "xgboost", "lightgbm"}
     model_seq_len: dict[str, int] = {}
     history_required: dict[str, int] = {}
     for s in strategy_symbols:
-        model_seq_len[s] = online_model_seq_len(model_name=cfg.model_name, model=models[s])
-        history_required[s] = online_history_required(model_name=cfg.model_name, model=models[s])
+        if signals_enabled.get(s, True):
+            model_seq_len[s] = online_model_seq_len(model_name=cfg.model_name, model=models[s])
+            history_required[s] = online_history_required(model_name=cfg.model_name, model=models[s])
+        else:
+            model_seq_len[s] = 1
+            history_required[s] = 1
 
     # Executor
     limiter = OrderRateLimiter(cfg.limits.max_ops_per_sec)
@@ -275,15 +428,13 @@ def run_trade(cfg: TradeConfig, *, confirm_live: str | None = None) -> None:
             rate_limiter=limiter,
         )
 
-    # Run writer
-    run_id = time.strftime("%Y%m%d_%H%M%S")
-    writer = TradeRunWriter(run_id=run_id, runs_dir=cfg.runs_dir)
     writer.write_config(
         {
             "mode": cfg.mode,
             "monitor_only": bool(cfg.monitor_only),
             "sim_account": cfg.sim_account,
             "executor": cfg.executor,
+            "account_profile": account_profile,
             "model_name": cfg.model_name,
             "symbols_requested": strategy_symbols,
             "symbols_resolved": resolved,
@@ -307,6 +458,7 @@ def run_trade(cfg: TradeConfig, *, confirm_live: str | None = None) -> None:
     last_targets: dict[str, int] = {s: 0 for s in strategy_symbols}
     last_snapshot = 0.0
     start_balance: float | None = None
+    last_orders_alive: dict[str, dict[str, Any]] = {}
 
     log.info(
         "trade.start",
@@ -339,7 +491,7 @@ def run_trade(cfg: TradeConfig, *, confirm_live: str | None = None) -> None:
 
         try:
             exec_syms = current_execution_symbols()
-            snap0 = snapshot_account_state(api=api, symbols=exec_syms, account=account)
+            snap0 = snapshot_account_state(api=api, symbols=exec_syms, account=account, account_meta=account_meta)
             writer.append_snapshot(snap0)
             writer.append_event(
                 {
@@ -437,9 +589,19 @@ def run_trade(cfg: TradeConfig, *, confirm_live: str | None = None) -> None:
             now = time.time()
             if now - last_snapshot >= float(cfg.snapshot_interval_sec):
                 exec_syms = current_execution_symbols()
-                snap = snapshot_account_state(api=api, symbols=exec_syms, account=account)
+                snap = snapshot_account_state(api=api, symbols=exec_syms, account=account, account_meta=account_meta)
                 writer.append_snapshot(snap)
                 last_snapshot = now
+
+                # Order/trade observability (best-effort diff of ALIVE orders).
+                try:
+                    cur_orders = _orders_alive_by_id(list(snap.get("orders_alive") or []))
+                    evts = _diff_orders_alive(prev=last_orders_alive, cur=cur_orders, ts=str(snap.get("ts") or now_utc()))
+                    for e in evts:
+                        writer.append_event(e)
+                    last_orders_alive = cur_orders
+                except Exception:
+                    pass
 
                 bal = snap.get("account", {}).get("balance")
                 if start_balance is None and isinstance(bal, (int, float)):
@@ -539,7 +701,8 @@ def run_trade(cfg: TradeConfig, *, confirm_live: str | None = None) -> None:
 
                                 # Reset online state and refresh subscriptions to the new underlying.
                                 try:
-                                    engines[sym].reset_states()
+                                    if engines.get(sym) is not None:
+                                        engines[sym].reset_states()
                                 except Exception:
                                     pass
                                 feature_buffers[sym] = []
@@ -553,6 +716,10 @@ def run_trade(cfg: TradeConfig, *, confirm_live: str | None = None) -> None:
                                 continue
 
                 # Compute factors incrementally
+                if not signals_enabled.get(sym, True):
+                    continue
+                if engines.get(sym) is None:
+                    continue
                 factors = engines[sym].compute_incremental(tick_dict)
                 feature_buffers[sym].append(factors)
                 req_len = int(history_required[sym])
@@ -668,7 +835,7 @@ def run_trade(cfg: TradeConfig, *, confirm_live: str | None = None) -> None:
             pass
         try:
             exec_syms = current_execution_symbols()
-            snap = snapshot_account_state(api=api, symbols=exec_syms, account=account)
+            snap = snapshot_account_state(api=api, symbols=exec_syms, account=account, account_meta=account_meta)
             writer.append_snapshot(snap)
         except Exception:
             pass

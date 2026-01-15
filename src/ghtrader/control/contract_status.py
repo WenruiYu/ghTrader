@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -53,6 +54,181 @@ def _write_json_atomic(path: Path, obj: dict[str, Any]) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
     tmp.replace(path)
+
+
+def _tick_bounds_cache_path(*, runs_dir: Path, lake_version: str, symbol: str, day: str) -> Path:
+    lv = "v2"
+    sym = str(symbol).strip()
+    safe = sym.replace("/", "_")
+    ds = str(day).strip()
+    return _cache_root(runs_dir=runs_dir) / "local_tick_bounds" / f"lake={lv}" / f"symbol={safe}" / f"date={ds}.json"
+
+
+def _parquet_files_fingerprint(date_dir: Path) -> list[dict[str, Any]]:
+    try:
+        files = sorted([p for p in date_dir.iterdir() if p.is_file() and p.suffix == ".parquet"], key=lambda x: x.name)
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for p in files:
+        try:
+            st = p.stat()
+            out.append({"name": p.name, "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))), "size": int(st.st_size)})
+        except Exception:
+            continue
+    return out
+
+
+def _ns_to_iso_utc(ns: int | None) -> str | None:
+    if ns is None:
+        return None
+    try:
+        if int(ns) <= 0:
+            return None
+        return datetime.fromtimestamp(float(int(ns)) / 1_000_000_000.0, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def _parquet_datetime_ns_bounds(path: Path) -> tuple[int | None, int | None]:
+    """
+    Best-effort (min_ns, max_ns) for the `datetime` column of a Parquet file.
+
+    Prefer Parquet row-group statistics; fall back to reading only the first and last row groups.
+    """
+    try:
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
+    except Exception:
+        return None, None
+
+    try:
+        pf = pq.ParquetFile(path)
+        if "datetime" not in pf.schema.names:
+            return None, None
+
+        # 1) Prefer row-group statistics (fast).
+        try:
+            idx = list(pf.schema.names).index("datetime")
+            md = pf.metadata
+            mn: int | None = None
+            mx: int | None = None
+            if md is not None:
+                for i in range(md.num_row_groups):
+                    st = md.row_group(i).column(idx).statistics
+                    if not st:
+                        continue
+                    try:
+                        a = st.min
+                        b = st.max
+                    except Exception:
+                        continue
+                    try:
+                        ai = int(a) if a is not None else None
+                        bi = int(b) if b is not None else None
+                    except Exception:
+                        continue
+                    if ai is not None:
+                        mn = ai if mn is None else min(mn, ai)
+                    if bi is not None:
+                        mx = bi if mx is None else max(mx, bi)
+            if mn is not None or mx is not None:
+                return mn, mx
+        except Exception:
+            pass
+
+        # 2) Fallback: read only first+last row group for `datetime`.
+        nrg = int(getattr(pf, "num_row_groups", 0) or 0)
+        if nrg <= 0:
+            return None, None
+        try:
+            t0 = pf.read_row_group(0, columns=["datetime"])
+            a0 = t0.column(0).combine_chunks()
+            mn0 = pc.min(a0).as_py() if len(a0) else None
+        except Exception:
+            mn0 = None
+        try:
+            t1 = pf.read_row_group(nrg - 1, columns=["datetime"])
+            a1 = t1.column(0).combine_chunks()
+            mx1 = pc.max(a1).as_py() if len(a1) else None
+        except Exception:
+            mx1 = None
+        try:
+            return (int(mn0) if mn0 is not None else None), (int(mx1) if mx1 is not None else None)
+        except Exception:
+            return None, None
+    except Exception:
+        return None, None
+
+
+def compute_local_tick_bounds_for_day(
+    *,
+    data_dir: Path,
+    runs_dir: Path,
+    symbol: str,
+    lake_version: str,
+    day: str,
+    refresh: bool,
+) -> dict[str, Any] | None:
+    """
+    Return best-effort local min/max tick timestamps for (symbol, day).
+
+    Uses a small cache keyed by Parquet file fingerprints.
+    """
+    lv = "v2"
+    _ = lake_version
+    sym = str(symbol).strip()
+    ds = str(day).strip()
+    if not sym or not ds:
+        return None
+
+    date_dir = _ticks_symbol_dir(data_dir=data_dir, symbol=sym, lake_version=lv) / f"date={ds}"
+    if not date_dir.exists():
+        return None
+
+    fp = _parquet_files_fingerprint(date_dir)
+    if not fp:
+        return None
+
+    cache_path = _tick_bounds_cache_path(runs_dir=runs_dir, lake_version=lv, symbol=sym, day=ds)
+    if not refresh:
+        cached = _read_json(cache_path)
+        try:
+            if cached and cached.get("files") == fp and (cached.get("min_datetime_ns") is not None or cached.get("max_datetime_ns") is not None):
+                return cached
+        except Exception:
+            pass
+
+    # Compute across all parquet parts for this day.
+    mn: int | None = None
+    mx: int | None = None
+    for item in fp:
+        try:
+            p = date_dir / str(item.get("name") or "")
+            a, b = _parquet_datetime_ns_bounds(p)
+            if a is not None:
+                mn = a if mn is None else min(mn, a)
+            if b is not None:
+                mx = b if mx is None else max(mx, b)
+        except Exception:
+            continue
+
+    payload = {
+        "symbol": sym,
+        "trading_day": ds,
+        "lake_version": lv,
+        "files": fp,
+        "min_datetime_ns": mn,
+        "max_datetime_ns": mx,
+        "min_datetime_ts": _ns_to_iso_utc(mn),
+        "max_datetime_ts": _ns_to_iso_utc(mx),
+        "computed_at": _now_iso(),
+    }
+    try:
+        _write_json_atomic(cache_path, payload)
+    except Exception:
+        pass
+    return payload
 
 
 def _ticks_symbol_dir(*, data_dir: Path, symbol: str, lake_version: str) -> Path:
@@ -381,6 +557,14 @@ def compute_contract_statuses(
     cal = get_trading_calendar(data_dir=data_dir, refresh=False)
     today = datetime.now(timezone.utc).date()
     today_trading = _last_trading_day_leq(cal, today)
+    checked_at = _now_iso()
+    now_s = time.time()
+    # Active contract freshness: if today's partition exists but the last tick is too old, mark stale.
+    try:
+        lag_min = float(os.environ.get("GHTRADER_CONTRACTS_LOCAL_TICK_LAG_STALE_MINUTES", "120") or "120")
+    except Exception:
+        lag_min = 120.0
+    lag_threshold_sec = float(max(0.0, lag_min * 60.0))
 
     out: list[dict[str, Any]] = []
     for c in contracts:
@@ -398,6 +582,34 @@ def compute_contract_statuses(
 
         sym_dir = _ticks_symbol_dir(data_dir=data_dir, symbol=sym, lake_version=lv)
         downloaded_set, local_min, local_max = _scan_date_dirs(sym_dir)
+
+        # Minute-level local bounds (best-effort; cached by file fingerprints).
+        bounds_first = compute_local_tick_bounds_for_day(
+            data_dir=data_dir,
+            runs_dir=runs_dir,
+            symbol=sym,
+            lake_version=lv,
+            day=str(local_min or ""),
+            refresh=False,
+        ) if local_min else None
+        bounds_last = compute_local_tick_bounds_for_day(
+            data_dir=data_dir,
+            runs_dir=runs_dir,
+            symbol=sym,
+            lake_version=lv,
+            day=str(local_max or ""),
+            refresh=False,
+        ) if local_max else None
+        local_first_tick_ns = int(bounds_first.get("min_datetime_ns")) if isinstance(bounds_first, dict) and bounds_first.get("min_datetime_ns") is not None else None
+        local_last_tick_ns = int(bounds_last.get("max_datetime_ns")) if isinstance(bounds_last, dict) and bounds_last.get("max_datetime_ns") is not None else None
+        local_first_tick_ts = str(bounds_first.get("min_datetime_ts") or "") if isinstance(bounds_first, dict) else ""
+        local_last_tick_ts = str(bounds_last.get("max_datetime_ts") or "") if isinstance(bounds_last, dict) else ""
+        local_last_tick_age_sec: float | None = None
+        if local_last_tick_ns is not None and local_last_tick_ns > 0:
+            try:
+                local_last_tick_age_sec = float(max(0.0, now_s - (float(local_last_tick_ns) / 1_000_000_000.0)))
+            except Exception:
+                local_last_tick_age_sec = None
 
         # Best-effort expected window:
         # - prefer remote metadata (open_date / expire_datetime when available)
@@ -512,6 +724,7 @@ def compute_contract_statuses(
 
         # Status
         status = "unknown"
+        stale_reason: str | None = None
         if not downloaded_set:
             status = "not-downloaded"
         elif days_expected is None or days_done is None:
@@ -523,10 +736,18 @@ def compute_contract_statuses(
                     status = "complete"
                 elif local_max and local_max < today_trading.isoformat():
                     status = "stale"
+                    stale_reason = "missing_trading_day"
                 else:
                     status = "incomplete"
             else:
                 status = "complete" if pct is not None and pct >= 1.0 else "incomplete"
+
+        # Within-day lag: a contract can be day-complete but still behind in minutes/hours.
+        if expired_b is False and status == "complete":
+            if local_max and local_max == today_trading.isoformat():
+                if local_last_tick_age_sec is not None and local_last_tick_age_sec > lag_threshold_sec:
+                    status = "stale"
+                    stale_reason = "tick_lag"
 
         # Local L5 detection (incremental cache)
         l5_sum = compute_local_l5_summary(
@@ -550,6 +771,14 @@ def compute_contract_statuses(
                 "local_days_downloaded": int(len(downloaded_set)),
                 "local_min": local_min,
                 "local_max": local_max,
+                "local_first_tick_ns": local_first_tick_ns,
+                "local_last_tick_ns": local_last_tick_ns,
+                "local_first_tick_ts": local_first_tick_ts or None,
+                "local_last_tick_ts": local_last_tick_ts or None,
+                "local_last_tick_age_sec": local_last_tick_age_sec,
+                "local_checked_at": checked_at,
+                "stale_reason": stale_reason,
+                "tick_lag_stale_threshold_sec": lag_threshold_sec if expired_b is False else None,
                 "days_expected": days_expected,
                 "days_done": days_done,
                 "pct": pct,
@@ -589,7 +818,8 @@ def compute_contract_statuses(
         "exchange": ex,
         "var": v,
         "lake_version": lv,
-        "generated_at": _now_iso(),
+        "generated_at": checked_at,
+        "local_checked_at": checked_at,
         "contracts": out,
         "active_ranges_available": False,
     }

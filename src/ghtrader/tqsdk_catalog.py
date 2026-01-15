@@ -343,6 +343,8 @@ def get_contract_catalog(
     runs_dir: Path | None = None,
     ttl_s: float = 3600.0,
     refresh: bool = False,
+    allow_stale_cache: bool = False,
+    offline: bool = False,
 ) -> dict[str, Any]:
     """
     Return a cached contract catalog:
@@ -363,13 +365,15 @@ def get_contract_catalog(
 
     if not refresh:
         cached = _read_json(p)
-        if cached and _is_fresh(cached, ttl_s=ttl_s):
+        if cached and (bool(allow_stale_cache) or _is_fresh(cached, ttl_s=ttl_s)):
             cached = dict(cached)
             cached.setdefault("source", "cache")
             cached.setdefault("exchange", ex)
             cached.setdefault("var", v)
             cached.setdefault("ok", bool(cached.get("ok", True)))
             return cached
+        if bool(offline):
+            return {"ok": False, "exchange": ex, "var": v, "contracts": [], "source": "cache", "error": "catalog_cache_missing_or_stale"}
 
     contracts, err = fetch_tqsdk_contracts(exchange=ex, var=v)
     if err is not None:

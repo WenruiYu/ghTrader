@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import os
 from typing import Any
 
 import re
@@ -27,14 +29,16 @@ def _psycopg():
         raise RuntimeError("psycopg not installed. Install with: pip install -e '.[questdb]'") from e
 
 
-def _connect(cfg: QuestDBQueryConfig):
+def _connect(cfg: QuestDBQueryConfig, *, connect_timeout_s: int = 2):
     psycopg = _psycopg()
+    to = int(connect_timeout_s) if int(connect_timeout_s) > 0 else 2
     return psycopg.connect(
         user=cfg.pg_user,
         password=cfg.pg_password,
         host=cfg.host,
         port=int(cfg.pg_port),
         dbname=cfg.pg_dbname,
+        connect_timeout=to,
     )
 
 
@@ -152,7 +156,7 @@ def query_symbol_day_bounds(
     l5_only: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """
-    Return {symbol: {first_day, last_day, n_days}} using QuestDB canonical ticks.
+    Return {symbol: {first_day, last_day, n_days, first_ns, last_ns, first_ts, last_ts}} using QuestDB canonical ticks.
 
     Notes:
     - Uses `trading_day` column (ISO YYYY-MM-DD strings, stored as SYMBOL).
@@ -176,20 +180,42 @@ def query_symbol_day_bounds(
         "SELECT symbol, "
         "min(cast(trading_day as string)) AS first_day, "
         "max(cast(trading_day as string)) AS last_day, "
-        "count(DISTINCT cast(trading_day as string)) AS n_days "
+        "count(DISTINCT cast(trading_day as string)) AS n_days, "
+        "min(datetime_ns) AS first_ns, "
+        "max(datetime_ns) AS last_ns "
         f"FROM {table} "
         f"WHERE {' AND '.join(where)} "
         "GROUP BY symbol"
     )
 
     out: dict[str, dict[str, Any]] = {}
-    with _connect(cfg) as conn:
+
+    def _ns_to_iso(ns: Any) -> str | None:
+        try:
+            n = int(ns)
+            if n <= 0:
+                return None
+            return datetime.fromtimestamp(float(n) / 1_000_000_000.0, tz=timezone.utc).isoformat()
+        except Exception:
+            return None
+
+    with _connect(cfg, connect_timeout_s=2) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             for row in cur.fetchall():
                 try:
                     sym = str(row[0])
-                    out[sym] = {"first_day": row[1], "last_day": row[2], "n_days": row[3]}
+                    first_ns = row[4]
+                    last_ns = row[5]
+                    out[sym] = {
+                        "first_day": row[1],
+                        "last_day": row[2],
+                        "n_days": row[3],
+                        "first_ns": int(first_ns) if first_ns is not None else None,
+                        "last_ns": int(last_ns) if last_ns is not None else None,
+                        "first_ts": _ns_to_iso(first_ns),
+                        "last_ts": _ns_to_iso(last_ns),
+                    }
                 except Exception:
                     continue
     return out
@@ -229,9 +255,17 @@ def query_contract_coverage(
             "first_tick_day": b.get("first_day"),
             "last_tick_day": b.get("last_day"),
             "tick_days": b.get("n_days"),
+            "first_tick_ns": b.get("first_ns"),
+            "last_tick_ns": b.get("last_ns"),
+            "first_tick_ts": b.get("first_ts"),
+            "last_tick_ts": b.get("last_ts"),
             "first_l5_day": l.get("first_day"),
             "last_l5_day": l.get("last_day"),
             "l5_days": l.get("n_days"),
+            "first_l5_ns": l.get("first_ns"),
+            "last_l5_ns": l.get("last_ns"),
+            "first_l5_ts": l.get("first_ts"),
+            "last_l5_ts": l.get("last_ts"),
         }
     return out
 

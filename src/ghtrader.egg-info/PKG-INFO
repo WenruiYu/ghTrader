@@ -18,20 +18,15 @@ Provides-Extra: dev
 Requires-Dist: pytest>=8.0; extra == "dev"
 Requires-Dist: pytest-cov>=5.0; extra == "dev"
 Requires-Dist: httpx>=0.27; extra == "dev"
-Requires-Dist: duckdb>=1.1.0; extra == "dev"
 Provides-Extra: control
 Requires-Dist: fastapi>=0.110; extra == "control"
 Requires-Dist: uvicorn[standard]>=0.24; extra == "control"
 Requires-Dist: jinja2>=3.1; extra == "control"
 Requires-Dist: python-multipart>=0.0.9; extra == "control"
 Requires-Dist: psutil>=5.9; extra == "control"
-Provides-Extra: db
-Requires-Dist: duckdb>=1.1.0; extra == "db"
 Provides-Extra: questdb
 Requires-Dist: questdb>=4.1.0; extra == "questdb"
 Requires-Dist: psycopg[binary]>=3.2.0; extra == "questdb"
-Provides-Extra: clickhouse
-Requires-Dist: clickhouse-connect>=0.8.0; extra == "clickhouse"
 Provides-Extra: tabular
 Requires-Dist: xgboost>=2.0; extra == "tabular"
 Requires-Dist: lightgbm>=4.0; extra == "tabular"
@@ -94,9 +89,17 @@ The canonical product/spec/plan for this repo is [`PRD.md`](PRD.md). All future 
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install in editable mode (includes vendored tqsdk-python)
-pip install -e ./tqsdk-python
-pip install -e .[dev,control]
+# Install ghTrader in editable mode (dev + dashboard)
+pip install -e ".[dev,control]"
+
+# Install TqSdk (required for data download/backtest)
+# Option A (recommended): install from PyPI
+pip install tqsdk
+# Option B (advanced): if you have a local checkout at ./tqsdk-python, install it editable instead
+# pip install -e ./tqsdk-python
+
+# Optional: add tabular baselines (xgboost/lightgbm)
+# pip install -e ".[tabular]"
 
 # Configure TqSdk credentials (Pro account with tq_dl required)
 # Option 1: Create .env file (recommended)
@@ -116,15 +119,15 @@ ghtrader download --symbol SHFE.cu2502 --start 2024-01-01 --end 2024-01-31
 # Build features and labels
 ghtrader build --symbol SHFE.cu2502
 
-# Train baseline model
-ghtrader train --model xgboost --symbol SHFE.cu2502
+# Train baseline model (works with default deps)
+ghtrader train --model logistic --symbol SHFE.cu2502
 
 # Train a deep model with DDP across 4 GPUs (recommended on this server)
 # (run inside the venv; requires torchrun available in PATH)
 torchrun --nproc_per_node=4 -m ghtrader.cli train --model deeplob --symbol SHFE.cu2502 --epochs 50 --batch-size 256 --seq-len 100 --lr 1e-3
 
-# Run backtest
-ghtrader backtest --model xgboost --symbol SHFE.cu2502
+# Run backtest (requires a trained model artifact for the same symbol/model/horizon)
+ghtrader backtest --model logistic --symbol SHFE.cu2502 --start 2024-01-01 --end 2024-01-31
 ```
 
 ---
@@ -157,7 +160,7 @@ Then open `http://127.0.0.1:8000` locally.
 | **Models** | `/models` | Model inventory, training forms, benchmarks |
 | **Trading** | `/trading` | Trading console, positions, run history |
 | **Ops** | `/ops` | Pipeline operations, ingest, schedule/build, integrity, locks |
-| **SQL** | `/explorer` | DuckDB SQL explorer for ad-hoc queries |
+| **SQL** | `/explorer` | QuestDB SQL explorer (read-only; canonical ticks) |
 | **System** | `/system` | CPU, memory, disk, GPU monitoring |
 
 ### Key features
@@ -184,14 +187,13 @@ ghTrader/
   README.md              # This file (project rules + setup)
   pyproject.toml         # Dependencies, entrypoints, formatting
   .gitignore             # Ignore data/, runs/, artifacts/, secrets
-  tqsdk-python/          # Vendored TqSdk (do not modify unless patching)
+  tqsdk-python/          # (optional) Local checkout of TqSdk source for patching; otherwise install `tqsdk` via pip
   src/ghtrader/
     __init__.py
     cli.py               # CLI entrypoint (download, record, build, train, backtest, paper)
     tq_ingest.py         # TqSdk integration: historical download + live recorder
     lake.py              # Parquet schema, partitioning, manifest writing/reading
-    db.py                # DuckDB lakehouse query layer (Parquet views + metrics index)
-    db_bench.py          # QuestDB/ClickHouse benchmark harness (optional)
+    db_bench.py          # QuestDB benchmark harness (optional)
     serving_db.py        # Optional serving DB sync (backfill + incremental)
     features.py          # FactorEngine + registry
     labels.py            # Event-time labels, horizons
@@ -222,33 +224,6 @@ Columns:
 - `volume`, `amount`, `open_interest` (float64)
 - `bid_price1..5`, `bid_volume1..5` (float64)
 - `ask_price1..5`, `ask_volume1..5` (float64)
-
----
-
-## DuckDB SQL layer (optional)
-
-DuckDB provides fast **read-only SQL** over the Parquet lake and powers the dashboard Explorer.
-
-Install:
-- If you installed `pip install -e ".[dev,control]"`, DuckDB is included.
-- Otherwise install it with: `pip install -e ".[db]"`
-
-Initialize/refresh Parquet-backed views (writes `data/ghtrader.duckdb` by default):
-
-```bash
-ghtrader db init
-```
-
-Run SQL (SELECT/WITH only) and export:
-
-```bash
-ghtrader sql --query "SELECT COUNT(*) AS n FROM ticks_raw_v2"
-ghtrader sql --query "SELECT * FROM run_metrics ORDER BY created_at DESC" --out runs_metrics.csv
-```
-
-Optional serving DB hooks (require external daemons):
-- `ghtrader db benchmark ...` (QuestDB/ClickHouse ingest/query benchmark)
-- `ghtrader db serve-sync ...` (best-effort backfill/incremental sync from Parquet partitions)
 
 ---
 
@@ -285,7 +260,7 @@ Common flows:
 
 ```bash
 # Sync locally-downloaded Parquet ticks to QuestDB (per symbol)
-ghtrader db serve-sync --backend questdb --symbol SHFE.cu2602 --ticks-lake raw
+ghtrader db serve-sync --symbol SHFE.cu2602 --ticks-lake raw
 
 # Sync all locally-downloaded contracts for a variety
 ghtrader db serve-sync-variety --exchange SHFE --var cu
@@ -296,6 +271,20 @@ ghtrader main-schedule --var cu --start 2015-01-01 --end 2026-01-01
 # Build derived main_l5 ticks for the L5 era only (writes to data/lake_v2/main_l5/...)
 ghtrader main-l5 --var cu
 ```
+
+## Data maintenance (Update)
+
+Manual update (active + recently expired contracts):
+
+```bash
+ghtrader update --exchange SHFE --var cu --recent-expired-days 10 --refresh-catalog
+```
+
+Dashboard update:
+- Data → Contracts → **Update** (bulk or per-contract)
+
+Optional daily Update scheduler (dashboard):
+- Set `GHTRADER_DAILY_UPDATE_TARGETS=SHFE:cu` (and optionally `GHTRADER_DAILY_UPDATE_RECENT_EXPIRED_DAYS=10`) in `.env` and restart the dashboard.
 
 ## Labels (event-time, multi-horizon)
 

@@ -175,8 +175,40 @@ class QuestDBBackend(ServingDBBackend):
 
     def ingest_df(self, *, table: str, df: pd.DataFrame) -> None:
         Sender = self._sender()
-        with Sender(self.config.host, int(self.config.questdb_ilp_port)) as sender:
+
+        host = str(self.config.host)
+        port = int(self.config.questdb_ilp_port)
+
+        # Help the QuestDB client map stable tag-like columns to SYMBOL.
+        # (The DataFrame ingestion API uses pandas categoricals to represent SYMBOL columns.)
+        for c in ["symbol", "trading_day", "ticks_lake", "lake_version", "underlying_contract"]:
+            if c in df.columns:
+                try:
+                    df[c] = df[c].astype("category")
+                except Exception:
+                    pass
+
+        # questdb>=4 uses Sender.from_conf() for TCP ILP.
+        # The direct Sender(host, port) constructor is not supported on 4.1.0.
+        sender_ctx = None
+        conf = f"tcp::addr={host}:{port};"
+        if hasattr(Sender, "from_conf"):
+            sender_ctx = Sender.from_conf(conf)
+        else:
+            # Backward-compat (older clients): attempt the old constructor forms.
+            try:
+                sender_ctx = Sender(host, port)
+            except TypeError:
+                # Some older variants accept a single config string.
+                sender_ctx = Sender(conf)
+
+        with sender_ctx as sender:
             sender.dataframe(df, table_name=table, at="ts")
+            # Ensure buffered ILP gets sent (safe best-effort; auto_flush may already handle it).
+            try:
+                sender.flush()
+            except Exception:
+                pass
 
 
 def make_serving_backend(config: ServingDBConfig) -> ServingDBBackend:

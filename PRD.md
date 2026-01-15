@@ -403,9 +403,9 @@ Requirements:
     - Quick action buttons for common workflows
     - Running and recent jobs tables
   - **Data hub** (`/data`):
-    - Tab 1: Coverage overview (ticks, main_l5, features, labels tables)
-    - Tab 2: Contract explorer (TqSdk catalog + local + QuestDB status)
-    - Tab 3: DB sync (QuestDB sync forms + status)
+    - Tab 1: Contract explorer (TqSdk catalog + local + QuestDB status; **primary workflow**)
+      - includes a collapsed **Overview** section (lazy-loaded) for coverage (ticks, main_l5, features, labels)
+    - Tab 2: DB sync (QuestDB sync forms + status)
   - **Models** (`/models`):
     - Tab 1: Model inventory (list trained artifacts with search/filter)
     - Tab 2: Training (train form + sweep form + active training jobs)
@@ -476,9 +476,15 @@ Requirements:
         - so that contracts already present locally are never “invisible” even if TqSdk does not list them.
     - For each contract, show:
       - **Local download status (Parquet mirror)**: `not-downloaded` / `incomplete` / `complete` / `stale` (active and behind today).
+        - Must also surface **minute-level freshness** for active contracts:
+          - `local_last_tick_ts` and derived `local_last_tick_age_sec`
+          - If the latest trading-day partition exists but the last tick is too old, mark `stale` with reason `tick_lag`
+          - Threshold must be configurable (e.g. `GHTRADER_CONTRACTS_LOCAL_TICK_LAG_STALE_MINUTES`, default 120)
       - **Coverage (QuestDB canonical)** (separate from local status):
         - first/last tick day present
+        - first/last tick timestamp present (minute-level, derived from `datetime_ns`)
         - first/last L5 day present
+        - first/last L5 timestamp present (minute-level, derived from `datetime_ns`)
         - distinct trading-day counts (tick days; L5 days) when available
         - freshness for active contracts (behind latest trading day → `stale`)
       - **L5 availability**:
@@ -494,6 +500,9 @@ Requirements:
       - Use a queue/scheduler that runs at most `GHTRADER_MAX_PARALLEL_TQSDK_JOBS` (default **4**) concurrently.
   - Progress UI must work for **already-running jobs** (no restart required) by using job logs + lake state.
   - Performance: progress computation must be safe to refresh (use caching/TTL; avoid heavy scans every few seconds).
+  - Reliability: dashboard queries that touch QuestDB must use **bounded timeouts**:
+    - QuestDB connection checks must set `connect_timeout` and fail fast with explicit errors
+    - Contract explorer must not hang indefinitely waiting for QuestDB; it must return promptly with `questdb.ok=false` and a clear error payload when unreachable
   - Must display basic system status (fast to load; safe to refresh):
     - CPU/memory (and optional load average / uptime).
     - Disk:
@@ -521,7 +530,7 @@ Canonical lock keys (minimum set):
 - `train:symbol=<SYM>,model=<M>,h=<H>` for `train`
 - `main_schedule:var=<VAR>` for `main-schedule`
 - `main_depth:symbol=<DERIVED>` for `main-depth`
-- `trade:mode=<MODE>` (and later: per-account key) for `trade`
+- `trade:account=<PROFILE>` for `trade` (one active run per broker account profile)
 
 Implementation:
 - `src/ghtrader/control/` (FastAPI app + job runner + SQLite store)
@@ -545,15 +554,39 @@ Trading mode defines whether orders may be sent:
 - **live (monitor-only)**: connect to the real broker account and record snapshots/events, but **never send orders**.
   This is the required first step before any live order routing.
 
-#### 5.12.2 Account configuration (env + .env)
+#### 5.12.2 Account configuration (.env + dashboard-managed accounts.env)
 
 TqSdk requires:
 
 - **Shinny/快期 auth** (already used for data): `TQSDK_USER`, `TQSDK_PASSWORD` → `TqAuth(...)`
-- **Broker account** (for live mode only):
-  - `TQ_BROKER_ID`
-  - `TQ_ACCOUNT_ID`
-  - `TQ_ACCOUNT_PASSWORD`
+- **Broker account** (for live mode only; multi-account via env profiles):
+  - **Primary source**: repo-local `.env` (gitignored)
+  - **Dashboard-managed source**: `runs/control/accounts.env` (gitignored via `runs/`)
+    - Written/updated by the dashboard when you add/edit/remove broker accounts.
+    - Loaded **after** `.env` and may **override** broker account env vars.
+  - **Profiles list**: `GHTRADER_TQ_ACCOUNT_PROFILES=main,alt,...` (comma-separated, optional)
+  - **Default profile (backwards compatible)**:
+    - `TQ_BROKER_ID`
+    - `TQ_ACCOUNT_ID`
+    - `TQ_ACCOUNT_PASSWORD`
+  - **Additional profiles**:
+    - For each profile `P` (sanitized to `A-Z0-9_`), define:
+      - `TQ_BROKER_ID_P`
+      - `TQ_ACCOUNT_ID_P`
+      - `TQ_ACCOUNT_PASSWORD_P`
+    - Example (`P=MAIN`): `TQ_BROKER_ID_MAIN`, `TQ_ACCOUNT_ID_MAIN`, `TQ_ACCOUNT_PASSWORD_MAIN`
+  - **Supported broker IDs**: dashboard should provide a selection list sourced from ShinnyTech’s published list (cached locally; fallback to manual entry if unavailable).
+
+##### 5.12.2.1 Account verification (read-only)
+
+ghTrader must provide a **verification** action for each broker account profile:
+
+- Verification must perform a **read-only login + single snapshot** (no orders).
+- Verification must cache a small non-secret result under `runs/control/cache/accounts/` for dashboard display:
+  - profile name
+  - configured status
+  - masked broker/account identifiers (never store raw passwords; never echo full account ids)
+  - timestamp and any error string
 
 #### 5.12.3 Execution styles (two executors)
 
@@ -618,9 +651,35 @@ Schedule resolution sources (in priority order):
 
 Trading runners must persist:
 
-- run config + mode/account/executor parameters
-- periodic **account snapshots** (balance/margin/positions/open orders)
-- order/trade events (fills, cancels, rejects) as structured logs
+- **Run config** (`runs/trading/<run_id>/run_config.json`):
+  - mode (`paper|sim|live`), `monitor_only`, sim account (`tqsim|tqkq`), executor (`targetpos|direct`)
+  - model name + symbols requested/resolved + binding (`requested_symbol -> execution_symbol`)
+  - risk limits + preflight flags
+
+- **Account snapshots** (`runs/trading/<run_id>/snapshots.jsonl`):
+  - Each line is a JSON object with `schema_version>=2`
+  - Required fields (best-effort; some may be `null` depending on account/provider):
+    - `ts` (UTC ISO)
+    - `account`: `balance`, `available`, `margin`, `float_profit`, `position_profit`, `risk_ratio`, **`equity`** (= `balance + float_profit` when both are available)
+    - `positions` per symbol (net/long/short, today/his splits when applicable)
+    - `orders_alive` (minimal fields for UI display)
+    - `account_meta` (non-secret hints for UI): mode, monitor_only, broker_configured
+
+- **Events** (`runs/trading/<run_id>/events.jsonl`):
+  - Each line is a JSON object with `ts` + `type`.
+  - Required event types for live monitoring UX:
+    - `startup_snapshot`, `preflight_failed`, `risk_kill`, `wait_update_failed`, `shutdown_signal`
+    - `roll` (continuous alias underlying change) + `roll_flatten_failed` (best-effort)
+    - `target_change` (signal/target updates; optional in monitor-only)
+    - `signals_disabled` (monitor-only may run without model artifacts; signals become optional)
+    - Order lifecycle (diff-based): `order_new`, `order_update`, `order_done`
+    - Trade fills (best-effort): `trade_fill`
+
+- **Fast dashboard reads** (recommended):
+  - Maintain an atomic `runs/trading/<run_id>/state.json` with:
+    - `last_snapshot` (latest snapshot object)
+    - `recent_events` (tail N, e.g. 50)
+  - This avoids tail-reading large JSONL files in the dashboard.
 
 Feature-spec correctness (required for live safety):
 - Online trading must enforce that the factor set/order used for inference matches the trained model’s expected feature shape.
@@ -628,6 +687,11 @@ Feature-spec correctness (required for live safety):
   - If a feature spec cannot be determined, the runner must fail fast in live order-enabled mode.
 
 Write under: `runs/trading/<run_id>/...` so the dashboard can display “last known state” without attaching to the live process.
+
+Dashboard read-only APIs (local-only via SSH forwarding):
+- `GET /api/trading/status`: last known active run + last snapshot + recent events (tail N)
+- `GET /api/trading/runs?limit=...`: list run history (run_id, last_ts, mode, balance/equity)
+- `GET /api/trading/run/{run_id}/tail?events=...&snapshots=...`: fetch recent lines for a specific run
 
 Implementation:
 - new modules: `src/ghtrader/tq_runtime.py`, `src/ghtrader/execution.py`, `src/ghtrader/symbol_resolver.py`
@@ -705,7 +769,9 @@ CI requirements:
 
 ### 6.5 Security and secrets
 
-- TqSdk credentials must be loaded from a **repo-local `.env` file** (gitignored).
+- TqSdk credentials must be loaded from **local files** that are **gitignored**:
+  - repo-local `.env` (Shinny/快期 auth; optional broker creds)
+  - `runs/control/accounts.env` (dashboard-managed broker account profiles; contains secrets)
 - `env.example` must be provided.
 - Never commit secrets.
 
@@ -721,11 +787,11 @@ CI requirements:
 
 ### 7.2 Credentials
 
-- Use `.env` (repo-local, gitignored).
+- Use `.env` (repo-local, gitignored) and `runs/control/accounts.env` (dashboard-managed, gitignored).
 - Template: `env.example`.
 
 Implementation:
-- `src/ghtrader/config.py` loads `.env` and provides `get_tqsdk_auth()`.
+- `src/ghtrader/config.py` loads `.env` then `runs/control/accounts.env` (if present) and provides `get_tqsdk_auth()`.
 
 ---
 

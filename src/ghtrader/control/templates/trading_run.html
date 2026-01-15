@@ -1,15 +1,130 @@
 {% extends "base.html" %}
 {% block content %}
-  <h2>Trading run {{ run_id }}</h2>
+  <div class="section-header">
+    <h2 class="mono">Trading run {{ run_id }}</h2>
+    <div class="section-header-actions">
+      <a class="btn btn-secondary btn-sm" href="/trading{{ token_qs }}">Back</a>
+      <button class="btn btn-secondary btn-sm" type="button" id="refreshRunBtn">Refresh</button>
+    </div>
+  </div>
 
-  <div class="card">
+  <div class="card card-compact">
     <div><b>Root:</b> <span class="mono">{{ root }}</span></div>
     <div><b>Config:</b> <span class="mono">{{ config_path }}</span></div>
     <div><b>Snapshots:</b> <span class="mono">{{ snapshots_path }}</span></div>
     <div><b>Events:</b> <span class="mono">{{ events_path }}</span></div>
   </div>
 
-  <h3>Last snapshot</h3>
-  <pre class="log">{{ last_snapshot }}</pre>
+  <div class="split-pane">
+    <div>
+      <div class="card">
+        <h3 class="mb-2">Run config</h3>
+        <pre class="log" id="runConfigPre">Loading…</pre>
+      </div>
+
+      <div class="card">
+        <h3 class="mb-2">Last snapshot</h3>
+        <pre class="log" id="runLastSnapshotPre">{{ last_snapshot }}</pre>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h3 class="mb-2">Recent events</h3>
+        <div class="tableWrap" style="max-height:480px; overflow:auto;">
+          <table class="table table-compact">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Type</th>
+                <th>Symbol</th>
+                <th>Details</th>
+              </tr>
+            </thead>
+            <tbody id="runEventsTbody">
+              <tr><td colspan="4" class="muted">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+  const runId = "{{ run_id }}";
+
+  function fmtTs(ts) {
+    try { return new Date(ts).toLocaleString(); } catch (e) { return String(ts || "--"); }
+  }
+  function safeJson(x) {
+    try { return JSON.stringify(x, null, 2); } catch (e) { return String(x || ""); }
+  }
+
+  async function loadRun() {
+    try {
+      const url = "/api/trading/run/" + encodeURIComponent(runId) + "/tail?events=200&snapshots=5";
+      const resp = await window.ghTrader.fetchApi(url);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data && data.ok === false) return;
+
+      const cfg = (data && data.config) ? data.config : null;
+      const state = (data && data.state) ? data.state : null;
+      const evs = (data && Array.isArray(data.events)) ? data.events : [];
+      const lastSnap = (state && state.last_snapshot) ? state.last_snapshot : null;
+
+      const cfgPre = document.getElementById("runConfigPre");
+      if (cfgPre) cfgPre.textContent = safeJson(cfg || {});
+
+      const snapPre = document.getElementById("runLastSnapshotPre");
+      if (snapPre && lastSnap) snapPre.textContent = safeJson(lastSnap);
+
+      const tbody = document.getElementById("runEventsTbody");
+      if (tbody) {
+        const rows = [];
+        const tail = evs.slice(-200).reverse();
+        for (const e of tail) {
+          const ts = e.ts || e.timestamp || "";
+          const typ = e.type || "";
+          const sym = e.symbol || (e.new && e.new.symbol) || (e.old && e.old.symbol) || "";
+          let detail = "";
+          if (typ === "target_change") {
+            detail = "old=" + (e.old ?? "--") + " new=" + (e.new ?? "--");
+          } else if (typ === "order_new") {
+            detail = "id=" + (e.order_id || "--") + " left=" + (e.volume_left ?? "--");
+          } else if (typ === "order_done") {
+            detail = "id=" + (e.order_id || "--");
+          } else if (typ === "trade_fill") {
+            detail = "id=" + (e.order_id || "--") + " vol=" + (e.volume ?? "--");
+          } else {
+            // Keep it short; full JSON is still accessible via the API.
+            detail = "";
+          }
+          rows.push([
+            "<tr>",
+            '<td class="mono text-xs">', fmtTs(ts), "</td>",
+            '<td class="mono text-xs">', String(typ || "--"), "</td>",
+            '<td class="mono text-xs">', String(sym || "--"), "</td>",
+            '<td class="text-xs muted">', String(detail || ""), "</td>",
+            "</tr>",
+          ].join(""));
+        }
+        tbody.innerHTML = rows.length ? rows.join("") : '<tr><td colspan="4" class="muted">No events</td></tr>';
+      }
+
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  const btn = document.getElementById("refreshRunBtn");
+  if (btn) btn.addEventListener("click", () => { loadRun(); window.ghTrader.toast("Run refreshed", "info"); });
+
+  loadRun();
+})();
+</script>
 {% endblock %}
 

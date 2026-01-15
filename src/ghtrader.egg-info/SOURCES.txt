@@ -5,7 +5,6 @@ src/ghtrader/audit.py
 src/ghtrader/benchmark.py
 src/ghtrader/cli.py
 src/ghtrader/config.py
-src/ghtrader/db.py
 src/ghtrader/db_bench.py
 src/ghtrader/distributed.py
 src/ghtrader/eval.py
@@ -60,12 +59,14 @@ src/ghtrader/control/templates/ops.html
 src/ghtrader/control/templates/system.html
 src/ghtrader/control/templates/trading.html
 src/ghtrader/control/templates/trading_run.html
+tests/test_accounts_profiles.py
 tests/test_audit_completeness.py
 tests/test_benchmark.py
 tests/test_cli.py
 tests/test_cli_session_registry.py
 tests/test_contract_explorer.py
 tests/test_contract_range.py
+tests/test_control_accounts_api.py
 tests/test_control_api.py
 tests/test_control_contracts_api.py
 tests/test_control_data_page.py
@@ -73,7 +74,6 @@ tests/test_control_explorer_page.py
 tests/test_control_jobs.py
 tests/test_control_locks.py
 tests/test_dashboard_ui_polish_v2.py
-tests/test_db_duckdb.py
 tests/test_ddp_smoke.py
 tests/test_distributed.py
 tests/test_features.py
@@ -89,11 +89,14 @@ tests/test_ops_page.py
 tests/test_pipeline.py
 tests/test_questdb_ingest_shape.py
 tests/test_questdb_semantics.py
+tests/test_questdb_sender_compat.py
 tests/test_serving_db_sync.py
 tests/test_symbol_normalization.py
 tests/test_symbol_resolver_lake_version.py
 tests/test_tq_ingest_nodata.py
+tests/test_tqsdk_l5_probe.py
 tests/test_trading_calendar.py
+tests/test_trading_observability.py
 tests/test_trading_runtime_utils.py
 tests/test_trading_symbol_and_orders.py
 tests/test_update_feature.py

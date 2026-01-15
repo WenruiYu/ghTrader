@@ -130,12 +130,33 @@ def build_router() -> Any:
         try:
             if trading_dir.exists():
                 for p in sorted([d for d in trading_dir.iterdir() if d.is_dir()], key=lambda x: x.name, reverse=True)[:50]:
-                    last = _read_last_jsonl_line(p / "snapshots.jsonl")
+                    state = None
+                    try:
+                        sf = p / "state.json"
+                        if sf.exists():
+                            state = json.loads(sf.read_text(encoding="utf-8"))
+                    except Exception:
+                        state = None
+                    last = None
+                    if isinstance(state, dict) and isinstance(state.get("last_snapshot"), dict):
+                        last = state.get("last_snapshot")
+                    else:
+                        last = _read_last_jsonl_line(p / "snapshots.jsonl")
+                    cfg = {}
+                    try:
+                        cf = p / "run_config.json"
+                        if cf.exists():
+                            cfg = json.loads(cf.read_text(encoding="utf-8"))
+                    except Exception:
+                        cfg = {}
                     runs.append(
                         {
                             "run_id": p.name,
                             "last_ts": (last or {}).get("ts", ""),
                             "balance": ((last or {}).get("account") or {}).get("balance", ""),
+                            "mode": cfg.get("mode", ""),
+                            "account_profile": cfg.get("account_profile", "default") or "default",
+                            "monitor_only": bool(cfg.get("monitor_only")) if ("monitor_only" in cfg) else None,
                         }
                     )
         except Exception:
@@ -204,12 +225,33 @@ def build_router() -> Any:
         try:
             if trading_dir.exists():
                 for p in sorted([d for d in trading_dir.iterdir() if d.is_dir()], key=lambda x: x.name, reverse=True)[:50]:
-                    last = _read_last_jsonl_line(p / "snapshots.jsonl")
+                    state = None
+                    try:
+                        sf = p / "state.json"
+                        if sf.exists():
+                            state = json.loads(sf.read_text(encoding="utf-8"))
+                    except Exception:
+                        state = None
+                    last = None
+                    if isinstance(state, dict) and isinstance(state.get("last_snapshot"), dict):
+                        last = state.get("last_snapshot")
+                    else:
+                        last = _read_last_jsonl_line(p / "snapshots.jsonl")
+                    cfg = {}
+                    try:
+                        cf = p / "run_config.json"
+                        if cf.exists():
+                            cfg = json.loads(cf.read_text(encoding="utf-8"))
+                    except Exception:
+                        cfg = {}
                     runs.append(
                         {
                             "run_id": p.name,
                             "last_ts": (last or {}).get("ts", ""),
                             "balance": ((last or {}).get("account") or {}).get("balance", ""),
+                            "mode": cfg.get("mode", ""),
+                            "account_profile": cfg.get("account_profile", "default") or "default",
+                            "monitor_only": bool(cfg.get("monitor_only")) if ("monitor_only" in cfg) else None,
                         }
                     )
         except Exception:
@@ -258,6 +300,7 @@ def build_router() -> Any:
                     host=str(host),
                     port=int(pg_port),
                     dbname=str(get_questdb_pg_dbname()),
+                    connect_timeout=1,
                 ) as conn:
                     with conn.cursor() as cur:
                         cur.execute("SELECT 1")
@@ -538,8 +581,6 @@ def build_router() -> Any:
             "ghtrader.cli",
             "db",
             "serve-sync",
-            "--backend",
-            "questdb",
             "--symbol",
             symbol,
             "--ticks-lake",
@@ -930,6 +971,7 @@ def build_router() -> Any:
         form = await request.form()
         mode = str(form.get("mode") or "paper").strip()
         monitor_only = str(form.get("monitor_only") or "").strip().lower() in {"true", "1", "yes", "on"}
+        account_profile = str(form.get("account_profile") or form.get("account") or "default").strip() or "default"
         sim_account = str(form.get("sim_account") or "tqsim").strip()
         executor = str(form.get("executor") or "targetpos").strip()
         model = str(form.get("model") or "").strip()
@@ -962,6 +1004,8 @@ def build_router() -> Any:
             "--mode",
             mode,
             "--monitor-only" if monitor_only else "--no-monitor-only",
+            "--account",
+            account_profile,
             "--sim-account",
             sim_account,
             "--executor",
@@ -1008,7 +1052,7 @@ def build_router() -> Any:
         for s in [s.strip() for s in symbols.split(",") if s.strip()]:
             argv += ["--symbols", s]
 
-        title = f"trade {mode} {executor} {model}"
+        title = f"trade {account_profile} {mode} {executor} {model}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -1265,6 +1309,8 @@ def build_router() -> Any:
             questdb["ok"] = False
             questdb["error"] = str(e)
 
+        # Coverage lists can get very large; keep /data page load fast by default.
+        # The Contracts tab will lazy-load any detailed coverage via API.
         return templates.TemplateResponse(
             request,
             "data.html",
@@ -1276,10 +1322,10 @@ def build_router() -> Any:
                 "lake_version": lv,
                 "show_v1": show_v1,
                 "show_v2": show_v2,
-                "ticks_v2": scan_partitioned_store(ticks_root_v2) if show_v2 else [],
-                "main_l5_v2": scan_partitioned_store(main_l5_root_v2) if show_v2 else [],
-                "features": scan_partitioned_store(features_root),
-                "labels": scan_partitioned_store(labels_root),
+                "ticks_v2": [],
+                "main_l5_v2": [],
+                "features": [],
+                "labels": [],
                 "questdb": questdb,
             },
         )
