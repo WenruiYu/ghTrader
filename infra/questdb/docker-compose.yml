@@ -1,5 +1,11 @@
 version: "3.8"
 
+# QuestDB configuration optimized for high-performance hardware:
+# - 2x 128-core AMD EPYC (256 cores total)
+# - 512GB RAM
+# - 4x RTX 6000 Ada GPUs
+# - 30TB NVMe storage
+
 services:
   questdb:
     image: questdb/questdb:latest
@@ -13,12 +19,76 @@ services:
       # Postgres wire protocol (SQL)
       - "8812:8812"
     volumes:
+      # For production, mount NVMe storage directly:
+      # - /mnt/nvme/questdb:/var/lib/questdb/db
       - questdb-data:/var/lib/questdb
     environment:
       # Disable telemetry
       - QDB_TELEMETRY_ENABLED=false
-      # Ensure WAL tables are supported (needed for DEDUP UPSERT KEYS).
+
+      # WAL (Write-Ahead Log) configuration
       - QDB_CAIRO_WAL_ENABLED=true
+
+      # Memory configuration (use ~80% of 512GB)
+      # Page cache for column files (main memory consumer)
+      - QDB_CAIRO_SQL_JIT_PAGE_SIZE=4194304
+      - QDB_CAIRO_SQL_COPY_BUFFER_SIZE=4194304
+
+      # Worker thread configuration (utilize high core count)
+      # Shared workers for general SQL execution
+      - QDB_SHARED_WORKER_COUNT=128
+
+      # ILP (Line Protocol) ingestion workers
+      - QDB_LINE_TCP_WRITER_WORKER_COUNT=32
+      - QDB_LINE_TCP_IO_WORKER_COUNT=32
+
+      # PostgreSQL wire protocol workers
+      - QDB_PG_WORKER_COUNT=32
+
+      # WAL apply workers (for DEDUP UPSERT operations)
+      - QDB_WAL_APPLY_WORKER_COUNT=64
+
+      # Cairo writer file operations
+      - QDB_CAIRO_WRITER_FO_COUNT=64
+
+      # O3 (Out-of-order) commit lag for time-series optimization
+      # Allow 5 minutes of out-of-order data before commit
+      - QDB_CAIRO_O3_COMMIT_LAG=300000000
+
+      # Maximum uncommitted rows before forced commit
+      - QDB_CAIRO_MAX_UNCOMMITTED_ROWS=500000
+
+      # SQL cache size (for prepared statement caching)
+      - QDB_CAIRO_SQL_CACHE_SIZE=1024
+
+      # HTTP connection pool for REST API
+      - QDB_HTTP_CONNECTION_POOL_SIZE=128
+
+      # Enable parallel GROUP BY for large aggregations
+      - QDB_CAIRO_SQL_PARALLEL_GROUPBY_ENABLED=true
+
+    deploy:
+      resources:
+        limits:
+          # Limit to 450GB to leave headroom for OS and other processes
+          memory: 450G
+        reservations:
+          # Reserve 400GB minimum
+          memory: 400G
+
+    # Health check for container orchestration
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
 volumes:
   questdb-data:
+    # For production, consider using a local driver with NVMe mount options:
+    # driver: local
+    # driver_opts:
+    #   type: none
+    #   o: bind
+    #   device: /mnt/nvme/questdb

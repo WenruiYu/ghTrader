@@ -57,9 +57,7 @@ def test_api_dashboard_summary_shape(tmp_path: Path, monkeypatch: pytest.MonkeyP
     data = r.json()
     assert data["ok"] is True
     assert "pipeline" in data
-    assert isinstance(data["data_symbols_v1"], int)
     assert isinstance(data["data_symbols_v2"], int)
-    assert isinstance(data["data_symbols_union"], int)
     assert isinstance(data["model_count"], int)
 
 

@@ -1,116 +1,112 @@
 from __future__ import annotations
 
-from datetime import date
-from pathlib import Path
+import pytest
 
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-
-from ghtrader.audit import run_audit
-from ghtrader.features import FactorEngine
-from ghtrader.integrity import read_sha256_sidecar, write_sha256_sidecar
-from ghtrader.labels import build_labels_for_symbol
-from ghtrader.lake import TICK_ARROW_SCHEMA
-from ghtrader.main_depth import materialize_main_with_depth
+from ghtrader.audit import audit_ticks_index_vs_table
 
 
-def test_ticks_write_has_sha_and_manifest(synthetic_lake):
-    data_dir, symbol, dates = synthetic_lake
-    d0 = dates[0]
-    part_dir = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / f"date={d0.isoformat()}"
-    parquet_files = list(part_dir.glob("*.parquet"))
-    assert parquet_files, "expected parquet partition file"
-    assert (part_dir / "_manifest.json").exists()
-    assert read_sha256_sidecar(parquet_files[0]) is not None
+def test_audit_ticks_index_vs_table_no_findings_when_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ghtrader.audit as aud
+    import ghtrader.questdb_index as qix
 
+    monkeypatch.setattr(qix, "ensure_index_tables", lambda **_kwargs: None)
 
-def test_audit_passes_on_clean_synthetic_lake(synthetic_lake, tmp_path: Path):
-    data_dir, symbol, dates = synthetic_lake
+    computed = {
+        ("SHFE.cu2501", "2025-01-02"): {
+            "rows_total": 10,
+            "first_datetime_ns": 1,
+            "last_datetime_ns": 10,
+            "l5_present": True,
+            "row_hash_min": 1,
+            "row_hash_max": 10,
+            "row_hash_sum": 55,
+            "row_hash_sum_abs": 55,
+        }
+    }
+    index_rows = {
+        ("SHFE.cu2501", "2025-01-02"): dict(computed[("SHFE.cu2501", "2025-01-02")]),
+    }
 
-    # Build features + labels so audit can cover all scopes
-    build_labels_for_symbol(symbol=symbol, data_dir=data_dir, horizons=[10], ticks_lake="raw")
-    FactorEngine().build_features_for_symbol(symbol=symbol, data_dir=data_dir, ticks_lake="raw")
+    monkeypatch.setattr(aud, "_compute_day_aggregates_from_ticks_table", lambda **_kwargs: computed)
+    monkeypatch.setattr(aud, "_fetch_index_rows", lambda **_kwargs: index_rows)
 
-    report_path, report = run_audit(data_dir=data_dir, runs_dir=tmp_path / "runs", scopes=["all"])
-    assert report_path.exists()
-    assert report["summary"]["errors"] == 0
-
-
-def test_audit_fails_on_tampered_checksum(synthetic_lake, tmp_path: Path):
-    data_dir, symbol, dates = synthetic_lake
-    d0 = dates[0]
-    part_dir = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / f"date={d0.isoformat()}"
-    p = sorted(part_dir.glob("*.parquet"))[0]
-    sidecar = p.with_suffix(p.suffix + ".sha256")
-    sidecar.write_text("deadbeef\n", encoding="utf-8")
-
-    _, report = run_audit(data_dir=data_dir, runs_dir=tmp_path / "runs", scopes=["ticks"])
-    assert report["summary"]["errors"] > 0
-    codes = {f["code"] for f in report["findings"]}
-    assert "checksum_mismatch" in codes or "missing_checksum" in codes
-
-
-def test_audit_detects_derived_vs_raw_mismatch(synthetic_lake_two_symbols, tmp_path: Path):
-    data_dir, (sym_a, sym_b), dates = synthetic_lake_two_symbols
-    d0, d1 = dates
-
-    derived = "KQ.m@SHFE.cu_audit"
-    schedule = pd.DataFrame([{"date": d0, "main_contract": sym_a}, {"date": d1, "main_contract": sym_b}])
-    schedule_path = tmp_path / "schedule.parquet"
-    schedule.to_parquet(schedule_path, index=False)
-    materialize_main_with_depth(derived_symbol=derived, schedule_path=schedule_path, data_dir=data_dir, overwrite=True)
-
-    # Tamper one derived parquet value but keep checksum consistent
-    der_dir = data_dir / "lake_v2" / "main_l5" / "ticks" / f"symbol={derived}" / f"date={d0.isoformat()}"
-    p_der = sorted(der_dir.glob("*.parquet"))[0]
-    # Read a single parquet file (avoid dataset schema-merge issues with dictionary encoding).
-    t = pq.ParquetFile(p_der).read()  # keep full schema (includes v2 metadata columns)
-    df = t.to_pandas()
-    df.loc[df.index[0], "last_price"] = float(df.loc[df.index[0], "last_price"]) + 1.0
-    t2 = pa.Table.from_pandas(df, schema=t.schema, preserve_index=False)
-    pq.write_table(t2, p_der, compression="zstd")
-    write_sha256_sidecar(p_der)
-
-    _, report = run_audit(data_dir=data_dir, runs_dir=tmp_path / "runs", scopes=["main_l5"])
-    assert report["summary"]["errors"] > 0
-    codes = {f["code"] for f in report["findings"]}
-    assert "derived_mismatch" in codes
-
-
-def test_audit_passes_on_v2_main_l5_with_metadata(synthetic_data_dir: Path, small_synthetic_tick_df: pd.DataFrame, tmp_path: Path):
-    from datetime import date
-
-    from ghtrader.lake import write_ticks_partition
-
-    data_dir = synthetic_data_dir
-    d0 = date(2025, 1, 1)
-    d1 = date(2025, 1, 2)
-
-    sym_a = "SHFE.cu2501"
-    sym_b = "SHFE.cu2502"
-    derived = "KQ.m@SHFE.cu_audit_v2"
-
-    df0a = small_synthetic_tick_df.copy()
-    df0a["symbol"] = sym_a
-    write_ticks_partition(df0a, data_dir=data_dir, symbol=sym_a, dt=d0, part_id="a-d0", lake_version="v2")
-
-    df1b = small_synthetic_tick_df.copy()
-    df1b["symbol"] = sym_b
-    df1b["datetime"] = df1b["datetime"].astype("int64") + 10_000_000_000
-    write_ticks_partition(df1b, data_dir=data_dir, symbol=sym_b, dt=d1, part_id="b-d1", lake_version="v2")
-
-    schedule = pd.DataFrame([{"date": d0, "main_contract": sym_a}, {"date": d1, "main_contract": sym_b}])
-    schedule_path = tmp_path / "schedule_audit_v2.parquet"
-    schedule.to_parquet(schedule_path, index=False)
-    materialize_main_with_depth(
-        derived_symbol=derived,
-        schedule_path=schedule_path,
-        data_dir=data_dir,
-        overwrite=True,
+    findings = audit_ticks_index_vs_table(
+        ticks_table="ghtrader_ticks_raw_v2",
+        ticks_lake="raw",
         lake_version="v2",
+        symbols=["SHFE.cu2501"],
+        index_table="ghtrader_symbol_day_index_v2",
     )
+    assert findings == []
 
-    _, report = run_audit(data_dir=data_dir, runs_dir=tmp_path / "runs", scopes=["main_l5"], lake_version="v2")
-    assert report["summary"]["errors"] == 0
+
+def test_audit_ticks_index_vs_table_reports_checksum_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ghtrader.audit as aud
+    import ghtrader.questdb_index as qix
+
+    monkeypatch.setattr(qix, "ensure_index_tables", lambda **_kwargs: None)
+
+    computed = {
+        ("SHFE.cu2501", "2025-01-02"): {
+            "rows_total": 10,
+            "first_datetime_ns": 1,
+            "last_datetime_ns": 10,
+            "l5_present": False,
+            "row_hash_min": 1,
+            "row_hash_max": 10,
+            "row_hash_sum": 55,
+            "row_hash_sum_abs": 55,
+        }
+    }
+    index_rows = {
+        ("SHFE.cu2501", "2025-01-02"): {
+            **computed[("SHFE.cu2501", "2025-01-02")],
+            "row_hash_sum": 56,
+        }
+    }
+
+    monkeypatch.setattr(aud, "_compute_day_aggregates_from_ticks_table", lambda **_kwargs: computed)
+    monkeypatch.setattr(aud, "_fetch_index_rows", lambda **_kwargs: index_rows)
+
+    findings = audit_ticks_index_vs_table(
+        ticks_table="ghtrader_ticks_raw_v2",
+        ticks_lake="raw",
+        lake_version="v2",
+        symbols=["SHFE.cu2501"],
+        index_table="ghtrader_symbol_day_index_v2",
+    )
+    assert any(f.code == "checksum_mismatch" for f in findings)
+
+
+def test_audit_ticks_index_vs_table_reports_index_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ghtrader.audit as aud
+    import ghtrader.questdb_index as qix
+
+    monkeypatch.setattr(qix, "ensure_index_tables", lambda **_kwargs: None)
+
+    computed = {
+        ("SHFE.cu2501", "2025-01-02"): {
+            "rows_total": 10,
+            "first_datetime_ns": 1,
+            "last_datetime_ns": 10,
+            "l5_present": False,
+            "row_hash_min": None,
+            "row_hash_max": None,
+            "row_hash_sum": None,
+            "row_hash_sum_abs": None,
+        }
+    }
+    index_rows: dict[tuple[str, str], dict] = {}
+
+    monkeypatch.setattr(aud, "_compute_day_aggregates_from_ticks_table", lambda **_kwargs: computed)
+    monkeypatch.setattr(aud, "_fetch_index_rows", lambda **_kwargs: index_rows)
+
+    findings = audit_ticks_index_vs_table(
+        ticks_table="ghtrader_ticks_raw_v2",
+        ticks_lake="raw",
+        lake_version="v2",
+        symbols=["SHFE.cu2501"],
+        index_table="ghtrader_symbol_day_index_v2",
+    )
+    assert any(f.code == "index_missing" for f in findings)
 

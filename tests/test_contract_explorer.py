@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 
 def test_df_has_l5_detection():
@@ -17,72 +18,72 @@ def test_df_has_l5_detection():
     assert _df_has_l5(df3) is False
 
 
-def test_parquet_local_l5_detection(tmp_path: Path):
-    from ghtrader.control.contract_status import _parquet_file_has_local_l5
-
-    p0 = tmp_path / "l1_only.parquet"
-    pd.DataFrame({"bid_price2": [float("nan")], "ask_price2": [float("nan")]}).to_parquet(p0, index=False)
-    assert _parquet_file_has_local_l5(p0) is False
-
-    p1 = tmp_path / "l5.parquet"
-    pd.DataFrame({"bid_price2": [50000.0], "ask_price2": [50001.0]}).to_parquet(p1, index=False)
-    assert _parquet_file_has_local_l5(p1) is True
-
-
-def test_contract_status_completeness_includes_no_data(tmp_path: Path):
+def test_contract_status_completeness_uses_questdb_present_dates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    PRD (QuestDB-first): contract completeness is computed from QuestDB index coverage,
+    not from local lake partitions.
+    """
     from ghtrader.control.contract_status import compute_contract_statuses
 
     data_dir = tmp_path / "data"
-    runs_dir = tmp_path / "runs"
 
-    sym_dir = data_dir / "lake_v2" / "ticks" / "symbol=SHFE.cu2001"
-    (sym_dir / "date=2020-01-06").mkdir(parents=True, exist_ok=True)
-    (sym_dir / "date=2020-01-07").mkdir(parents=True, exist_ok=True)
-    (sym_dir / "date=2020-01-10").mkdir(parents=True, exist_ok=True)
-    (sym_dir / "_no_data_dates.json").write_text(json.dumps(["2020-01-08"]))
+    # Hermetic: avoid calendar downloads and QuestDB connections.
+    import ghtrader.control.contract_status as cs
+    import ghtrader.questdb_index as qix
+
+    monkeypatch.setattr(cs, "get_trading_calendar", lambda **_kwargs: [])
+    monkeypatch.setattr(qix, "list_no_data_trading_days", lambda **_kwargs: set())
+
+    cov = {
+        "SHFE.cu2001": {
+            "first_tick_day": "2020-01-06",
+            "last_tick_day": "2020-01-10",
+            "present_dates": {"2020-01-06", "2020-01-07", "2020-01-10"},
+        }
+    }
 
     res = compute_contract_statuses(
         exchange="SHFE",
         var="cu",
-        lake_version="v2",
         data_dir=data_dir,
-        runs_dir=runs_dir,
         contracts=[{"symbol": "SHFE.cu2001", "expired": True, "expire_datetime": None}],
-        refresh_l5=False,
-        max_l5_scan_per_symbol=0,
+        questdb_cov_by_symbol=cov,
     )
 
     row = res["contracts"][0]
     assert res["active_ranges_available"] is False
     assert row["days_expected"] == 5  # weekday fallback
-    assert row["days_done"] == 4  # 3 downloaded + 1 no-data marker
-    assert abs(float(row["pct"]) - 0.8) < 1e-9
+    assert row["days_done"] == 3  # 3 present in QuestDB index
+    assert abs(float(row["pct"]) - 0.6) < 1e-9
     assert row["status"] == "incomplete"
 
 
-def test_contract_status_prefers_questdb_bounds_for_expected_range(tmp_path: Path):
+def test_contract_status_prefers_questdb_bounds_for_expected_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ghtrader.control.contract_status import compute_contract_statuses
 
     data_dir = tmp_path / "data"
-    runs_dir = tmp_path / "runs"
 
-    # Local has only 2 days.
-    sym_dir = data_dir / "lake_v2" / "ticks" / "symbol=SHFE.cu2001"
-    (sym_dir / "date=2020-01-06").mkdir(parents=True, exist_ok=True)
-    (sym_dir / "date=2020-01-07").mkdir(parents=True, exist_ok=True)
+    # Hermetic: avoid calendar downloads and QuestDB connections.
+    import ghtrader.control.contract_status as cs
+    import ghtrader.questdb_index as qix
+
+    monkeypatch.setattr(cs, "get_trading_calendar", lambda **_kwargs: [])
+    monkeypatch.setattr(qix, "list_no_data_trading_days", lambda **_kwargs: set())
 
     # QuestDB says contract spans a longer range (5 weekdays).
-    cov = {"SHFE.cu2001": {"first_tick_day": "2020-01-06", "last_tick_day": "2020-01-10"}}
+    cov = {
+        "SHFE.cu2001": {
+            "first_tick_day": "2020-01-06",
+            "last_tick_day": "2020-01-10",
+            "present_dates": {"2020-01-06", "2020-01-07"},
+        }
+    }
 
     res = compute_contract_statuses(
         exchange="SHFE",
         var="cu",
-        lake_version="v2",
         data_dir=data_dir,
-        runs_dir=runs_dir,
         contracts=[{"symbol": "SHFE.cu2001", "expired": True, "expire_datetime": None}],
-        refresh_l5=False,
-        max_l5_scan_per_symbol=0,
         questdb_cov_by_symbol=cov,
     )
     row = res["contracts"][0]
@@ -139,6 +140,61 @@ def test_tqsdk_scheduler_tick_respects_max_parallel(tmp_path: Path, monkeypatch)
 
     started2 = _tqsdk_scheduler_tick(store=store, jm=jm, max_parallel=4)
     assert started2 == 0
+
+
+def test_tqsdk_scheduler_starts_data_fill_missing_jobs(tmp_path: Path, monkeypatch):
+    """
+    data fill-missing uses TqSdk and must be treated as scheduler-throttled heavy work.
+    """
+    from ghtrader.control.app import _tqsdk_scheduler_tick
+    from ghtrader.control.db import JobStore
+    from ghtrader.control.jobs import JobManager
+
+    db_path = tmp_path / "jobs.db"
+    logs_dir = tmp_path / "logs"
+    store = JobStore(db_path)
+    jm = JobManager(store=store, logs_dir=logs_dir)
+
+    # One queued fill-missing job (pid is NULL).
+    store.create_job(
+        job_id="qfill1",
+        title="data-fill-missing SHFE.cu",
+        command=[
+            "python",
+            "-m",
+            "ghtrader.cli",
+            "data",
+            "fill-missing",
+            "--exchange",
+            "SHFE",
+            "--var",
+            "cu",
+            "--refresh-catalog",
+            "0",
+            "--chunk-days",
+            "5",
+            "--data-dir",
+            "data",
+            "--runs-dir",
+            "runs",
+        ],
+        cwd=tmp_path,
+        source="dashboard",
+        log_path=logs_dir / "job-qfill1.log",
+    )
+
+    started_ids: list[str] = []
+
+    def fake_start_queued_job(job_id: str):
+        store.update_job(job_id, status="running", pid=999, started_at="t")
+        started_ids.append(job_id)
+        return store.get_job(job_id)
+
+    monkeypatch.setattr(jm, "start_queued_job", fake_start_queued_job)
+
+    started = _tqsdk_scheduler_tick(store=store, jm=jm, max_parallel=4)
+    assert started == 1
+    assert started_ids == ["qfill1"]
 
 
 def test_pre20_quotes_filter_and_expire_datetime_iso(tmp_path: Path, monkeypatch):

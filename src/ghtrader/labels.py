@@ -9,21 +9,24 @@ Labels are based on mid-price movement over N ticks:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
-import shutil
-import uuid
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 import structlog
 
-from ghtrader.lake import LakeVersion, TicksLake, list_available_dates_in_lake, read_ticks_for_symbol, ticks_symbol_dir
+from ghtrader.ticks_schema import LakeVersion, TicksLake, row_hash_from_ticks_df
 
 log = structlog.get_logger()
+
+
+def _hash_csv(values: list[str]) -> str:
+    import hashlib
+
+    s = ",".join([str(v) for v in values])
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 def _stable_hash_df(df: pd.DataFrame) -> str:
     import hashlib
@@ -51,10 +54,17 @@ PRICE_TICKS = {
 
 def _get_price_tick(symbol: str) -> float:
     """Get price tick for a symbol (simplified lookup)."""
-    # Extract product code from symbol like "SHFE.cu2502"
-    parts = symbol.split(".")
-    if len(parts) >= 2:
+    # Extract product code from symbol like "SHFE.cu2502" or continuous like "KQ.m@SHFE.cu".
+    s = str(symbol or "").strip()
+    parts = s.split(".")
+    code = ""
+    if s.startswith("KQ.m@") and len(parts) >= 3:
+        # Continuous: last component is variety (e.g. 'cu').
+        code = parts[-1]
+    elif len(parts) >= 2:
         code = parts[1]
+
+    if code:
         for product, tick in PRICE_TICKS.items():
             if code.startswith(product):
                 return tick
@@ -144,356 +154,389 @@ def compute_multi_horizon_labels(
 # Build labels for symbol
 # ---------------------------------------------------------------------------
 
-def labels_dir(data_dir: Path) -> Path:
-    """Return the labels directory."""
-    return data_dir / "labels"
-
-
 def build_labels_for_symbol(
+    *,
     symbol: str,
     data_dir: Path,
     horizons: list[int],
     threshold_k: int = 1,
     ticks_lake: TicksLake = "raw",
     overwrite: bool = False,
-    *,
     lake_version: LakeVersion = "v2",
-) -> Path:
+) -> dict[str, Any]:
     """
-    Build multi-horizon labels for a symbol from Parquet lake.
-    
-    Args:
-        symbol: Instrument code
-        data_dir: Data directory root
-        horizons: List of horizon values (N ticks)
-        threshold_k: Threshold in price ticks
-    
-    Returns:
-        Path to output Parquet file
+    Build labels from canonical ticks and store them in QuestDB (`ghtrader_labels_v2`).
+
+    This is the canonical QuestDB-first workflow for label building.
+
+    - Primary storage: QuestDB (QuestDB-first).
     """
-    log.info("labels.build_start", symbol=symbol, horizons=horizons, threshold_k=threshold_k)
+    from ghtrader.config import (
+        get_questdb_host,
+        get_questdb_ilp_port,
+        get_questdb_pg_dbname,
+        get_questdb_pg_password,
+        get_questdb_pg_port,
+        get_questdb_pg_user,
+    )
+    from ghtrader.questdb_features_labels import LABELS_TABLE_V2, ensure_labels_tables, insert_label_build
+    from ghtrader.questdb_index import INDEX_TABLE_V2, ensure_index_tables, list_present_trading_days, query_symbol_day_index_bounds
+    from ghtrader.questdb_client import make_questdb_query_config_from_env
+    from ghtrader.questdb_queries import fetch_ticks_for_symbol_day
+    from ghtrader.serving_db import ServingDBConfig, make_serving_backend
 
-    dates = list_available_dates_in_lake(data_dir, symbol, ticks_lake=ticks_lake, lake_version=lake_version)
-    if not dates:
-        raise ValueError(f"No tick data found for {symbol}")
+    lv = str(lake_version).lower().strip() or "v2"
+    tl = str(ticks_lake).lower().strip() or "raw"
+    hs = [int(h) for h in horizons if int(h) > 0]
+    if not hs:
+        raise ValueError("horizons must be non-empty")
 
-    # Output root
-    out_root = labels_dir(data_dir) / f"symbol={symbol}"
-    if overwrite and out_root.exists():
-        shutil.rmtree(out_root)
-    out_root.mkdir(parents=True, exist_ok=True)
+    # Derived ticks require provenance for roll-boundary-safe lookahead (QuestDB-only; no file-based schedule export).
+    schedule_hash: str | None = None
 
-    # Get price tick
-    price_tick = _get_price_tick(symbol)
-    log.debug("labels.price_tick", symbol=symbol, price_tick=price_tick)
-
-    max_h = max(horizons) if horizons else 0
-
-    # For derived ticks, avoid cross-day lookahead on roll boundaries + record schedule provenance.
-    underlying_by_date: dict[date, str] = {}
-    segment_id_by_date: dict[date, int] = {}
-    schedule_prov: dict[str, Any] = {}
-    if ticks_lake == "main_l5":
-        schedule_path = (
-            ticks_symbol_dir(
-                data_dir,
-                symbol,
-                ticks_lake="main_l5",
-                lake_version=lake_version,
-            )
-            / "schedule.parquet"
+    cfg = make_questdb_query_config_from_env()
+    backend = make_serving_backend(
+        ServingDBConfig(
+            backend="questdb",
+            host=str(get_questdb_host()),
+            questdb_ilp_port=int(get_questdb_ilp_port()),
+            questdb_pg_port=int(get_questdb_pg_port()),
+            questdb_pg_user=str(get_questdb_pg_user()),
+            questdb_pg_password=str(get_questdb_pg_password()),
+            questdb_pg_dbname=str(get_questdb_pg_dbname()),
         )
-        if not schedule_path.exists():
-            raise ValueError(
-                f"Missing schedule.parquet for derived ticks: {schedule_path}. "
-                "Run `ghtrader main-l5` (or `main-depth`) first."
-            )
+    )
+
+    ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
+
+    bounds = query_symbol_day_index_bounds(cfg=cfg, symbols=[symbol], lake_version=lv, ticks_lake=tl, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
+    b = bounds.get(symbol) or {}
+    d0s = str(b.get("first_day") or "").strip()
+    d1s = str(b.get("last_day") or "").strip()
+    dates: list[date] = []
+    if d0s and d1s:
+        start_d = date.fromisoformat(d0s)
+        end_d = date.fromisoformat(d1s)
+        dates = sorted(list_present_trading_days(cfg=cfg, symbol=symbol, start_day=start_d, end_day=end_d, lake_version=lv, ticks_lake=tl, index_table=INDEX_TABLE_V2))
+    if not dates:
+        raise ValueError(f"No tick data found for {symbol} (ticks_lake={ticks_lake}, lake_version={lake_version}) in QuestDB index")
+
+    price_tick = float(_get_price_tick(symbol))
+    horizons_str = ",".join([str(h) for h in sorted(hs)])
+    ticks_table = "ghtrader_ticks_main_l5_v2" if tl == "main_l5" else "ghtrader_ticks_raw_v2"
+    if tl == "main_l5" and schedule_hash is None:
+        # Best-effort: pull schedule_hash from derived tick rows.
         try:
-            sched = pd.read_parquet(schedule_path)
-            if "date" not in sched.columns or "main_contract" not in sched.columns:
-                raise ValueError(f"Unexpected schedule schema: {list(sched.columns)}")
-            sched = sched.copy()
-            sched["date"] = pd.to_datetime(sched["date"], errors="coerce").dt.date
-            sched = sched.dropna(subset=["date", "main_contract"]).sort_values("date").reset_index(drop=True)
-            # Ensure segment_id exists for older schedule copies.
-            if "segment_id" not in sched.columns:
-                seg_ids: list[int] = []
-                seg = 0
-                prev: str | None = None
-                for mc in sched["main_contract"].astype(str).tolist():
-                    if prev is None:
-                        seg = 0
-                    elif mc != prev:
-                        seg += 1
-                    seg_ids.append(int(seg))
-                    prev = mc
-                sched["segment_id"] = seg_ids
+            from ghtrader.questdb_queries import _connect
 
-            for _, r in sched.iterrows():
-                d = r["date"]
-                underlying_by_date[d] = str(r["main_contract"])
-                try:
-                    segment_id_by_date[d] = int(r.get("segment_id", 0) or 0)
-                except Exception:
-                    segment_id_by_date[d] = 0
-
-            schedule_hash = _stable_hash_df(sched[["date", "main_contract", "segment_id"]])
-            d0 = sched["date"].min()
-            d1 = sched["date"].max()
-            schedule_prov = {
-                "path": str(schedule_path),
-                "hash": str(schedule_hash),
-                "l5_start_date": (d0.isoformat() if hasattr(d0, "isoformat") else str(d0)),
-                "end_date": (d1.isoformat() if hasattr(d1, "isoformat") else str(d1)),
-                "rows": int(len(sched)),
-            }
-        except Exception as e:
-            raise ValueError(f"Failed to load schedule.parquet for derived ticks ({e})") from e
-
-    # Canonical schema for partitions
-    schema_fields: list[pa.Field] = [pa.field("symbol", pa.string()), pa.field("datetime", pa.int64())]
-    if ticks_lake == "main_l5":
-        schema_fields += [pa.field("underlying_contract", pa.string()), pa.field("segment_id", pa.int64())]
-    schema_fields += [pa.field("mid", pa.float64())] + [pa.field(f"label_{n}", pa.float64()) for n in horizons]
-    schema = pa.schema(schema_fields)
-
-    # Manifest safety gate: do not mix outputs across config/schema changes unless overwrite is explicit.
-    if not overwrite:
-        manifest_path = out_root / "manifest.json"
-        if manifest_path.exists():
-            try:
-                import hashlib
-                import json
-
-                cols_str = ",".join(f"{f.name}:{f.type}" for f in schema)
-                expected_schema_hash = hashlib.sha256(cols_str.encode()).hexdigest()[:16]
-                existing = json.loads(manifest_path.read_text())
-                if str(existing.get("dataset")) != "labels":
-                    raise ValueError("dataset mismatch")
-                if str(existing.get("symbol")) != str(symbol):
-                    raise ValueError("symbol mismatch")
-                if str(existing.get("ticks_lake")) != str(ticks_lake):
-                    raise ValueError("ticks_lake mismatch")
-                if str(existing.get("lake_version") or "v2") != str(lake_version):
-                    raise ValueError("lake_version mismatch")
-                if list(existing.get("horizons") or []) != list(horizons):
-                    raise ValueError("horizons mismatch")
-                if int(existing.get("threshold_k") or 0) != int(threshold_k):
-                    raise ValueError("threshold_k mismatch")
-                if str(existing.get("schema_hash") or "") != expected_schema_hash:
-                    raise ValueError("schema_hash mismatch")
-                if ticks_lake == "main_l5" and schedule_prov:
-                    ex_sched = dict(existing.get("schedule") or {})
-                    if str(ex_sched.get("hash") or "") and str(ex_sched.get("hash")) != str(schedule_prov.get("hash") or ""):
-                        raise ValueError("schedule_hash mismatch")
-                    if str(ex_sched.get("l5_start_date") or "") and str(ex_sched.get("l5_start_date")) != str(schedule_prov.get("l5_start_date") or ""):
-                        raise ValueError("l5_start_date mismatch")
-            except Exception as e:
-                raise ValueError(
-                    f"Existing labels manifest does not match requested build ({e}). "
-                    f"Refusing to mix outputs. Re-run with overwrite=True to rebuild."
-                )
-
-    # Determine which dates need work (incremental default).
-    existing_dates: set[date] = set()
-    for ddir in out_root.iterdir():
-        if not ddir.is_dir() or not ddir.name.startswith("date="):
-            continue
-        try:
-            dt = date.fromisoformat(ddir.name.split("=", 1)[1])
+            with _connect(cfg, connect_timeout_s=2) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT schedule_hash FROM {ticks_table} "
+                        "WHERE symbol=%s AND ticks_lake=%s AND lake_version=%s LIMIT 1",
+                        [str(symbol), str(tl), str(lv)],
+                    )
+                    r = cur.fetchone()
+            if r and r[0] is not None:
+                schedule_hash = str(r[0])
         except Exception:
-            continue
-        if any(ddir.glob("*.parquet")):
-            existing_dates.add(dt)
+            schedule_hash = None
+    if tl == "main_l5" and schedule_hash is None and dates:
+        # Fallback: read a single row from the first available day.
+        try:
+            df0 = fetch_ticks_for_symbol_day(
+                cfg=cfg,
+                table=ticks_table,
+                symbol=symbol,
+                trading_day=dates[0].isoformat(),
+                lake_version=lv,
+                ticks_lake=tl,
+                limit=1,
+                order="asc",
+                include_provenance=True,
+                connect_timeout_s=2,
+            )
+            if not df0.empty and "schedule_hash" in df0.columns:
+                v0 = df0["schedule_hash"].iloc[0]
+                if not pd.isna(v0):
+                    schedule_hash = str(v0)
+        except Exception:
+            schedule_hash = None
 
-    missing_dates = [d for d in dates if d not in existing_dates]
-    dates_to_process: set[date] = set()
-    if overwrite:
-        dates_to_process = set(dates)
-    else:
-        # Backfill/appends guard: if a day is missing, also recompute the previous available tick day.
-        idx_map = {d: i for i, d in enumerate(dates)}
-        for d in missing_dates:
-            dates_to_process.add(d)
-            j = idx_map.get(d)
-            if j is not None and j - 1 >= 0:
-                dates_to_process.add(dates[j - 1])
+    build_id = _hash_csv([symbol, tl, lv, str(schedule_hash or ""), horizons_str, str(int(threshold_k)), str(price_tick)])
+    # QuestDB ILP expects tz-naive timestamps.
+    build_ts = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    total_rows = 0
-    # Process each day; include up to max_h future ticks from next day for cross-boundary labels
-    for dt in sorted(dates_to_process):
-        idx = {d: i for i, d in enumerate(dates)}.get(dt, None)
-        df_day = read_ticks_for_symbol(
-            data_dir,
-            symbol,
-            start_date=dt,
-            end_date=dt,
-            ticks_lake=ticks_lake,
-            lake_version=lake_version,
+    ensure_labels_tables(cfg=cfg, horizons=hs, connect_timeout_s=2)
+
+    idx_map = {d: i for i, d in enumerate(dates)}
+    max_h = max(hs) if hs else 0
+    rows_total = 0
+    days_done = 0
+
+    for dt in dates:
+        df_day = fetch_ticks_for_symbol_day(
+            cfg=cfg,
+            table=ticks_table,
+            symbol=symbol,
+            trading_day=dt.isoformat(),
+            lake_version=lv,
+            ticks_lake=tl,
+            limit=None,
+            order="asc",
+            include_provenance=(tl == "main_l5"),
+            connect_timeout_s=2,
         )
         if df_day.empty:
             continue
+        df_day = df_day.copy()
+        if "row_hash" not in df_day.columns or pd.to_numeric(df_day["row_hash"], errors="coerce").isna().all():
+            df_day["row_hash"] = row_hash_from_ticks_df(df_day)
+        if tl == "main_l5" and schedule_hash is None and "schedule_hash" in df_day.columns:
+            try:
+                sh0 = df_day["schedule_hash"].iloc[0]
+                if not pd.isna(sh0):
+                    schedule_hash = str(sh0)
+            except Exception:
+                pass
+
+        # Per-day provenance (only for derived ticks)
+        u0 = ""
+        seg0_opt: int | None = None
+        if tl == "main_l5":
+            try:
+                if "underlying_contract" in df_day.columns and not df_day["underlying_contract"].empty:
+                    uval = df_day["underlying_contract"].iloc[0]
+                    u0 = "" if pd.isna(uval) else str(uval)
+            except Exception:
+                u0 = ""
+            try:
+                if "segment_id" in df_day.columns and not df_day["segment_id"].empty:
+                    sval = pd.to_numeric(df_day["segment_id"].iloc[0], errors="coerce")
+                    seg0_opt = None if pd.isna(sval) else int(sval)
+            except Exception:
+                seg0_opt = None
+        seg0 = int(seg0_opt or 0)
 
         df_future = pd.DataFrame()
-        if max_h > 0 and idx is not None and idx + 1 < len(dates):
-            next_dt = dates[idx + 1]
-            allow_cross = True
-            if ticks_lake == "main_l5":
-                seg0 = segment_id_by_date.get(dt)
-                seg1 = segment_id_by_date.get(next_dt)
-                allow_cross = bool(seg0 is not None and seg1 is not None and seg0 == seg1)
-                if not allow_cross:
-                    u0 = underlying_by_date.get(dt)
-                    u1 = underlying_by_date.get(next_dt)
-                    allow_cross = bool(u0 and u1 and u0 == u1)
-
-            if allow_cross:
-                df_next = read_ticks_for_symbol(
-                    data_dir,
-                    symbol,
-                    start_date=next_dt,
-                    end_date=next_dt,
-                    ticks_lake=ticks_lake,
-                    lake_version=lake_version,
-                )
-            else:
-                df_next = pd.DataFrame()
+        i = idx_map.get(dt)
+        if max_h > 0 and i is not None and i + 1 < len(dates):
+            next_dt = dates[i + 1]
+            df_next = fetch_ticks_for_symbol_day(
+                cfg=cfg,
+                table=ticks_table,
+                symbol=symbol,
+                trading_day=next_dt.isoformat(),
+                lake_version=lv,
+                ticks_lake=tl,
+                limit=int(max_h),
+                order="asc",
+                include_provenance=(tl == "main_l5"),
+                connect_timeout_s=2,
+            )
             if not df_next.empty:
-                df_future = df_next.head(max_h)
+                allow_cross = True
+                if tl == "main_l5":
+                    u1 = ""
+                    seg1_opt: int | None = None
+                    try:
+                        if "underlying_contract" in df_next.columns and not df_next["underlying_contract"].empty:
+                            uval1 = df_next["underlying_contract"].iloc[0]
+                            u1 = "" if pd.isna(uval1) else str(uval1)
+                    except Exception:
+                        u1 = ""
+                    try:
+                        if "segment_id" in df_next.columns and not df_next["segment_id"].empty:
+                            sval1 = pd.to_numeric(df_next["segment_id"].iloc[0], errors="coerce")
+                            seg1_opt = None if pd.isna(sval1) else int(sval1)
+                    except Exception:
+                        seg1_opt = None
+
+                    allow_cross = bool(seg0_opt is not None and seg1_opt is not None and seg0_opt == seg1_opt)
+                    if not allow_cross:
+                        allow_cross = bool(u0 and u1 and u0 == u1)
+
+                if allow_cross:
+                    df_future = df_next.head(int(max_h)).copy()
+                    if "row_hash" not in df_future.columns or pd.to_numeric(df_future["row_hash"], errors="coerce").isna().all():
+                        df_future["row_hash"] = row_hash_from_ticks_df(df_future)
 
         if not df_future.empty:
             df_in = pd.concat([df_day, df_future], ignore_index=True)
         else:
             df_in = df_day
 
-        labels_in = compute_multi_horizon_labels(df_in, horizons, threshold_k, price_tick)
+        labels_in = compute_multi_horizon_labels(df_in, hs, int(threshold_k), float(price_tick))
         labels_day = labels_in.iloc[: len(df_day)].reset_index(drop=True)
 
-        labels_day["datetime"] = df_day["datetime"].values
-        labels_day["symbol"] = symbol
-        if ticks_lake == "main_l5":
-            labels_day["underlying_contract"] = underlying_by_date.get(dt) or ""
-            labels_day["segment_id"] = int(segment_id_by_date.get(dt, 0) or 0)
+        datetime_ns = pd.to_numeric(df_day["datetime"], errors="coerce").fillna(0).astype("int64").values
+        row_hash = pd.to_numeric(df_day.get("row_hash"), errors="coerce").fillna(0).astype("int64").values
 
-        cols = ["symbol", "datetime"]
-        if ticks_lake == "main_l5":
-            cols += ["underlying_contract", "segment_id"]
-        cols += ["mid"] + [f"label_{n}" for n in horizons]
-        labels_day = labels_day[cols]
+        out = pd.DataFrame(
+            {
+                "symbol": str(symbol),
+                "ts": pd.to_datetime(datetime_ns, unit="ns"),
+                "datetime_ns": datetime_ns,
+                "trading_day": str(dt.isoformat()),
+                "row_hash": row_hash,
+                "ticks_lake": str(tl),
+                "lake_version": str(lv),
+                "build_id": str(build_id),
+                "build_ts": build_ts,
+                "horizons": str(horizons_str),
+                "threshold_k": int(threshold_k),
+                "price_tick": float(price_tick),
+                "schedule_hash": str(schedule_hash or ""),
+                "mid": pd.to_numeric(labels_day.get("mid"), errors="coerce"),
+            }
+        )
+        if tl == "main_l5":
+            out["underlying_contract"] = str(u0 or "")
+            out["segment_id"] = int(seg0)
+        else:
+            out["underlying_contract"] = ""
+            out["segment_id"] = 0
 
-        out_dir = out_root / f"date={dt.isoformat()}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        # Deterministic per-date output name; remove any previous parquet(s) for this date.
-        for p in out_dir.glob("*.parquet*"):
-            try:
-                p.unlink()
-            except Exception:
-                pass
+        for h in hs:
+            out[f"label_{h}"] = pd.to_numeric(labels_day.get(f"label_{h}"), errors="coerce")
 
-        out_path = out_dir / "part.parquet"
-        tmp_path = out_dir / "part.parquet.tmp"
-        table = pa.Table.from_pandas(labels_day, schema=schema, preserve_index=False)
-        pq.write_table(table, tmp_path, compression="zstd")
-        tmp_path.replace(out_path)
-        try:
-            from ghtrader.integrity import write_sha256_sidecar
+        for c in ["symbol", "trading_day", "ticks_lake", "lake_version", "build_id", "horizons", "schedule_hash", "underlying_contract"]:
+            if c in out.columns:
+                try:
+                    out[c] = out[c].astype("category")
+                except Exception:
+                    pass
 
-            write_sha256_sidecar(out_path)
-        except Exception as e:
-            log.warning("labels.checksum_failed", path=str(out_path), error=str(e))
+        backend.ingest_df(table=LABELS_TABLE_V2, df=out)
 
-        total_rows += len(labels_day)
+        rows_total += int(len(out))
+        days_done += 1
 
-    log.info("labels.build_done", symbol=symbol, rows=total_rows, root=str(out_root))
+    insert_label_build(
+        cfg=cfg,
+        symbol=str(symbol),
+        ticks_lake=str(tl),
+        lake_version=str(lv),
+        build_id=str(build_id),
+        horizons=str(horizons_str),
+        threshold_k=int(threshold_k),
+        price_tick=float(price_tick),
+        schedule_hash=str(schedule_hash or ""),
+        rows_total=int(rows_total),
+        first_day=(dates[0].isoformat() if dates else ""),
+        last_day=(dates[-1].isoformat() if dates else ""),
+        connect_timeout_s=2,
+    )
 
-    # Rebuild symbol-level manifest from on-disk partitions (covers incremental runs).
-    row_counts: dict[str, int] = {}
-    files: list[dict] = []
-    try:
-        import hashlib
-
-        from ghtrader.integrity import now_utc_iso, parquet_num_rows, read_sha256_sidecar, write_json_atomic
-
-        total_rows2 = 0
-        for ddir in sorted([p for p in out_root.iterdir() if p.is_dir() and p.name.startswith("date=")], key=lambda p: p.name):
-            dt_s = ddir.name.split("=", 1)[1]
-            pq_files = sorted(ddir.glob("*.parquet"))
-            if not pq_files:
-                continue
-            p = pq_files[0]
-            rows = parquet_num_rows(p)
-            sha = read_sha256_sidecar(p) or ""
-            row_counts[dt_s] = int(rows)
-            total_rows2 += int(rows)
-            files.append({"date": dt_s, "file": f"{ddir.name}/{p.name}", "rows": int(rows), "sha256": sha})
-
-        cols_str = ",".join(f"{f.name}:{f.type}" for f in schema)
-        schema_hash = hashlib.sha256(cols_str.encode()).hexdigest()[:16]
-        manifest = {
-            "created_at": now_utc_iso(),
-            "dataset": "labels",
-            "symbol": symbol,
-            "ticks_lake": ticks_lake,
-            "lake_version": lake_version,
-            "horizons": list(horizons),
-            "threshold_k": int(threshold_k),
-            "schema_hash": schema_hash,
-            "rows_total": int(total_rows2),
-            "row_counts": row_counts,
-            "files": files,
-        }
-        if ticks_lake == "main_l5" and schedule_prov:
-            manifest["schedule"] = schedule_prov
-        write_json_atomic(out_root / "manifest.json", manifest)
-    except Exception as e:
-        log.warning("labels.manifest_failed", symbol=symbol, error=str(e))
-
-    return out_root
+    return {
+        "ok": True,
+        "symbol": str(symbol),
+        "ticks_lake": str(tl),
+        "lake_version": str(lv),
+        "build_id": str(build_id),
+        "rows_total": int(rows_total),
+        "days": int(days_done),
+        "schedule_hash": str(schedule_hash or ""),
+        "horizons": sorted(hs),
+        "threshold_k": int(threshold_k),
+        "price_tick": float(price_tick),
+    }
 
 
 def read_labels_for_symbol(data_dir: Path, symbol: str) -> pd.DataFrame:
-    """Read labels for a symbol."""
-    base_dir = labels_dir(data_dir) / f"symbol={symbol}"
-    legacy_path = base_dir / "labels.parquet"
-    if legacy_path.exists():
-        legacy_schema = pq.read_schema(legacy_path)
-        fields = []
-        for f in legacy_schema:
-            if f.name == "symbol":
-                fields.append(pa.field("symbol", pa.string()))
-            else:
-                fields.append(f)
-        schema = pa.schema(fields)
-        return pq.read_table(legacy_path, schema=schema).to_pandas()
+    """Read labels for a symbol from QuestDB (canonical source)."""
+    from ghtrader.questdb_client import connect_pg as _connect, make_questdb_query_config_from_env
+    from ghtrader.questdb_features_labels import LABELS_TABLE_V2, get_latest_label_build
 
-    if not base_dir.exists():
-        raise FileNotFoundError(f"Labels not found for {symbol}: {base_dir}")
+    _ = data_dir  # unused; QuestDB is the canonical source
 
-    partitions: list[Path] = []
-    for date_dir in sorted(base_dir.iterdir()):
-        if not date_dir.is_dir() or not date_dir.name.startswith("date="):
-            continue
-        partitions.extend(sorted(date_dir.glob("*.parquet")))
+    lv = "v2"
+    pref = "main_l5" if str(symbol).startswith("KQ.m@") else "raw"
+    alt = "raw" if pref == "main_l5" else "main_l5"
+    cfg = make_questdb_query_config_from_env()
+    b_pref = get_latest_label_build(cfg=cfg, symbol=symbol, ticks_lake=pref, lake_version=lv)
+    b_alt = get_latest_label_build(cfg=cfg, symbol=symbol, ticks_lake=alt, lake_version=lv)
+    b = b_pref or b_alt
+    if not b:
+        raise FileNotFoundError(f"Labels not found for {symbol} in QuestDB")
 
-    if not partitions:
-        raise FileNotFoundError(f"No label partitions found for {symbol}: {base_dir}")
+    tl = pref if b_pref else alt
+    build_id = str(b.get("build_id") or "").strip()
+    if not build_id:
+        raise FileNotFoundError(f"QuestDB labels build not found for {symbol}")
 
-    schema = pq.read_schema(partitions[0])
-    tables = [pq.read_table(p, schema=schema) for p in partitions]
-    combined = pa.concat_tables(tables)
-    df = combined.to_pandas()
+    hs_s = str(b.get("horizons") or "").strip()
+    hs = [h.strip() for h in hs_s.split(",") if h.strip()]
+    label_cols = [f"label_{h}" for h in hs] if hs else []
+    cols = ["datetime_ns AS datetime", "underlying_contract", "segment_id", "mid"] + label_cols
+    sql = (
+        f"SELECT {', '.join(cols)} FROM {LABELS_TABLE_V2} "
+        "WHERE symbol=%s AND ticks_lake=%s AND lake_version=%s AND build_id=%s "
+        "ORDER BY datetime ASC"
+    )
+    with _connect(cfg, connect_timeout_s=2) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, [str(symbol), str(tl), str(lv), str(build_id)])
+            rows = cur.fetchall()
+    if not rows:
+        raise FileNotFoundError(f"No QuestDB labels rows for {symbol}")
+
+    df = pd.DataFrame(rows, columns=["datetime", "underlying_contract", "segment_id", "mid"] + label_cols)
+    df.insert(0, "symbol", str(symbol))
+    df["datetime"] = pd.to_numeric(df["datetime"], errors="coerce").fillna(0).astype("int64")
+    if "segment_id" in df.columns:
+        df["segment_id"] = pd.to_numeric(df["segment_id"], errors="coerce").fillna(0).astype("int64")
+    df["mid"] = pd.to_numeric(df["mid"], errors="coerce")
+    for c in label_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.sort_values("datetime").reset_index(drop=True)
 
 
 def read_labels_manifest(data_dir: Path, symbol: str) -> dict[str, Any]:
-    """Read the labels manifest for a symbol (if present)."""
-    p = labels_dir(data_dir) / f"symbol={symbol}" / "manifest.json"
-    if not p.exists():
-        return {}
-    try:
-        import json
+    """Read the labels manifest for a symbol from QuestDB (canonical)."""
+    _ = data_dir  # unused; QuestDB is the canonical source
 
-        return dict(json.loads(p.read_text()))
+    # QuestDB-first: read the most recent build record for this symbol.
+    try:
+        from ghtrader.questdb_client import make_questdb_query_config_from_env
+        from ghtrader.questdb_features_labels import LABELS_TABLE_V2, LABEL_BUILDS_TABLE_V2, get_latest_label_build
+
+        lv = "v2"
+        pref = "main_l5" if str(symbol).startswith("KQ.m@") else "raw"
+        alt = "raw" if pref == "main_l5" else "main_l5"
+        cfg = make_questdb_query_config_from_env()
+        b_pref = get_latest_label_build(cfg=cfg, symbol=symbol, ticks_lake=pref, lake_version=lv)
+        b_alt = get_latest_label_build(cfg=cfg, symbol=symbol, ticks_lake=alt, lake_version=lv)
+        b = b_pref or b_alt
+        if not b:
+            return {}
+        tl = pref if b_pref else alt
+
+        hs_s = str(b.get("horizons") or "").strip()
+        hs = [int(x) for x in hs_s.split(",") if str(x).strip().isdigit()] if hs_s else []
+
+        m: dict[str, Any] = {
+            "created_at": str(b.get("ts") or ""),
+            "dataset": "labels",
+            "symbol": str(symbol),
+            "ticks_lake": str(tl),
+            "lake_version": str(lv),
+            "horizons": hs,
+            "threshold_k": b.get("threshold_k"),
+            "schema_hash": "",
+            "questdb": {
+                "table": LABELS_TABLE_V2,
+                "builds_table": LABEL_BUILDS_TABLE_V2,
+                "build_id": str(b.get("build_id") or ""),
+            },
+        }
+        if str(tl) == "main_l5":
+            m["schedule"] = {
+                "hash": str(b.get("schedule_hash") or ""),
+                "l5_start_date": str(b.get("first_day") or ""),
+                "end_date": str(b.get("last_day") or ""),
+            }
+        return m
     except Exception:
         return {}
 

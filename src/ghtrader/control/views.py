@@ -11,7 +11,6 @@ from fastapi.templating import Jinja2Templates
 
 from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
 from ghtrader.control import auth
-from ghtrader.control.coverage import scan_partitioned_store
 from ghtrader.control.jobs import JobSpec, python_module_argv
 from ghtrader.control.system_info import cpu_mem_info, disk_usage, gpu_info
 
@@ -524,89 +523,6 @@ def build_router() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
-    @router.post("/ops/db/serve_sync_variety")
-    async def ops_db_serve_sync_variety(request: Request):
-        _require_auth(request)
-        form = await request.form()
-        exchange = str(form.get("exchange") or "SHFE").strip()
-        variety = str(form.get("variety") or "cu").strip()
-        data_dir = str(form.get("data_dir") or "data").strip()
-        runs_dir = str(form.get("runs_dir") or "runs").strip()
-        host = str(form.get("host") or "127.0.0.1").strip()
-        questdb_ilp_port = str(form.get("questdb_ilp_port") or "9009").strip()
-        questdb_pg_port = str(form.get("questdb_pg_port") or "8812").strip()
-
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "db",
-            "serve-sync-variety",
-            "--exchange",
-            exchange,
-            "--var",
-            variety,
-            "--data-dir",
-            data_dir,
-            "--runs-dir",
-            runs_dir,
-            "--host",
-            host,
-            "--questdb-ilp-port",
-            questdb_ilp_port,
-            "--questdb-pg-port",
-            questdb_pg_port,
-        )
-        title = f"db serve-sync-variety {exchange}.{variety}"
-        jm = request.app.state.job_manager
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
-
-    @router.post("/ops/db/serve_sync")
-    async def ops_db_serve_sync(request: Request):
-        _require_auth(request)
-        form = await request.form()
-        symbol = str(form.get("symbol") or "").strip()
-        ticks_lake = str(form.get("ticks_lake") or "raw").strip()
-        mode = str(form.get("mode") or "incremental").strip()
-        start = str(form.get("start") or "").strip()
-        end = str(form.get("end") or "").strip()
-        data_dir = str(form.get("data_dir") or "data").strip()
-        runs_dir = str(form.get("runs_dir") or "runs").strip()
-        host = str(form.get("host") or "127.0.0.1").strip()
-        questdb_ilp_port = str(form.get("questdb_ilp_port") or "9009").strip()
-        questdb_pg_port = str(form.get("questdb_pg_port") or "8812").strip()
-        if not symbol:
-            raise HTTPException(status_code=400, detail="symbol required")
-
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "db",
-            "serve-sync",
-            "--symbol",
-            symbol,
-            "--ticks-lake",
-            ticks_lake,
-            "--mode",
-            mode,
-            "--data-dir",
-            data_dir,
-            "--runs-dir",
-            runs_dir,
-            "--host",
-            host,
-            "--questdb-ilp-port",
-            questdb_ilp_port,
-            "--questdb-pg-port",
-            questdb_pg_port,
-        )
-        if start:
-            argv += ["--start", start]
-        if end:
-            argv += ["--end", end]
-        title = f"db serve-sync {symbol} ticks_lake={ticks_lake}"
-        jm = request.app.state.job_manager
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
-
     @router.post("/ops/build/build")
     async def ops_build_build(request: Request):
         _require_auth(request)
@@ -675,9 +591,7 @@ def build_router() -> Any:
         form = await request.form()
         var = str(form.get("variety") or "cu").strip()
         derived_symbol = str(form.get("derived_symbol") or f"KQ.m@SHFE.{var}").strip()
-        schedule_path = str(form.get("schedule_path") or "").strip()
         overwrite = str(form.get("overwrite") or "false").strip().lower() == "true"
-        data_dir = str(form.get("data_dir") or "data").strip()
         if not var or not derived_symbol:
             raise HTTPException(status_code=400, detail="variety/derived_symbol required")
         argv = python_module_argv(
@@ -687,39 +601,9 @@ def build_router() -> Any:
             var,
             "--symbol",
             derived_symbol,
-            "--data-dir",
-            data_dir,
             "--overwrite" if overwrite else "--no-overwrite",
         )
-        if schedule_path:
-            argv += ["--schedule-path", schedule_path]
         title = f"main-l5 {var} {derived_symbol}"
-        jm = request.app.state.job_manager
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
-
-    @router.post("/ops/build/main_depth")
-    async def ops_build_main_depth(request: Request):
-        _require_auth(request)
-        form = await request.form()
-        derived_symbol = str(form.get("derived_symbol") or "").strip()
-        schedule_path = str(form.get("schedule_path") or "").strip()
-        overwrite = str(form.get("overwrite") or "false").strip().lower() == "true"
-        data_dir = str(form.get("data_dir") or "data").strip()
-        if not derived_symbol or not schedule_path:
-            raise HTTPException(status_code=400, detail="derived_symbol/schedule_path required")
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "main-depth",
-            "--symbol",
-            derived_symbol,
-            "--schedule-path",
-            schedule_path,
-            "--data-dir",
-            data_dir,
-            "--overwrite" if overwrite else "--no-overwrite",
-        )
-        title = f"main-depth {derived_symbol}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -1204,22 +1088,15 @@ def build_router() -> Any:
                 str(data_dir),
             )
             title = f"main-schedule {var} {start_date}->{end_date}"
-        elif job_type == "main_depth":
-            derived_symbol = str(form.get("derived_symbol") or "KQ.m@SHFE.cu").strip()
-            schedule_path = str(form.get("schedule_path") or "").strip()
-            if not schedule_path:
-                raise HTTPException(status_code=400, detail="schedule_path is required for main_depth")
-            argv = python_module_argv(
-                "ghtrader.cli",
-                "main-depth",
-                "--symbol",
-                derived_symbol,
-                "--schedule-path",
-                schedule_path,
-                "--data-dir",
-                str(data_dir),
-            )
-            title = f"main-depth {derived_symbol}"
+        elif job_type == "main_l5":
+            var = symbol_or_var or "cu"
+            derived_symbol = str(form.get("derived_symbol") or "").strip()
+            overwrite = str(form.get("overwrite") or "0").strip().lower() in {"1", "true", "yes", "on"}
+            argv = python_module_argv("ghtrader.cli", "main-l5", "--var", var)
+            if derived_symbol:
+                argv += ["--symbol", derived_symbol]
+            argv += ["--overwrite" if overwrite else "--no-overwrite"]
+            title = f"main-l5 {var}"
         else:
             raise HTTPException(status_code=400, detail=f"Unknown job_type: {job_type}")
 
@@ -1264,13 +1141,6 @@ def build_router() -> Any:
 
         data_dir = get_data_dir()
         lv = "v2"
-        show_v1 = False
-        show_v2 = True
-
-        ticks_root_v2 = data_dir / "lake_v2" / "ticks"
-        main_l5_root_v2 = data_dir / "lake_v2" / "main_l5" / "ticks"
-        features_root = data_dir / "features"
-        labels_root = data_dir / "labels"
 
         # QuestDB reachability (best-effort) for sync tab
         questdb: dict[str, Any] = {"ok": False}
@@ -1320,8 +1190,6 @@ def build_router() -> Any:
                 "token_qs": _token_qs(request),
                 "running_count": len(running),
                 "lake_version": lv,
-                "show_v1": show_v1,
-                "show_v2": show_v2,
                 "ticks_v2": [],
                 "main_l5_v2": [],
                 "features": [],
@@ -1375,22 +1243,10 @@ def build_router() -> Any:
             err = "Query is required."
         else:
             try:
-                from ghtrader.config import (
-                    get_questdb_host,
-                    get_questdb_pg_dbname,
-                    get_questdb_pg_password,
-                    get_questdb_pg_port,
-                    get_questdb_pg_user,
-                )
-                from ghtrader.questdb_queries import QuestDBQueryConfig, query_sql_read_only
+                from ghtrader.questdb_client import make_questdb_query_config_from_env
+                from ghtrader.questdb_queries import query_sql_read_only
 
-                cfg = QuestDBQueryConfig(
-                    host=str(get_questdb_host()),
-                    pg_port=int(get_questdb_pg_port()),
-                    pg_user=str(get_questdb_pg_user()),
-                    pg_password=str(get_questdb_pg_password()),
-                    pg_dbname=str(get_questdb_pg_dbname()),
-                )
+                cfg = make_questdb_query_config_from_env()
                 columns, rows = query_sql_read_only(cfg=cfg, query=query, limit=int(limit), connect_timeout_s=2)
             except Exception as e:
                 err = str(e)

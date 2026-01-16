@@ -7,8 +7,9 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import structlog
+
+from ghtrader.json_io import read_json, write_json_atomic
 
 log = structlog.get_logger()
 
@@ -31,7 +32,7 @@ def holidays_cache_path(data_dir: Path) -> Path:
 
 
 def calendar_cache_path(data_dir: Path) -> Path:
-    return data_dir / "trading_calendar" / "calendar.parquet"
+    return data_dir / "trading_calendar" / "calendar.json"
 
 
 def _parse_date_any(s: str) -> date | None:
@@ -97,7 +98,7 @@ def _load_holidays_from_json_text(text: str) -> set[date]:
     return out
 
 
-def get_holidays(*, data_dir: Path, refresh: bool = False) -> set[date]:
+def get_holidays(*, data_dir: Path, refresh: bool = False, allow_download: bool = True) -> set[date]:
     """
     Return a cached set of holiday dates.
 
@@ -113,6 +114,10 @@ def get_holidays(*, data_dir: Path, refresh: bool = False) -> set[date]:
                 return days
         except Exception as e:
             log.warning("calendar.holidays_cache_read_failed", path=str(cache), error=str(e))
+
+    # Some dashboard/UI paths must be cache-only (no network).
+    if not bool(allow_download):
+        return set()
 
     try:
         url = holiday_url()
@@ -152,11 +157,15 @@ def _load_calendar_from_cache(path: Path) -> list[date] | None:
     try:
         if not path.exists():
             return None
-        df = pd.read_parquet(path)
-        if "date" not in df.columns:
+        obj = read_json(path)
+        if not isinstance(obj, list):
             return None
-        d = pd.to_datetime(df["date"], errors="coerce").dt.date.dropna()
-        return sorted(set(d.tolist()))
+        out: set[date] = set()
+        for it in obj:
+            d = _parse_date_any(str(it))
+            if d is not None:
+                out.add(d)
+        return sorted(out)
     except Exception as e:
         log.warning("calendar.cache_read_failed", path=str(path), error=str(e))
         return None
@@ -164,11 +173,10 @@ def _load_calendar_from_cache(path: Path) -> list[date] | None:
 
 def _write_calendar_cache(path: Path, days: list[date]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame({"date": pd.to_datetime([d.isoformat() for d in days])})
-    df.to_parquet(path, index=False)
+    write_json_atomic(path, [d.isoformat() for d in days])
 
 
-def get_trading_calendar(*, data_dir: Path, refresh: bool = False) -> list[date]:
+def get_trading_calendar(*, data_dir: Path, refresh: bool = False, allow_download: bool = True) -> list[date]:
     """
     Return a cached list of trading days (weekday minus Shinny holiday list).
 
@@ -183,7 +191,7 @@ def get_trading_calendar(*, data_dir: Path, refresh: bool = False) -> list[date]
             return cached
 
     # Compute a practical calendar window and cache it.
-    holidays = get_holidays(data_dir=data_dir, refresh=refresh)
+    holidays = get_holidays(data_dir=data_dir, refresh=refresh, allow_download=allow_download)
     if not holidays:
         return []
 

@@ -52,8 +52,9 @@ def _schedule_dir(data_dir: Path, var: str) -> Path:
 class MainScheduleResult:
     schedule: pd.DataFrame
     schedule_hash: str
-    schedule_path: Path
-    manifest_path: Path
+    exchange: str
+    variety: str
+    questdb_table: str
 
 
 def normalize_contract_symbol(raw_symbol: str, *, exchange: str = "SHFE") -> str:

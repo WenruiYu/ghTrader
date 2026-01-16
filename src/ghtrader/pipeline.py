@@ -344,7 +344,7 @@ def run_hyperparam_sweep(
     manifest = read_features_manifest(data_dir, symbol)
     lab_manifest = read_labels_manifest(data_dir, symbol)
     if not manifest or not lab_manifest:
-        raise ValueError("Missing features/labels manifest.json. Run `ghtrader build` first.")
+        raise ValueError("Missing QuestDB build metadata for features/labels. Run `ghtrader build` first.")
     tl_f = str(manifest.get("ticks_lake") or "")
     tl_l = str(lab_manifest.get("ticks_lake") or "")
     if tl_f != tl_l:
@@ -553,9 +553,48 @@ class OfflineMicroSim:
     
     def load_ticks(self, data_dir: Path, symbol: str, start_date: date, end_date: date) -> None:
         """Load tick data for simulation."""
-        from ghtrader.lake import read_ticks_for_symbol
-        
-        df = read_ticks_for_symbol(data_dir, symbol, start_date, end_date)
+        import pandas as pd
+
+        from ghtrader.questdb_client import make_questdb_query_config_from_env
+        from ghtrader.questdb_index import list_present_trading_days
+        from ghtrader.questdb_queries import fetch_ticks_for_symbol_day
+
+        _ = data_dir  # QuestDB is the canonical source
+
+        lv = "v2"
+        tl = "main_l5" if str(symbol).startswith("KQ.m@") else "raw"
+        table = "ghtrader_ticks_main_l5_v2" if tl == "main_l5" else "ghtrader_ticks_raw_v2"
+        cfg = make_questdb_query_config_from_env()
+
+        days = sorted(
+            list_present_trading_days(
+                cfg=cfg,
+                symbol=str(symbol),
+                start_day=start_date,
+                end_day=end_date,
+                lake_version=lv,
+                ticks_lake=tl,
+            )
+        )
+
+        frames: list[pd.DataFrame] = []
+        for d in days:
+            df_day = fetch_ticks_for_symbol_day(
+                cfg=cfg,
+                table=table,
+                symbol=str(symbol),
+                trading_day=d.isoformat(),
+                lake_version=lv,
+                ticks_lake=tl,
+                limit=None,
+                order="asc",
+                include_provenance=(tl == "main_l5"),
+                connect_timeout_s=2,
+            )
+            if not df_day.empty:
+                frames.append(df_day)
+
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         self.tick_data = df.to_dict("records")
         log.info("microsim.loaded", n_ticks=len(self.tick_data))
     

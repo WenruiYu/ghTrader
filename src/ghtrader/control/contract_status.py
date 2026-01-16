@@ -1,323 +1,77 @@
+"""
+Contract status computation for Data Hub.
+
+PRD: QuestDB is the canonical data source. This module must not depend on local file-based tick
+storage scans for status/coverage.
+"""
+
 from __future__ import annotations
 
-from bisect import bisect_left, bisect_right
-import json
 import os
 import time
-import uuid
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
-import pandas as pd
+import structlog
 
 from ghtrader.trading_calendar import get_trading_calendar
+
+log = structlog.get_logger()
+
+
+def infer_contract_date_range(symbol: str) -> tuple[date | None, date | None]:
+    """
+    Infer approximate trading date range from SHFE contract symbol.
+
+    SHFE futures contracts have a YYMM suffix indicating expiry month.
+    Trading typically starts ~12-13 months before expiry and ends on the
+    15th of the expiry month (last trading day).
+    """
+    import re
+
+    if not symbol:
+        return None, None
+
+    match = re.match(r"^(?:[A-Z]+\.)?([a-zA-Z]+)(\d{4})$", str(symbol).strip())
+    if not match:
+        return None, None
+
+    yymm = match.group(2)
+    if len(yymm) != 4:
+        return None, None
+    try:
+        yy = int(yymm[:2])
+        mm = int(yymm[2:])
+    except ValueError:
+        return None, None
+    if mm < 1 or mm > 12:
+        return None, None
+
+    year = (1900 + yy) if yy >= 90 else (2000 + yy)
+    try:
+        end_date = date(year, mm, 15)
+    except ValueError:
+        return None, None
+
+    try:
+        start_date = date(year - 1, mm, 1)
+    except ValueError:
+        return None, None
+
+    return start_date, end_date
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _parse_yyyymmdd(s: str) -> date | None:
-    try:
-        return date.fromisoformat(str(s).strip())
-    except Exception:
-        return None
-
-
-def _cache_root(*, runs_dir: Path) -> Path:
-    return runs_dir / "control" / "cache" / "contract_status"
-
-
-def _l5_cache_path(*, runs_dir: Path, lake_version: str, symbol: str) -> Path:
-    lv = "v2"
-    sym = str(symbol).strip()
-    safe = sym.replace("/", "_")
-    return _cache_root(runs_dir=runs_dir) / "local_l5" / f"lake={lv}" / f"symbol={safe}.json"
-
-
-def _read_json(path: Path) -> dict[str, Any] | None:
-    try:
-        if not path.exists():
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
-
-
-def _write_json_atomic(path: Path, obj: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f".tmp-{uuid.uuid4().hex}")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
-    tmp.replace(path)
-
-
-def _tick_bounds_cache_path(*, runs_dir: Path, lake_version: str, symbol: str, day: str) -> Path:
-    lv = "v2"
-    sym = str(symbol).strip()
-    safe = sym.replace("/", "_")
-    ds = str(day).strip()
-    return _cache_root(runs_dir=runs_dir) / "local_tick_bounds" / f"lake={lv}" / f"symbol={safe}" / f"date={ds}.json"
-
-
-def _parquet_files_fingerprint(date_dir: Path) -> list[dict[str, Any]]:
-    try:
-        files = sorted([p for p in date_dir.iterdir() if p.is_file() and p.suffix == ".parquet"], key=lambda x: x.name)
-    except Exception:
-        return []
-    out: list[dict[str, Any]] = []
-    for p in files:
-        try:
-            st = p.stat()
-            out.append({"name": p.name, "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))), "size": int(st.st_size)})
-        except Exception:
-            continue
-    return out
-
-
-def _ns_to_iso_utc(ns: int | None) -> str | None:
-    if ns is None:
-        return None
-    try:
-        if int(ns) <= 0:
-            return None
-        return datetime.fromtimestamp(float(int(ns)) / 1_000_000_000.0, tz=timezone.utc).isoformat()
-    except Exception:
-        return None
-
-
-def _parquet_datetime_ns_bounds(path: Path) -> tuple[int | None, int | None]:
-    """
-    Best-effort (min_ns, max_ns) for the `datetime` column of a Parquet file.
-
-    Prefer Parquet row-group statistics; fall back to reading only the first and last row groups.
-    """
-    try:
-        import pyarrow.compute as pc
-        import pyarrow.parquet as pq
-    except Exception:
-        return None, None
-
-    try:
-        pf = pq.ParquetFile(path)
-        if "datetime" not in pf.schema.names:
-            return None, None
-
-        # 1) Prefer row-group statistics (fast).
-        try:
-            idx = list(pf.schema.names).index("datetime")
-            md = pf.metadata
-            mn: int | None = None
-            mx: int | None = None
-            if md is not None:
-                for i in range(md.num_row_groups):
-                    st = md.row_group(i).column(idx).statistics
-                    if not st:
-                        continue
-                    try:
-                        a = st.min
-                        b = st.max
-                    except Exception:
-                        continue
-                    try:
-                        ai = int(a) if a is not None else None
-                        bi = int(b) if b is not None else None
-                    except Exception:
-                        continue
-                    if ai is not None:
-                        mn = ai if mn is None else min(mn, ai)
-                    if bi is not None:
-                        mx = bi if mx is None else max(mx, bi)
-            if mn is not None or mx is not None:
-                return mn, mx
-        except Exception:
-            pass
-
-        # 2) Fallback: read only first+last row group for `datetime`.
-        nrg = int(getattr(pf, "num_row_groups", 0) or 0)
-        if nrg <= 0:
-            return None, None
-        try:
-            t0 = pf.read_row_group(0, columns=["datetime"])
-            a0 = t0.column(0).combine_chunks()
-            mn0 = pc.min(a0).as_py() if len(a0) else None
-        except Exception:
-            mn0 = None
-        try:
-            t1 = pf.read_row_group(nrg - 1, columns=["datetime"])
-            a1 = t1.column(0).combine_chunks()
-            mx1 = pc.max(a1).as_py() if len(a1) else None
-        except Exception:
-            mx1 = None
-        try:
-            return (int(mn0) if mn0 is not None else None), (int(mx1) if mx1 is not None else None)
-        except Exception:
-            return None, None
-    except Exception:
-        return None, None
-
-
-def compute_local_tick_bounds_for_day(
-    *,
-    data_dir: Path,
-    runs_dir: Path,
-    symbol: str,
-    lake_version: str,
-    day: str,
-    refresh: bool,
-) -> dict[str, Any] | None:
-    """
-    Return best-effort local min/max tick timestamps for (symbol, day).
-
-    Uses a small cache keyed by Parquet file fingerprints.
-    """
-    lv = "v2"
-    _ = lake_version
-    sym = str(symbol).strip()
-    ds = str(day).strip()
-    if not sym or not ds:
-        return None
-
-    date_dir = _ticks_symbol_dir(data_dir=data_dir, symbol=sym, lake_version=lv) / f"date={ds}"
-    if not date_dir.exists():
-        return None
-
-    fp = _parquet_files_fingerprint(date_dir)
-    if not fp:
-        return None
-
-    cache_path = _tick_bounds_cache_path(runs_dir=runs_dir, lake_version=lv, symbol=sym, day=ds)
-    if not refresh:
-        cached = _read_json(cache_path)
-        try:
-            if cached and cached.get("files") == fp and (cached.get("min_datetime_ns") is not None or cached.get("max_datetime_ns") is not None):
-                return cached
-        except Exception:
-            pass
-
-    # Compute across all parquet parts for this day.
-    mn: int | None = None
-    mx: int | None = None
-    for item in fp:
-        try:
-            p = date_dir / str(item.get("name") or "")
-            a, b = _parquet_datetime_ns_bounds(p)
-            if a is not None:
-                mn = a if mn is None else min(mn, a)
-            if b is not None:
-                mx = b if mx is None else max(mx, b)
-        except Exception:
-            continue
-
-    payload = {
-        "symbol": sym,
-        "trading_day": ds,
-        "lake_version": lv,
-        "files": fp,
-        "min_datetime_ns": mn,
-        "max_datetime_ns": mx,
-        "min_datetime_ts": _ns_to_iso_utc(mn),
-        "max_datetime_ts": _ns_to_iso_utc(mx),
-        "computed_at": _now_iso(),
-    }
-    try:
-        _write_json_atomic(cache_path, payload)
-    except Exception:
-        pass
-    return payload
-
-
-def _ticks_symbol_dir(*, data_dir: Path, symbol: str, lake_version: str) -> Path:
-    _ = lake_version  # v2-only
-    return data_dir / "lake_v2" / "ticks" / f"symbol={symbol}"
-
-
-def _no_data_dates_path(*, data_dir: Path, symbol: str, lake_version: str) -> Path:
-    return _ticks_symbol_dir(data_dir=data_dir, symbol=symbol, lake_version=lake_version) / "_no_data_dates.json"
-
-
-def _scan_date_dirs(symbol_dir: Path) -> tuple[set[str], str | None, str | None]:
-    """
-    Return (downloaded_dates_iso, min_date_iso, max_date_iso).
-    """
-    out: set[str] = set()
-    min_s: str | None = None
-    max_s: str | None = None
-    if not symbol_dir.exists():
-        return out, None, None
-    try:
-        for p in symbol_dir.iterdir():
-            if not p.is_dir():
-                continue
-            name = p.name
-            if not name.startswith("date="):
-                continue
-            ds = name.split("=", 1)[-1].strip()
-            if not ds or len(ds) != 10:
-                continue
-            try:
-                _ = date.fromisoformat(ds)
-            except Exception:
-                continue
-            out.add(ds)
-            if min_s is None or ds < min_s:
-                min_s = ds
-            if max_s is None or ds > max_s:
-                max_s = ds
-    except Exception:
-        return out, None, None
-    return out, min_s, max_s
-
-
-def _read_json_list(path: Path) -> list[str]:
-    try:
-        if not path.exists():
-            return []
-        with open(path, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        if not isinstance(obj, list):
-            return []
-        return [str(x) for x in obj]
-    except Exception:
-        return []
-
-
-def _raw_contract_from_symbol(*, symbol: str, var: str) -> str | None:
-    """
-    'SHFE.cu2003' + 'cu' -> 'CU2003'
-    """
-    sym = str(symbol).strip()
-    v = str(var).strip().lower()
-    if not sym or not v:
-        return None
-    if "." not in sym:
-        return None
-    tail = sym.split(".", 1)[-1]
-    if not tail.lower().startswith(v):
-        return None
-    yymm = tail[len(v) :].strip()
-    if not (len(yymm) == 4 and yymm.isdigit()):
-        # best-effort: take last 4 digits
-        digits = "".join([c for c in tail if c.isdigit()])
-        if len(digits) >= 4:
-            yymm = digits[-4:]
-        else:
-            return None
-    return f"{v.upper()}{yymm}"
-
-
 def _last_trading_day_leq(cal: list[date], today: date) -> date:
     if not cal:
-        # fallback approximation
         d = today
         while d.weekday() >= 5:
             d -= timedelta(days=1)
         return d
-    # calendar is sorted
     lo = 0
     hi = len(cal)
     while lo < hi:
@@ -330,353 +84,163 @@ def _last_trading_day_leq(cal: list[date], today: date) -> date:
     return cal[idx] if idx >= 0 else today
 
 
-def _count_weekdays_between(start: date, end: date) -> int:
-    """
-    Count weekdays in [start, end] inclusive (Mon-Fri).
-    """
-    if end < start:
-        return 0
-    n = (end - start).days + 1
-    full_weeks, rem = divmod(n, 7)
-    count = full_weeks * 5
-    for i in range(rem):
-        if (start.weekday() + i) % 7 < 5:
-            count += 1
-    return int(count)
-
-
 def _count_trading_days_between(*, cal: list[date], start: date, end: date) -> int:
-    """
-    Count trading days in [start, end] using cached calendar when available,
-    otherwise fall back to weekday-only.
-    """
     if end < start:
         return 0
-    if cal:
-        i0 = bisect_left(cal, start)
-        i1 = bisect_right(cal, end)
-        return int(max(0, i1 - i0))
-    return _count_weekdays_between(start, end)
+    if not cal:
+        # Weekday fallback (best-effort)
+        n = 0
+        d = start
+        while d <= end:
+            if d.weekday() < 5:
+                n += 1
+            d += timedelta(days=1)
+        return n
+    # Binary search in a sorted calendar list.
+    from bisect import bisect_left, bisect_right
+
+    i0 = bisect_left(cal, start)
+    i1 = bisect_right(cal, end)
+    return int(max(0, i1 - i0))
 
 
-def _parquet_file_has_local_l5(path: Path) -> bool:
-    """
-    Return True if a small sample shows level2-5 bid/ask price values that are not NaN.
-
-    Important: our ingest pads missing depth columns with NaN (float), not NULL.
-    """
-    try:
-        import numpy as np
-        import pyarrow as pa  # noqa: F401
-        import pyarrow.parquet as pq
-    except Exception:
-        return False
-
-    try:
-        pf = pq.ParquetFile(path)
-        want = [
-            "bid_price2",
-            "ask_price2",
-            "bid_price3",
-            "ask_price3",
-            "bid_price4",
-            "ask_price4",
-            "bid_price5",
-            "ask_price5",
-        ]
-        cols = [c for c in want if c in pf.schema.names]
-        if not cols:
-            return False
-
-        for batch in pf.iter_batches(batch_size=512, columns=cols):
-            # Check only first batch for speed.
-            for col in cols:
-                arr = batch.column(col).to_numpy(zero_copy_only=False)  # type: ignore[attr-defined]
-                if arr is None:
-                    continue
-                # L5-present should have finite positive prices.
-                try:
-                    if bool(np.isfinite(arr).any() and (arr > 0).any()):
-                        return True
-                except Exception:
-                    # If dtype is odd, fall back to per-element check.
-                    for x in arr:
-                        try:
-                            xf = float(x)
-                            if xf > 0.0 and xf == xf:  # not NaN
-                                return True
-                        except Exception:
-                            continue
-            break
-        return False
-    except Exception:
-        return False
-
-
-def _pick_one_parquet(date_dir: Path) -> Path | None:
-    try:
-        files = sorted([p for p in date_dir.iterdir() if p.is_file() and p.suffix == ".parquet"])
-        return files[0] if files else None
-    except Exception:
+def _raw_contract_from_symbol(*, symbol: str, var: str) -> str | None:
+    s = str(symbol).strip()
+    if not s:
         return None
-
-
-@dataclass(frozen=True)
-class LocalL5Summary:
-    status: str  # ready|partial|missing_pyarrow|no_local_data
-    l5_days: int
-    scanned_days: int
-    total_days: int
-    l5_min: str | None
-    l5_max: str | None
-
-
-def compute_local_l5_summary(
-    *,
-    data_dir: Path,
-    runs_dir: Path,
-    symbol: str,
-    lake_version: str,
-    downloaded_dates: Iterable[str],
-    refresh: bool = False,
-    max_scan: int = 10,
-) -> LocalL5Summary:
-    """
-    Incrementally scan local Parquet to detect L5 presence per date.
-
-    Uses a persistent per-symbol cache file under runs/control/cache/.
-    """
-    ds_all = sorted({str(d).strip() for d in downloaded_dates if str(d).strip()})
-    if not ds_all:
-        return LocalL5Summary(status="no_local_data", l5_days=0, scanned_days=0, total_days=0, l5_min=None, l5_max=None)
-
-    # If pyarrow isn't available, report gracefully.
-    try:
-        import pyarrow.parquet as pq  # noqa: F401
-    except Exception:
-        return LocalL5Summary(status="missing_pyarrow", l5_days=0, scanned_days=0, total_days=len(ds_all), l5_min=None, l5_max=None)
-
-    p_cache = _l5_cache_path(runs_dir=runs_dir, lake_version=lake_version, symbol=symbol)
-    cached = _read_json(p_cache) if not refresh else None
-    dates_map: dict[str, bool] = {}
-    if cached and isinstance(cached.get("dates"), dict):
-        for k, v in cached["dates"].items():
-            if isinstance(k, str):
-                dates_map[k] = bool(v)
-
-    missing = [d for d in ds_all if d not in dates_map]
-    if refresh:
-        missing = list(ds_all)
-
-    # Scan a bounded number of missing dates to keep APIs responsive.
-    scanned_now = 0
-    sym_dir = _ticks_symbol_dir(data_dir=data_dir, symbol=symbol, lake_version=lake_version)
-    for ds in missing:
-        if scanned_now >= int(max_scan):
-            break
-        date_dir = sym_dir / f"date={ds}"
-        p = _pick_one_parquet(date_dir)
-        if p is None:
-            # no parquet => treat as not l5 (but keep cache entry so we don't keep rescanning)
-            dates_map[ds] = False
-        else:
-            dates_map[ds] = bool(_parquet_file_has_local_l5(p))
-        scanned_now += 1
-
-    try:
-        payload = {
-            "symbol": str(symbol),
-            "lake_version": str(lake_version),
-            "updated_at": _now_iso(),
-            "updated_at_unix": float(time.time()),
-            "dates": {k: bool(v) for k, v in sorted(dates_map.items())},
-        }
-        _write_json_atomic(p_cache, payload)
-    except Exception:
-        pass
-
-    l5_dates = [d for d, has in dates_map.items() if has]
-    l5_min = min(l5_dates) if l5_dates else None
-    l5_max = max(l5_dates) if l5_dates else None
-    status = "ready" if len(dates_map) >= len(ds_all) else "partial"
-    return LocalL5Summary(
-        status=status,
-        l5_days=int(len(l5_dates)),
-        scanned_days=int(len(dates_map)),
-        total_days=int(len(ds_all)),
-        l5_min=l5_min,
-        l5_max=l5_max,
-    )
-
-
-@dataclass(frozen=True)
-class ContractStatus:
-    symbol: str
-    raw_contract: str | None
-    expired: bool | None
-    expire_datetime: str | None
-    local_days_downloaded: int
-    local_min: str | None
-    local_max: str | None
-    days_expected: int | None
-    days_done: int | None
-    pct: float | None
-    status: str  # not-downloaded|incomplete|complete|stale|unknown
-    expected_first: str | None
-    expected_last: str | None
-    local_l5_status: str
-    local_l5_days: int
-    local_l5_min: str | None
-    local_l5_max: str | None
-    local_l5_scanned_days: int
-    local_l5_total_days: int
+    if "." in s:
+        tail = s.split(".", 1)[1].strip()
+    else:
+        tail = s
+    tail = tail.strip()
+    if not tail:
+        return None
+    # Best-effort: ensure it matches variety prefix.
+    v = str(var).lower().strip()
+    if v and not tail.lower().startswith(v):
+        return None
+    return tail
 
 
 def compute_contract_statuses(
     *,
     exchange: str,
     var: str,
-    lake_version: str,
     data_dir: Path,
-    runs_dir: Path,
     contracts: list[dict[str, Any]],
-    refresh_l5: bool = False,
-    max_l5_scan_per_symbol: int = 10,
     questdb_cov_by_symbol: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
-    Compute per-contract local coverage/completeness + incremental local L5 scan.
+    Compute per-contract status for the Data Hub.
 
-    `contracts` is typically the `contracts` list from `ghtrader.tqsdk_catalog.get_contract_catalog()`.
+    QuestDB-first:
+    - Coverage and bounds come from `ghtrader_symbol_day_index_v2`.
+    - No filesystem tick-store scans are performed.
     """
     ex = str(exchange).upper().strip()
     v = str(var).lower().strip()
-    _ = lake_version  # v2-only
     lv = "v2"
 
-    cal = get_trading_calendar(data_dir=data_dir, refresh=False)
+    cal = get_trading_calendar(data_dir=data_dir, refresh=False, allow_download=False)
     today = datetime.now(timezone.utc).date()
     today_trading = _last_trading_day_leq(cal, today)
     checked_at = _now_iso()
     now_s = time.time()
-    # Active contract freshness: if today's partition exists but the last tick is too old, mark stale.
+
     try:
-        lag_min = float(os.environ.get("GHTRADER_CONTRACTS_LOCAL_TICK_LAG_STALE_MINUTES", "120") or "120")
+        lag_min = float(os.environ.get("GHTRADER_CONTRACTS_TICK_LAG_STALE_MINUTES", "120") or "120")
     except Exception:
         lag_min = 120.0
     lag_threshold_sec = float(max(0.0, lag_min * 60.0))
 
+    # If caller did not provide coverage, best-effort fetch from QuestDB index.
+    cov = questdb_cov_by_symbol
+    if cov is None:
+        try:
+            from ghtrader.questdb_client import make_questdb_query_config_from_env
+            from ghtrader.questdb_index import INDEX_TABLE_V2, ensure_index_tables, query_contract_coverage_from_index
+
+            cfg = make_questdb_query_config_from_env()
+            ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
+            syms = [str((r or {}).get("symbol") or "").strip() for r in contracts if str((r or {}).get("symbol") or "").strip()]
+            cov = query_contract_coverage_from_index(cfg=cfg, symbols=syms, lake_version=lv, ticks_lake="raw", index_table=INDEX_TABLE_V2)
+        except Exception:
+            cov = None
+
     out: list[dict[str, Any]] = []
     for c in contracts:
-        sym = str(c.get("symbol") or "").strip()
+        sym = str((c or {}).get("symbol") or "").strip()
         if not sym:
             continue
-        expired = c.get("expired")
+
+        expired = (c or {}).get("expired")
         expired_b = bool(expired) if expired is not None else None
-        exp_dt = c.get("expire_datetime")
+        exp_dt = (c or {}).get("expire_datetime")
         exp_dt_s = str(exp_dt).strip() if exp_dt not in (None, "") else None
-        open_dt = c.get("open_date")
+        open_dt = (c or {}).get("open_date")
         open_dt_s = str(open_dt).strip() if open_dt not in (None, "") else None
 
         raw = _raw_contract_from_symbol(symbol=sym, var=v)
 
-        sym_dir = _ticks_symbol_dir(data_dir=data_dir, symbol=sym, lake_version=lv)
-        downloaded_set, local_min, local_max = _scan_date_dirs(sym_dir)
+        qc = cov.get(sym) if isinstance(cov, dict) else None
+        present_dates_raw = qc.get("present_dates") if isinstance(qc, dict) else None
+        downloaded_set: set[str] = set()
+        if isinstance(present_dates_raw, set):
+            downloaded_set = {str(d) for d in present_dates_raw}
 
-        # Minute-level local bounds (best-effort; cached by file fingerprints).
-        bounds_first = compute_local_tick_bounds_for_day(
-            data_dir=data_dir,
-            runs_dir=runs_dir,
-            symbol=sym,
-            lake_version=lv,
-            day=str(local_min or ""),
-            refresh=False,
-        ) if local_min else None
-        bounds_last = compute_local_tick_bounds_for_day(
-            data_dir=data_dir,
-            runs_dir=runs_dir,
-            symbol=sym,
-            lake_version=lv,
-            day=str(local_max or ""),
-            refresh=False,
-        ) if local_max else None
-        local_first_tick_ns = int(bounds_first.get("min_datetime_ns")) if isinstance(bounds_first, dict) and bounds_first.get("min_datetime_ns") is not None else None
-        local_last_tick_ns = int(bounds_last.get("max_datetime_ns")) if isinstance(bounds_last, dict) and bounds_last.get("max_datetime_ns") is not None else None
-        local_first_tick_ts = str(bounds_first.get("min_datetime_ts") or "") if isinstance(bounds_first, dict) else ""
-        local_last_tick_ts = str(bounds_last.get("max_datetime_ts") or "") if isinstance(bounds_last, dict) else ""
-        local_last_tick_age_sec: float | None = None
-        if local_last_tick_ns is not None and local_last_tick_ns > 0:
+        db_min = str(qc.get("first_tick_day") or "").strip() if isinstance(qc, dict) else ""
+        db_max = str(qc.get("last_tick_day") or "").strip() if isinstance(qc, dict) else ""
+
+        db_first_tick_ns = int(qc.get("first_tick_ns")) if isinstance(qc, dict) and qc.get("first_tick_ns") is not None else None
+        db_last_tick_ns = int(qc.get("last_tick_ns")) if isinstance(qc, dict) and qc.get("last_tick_ns") is not None else None
+        db_first_tick_ts = str(qc.get("first_tick_ts") or "").strip() if isinstance(qc, dict) else ""
+        db_last_tick_ts = str(qc.get("last_tick_ts") or "").strip() if isinstance(qc, dict) else ""
+
+        db_last_tick_age_sec: float | None = None
+        if db_last_tick_ns is not None and db_last_tick_ns > 0:
             try:
-                local_last_tick_age_sec = float(max(0.0, now_s - (float(local_last_tick_ns) / 1_000_000_000.0)))
+                db_last_tick_age_sec = float(max(0.0, now_s - (float(db_last_tick_ns) / 1_000_000_000.0)))
             except Exception:
-                local_last_tick_age_sec = None
+                db_last_tick_age_sec = None
 
-        # Best-effort expected window:
-        # - prefer remote metadata (open_date / expire_datetime when available)
-        # - otherwise fall back to QuestDB canonical bounds (when provided)
-        # - otherwise fall back to locally observed min/max
+        # Expected window (prefer catalog, fall back to QuestDB bounds, then symbol inference).
         expected_first: date | None = None
         if open_dt_s:
             try:
                 expected_first = date.fromisoformat(open_dt_s[:10])
             except Exception:
                 expected_first = None
+        if expected_first is None and db_min:
+            try:
+                expected_first = date.fromisoformat(db_min[:10])
+            except Exception:
+                expected_first = None
+        if expected_first is None:
+            a0, _ = infer_contract_date_range(sym)
+            expected_first = a0
 
-        # Compute expected_last from "activeness" + expire_datetime if known.
         expire_trading: date | None = None
         if exp_dt_s:
             try:
-                expire_day = date.fromisoformat(exp_dt_s[:10])
-                expire_trading = _last_trading_day_leq(cal, expire_day)
+                exp_day = date.fromisoformat(exp_dt_s[:10])
+                expire_trading = _last_trading_day_leq(cal, exp_day)
             except Exception:
                 expire_trading = None
 
         expected_last: date | None = None
         if expired_b is False:
-            # Resolve after expected_first is known.
-            expected_last = None
-        else:
-            expected_last = expire_trading if expire_trading else None
-
-        # Prefer QuestDB canonical coverage bounds (when provided).
-        if questdb_cov_by_symbol is not None:
-            qc = questdb_cov_by_symbol.get(sym) or {}
-            db_first_s = str(qc.get("first_tick_day") or "").strip()
-            db_last_s = str(qc.get("last_tick_day") or "").strip()
-            try:
-                db_first = date.fromisoformat(db_first_s) if db_first_s else None
-            except Exception:
-                db_first = None
-            try:
-                db_last = date.fromisoformat(db_last_s) if db_last_s else None
-            except Exception:
-                db_last = None
-
-            # Use QuestDB bounds when remote metadata is missing:
-            # - open_date missing -> allow db_first to extend expected range backwards
-            # - expire_datetime missing -> allow db_last to extend expected range forwards (expired only)
-            if expected_first is None and db_first is not None:
-                expected_first = db_first
-            if expired_b is not False:
-                if expire_trading is None and db_last is not None:
-                    expected_last = db_last
-
-        # Final local fallbacks.
-        if expected_first is None and local_min:
-            try:
-                expected_first = date.fromisoformat(local_min)
-            except Exception:
-                expected_first = None
-        if expired_b is False:
             expected_last = today_trading if expected_first else None
         else:
-            if expected_last is None and local_max:
+            expected_last = expire_trading if expire_trading else None
+            if expected_last is None and db_max and expired_b is not False:
                 try:
-                    expected_last = date.fromisoformat(local_max) if expected_first else None
+                    expected_last = date.fromisoformat(db_max[:10])
                 except Exception:
                     expected_last = None
+            if expected_last is None:
+                _, b0 = infer_contract_date_range(sym)
+                expected_last = b0
 
-        # Expected days + done days (downloaded + no-data within expected window).
         days_expected: int | None = None
         days_done: int | None = None
         pct: float | None = None
@@ -688,53 +252,57 @@ def compute_contract_statuses(
 
             downloaded_in_range = {d for d in downloaded_set if expected_iso0 <= d <= expected_iso1}
 
-            # No-data markers count as done (trading days only).
-            no_data_raw = _read_json_list(_no_data_dates_path(data_dir=data_dir, symbol=sym, lake_version=lv))
-            cal_set = set(cal) if cal else None
+            # No-data markers count as done (QuestDB-only).
+            no_data_days: set[date] = set()
+            try:
+                from ghtrader.questdb_client import make_questdb_query_config_from_env
+                from ghtrader.questdb_index import list_no_data_trading_days
+
+                cfg = make_questdb_query_config_from_env()
+                no_data_days = set(
+                    list_no_data_trading_days(
+                        cfg=cfg,
+                        symbol=sym,
+                        start_day=expected_first,
+                        end_day=expected_last,
+                        lake_version=lv,
+                        ticks_lake="raw",
+                    )
+                )
+            except Exception:
+                no_data_days = set()
+
+            # Active contracts: do not treat today's trading day as no-data.
+            if expired_b is False and expected_last == today_trading and no_data_days:
+                no_data_days = {d for d in no_data_days if d != today_trading}
+
             no_data_effective = 0
-            for ds in no_data_raw:
-                ds_s = str(ds).strip()
-                if not ds_s:
-                    continue
-                if ds_s < expected_iso0 or ds_s > expected_iso1:
-                    continue
-                d = _parse_yyyymmdd(ds_s)
-                if d is None:
-                    continue
-                if cal_set is not None:
-                    if d not in cal_set:
-                        continue
-                else:
-                    if d.weekday() >= 5:
-                        continue
-                if ds_s in downloaded_in_range:
+            for d in no_data_days:
+                ds = d.isoformat()
+                if ds in downloaded_in_range:
                     continue
                 no_data_effective += 1
 
-            done = int(len(downloaded_in_range) + no_data_effective)
-            days_done = int(min(done, days_expected) if days_expected > 0 else done)
+            done = int(len(downloaded_in_range) + int(no_data_effective))
+            days_done = int(min(done, days_expected) if days_expected and days_expected > 0 else done)
             pct = float(days_done / days_expected) if days_expected and days_expected > 0 else 0.0
-            if pct < 0.0:
-                pct = 0.0
-            if pct > 1.0:
-                pct = 1.0
-        else:
-            expected_iso0 = None
-            expected_iso1 = None
+            pct = float(max(0.0, min(1.0, pct)))
 
-        # Status
+        # Status taxonomy (QuestDB-first).
         status = "unknown"
         stale_reason: str | None = None
-        if not downloaded_set:
+        index_missing = (cov is not None and qc is None)
+        if cov is not None and qc is None:
+            status = "unindexed"
+        elif not downloaded_set:
             status = "not-downloaded"
         elif days_expected is None or days_done is None:
             status = "unknown"
         else:
             if expired_b is False:
-                # Active: allow distinct "stale" when it's behind today.
                 if pct is not None and pct >= 1.0:
                     status = "complete"
-                elif local_max and local_max < today_trading.isoformat():
+                elif db_max and db_max < today_trading.isoformat():
                     status = "stale"
                     stale_reason = "missing_trading_day"
                 else:
@@ -742,76 +310,55 @@ def compute_contract_statuses(
             else:
                 status = "complete" if pct is not None and pct >= 1.0 else "incomplete"
 
-        # Within-day lag: a contract can be day-complete but still behind in minutes/hours.
         if expired_b is False and status == "complete":
-            if local_max and local_max == today_trading.isoformat():
-                if local_last_tick_age_sec is not None and local_last_tick_age_sec > lag_threshold_sec:
+            if db_max and db_max == today_trading.isoformat():
+                if db_last_tick_age_sec is not None and db_last_tick_age_sec > lag_threshold_sec:
                     status = "stale"
                     stale_reason = "tick_lag"
-
-        # Local L5 detection (incremental cache)
-        l5_sum = compute_local_l5_summary(
-            data_dir=data_dir,
-            runs_dir=runs_dir,
-            symbol=sym,
-            lake_version=lv,
-            downloaded_dates=downloaded_set,
-            refresh=bool(refresh_l5),
-            max_scan=int(max_l5_scan_per_symbol),
-        )
 
         out.append(
             {
                 "symbol": sym,
                 "raw_contract": raw,
-                "catalog_source": str(c.get("catalog_source") or ""),
+                "catalog_source": str((c or {}).get("catalog_source") or ""),
                 "expired": expired_b,
                 "expire_datetime": exp_dt_s,
                 "open_date": open_dt_s,
-                "local_days_downloaded": int(len(downloaded_set)),
-                "local_min": local_min,
-                "local_max": local_max,
-                "local_first_tick_ns": local_first_tick_ns,
-                "local_last_tick_ns": local_last_tick_ns,
-                "local_first_tick_ts": local_first_tick_ts or None,
-                "local_last_tick_ts": local_last_tick_ts or None,
-                "local_last_tick_age_sec": local_last_tick_age_sec,
-                "local_checked_at": checked_at,
+                "days_present": int(len(downloaded_set)),
+                "db_min": db_min or None,
+                "db_max": db_max or None,
+                "db_first_tick_ns": db_first_tick_ns,
+                "db_last_tick_ns": db_last_tick_ns,
+                "db_first_tick_ts": (db_first_tick_ts or None),
+                "db_last_tick_ts": (db_last_tick_ts or None),
+                "db_last_tick_age_sec": db_last_tick_age_sec,
+                "checked_at": checked_at,
                 "stale_reason": stale_reason,
-                "tick_lag_stale_threshold_sec": lag_threshold_sec if expired_b is False else None,
+                "tick_lag_stale_threshold_sec": (lag_threshold_sec if expired_b is False else None),
                 "days_expected": days_expected,
                 "days_done": days_done,
                 "pct": pct,
                 "status": status,
+                "index_missing": bool(index_missing),
                 "expected_first": expected_first.isoformat() if expected_first else None,
                 "expected_last": expected_last.isoformat() if expected_last else None,
-                "local_l5": {
-                    "status": l5_sum.status,
-                    "l5_days": int(l5_sum.l5_days),
-                    "l5_min": l5_sum.l5_min,
-                    "l5_max": l5_sum.l5_max,
-                    "scanned_days": int(l5_sum.scanned_days),
-                    "total_days": int(l5_sum.total_days),
-                },
+                # QuestDB coverage summary (used by Data Hub table rendering).
+                "questdb_coverage": qc if isinstance(qc, dict) else {},
             }
         )
 
-    # Sort by contract suffix when possible.
-    def _sort_key(r: dict[str, Any]) -> tuple[int, str]:
-        sym = str(r.get("symbol") or "")
-        tail = ""
-        for i in range(len(sym) - 1, -1, -1):
-            if sym[i].isdigit():
-                tail = sym[i] + tail
-            else:
-                break
-        try:
-            n = int(tail) if tail else 10**9
-        except Exception:
-            n = 10**9
-        return (n, sym)
+    out.sort(key=lambda r: str(r.get("symbol") or ""))
 
-    out.sort(key=_sort_key)
+    # Summary (QuestDB-first)
+    symbols_total = int(len(out))
+    symbols_indexed = int(sum(1 for r in out if r.get("index_missing") is not True))
+    symbols_unindexed = int(symbols_total - symbols_indexed)
+    symbols_complete = int(sum(1 for r in out if r.get("status") == "complete"))
+    symbols_missing = int(sum(1 for r in out if r.get("status") in ("incomplete", "missing", "not-downloaded")))
+    symbols_stale = int(sum(1 for r in out if r.get("status") == "stale"))
+
+    index_healthy = bool(symbols_unindexed == 0) if symbols_total > 0 else True
+    index_coverage_ratio = float(symbols_indexed / symbols_total) if symbols_total > 0 else 1.0
 
     return {
         "ok": True,
@@ -822,5 +369,18 @@ def compute_contract_statuses(
         "local_checked_at": checked_at,
         "contracts": out,
         "active_ranges_available": False,
+        "completeness": {
+            "summary": {
+                "symbols_total": symbols_total,
+                "symbols_indexed": symbols_indexed,
+                "symbols_unindexed": symbols_unindexed,
+                "symbols_complete": symbols_complete,
+                "symbols_missing": symbols_missing,
+                "symbols_stale": symbols_stale,
+                "index_healthy": index_healthy,
+                "index_coverage_ratio": index_coverage_ratio,
+                "bootstrap_recommended": (not index_healthy and symbols_unindexed > 0),
+            }
+        },
     }
 

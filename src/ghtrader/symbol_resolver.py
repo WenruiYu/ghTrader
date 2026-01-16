@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-
-import pandas as pd
 
 
 def is_continuous_alias(symbol: str) -> bool:
@@ -12,18 +9,20 @@ def is_continuous_alias(symbol: str) -> bool:
     return symbol.startswith("KQ.m@") and "." in symbol
 
 
-def _extract_variety(symbol: str) -> str:
-    # KQ.m@SHFE.cu -> cu
-    return symbol.rsplit(".", 1)[1].strip().lower()
-
-
-def _candidate_schedule_paths(*, symbol: str, data_dir: Path) -> list[Path]:
-    var = _extract_variety(symbol)
-    # Preferred: roll schedule built by `main-schedule`
-    p_rolls = data_dir / "rolls" / "shfe_main_schedule" / f"var={var}" / "schedule.parquet"
-    # Fallback: schedule copied into derived main_l5 ticks root by `main-depth`
-    p_derived_v2 = data_dir / "lake_v2" / "main_l5" / "ticks" / f"symbol={symbol}" / "schedule.parquet"
-    return [p_rolls, p_derived_v2]
+def _extract_exchange_variety(symbol: str) -> tuple[str, str]:
+    # KQ.m@SHFE.cu -> ("SHFE", "cu")
+    s = str(symbol).strip()
+    if not s.startswith("KQ.m@"):
+        raise ValueError(f"Not a continuous alias: {symbol}")
+    tail = s[len("KQ.m@") :]
+    if "." not in tail:
+        raise ValueError(f"Unexpected continuous alias format: {symbol}")
+    ex, var = tail.split(".", 1)
+    ex = ex.upper().strip()
+    var = var.lower().strip()
+    if not ex or not var:
+        raise ValueError(f"Unexpected continuous alias format: {symbol}")
+    return ex, var
 
 
 def resolve_trading_symbol(*, symbol: str, data_dir: Path, trading_day: date | None = None) -> str:
@@ -57,33 +56,15 @@ def resolve_trading_symbol(*, symbol: str, data_dir: Path, trading_day: date | N
         td_ns = _get_trading_day_from_timestamp(now_ns)
         trading_day = _timestamp_nano_to_datetime(td_ns).date()
 
-    last_err: Exception | None = None
-    for p in _candidate_schedule_paths(symbol=symbol, data_dir=data_dir):
-        if not p.exists():
-            continue
-        try:
-            df = pd.read_parquet(p)
-            if df is None or df.empty:
-                continue
-            if "date" not in df.columns or "main_contract" not in df.columns:
-                continue
-            df = df.copy()
-            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-            df = df.dropna(subset=["date", "main_contract"])
-            if df.empty:
-                continue
-            eligible = df[df["date"] <= trading_day]
-            if eligible.empty:
-                # If schedule doesn't start yet, pick earliest available (best-effort)
-                row = df.sort_values("date").iloc[0]
-            else:
-                row = eligible.sort_values("date").iloc[-1]
-            return str(row["main_contract"])
-        except Exception as e:
-            last_err = e
-            continue
+    ex, var = _extract_exchange_variety(symbol)
 
-    if last_err:
-        raise RuntimeError(f"Failed to resolve continuous symbol {symbol}: {last_err}") from last_err
-    raise FileNotFoundError(f"No schedule.parquet found to resolve continuous symbol {symbol} under {data_dir}")
+    # QuestDB is the canonical schedule source (PRD 5.12.5).
+    from ghtrader.questdb_client import make_questdb_query_config_from_env
+    from ghtrader.questdb_main_schedule import resolve_main_contract
+
+    _ = data_dir  # unused; schedule is stored in QuestDB
+
+    cfg = make_questdb_query_config_from_env()
+    main_contract, _, _ = resolve_main_contract(cfg=cfg, exchange=ex, variety=var, trading_day=trading_day, connect_timeout_s=2)
+    return str(main_contract)
 

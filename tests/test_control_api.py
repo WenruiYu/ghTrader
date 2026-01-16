@@ -5,7 +5,6 @@ import json
 import os
 import sys
 import time
-from datetime import date
 from pathlib import Path
 
 import pytest
@@ -189,22 +188,16 @@ def test_control_api_job_lifecycle(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert "api-hello" in log_text
 
 
-def _touch_tick_day(data_dir: Path, symbol: str, day: date) -> None:
-    d = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / f"date={day.isoformat()}"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "part-test.parquet").write_bytes(b"PAR1")
-
-
-def _write_no_data_dates(data_dir: Path, symbol: str, days: list[date]) -> None:
-    p = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / "_no_data_dates.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps([d.isoformat() for d in days], indent=2))
-
-
 def test_control_api_ingest_status_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test ingest status API endpoints.
+    
+    Note: Without QuestDB, coverage data is not available, so days_done is 0.
+    """
     monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+    # Force QuestDB to be unreachable in this unit test.
+    monkeypatch.setenv("GHTRADER_QUESTDB_PG_PORT", "1")
 
     mod = importlib.import_module("ghtrader.control.app")
     importlib.reload(mod)
@@ -213,17 +206,6 @@ def test_control_api_ingest_status_endpoints(tmp_path: Path, monkeypatch: pytest
 
     store = app.state.job_store
     data_dir = tmp_path / "data"
-
-    sym1 = "SHFE.cu2501"
-    _touch_tick_day(data_dir, sym1, date(2025, 1, 2))
-    _touch_tick_day(data_dir, sym1, date(2025, 1, 3))
-    _write_no_data_dates(data_dir, sym1, [date(2025, 1, 6)])
-
-    sym2 = "SHFE.cu2502"
-    _touch_tick_day(data_dir, sym2, date(2025, 1, 2))
-    _touch_tick_day(data_dir, sym2, date(2025, 1, 3))
-    _touch_tick_day(data_dir, sym2, date(2025, 1, 6))
-    _touch_tick_day(data_dir, sym2, date(2025, 1, 7))
 
     job_id = "ingest123"
     log_path = tmp_path / "runs" / "control" / "logs" / f"job-{job_id}.log"
@@ -268,7 +250,8 @@ def test_control_api_ingest_status_endpoints(tmp_path: Path, monkeypatch: pytest
     s = r.json()
     assert s["kind"] == "download_contract_range"
     assert s["summary"]["days_expected_total"] == 8
-    assert s["summary"]["days_done_total"] == 7
+    # Without QuestDB, days_done is 0
+    assert s["summary"]["days_done_total"] == 0
     assert s["job_status"] == "running"
 
     r2 = client.get("/api/ingest/status")

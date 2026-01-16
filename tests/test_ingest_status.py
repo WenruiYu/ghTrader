@@ -1,34 +1,9 @@
 from __future__ import annotations
 
-import json
 from datetime import date
 from pathlib import Path
 
-
-def _touch_tick_day(data_dir: Path, symbol: str, day: date) -> None:
-    # v2-only: data/lake_v2
-    d = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / f"date={day.isoformat()}"
-    d.mkdir(parents=True, exist_ok=True)
-    # Presence of the date dir indicates a downloaded day; parquet files may be multiple parts.
-    (d / "part-test.parquet").write_bytes(b"PAR1")
-
-
-def _write_no_data_dates(data_dir: Path, symbol: str, days: list[date]) -> None:
-    p = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / "_no_data_dates.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps([d.isoformat() for d in days], indent=2))
-
-
-def _touch_tick_day_v2(data_dir: Path, symbol: str, day: date) -> None:
-    d = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / f"date={day.isoformat()}"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "part-test.parquet").write_bytes(b"PAR1")
-
-
-def _write_no_data_dates_v2(data_dir: Path, symbol: str, days: list[date]) -> None:
-    p = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / "_no_data_dates.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps([d.isoformat() for d in days], indent=2))
+import pytest
 
 
 def test_parse_ingest_command_download_variants(tmp_path: Path) -> None:
@@ -133,27 +108,22 @@ def test_parse_log_tail_extracts_current_symbol_and_chunk() -> None:
     assert out.get("chunk_end") == "2025-02-21"
 
 
-def test_compute_range_progress_from_lake_and_no_data(tmp_path: Path) -> None:
+def test_compute_range_progress_without_questdb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that without QuestDB, progress reports 0 days done.
+    
+    QuestDB is now the canonical source for coverage data. Without QuestDB,
+    the function gracefully returns empty coverage.
+    """
     from ghtrader.control.ingest_status import compute_download_contract_range_status
+
+    # Force QuestDB to be unreachable in this unit test.
+    monkeypatch.setenv("GHTRADER_QUESTDB_PG_PORT", "1")
 
     data_dir = tmp_path / "data"
 
     # Window: 2025-01-02..2025-01-07 (weekday fallback calendar => 4 trading days)
     d0 = date(2025, 1, 2)
     d1 = date(2025, 1, 7)
-
-    # CU2501: downloaded 2, no-data 1 => done 3/4
-    sym1 = "SHFE.cu2501"
-    _touch_tick_day(data_dir, sym1, date(2025, 1, 2))
-    _touch_tick_day(data_dir, sym1, date(2025, 1, 3))
-    _write_no_data_dates(data_dir, sym1, [date(2025, 1, 6)])
-
-    # CU2502: downloaded 4 => done 4/4
-    sym2 = "SHFE.cu2502"
-    _touch_tick_day(data_dir, sym2, date(2025, 1, 2))
-    _touch_tick_day(data_dir, sym2, date(2025, 1, 3))
-    _touch_tick_day(data_dir, sym2, date(2025, 1, 6))
-    _touch_tick_day(data_dir, sym2, date(2025, 1, 7))
 
     status = compute_download_contract_range_status(
         exchange="SHFE",
@@ -168,27 +138,24 @@ def test_compute_range_progress_from_lake_and_no_data(tmp_path: Path) -> None:
     assert status["kind"] == "download_contract_range"
     assert status["summary"]["contracts_total"] == 2
     assert status["summary"]["days_expected_total"] == 8
-    assert status["summary"]["days_done_total"] == 7
-    assert 0.86 < status["summary"]["pct"] < 0.89
+    # Without QuestDB, days_done is 0
+    assert status["summary"]["days_done_total"] == 0
+    assert status["summary"]["pct"] == 0.0
 
 
-def test_compute_range_progress_v2_scans_lake_v2(tmp_path: Path) -> None:
+def test_compute_range_progress_v2_without_questdb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that without QuestDB, progress reports 0 days done for v2.
+    
+    QuestDB is now the canonical source for coverage data.
+    """
     from ghtrader.control.ingest_status import compute_download_contract_range_status
+
+    # Force QuestDB to be unreachable in this unit test.
+    monkeypatch.setenv("GHTRADER_QUESTDB_PG_PORT", "1")
 
     data_dir = tmp_path / "data"
     d0 = date(2025, 1, 2)
     d1 = date(2025, 1, 7)
-
-    sym1 = "SHFE.cu2501"
-    _touch_tick_day_v2(data_dir, sym1, date(2025, 1, 2))
-    _touch_tick_day_v2(data_dir, sym1, date(2025, 1, 3))
-    _write_no_data_dates_v2(data_dir, sym1, [date(2025, 1, 6)])
-
-    sym2 = "SHFE.cu2502"
-    _touch_tick_day_v2(data_dir, sym2, date(2025, 1, 2))
-    _touch_tick_day_v2(data_dir, sym2, date(2025, 1, 3))
-    _touch_tick_day_v2(data_dir, sym2, date(2025, 1, 6))
-    _touch_tick_day_v2(data_dir, sym2, date(2025, 1, 7))
 
     status = compute_download_contract_range_status(
         exchange="SHFE",
@@ -204,5 +171,6 @@ def test_compute_range_progress_v2_scans_lake_v2(tmp_path: Path) -> None:
     assert status["kind"] == "download_contract_range"
     assert status["lake_version"] == "v2"
     assert status["summary"]["days_expected_total"] == 8
-    assert status["summary"]["days_done_total"] == 7
+    # Without QuestDB, days_done is 0
+    assert status["summary"]["days_done_total"] == 0
 

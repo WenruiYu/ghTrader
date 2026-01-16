@@ -82,27 +82,20 @@
       </div>
 
       <div class="grid3 mb-2">
-        <form method="post" action="/ops/db/serve_sync_variety{{ token_qs }}">
-          <input type="hidden" name="exchange" value="SHFE"/>
-          <input type="hidden" name="variety" value="cu"/>
-          <input type="hidden" name="data_dir" value="data"/>
-          <input type="hidden" name="runs_dir" value="runs"/>
-          <button type="submit" class="btn" style="width:100%;">1) Sync cu to QuestDB</button>
-        </form>
         <form method="post" action="/ops/build/main_schedule{{ token_qs }}">
           <input type="hidden" name="variety" value="cu"/>
           <input type="hidden" name="start_date" value="{{ default_schedule_start }}"/>
           <input type="hidden" name="end_date" value="{{ default_schedule_end }}"/>
           <input type="hidden" name="threshold" value="1.1"/>
           <input type="hidden" name="data_dir" value="data"/>
-          <button type="submit" class="btn btn-secondary" style="width:100%;">2) Build Schedule (cu)</button>
+          <button type="submit" class="btn btn-secondary" style="width:100%;">1) Build Schedule (cu)</button>
         </form>
         <form method="post" action="/ops/build/main_l5{{ token_qs }}">
           <input type="hidden" name="variety" value="cu"/>
           <input type="hidden" name="derived_symbol" value="KQ.m@SHFE.cu"/>
           <input type="hidden" name="data_dir" value="data"/>
           <input type="hidden" name="overwrite" value="false"/>
-          <button type="submit" class="btn btn-secondary" style="width:100%;">3) Build main_l5 (cu)</button>
+          <button type="submit" class="btn btn-secondary" style="width:100%;">2) Build main_l5 (cu)</button>
         </form>
       </div>
       <div class="grid3">
@@ -113,10 +106,10 @@
           <input type="hidden" name="ticks_lake" value="main_l5"/>
           <input type="hidden" name="overwrite" value="false"/>
           <input type="hidden" name="data_dir" value="data"/>
-          <button type="submit" class="btn btn-secondary" style="width:100%;">4) Build Features/Labels</button>
+          <button type="submit" class="btn btn-secondary" style="width:100%;">3) Build Features/Labels</button>
         </form>
-        <a href="/models{{ token_qs }}" class="btn btn-secondary" style="width:100%; text-align:center; display:block; text-decoration:none;">5) Train Model</a>
-        <a href="/trading{{ token_qs }}" class="btn btn-secondary" style="width:100%; text-align:center; display:block; text-decoration:none;">6) Start Trading</a>
+        <a href="/models{{ token_qs }}" class="btn btn-secondary" style="width:100%; text-align:center; display:block; text-decoration:none;">4) Train Model</a>
+        <a href="/trading{{ token_qs }}" class="btn btn-secondary" style="width:100%; text-align:center; display:block; text-decoration:none;">5) Start Trading</a>
       </div>
     </div>
 
@@ -217,7 +210,7 @@
           <li style="margin-bottom:8px;"><strong>Contract range:</strong> Use for bulk backfill of a variety (all cu contracts)</li>
           <li style="margin-bottom:8px;"><strong>Lake:</strong> v2-only (trading-day partitioning)</li>
           <li style="margin-bottom:8px;"><strong>Chunk days:</strong> Smaller chunks = more resilient to interrupts</li>
-          <li><strong>Live recorder:</strong> Subscribes to ticks and appends to lake in real-time</li>
+          <li><strong>Live recorder:</strong> Subscribes to ticks and appends to QuestDB in real-time</li>
         </ul>
       </div>
     </div>
@@ -248,16 +241,14 @@
           <h3 class="mb-2">Build main_l5</h3>
           <p class="muted text-sm mb-2">Materialize continuous main contract with L5 depth from underlying specific contracts.</p>
           <form class="form" method="post" action="/ops/build/main_l5{{ token_qs }}">
-            <div class="grid3">
+            <div class="grid2">
               <div><label>Variety</label><input name="variety" value="cu"/></div>
               <div><label>Derived symbol</label><input name="derived_symbol" value="KQ.m@SHFE.cu"/></div>
-              <div><label>Schedule path (optional)</label><input name="schedule_path" placeholder="auto"/></div>
             </div>
-            <div class="grid2">
+            <div class="grid1">
               <div><label>Overwrite</label>
                 <select name="overwrite"><option value="false" selected>false</option><option value="true">true</option></select>
               </div>
-              <div><label>Data dir</label><input name="data_dir" value="data"/></div>
             </div>
             <button type="submit">Build main_l5</button>
           </form>
@@ -401,7 +392,7 @@
             <tr><td class="mono">build:symbol=X,ticks_lake=Y</td><td>build</td><td>Feature/label build</td></tr>
             <tr><td class="mono">train:symbol=X,model=M,h=H</td><td>train</td><td>Model training</td></tr>
             <tr><td class="mono">main_schedule:var=X</td><td>main-schedule</td><td>Schedule computation</td></tr>
-            <tr><td class="mono">main_depth:symbol=X</td><td>main-depth, main-l5</td><td>Derived dataset build</td></tr>
+            <tr><td class="mono">main_l5:symbol=X</td><td>main-l5</td><td>Derived dataset build</td></tr>
             <tr><td class="mono">trade:mode=X</td><td>trade</td><td>Trading execution</td></tr>
           </tbody>
         </table>

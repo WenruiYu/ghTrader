@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pandas as pd
 
-from ghtrader.lake import write_ticks_partition
 from ghtrader.tqsdk_l5_probe import probe_l5_for_symbol
 
 
@@ -20,21 +19,18 @@ def _install_fake_tqsdk(monkeypatch, *, api_cls: type) -> None:
     monkeypatch.setitem(sys.modules, "tqsdk", m)
 
 
-def test_probe_l5_auto_uses_local_last_day(
+def test_probe_l5_auto_uses_questdb_last_day(
     monkeypatch, synthetic_data_dir: Path, small_synthetic_tick_df: pd.DataFrame, tmp_path: Path
 ) -> None:
     sym = "SHFE.cu2404"
     d0 = date(2024, 4, 15)
 
-    # Create local Parquet partition so probe can pick local_max.
-    df0 = small_synthetic_tick_df.copy()
-    df0["symbol"] = sym
-    write_ticks_partition(df0, data_dir=synthetic_data_dir, symbol=sym, dt=d0, part_id="p0")
-
     import ghtrader.tqsdk_l5_probe as mod
 
     # Avoid network calendar download; weekday-only fallback is fine for this unit test.
     monkeypatch.setattr(mod, "get_trading_calendar", lambda *, data_dir, refresh=False: [])
+    # QuestDB-first: probe day should come from index bounds when available.
+    monkeypatch.setattr(mod, "_questdb_last_day", lambda *, symbol: d0)
     # Avoid requiring real TqSdk credentials.
     monkeypatch.setattr(mod, "get_tqsdk_auth", lambda: None)
 
@@ -75,7 +71,7 @@ def test_probe_l5_auto_uses_local_last_day(
     out = probe_l5_for_symbol(symbol=sym, data_dir=synthetic_data_dir, runs_dir=tmp_path / "runs", probe_day=None)
 
     assert out["probed_day"] == d0.isoformat()
-    assert out["probe_day_source"] == "local_max"
+    assert out["probe_day_source"] == "questdb_max"
     assert int(out["ticks_rows"]) == 1
     assert out["l5_present"] is True
     assert calls["start_dt"] == d0

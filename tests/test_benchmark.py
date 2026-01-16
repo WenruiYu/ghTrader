@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from ghtrader.benchmark import run_benchmark
 from ghtrader.features import FactorEngine
 from ghtrader.labels import build_labels_for_symbol
 
 
-def test_run_benchmark_multi_split_reports_mean_std(synthetic_lake, tmp_path: Path):
-    data_dir, symbol, _dates = synthetic_lake
+@pytest.mark.skip(reason="Requires QuestDB + tick data for read_features_for_symbol/read_labels_for_symbol")
+def test_run_benchmark_multi_split_reports_mean_std(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    symbol = "SHFE.cu2501"
     artifacts_dir = tmp_path / "artifacts"
     runs_dir = tmp_path / "runs"
 

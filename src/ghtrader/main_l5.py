@@ -1,24 +1,19 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from datetime import date, datetime
-from pathlib import Path
+from datetime import date
 from typing import Any
 
 import pandas as pd
 import structlog
 
-from ghtrader.config import (
-    get_data_dir,
-    get_questdb_host,
-    get_questdb_pg_dbname,
-    get_questdb_pg_password,
-    get_questdb_pg_port,
-    get_questdb_pg_user,
+from ghtrader.main_depth import (
+    MainDepthQuestDBResult,
+    materialize_main_with_depth,
 )
-from ghtrader.main_depth import MainDepthMaterializationResult, materialize_main_with_depth
-from ghtrader.questdb_queries import QuestDBQueryConfig, query_contract_coverage
+from ghtrader.questdb_index import INDEX_TABLE_V2, ensure_index_tables, query_contract_coverage_from_index
+from ghtrader.questdb_client import make_questdb_query_config_from_env
+from ghtrader.questdb_main_schedule import fetch_schedule
 
 log = structlog.get_logger()
 
@@ -27,34 +22,12 @@ log = structlog.get_logger()
 class MainL5BuildResult:
     derived_symbol: str
     lake_version: str
-    schedule_full_path: Path
-    schedule_l5_path: Path
+    exchange: str
+    variety: str
+    schedule_hash: str
     l5_start_date: date
-    materialization: MainDepthMaterializationResult
-
-
-def _roll_schedule_path(data_dir: Path, var: str) -> Path:
-    return data_dir / "rolls" / "shfe_main_schedule" / f"var={str(var).lower().strip()}" / "schedule.parquet"
-
-
-def _roll_schedule_l5_path(data_dir: Path, var: str) -> Path:
-    return data_dir / "rolls" / "shfe_main_schedule" / f"var={str(var).lower().strip()}" / "schedule_l5.parquet"
-
-
-def _recompute_segment_id(schedule: pd.DataFrame) -> pd.DataFrame:
-    s = schedule.sort_values("date").reset_index(drop=True).copy()
-    seg_ids: list[int] = []
-    seg = 0
-    prev: str | None = None
-    for mc in s["main_contract"].astype(str).tolist():
-        if prev is None:
-            seg = 0
-        elif mc != prev:
-            seg += 1
-        seg_ids.append(int(seg))
-        prev = mc
-    s["segment_id"] = seg_ids
-    return s
+    schedule_rows_used: int
+    materialization: MainDepthQuestDBResult
 
 
 def _parse_day(x: Any) -> date | None:
@@ -87,100 +60,75 @@ def build_main_l5_l5_era_only(
     *,
     var: str,
     derived_symbol: str,
-    schedule_path: Path | None = None,
-    data_dir: Path | None = None,
+    exchange: str = "SHFE",
     overwrite: bool = False,
-    lake_version: str = "v2",
-    questdb_table: str | None = None,
 ) -> MainL5BuildResult:
     """
     Build derived main_l5 ticks starting from the earliest date where the schedule's
     main contract has true L5 available (QuestDB-backed coverage).
+
+    Args:
+        var: Variety code (e.g. 'cu', 'au', 'ag')
+        derived_symbol: continuous-style symbol name (e.g. 'KQ.m@SHFE.cu')
+        overwrite: if True, re-process days that already exist
     """
-    if data_dir is None:
-        data_dir = get_data_dir()
-
-    _ = lake_version  # v2-only
     lv = "v2"
+    ex = str(exchange).upper().strip()
+    var_l = str(var).lower().strip()
 
-    schedule_full_path = schedule_path or _roll_schedule_path(data_dir, var)
-    if not schedule_full_path.exists():
-        raise FileNotFoundError(str(schedule_full_path))
-
-    schedule = pd.read_parquet(schedule_full_path)
+    # Load canonical schedule from QuestDB.
+    cfg = make_questdb_query_config_from_env()
+    schedule = fetch_schedule(cfg=cfg, exchange=ex, variety=var_l, start_day=None, end_day=None, connect_timeout_s=2)
     if schedule.empty:
-        raise ValueError("Schedule is empty")
-    if "date" not in schedule.columns or "main_contract" not in schedule.columns:
-        raise ValueError(f"Schedule missing required columns: {list(schedule.columns)}")
+        raise FileNotFoundError(f"No schedule rows found in QuestDB for {ex}.{var_l}. Run `ghtrader main-schedule --var {var_l} ...` first.")
 
-    schedule = schedule.copy()
-    schedule["date"] = pd.to_datetime(schedule["date"], errors="coerce").dt.date
-    schedule["main_contract"] = schedule["main_contract"].astype(str)
-    schedule = schedule.dropna(subset=["date", "main_contract"]).sort_values("date").reset_index(drop=True)
-    if schedule.empty:
-        raise ValueError("Schedule has no usable rows after normalization")
+    # Extract schedule_hash (expected stable across rows for a schedule build).
+    schedule_hash = ""
+    try:
+        schedule_hash = str(schedule["schedule_hash"].dropna().astype(str).iloc[0])
+    except Exception:
+        schedule_hash = ""
+    if not schedule_hash:
+        raise RuntimeError(
+            f"Schedule rows for {ex}.{var_l} are missing schedule_hash. "
+            "Re-run `ghtrader main-schedule` to (re)populate `ghtrader_main_schedule_v2`."
+        )
 
     underlyings = sorted(set([c for c in schedule["main_contract"].astype(str).tolist() if c]))
 
     # Query QuestDB coverage to detect true-L5 era.
-    cfg = QuestDBQueryConfig(
-        host=get_questdb_host(),
-        pg_port=int(get_questdb_pg_port()),
-        pg_user=str(get_questdb_pg_user()),
-        pg_password=str(get_questdb_pg_password()),
-        pg_dbname=str(get_questdb_pg_dbname()),
-    )
-    tbl = str(questdb_table).strip() if questdb_table is not None and str(questdb_table).strip() else "ghtrader_ticks_raw_v2"
-    cov = query_contract_coverage(cfg=cfg, table=tbl, symbols=underlyings, lake_version="v2", ticks_lake="raw")
+    ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
+    cov = query_contract_coverage_from_index(cfg=cfg, symbols=underlyings, lake_version="v2", ticks_lake="raw", index_table=INDEX_TABLE_V2)
 
     keep_mask: list[bool] = []
     for _, row in schedule.iterrows():
-        d: date = row["date"]
+        d: date = row["trading_day"]
         c: str = str(row["main_contract"])
         keep_mask.append(_row_has_l5_for_contract_day(contract=c, day=d, cov=cov))
     schedule_l5 = schedule[pd.Series(keep_mask)].copy()
     if schedule_l5.empty:
-        raise RuntimeError("No schedule rows have true L5 coverage (QuestDB). Is L5 data synced to QuestDB?")
+        raise RuntimeError("No schedule rows have true L5 coverage (QuestDB index). Is L5 data ingested and the index populated?")
 
-    schedule_l5 = schedule_l5.sort_values("date").reset_index(drop=True)
-    l5_start_date: date = schedule_l5["date"].iloc[0]
+    schedule_l5 = schedule_l5.sort_values("trading_day").reset_index(drop=True)
+    l5_start_date: date = schedule_l5["trading_day"].iloc[0]
 
-    # Recompute segment ids for the effective schedule (L5 era only).
-    schedule_l5 = _recompute_segment_id(schedule_l5)
-
-    schedule_l5_path = _roll_schedule_l5_path(data_dir, var)
-    schedule_l5_path.parent.mkdir(parents=True, exist_ok=True)
-    schedule_l5.to_parquet(schedule_l5_path, index=False)
-    try:
-        manifest = {
-            "created_at": datetime.now().isoformat(),
-            "variety": str(var).lower().strip(),
-            "derived_symbol": str(derived_symbol),
-            "schedule_full_path": str(schedule_full_path),
-            "schedule_l5_path": str(schedule_l5_path),
-            "l5_start_date": l5_start_date.isoformat(),
-            "rows": int(len(schedule_l5)),
-            "questdb": {"table": tbl},
-        }
-        (schedule_l5_path.parent / "schedule_l5_manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
-    except Exception:
-        pass
-
-    # Materialize derived ticks using the effective L5-era schedule.
+    # Materialize derived ticks to QuestDB (ghtrader_ticks_main_l5_v2)
     mat = materialize_main_with_depth(
         derived_symbol=str(derived_symbol),
-        schedule_path=schedule_l5_path,
-        data_dir=data_dir,
+        schedule=schedule_l5,
+        schedule_hash=str(schedule_hash),
+        lake_version=lv,
         overwrite=bool(overwrite),
-        lake_version=lv,  # type: ignore[arg-type]
     )
 
     return MainL5BuildResult(
         derived_symbol=str(derived_symbol),
         lake_version=lv,
-        schedule_full_path=schedule_full_path,
-        schedule_l5_path=schedule_l5_path,
+        exchange=ex,
+        variety=var_l,
+        schedule_hash=str(schedule_hash),
         l5_start_date=l5_start_date,
+        schedule_rows_used=int(len(schedule_l5)),
         materialization=mat,
     )
 

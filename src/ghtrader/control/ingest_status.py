@@ -1,6 +1,12 @@
+"""
+Ingest status computation for dashboard.
+
+This module provides ingest progress information for download operations.
+QuestDB index tables are the canonical data source.
+"""
+
 from __future__ import annotations
 
-import json
 import time
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
@@ -10,6 +16,80 @@ from typing import Any, Literal
 
 
 IngestKind = Literal["download", "download_contract_range", "record", "unknown"]
+
+
+# ---------------------------------------------------------------------------
+# QuestDB-first helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_questdb_cfg():
+    """Build QuestDB query config from environment."""
+    try:
+        from ghtrader.questdb_client import make_questdb_query_config_from_env
+
+        return make_questdb_query_config_from_env()
+    except Exception:
+        return None
+
+
+def _query_symbol_coverage_from_questdb(
+    *,
+    symbol: str,
+    start_day: date,
+    end_day: date,
+    lake_version: str = "v2",
+    ticks_lake: str = "raw",
+) -> dict[str, Any] | None:
+    """
+    Query symbol coverage from QuestDB index table.
+
+    Returns dict with present_days, no_data_days, first_day, last_day or None if unavailable.
+    """
+    cfg = _make_questdb_cfg()
+    if cfg is None:
+        return None
+
+    try:
+        from ghtrader.questdb_index import (
+            INDEX_TABLE_V2,
+            NO_DATA_TABLE_V2,
+            list_no_data_trading_days,
+            list_present_trading_days,
+        )
+
+        present = list_present_trading_days(
+            cfg=cfg,
+            symbol=symbol,
+            start_day=start_day,
+            end_day=end_day,
+            lake_version=lake_version,
+            ticks_lake=ticks_lake,
+            index_table=INDEX_TABLE_V2,
+        )
+        no_data = list_no_data_trading_days(
+            cfg=cfg,
+            symbol=symbol,
+            start_day=start_day,
+            end_day=end_day,
+            lake_version=lake_version,
+            ticks_lake=ticks_lake,
+        )
+
+        present_set = set(present)
+        no_data_set = set(no_data)
+
+        return {
+            "present_days": len(present_set),
+            "present_dates": present_set,
+            "no_data_days": len(no_data_set),
+            "no_data_dates": no_data_set,
+            "first_day": min(present).isoformat() if present else None,
+            "last_day": max(present).isoformat() if present else None,
+            "source": "questdb",
+        }
+    except Exception:
+        return None
 
 
 def _infer_market_from_symbol(symbol: str) -> str | None:
@@ -58,56 +138,6 @@ def _iter_contract_yymms(start_contract: str, end_contract: str) -> list[str]:
     return out
 
 
-def _read_json_list(path: Path) -> list[str]:
-    try:
-        if not path.exists():
-            return []
-        raw = json.loads(path.read_text())
-        if not isinstance(raw, list):
-            return []
-        return [str(x) for x in raw]
-    except Exception:
-        return []
-
-
-def _lake_root_dir(data_dir: Path, lake_version: str | None) -> Path:
-    _ = lake_version  # v2-only
-    return data_dir / "lake_v2"
-
-
-def _ticks_symbol_dir(data_dir: Path, symbol: str, *, lake_version: str | None = None) -> Path:
-    return _lake_root_dir(data_dir, lake_version) / "ticks" / f"symbol={symbol}"
-
-
-def _no_data_dates_path(data_dir: Path, symbol: str, *, lake_version: str | None = None) -> Path:
-    return _ticks_symbol_dir(data_dir, symbol, lake_version=lake_version) / "_no_data_dates.json"
-
-
-def _scan_downloaded_date_dirs(symbol_dir: Path, *, start_iso: str, end_iso: str) -> tuple[set[str], str | None, str | None]:
-    """
-    Return (downloaded_date_strings, min_date_str, max_date_str) for date partitions in [start_iso, end_iso].
-
-    We compare ISO strings lexicographically (safe for YYYY-MM-DD).
-    """
-    out: set[str] = set()
-    min_s: str | None = None
-    max_s: str | None = None
-    if not symbol_dir.exists():
-        return out, None, None
-    for child in symbol_dir.iterdir():
-        if not child.is_dir() or not child.name.startswith("date="):
-            continue
-        dt_s = child.name.split("=", 1)[1]
-        if dt_s < start_iso or dt_s > end_iso:
-            continue
-        out.add(dt_s)
-        if min_s is None or dt_s < min_s:
-            min_s = dt_s
-        if max_s is None or dt_s > max_s:
-            max_s = dt_s
-    return out, min_s, max_s
-
-
 def _weekday_is_trading_day(d: date) -> bool:
     return d.weekday() < 5
 
@@ -121,7 +151,7 @@ def _load_calendar(data_dir: Path) -> list[date] | None:
     try:
         from ghtrader.trading_calendar import get_trading_calendar
 
-        cal = get_trading_calendar(data_dir=data_dir, refresh=False)
+        cal = get_trading_calendar(data_dir=data_dir, refresh=False, allow_download=False)
         return cal if cal else None
     except Exception:
         return None
@@ -358,9 +388,7 @@ def compute_download_contract_range_status(
     lake_version: str | None = None,
 ) -> dict[str, Any]:
     """
-    Compute progress for `ghtrader download-contract-range` using:
-    - configured backfill date window (start_date/end_date)
-    - Parquet lake partitions + _no_data_dates.json markers
+    Compute progress for `ghtrader download-contract-range` using QuestDB index tables.
 
     Note: akshare/active-ranges have been removed.
     """
@@ -402,28 +430,26 @@ def compute_download_contract_range_status(
         expected = int(expected_per_contract)
         days_expected_total += int(expected_per_contract)
 
-        downloaded_set, min_dl, max_dl = _scan_downloaded_date_dirs(
-            _ticks_symbol_dir(data_dir, tick_symbol, lake_version=lake_version),
-            start_iso=start_iso,
-            end_iso=end_iso,
+        # Query coverage from QuestDB (no Parquet fallback)
+        qdb_cov = _query_symbol_coverage_from_questdb(
+            symbol=tick_symbol,
+            start_day=start_date,
+            end_day=end_date,
+            lake_version=lake_version or "v2",
+            ticks_lake="raw",
         )
 
-        no_data_raw = _read_json_list(_no_data_dates_path(data_dir, tick_symbol, lake_version=lake_version))
-        no_data_effective = 0
-        for ds in no_data_raw:
-            ds_s = str(ds).strip()
-            if not ds_s:
-                continue
-            if ds_s < start_iso or ds_s > end_iso:
-                continue
-            d = _parse_yyyymmdd(ds_s)
-            if d is None:
-                continue
-            if not _is_trading_day(cal_set, d):
-                continue
-            if ds_s in downloaded_set:
-                continue
-            no_data_effective += 1
+        if qdb_cov is not None:
+            downloaded_set = {d.isoformat() for d in qdb_cov.get("present_dates", set())}
+            no_data_effective = qdb_cov.get("no_data_days", 0)
+            min_dl = qdb_cov.get("first_day")
+            max_dl = qdb_cov.get("last_day")
+        else:
+            # QuestDB unavailable - empty coverage
+            downloaded_set: set[str] = set()
+            no_data_effective = 0
+            min_dl = None
+            max_dl = None
 
         done = int(len(downloaded_set) + no_data_effective)
         if expected > 0 and done >= expected:
@@ -602,29 +628,22 @@ def ingest_status_for_job(
         # Expected trading-day count
         expected = _count_trading_days(cal, start=d0, end=d1)
 
-        # Downloaded dates in range
-        downloaded_set, min_dl, max_dl = _scan_downloaded_date_dirs(
-            _ticks_symbol_dir(data_dir, symbol, lake_version=lv),
-            start_iso=d0.isoformat(),
-            end_iso=d1.isoformat(),
+        # Query coverage from QuestDB
+        qdb_cov = _query_symbol_coverage_from_questdb(
+            symbol=symbol,
+            start_day=d0,
+            end_day=d1,
+            lake_version=lv,
+            ticks_lake="raw",
         )
-        # No-data dates in range (exclude already-downloaded)
-        no_data_raw = _read_json_list(_no_data_dates_path(data_dir, symbol, lake_version=lv))
-        no_data_effective = 0
-        for ds in no_data_raw:
-            ds_s = str(ds).strip()
-            if not ds_s:
-                continue
-            if ds_s < d0.isoformat() or ds_s > d1.isoformat():
-                continue
-            dd = _parse_yyyymmdd(ds_s)
-            if dd is None:
-                continue
-            if not _is_trading_day(cal_set, dd):
-                continue
-            if ds_s in downloaded_set:
-                continue
-            no_data_effective += 1
+
+        if qdb_cov is not None:
+            downloaded_set = {d.isoformat() for d in qdb_cov.get("present_dates", set())}
+            no_data_effective = qdb_cov.get("no_data_days", 0)
+        else:
+            # QuestDB unavailable
+            downloaded_set: set[str] = set()
+            no_data_effective = 0
 
         done = int(len(downloaded_set) + no_data_effective)
         pct = float(done / expected) if expected > 0 else 0.0

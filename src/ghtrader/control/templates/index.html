@@ -103,13 +103,6 @@
   <div class="card">
     <h3 class="mb-3">Quick Actions</h3>
     <div class="grid4">
-      <form method="post" action="/ops/db/serve_sync_variety{{ token_qs }}">
-        <input type="hidden" name="exchange" value="SHFE"/>
-        <input type="hidden" name="variety" value="cu"/>
-        <input type="hidden" name="data_dir" value="data"/>
-        <input type="hidden" name="runs_dir" value="runs"/>
-        <button type="submit" class="btn btn-secondary" style="width:100%;">Sync cu to QuestDB</button>
-      </form>
       <form method="post" action="/ops/build/main_schedule{{ token_qs }}">
         <input type="hidden" name="variety" value="cu"/>
         <input type="hidden" name="start_date" value="{{ default_schedule_start }}"/>

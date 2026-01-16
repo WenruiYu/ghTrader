@@ -185,7 +185,7 @@ def run_backtest(
     
     # Load model
     model_dir = artifacts_dir / symbol / model_name
-    model_files = list(model_dir.glob(f"model_h{horizon}.*"))
+    model_files = sorted([p for p in model_dir.glob(f"model_h{horizon}.*") if not p.name.endswith(".meta.json")])
     if not model_files:
         raise FileNotFoundError(f"No model found for {model_name} horizon {horizon} in {model_dir}")
     model_path = model_files[0]
@@ -193,8 +193,18 @@ def run_backtest(
     model = load_model(model_name, model_path)
     log.info("backtest.model_loaded", path=str(model_path))
     
-    # Create factor engine for online feature computation
-    factor_engine = FactorEngine()
+    # Create factor engine for online feature computation (prefer model metadata for parity).
+    enabled_factors: list[str] | None = None
+    try:
+        from ghtrader.json_io import read_json
+
+        meta = read_json(model_dir / f"model_h{horizon}.meta.json") or {}
+        ef = (meta or {}).get("enabled_factors") if isinstance(meta, dict) else None
+        if isinstance(ef, list) and ef and all(isinstance(x, str) and x.strip() for x in ef):
+            enabled_factors = [str(x).strip() for x in ef if str(x).strip()]
+    except Exception:
+        enabled_factors = None
+    factor_engine = FactorEngine(enabled_factors=enabled_factors or None) if enabled_factors else FactorEngine()
     
     # Strategy
     strategy = SignalStrategy(threshold_up=threshold_up, threshold_down=threshold_down)
@@ -330,12 +340,10 @@ def run_backtest(
         json.dump(metrics.to_dict(), f, indent=2, default=str)
     
     # Save trade log
-    pd.DataFrame(trade_log).to_parquet(report_dir / "trades.parquet", compression="zstd")
+    pd.DataFrame(trade_log).to_csv(report_dir / "trades.csv", index=False)
     
     # Save equity curve
-    pd.Series(equity_curve).to_frame("equity").to_parquet(
-        report_dir / "equity.parquet", compression="zstd"
-    )
+    pd.Series(equity_curve).to_frame("equity").to_csv(report_dir / "equity.csv", index=False)
     
     log.info(
         "backtest.report_saved",

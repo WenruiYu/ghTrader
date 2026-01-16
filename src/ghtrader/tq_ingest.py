@@ -17,13 +17,8 @@ import structlog
 import sys
 
 from ghtrader.config import get_tqsdk_auth  # noqa: E402
-from ghtrader.lake import (  # noqa: E402
-    LakeVersion,
-    TICK_COLUMN_NAMES,
-    list_available_dates,
-    write_manifest,
-    write_ticks_partition,
-)
+from ghtrader.ingest_manifest import write_manifest  # noqa: E402
+from ghtrader.ticks_schema import LakeVersion, TICK_COLUMN_NAMES  # noqa: E402
 
 log = structlog.get_logger()
 
@@ -65,6 +60,24 @@ def _maybe_make_questdb_backend():
         return None
 
 
+def _make_questdb_backend_required():
+    """
+    QuestDB-first ingest requires QuestDB to be configured + reachable.
+    """
+    b = _maybe_make_questdb_backend()
+    if b is None:
+        raise RuntimeError(
+            "QuestDB backend is required for tick ingest. Ensure QuestDB is running and install extras: pip install -e '.[questdb]'"
+        )
+    return b
+
+
+def _make_questdb_query_cfg():
+    from ghtrader.questdb_client import make_questdb_query_config_from_env
+
+    return make_questdb_query_config_from_env()
+
+
 def _questdb_df_for_ticks(*, df: pd.DataFrame, trading_day: date, ticks_lake: str, lake_version: str) -> pd.DataFrame:
     """
     Prepare a tick dataframe for QuestDB ILP ingestion, matching the shape used by serving_db.sync_ticks_to_serving_db().
@@ -83,27 +96,24 @@ def _questdb_df_for_ticks(*, df: pd.DataFrame, trading_day: date, ticks_lake: st
 
     # Deterministic row identity hash for idempotent sync + safe dedup.
     try:
-        import numpy as np
+        from ghtrader.ticks_schema import row_hash_from_ticks_df
 
-        prime = np.uint64(1099511628211)
-        h = np.full(len(out), np.uint64(1469598103934665603))
-
-        # Mix datetime_ns (int64 bits)
-        h ^= dt_ns.to_numpy(dtype="int64", copy=False).view(np.uint64)
-        h *= prime
-
-        # Mix all canonical numeric tick columns (float64 bits)
-        for col in _TICK_NUMERIC_COLS:
-            a = pd.to_numeric(out.get(col), errors="coerce").to_numpy(dtype="float64", copy=False)
-            h ^= a.view(np.uint64)
-            h *= prime
-
-        # Store as signed int64 (QuestDB LONG); sign does not matter for equality.
-        out["row_hash"] = h.view(np.int64)
+        out["row_hash"] = row_hash_from_ticks_df(df)
     except Exception:
         out["row_hash"] = dt_ns
 
     return out
+
+
+def _df_has_true_l5(df: pd.DataFrame) -> bool:
+    """
+    True L5 means at least one of levels 2–5 has positive, non-NaN values.
+
+    Note: This is a thin wrapper around the unified l5_detection module.
+    """
+    from ghtrader.l5_detection import has_l5_df
+
+    return has_l5_df(df)
 
 
 # ---------------------------------------------------------------------------
@@ -126,55 +136,7 @@ def _infer_market_from_symbol(symbol: str) -> str | None:
     return None
 
 
-def _no_data_dates_path(data_dir: Path, symbol: str) -> Path:
-    # v2-only: trading-day partitioned lake.
-    return data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / "_no_data_dates.json"
-
-
-def _no_data_dates_path_in_lake(data_dir: Path, symbol: str, *, lake_version: LakeVersion) -> Path:
-    from ghtrader.lake import ticks_symbol_dir
-
-    return ticks_symbol_dir(data_dir, symbol, ticks_lake="raw", lake_version=lake_version) / "_no_data_dates.json"
-
-
-def _load_no_data_dates(data_dir: Path, symbol: str, *, lake_version: LakeVersion = "v2") -> set[date]:
-    p = _no_data_dates_path_in_lake(data_dir, symbol, lake_version=lake_version)
-    if not p.exists():
-        return set()
-    try:
-        with open(p, "r") as f:
-            raw = json.load(f)
-        if not isinstance(raw, list):
-            return set()
-        out: set[date] = set()
-        for s in raw:
-            try:
-                out.add(date.fromisoformat(str(s)))
-            except Exception:
-                continue
-        return out
-    except Exception as e:
-        log.warning("tq_ingest.no_data_read_failed", symbol=symbol, path=str(p), error=str(e))
-        return set()
-
-
-def _write_no_data_dates(data_dir: Path, symbol: str, dates_set: set[date], *, lake_version: LakeVersion = "v2") -> None:
-    p = _no_data_dates_path_in_lake(data_dir, symbol, lake_version=lake_version)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    payload = sorted({d.isoformat() for d in dates_set})
-    with open(p, "w") as f:
-        json.dump(payload, f, indent=2)
-
-
-def _mark_no_data_dates(data_dir: Path, symbol: str, dates_to_add: set[date], *, lake_version: LakeVersion = "v2") -> None:
-    if not dates_to_add:
-        return
-    cur = _load_no_data_dates(data_dir, symbol, lake_version=lake_version)
-    before = len(cur)
-    cur |= dates_to_add
-    if len(cur) != before:
-        _write_no_data_dates(data_dir, symbol, cur, lake_version=lake_version)
-        log.info("tq_ingest.no_data_updated", symbol=symbol, added=len(dates_to_add), total=len(cur))
+# All no-data tracking is handled via QuestDB ghtrader_no_data_days_v2 table.
 
 
 def download_historical_ticks(
@@ -185,14 +147,18 @@ def download_historical_ticks(
     chunk_days: int = 5,
     *,
     lake_version: LakeVersion = "v2",
+    auto_bootstrap_index: bool = True,
 ) -> None:
     """
-    Download historical L5 ticks for a symbol and write to Parquet lake.
+    Download historical L5 ticks for a symbol and ingest to QuestDB (canonical).
+
+    QuestDB is the single source of truth. Parquet export has been removed
+    from the primary ingest path.
     
     Uses TqSdk Pro `get_tick_data_series()` which requires `tq_dl` permission.
     
     Downloads in chunks to avoid memory issues and provides resume capability
-    by checking existing partitions.
+    by checking the QuestDB index table.
     
     Args:
         symbol: Instrument code (e.g., "SHFE.cu2502")
@@ -201,15 +167,108 @@ def download_historical_ticks(
         data_dir: Data directory root
         chunk_days: Number of days per download chunk
     """
-    log.info("tq_ingest.download_start", symbol=symbol, start=str(start_date), end=str(end_date))
-    
-    # Check which dates already exist in the selected lake version
-    existing_dates = set(list_available_dates(data_dir, symbol, lake_version=lake_version))
-    from ghtrader.trading_calendar import get_trading_days
+    log.info("tq_ingest.download_start", symbol=symbol, start=str(start_date), end=str(end_date), lake_version=str(lake_version))
+
+    # QuestDB-first: canonical tick storage + index/no-data tracking.
+    questdb_backend = _make_questdb_backend_required()
+    try:
+        # Ensure the canonical tick table supports derived-ticks provenance columns as well.
+        questdb_backend.ensure_table(table=_QUESTDB_TICKS_RAW_TABLE, include_segment_metadata=True)
+    except Exception as e:
+        raise RuntimeError(f"QuestDB table init failed for {_QUESTDB_TICKS_RAW_TABLE}: {e}") from e
+
+    from ghtrader.questdb_index import (
+        INDEX_TABLE_V2,
+        SymbolDayIndexRow,
+        ensure_index_tables,
+        list_no_data_trading_days,
+        list_present_trading_days,
+        upsert_no_data_days,
+        upsert_symbol_day_index_rows,
+        bootstrap_symbol_day_index_from_ticks,
+    )
+    from ghtrader.questdb_queries import query_symbol_latest
+    from ghtrader.trading_calendar import get_trading_calendar, get_trading_days
+
+    qcfg = _make_questdb_query_cfg()
+    ensure_index_tables(cfg=qcfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
 
     market = _infer_market_from_symbol(symbol)
     all_dates = get_trading_days(market=market, start=start_date, end=end_date, data_dir=data_dir)
-    no_data_dates = _load_no_data_dates(data_dir, symbol, lake_version=lake_version)
+
+    # Determine today's trading day (best-effort) so we can avoid treating it as final no-data.
+    today_trading = None
+    try:
+        cal = get_trading_calendar(data_dir=data_dir, refresh=False)
+        today0 = date.today()
+        if cal:
+            from bisect import bisect_right
+
+            j = bisect_right(cal, today0)
+            today_trading = cal[j - 1] if j > 0 else today0
+        else:
+            d = today0
+            while d.weekday() >= 5:
+                d -= timedelta(days=1)
+            today_trading = d
+    except Exception:
+        today_trading = None
+
+    # Query QuestDB for existing data (single source of truth).
+    existing_dates = set(
+        list_present_trading_days(
+            cfg=qcfg,
+            symbol=symbol,
+            start_day=start_date,
+            end_day=end_date,
+            lake_version=str(lake_version),
+            ticks_lake="raw",
+        )
+    )
+    no_data_dates = set(
+        list_no_data_trading_days(
+            cfg=qcfg,
+            symbol=symbol,
+            start_day=start_date,
+            end_day=end_date,
+            lake_version=str(lake_version),
+            ticks_lake="raw",
+        )
+    )
+    # Don't let a premature no-data marker for today's trading day block retries.
+    try:
+        if today_trading is not None and end_date >= today_trading:
+            no_data_dates.discard(today_trading)
+    except Exception:
+        pass
+
+    # If index is empty but ticks exist, bootstrap the index once for resume correctness.
+    if auto_bootstrap_index and not existing_dates:
+        try:
+            latest = query_symbol_latest(cfg=qcfg, table=_QUESTDB_TICKS_RAW_TABLE, symbols=[symbol], lake_version=str(lake_version), ticks_lake="raw")
+            if latest.get(symbol):
+                bootstrap_symbol_day_index_from_ticks(
+                    cfg=qcfg,
+                    ticks_table=_QUESTDB_TICKS_RAW_TABLE,
+                    symbols=[symbol],
+                    lake_version=str(lake_version),
+                    ticks_lake="raw",
+                    index_table=INDEX_TABLE_V2,
+                    batch_symbols=1,
+                )
+                existing_dates = set(
+                    list_present_trading_days(
+                        cfg=qcfg,
+                        symbol=symbol,
+                        start_day=start_date,
+                        end_day=end_date,
+                        lake_version=str(lake_version),
+                        ticks_lake="raw",
+                    )
+                )
+        except Exception:
+            pass
+
     missing_dates = [d for d in all_dates if d not in existing_dates and d not in no_data_dates]
     
     if not missing_dates:
@@ -224,15 +283,6 @@ def download_historical_ticks(
         missing=len(missing_dates),
     )
 
-    # QuestDB canonical write-first/double-write (best-effort): prepare table for ingestion.
-    questdb_backend = _maybe_make_questdb_backend()
-    if questdb_backend is not None:
-        try:
-            questdb_backend.ensure_table(table=_QUESTDB_TICKS_RAW_TABLE, include_segment_metadata=False)
-        except Exception as e:
-            log.warning("tq_ingest.questdb_init_failed", table=_QUESTDB_TICKS_RAW_TABLE, error=str(e))
-            questdb_backend = None
-    
     # Create TqApi (outside backtest mode, not in coroutine)
     # Add vendored tqsdk to path if present (repo-local install pattern).
     _TQSDK_PATH = Path(__file__).parent.parent.parent.parent / "tqsdk-python"
@@ -277,7 +327,26 @@ def download_historical_ticks(
             
             if df.empty:
                 log.warning("tq_ingest.empty_chunk", symbol=symbol, chunk_start=str(chunk_start))
-                _mark_no_data_dates(data_dir, symbol, set(chunk) - existing_dates, lake_version=lake_version)
+                missing_in_chunk = set(chunk) - existing_dates - no_data_dates
+                # Do not mark today's trading day as no-data (keep it retriable).
+                try:
+                    if today_trading is not None:
+                        missing_in_chunk = {d for d in missing_in_chunk if d != today_trading}
+                except Exception:
+                    pass
+                if missing_in_chunk:
+                    try:
+                        upsert_no_data_days(
+                            cfg=qcfg,
+                            symbol=symbol,
+                            trading_days=[d.isoformat() for d in sorted(missing_in_chunk)],
+                            ticks_lake="raw",
+                            lake_version=str(lake_version),
+                            reason="tqsdk_empty_chunk",
+                        )
+                        no_data_dates |= set(missing_in_chunk)
+                    except Exception as e:
+                        log.warning("tq_ingest.questdb_no_data_upsert_failed", symbol=symbol, error=str(e))
                 continue
             
             # Rename columns to match our schema
@@ -320,6 +389,7 @@ def download_historical_ticks(
                 df["_date"] = cal_dates
             
             written_dates: set[date] = set()
+            idx_rows: list[SymbolDayIndexRow] = []
             for dt, group_df in df.groupby("_date"):
                 if dt in existing_dates:
                     continue
@@ -327,31 +397,75 @@ def download_historical_ticks(
                 # Drop temp columns
                 partition_df = group_df.drop(columns=["_date", "_tq_id"], errors="ignore")
                 
-                # QuestDB canonical write (best-effort), then Parquet mirror.
-                if questdb_backend is not None:
-                    try:
-                        qdf = _questdb_df_for_ticks(
-                            df=partition_df,
-                            trading_day=dt,
+                # QuestDB canonical write (required).
+                qdf = _questdb_df_for_ticks(df=partition_df, trading_day=dt, ticks_lake="raw", lake_version=str(lake_version))
+                try:
+                    questdb_backend.ingest_df(table=_QUESTDB_TICKS_RAW_TABLE, df=qdf)
+                except Exception as e:
+                    log.error("tq_ingest.questdb_ingest_failed", symbol=symbol, date=str(dt), error=str(e))
+                    raise
+
+                # Update per-day index row (QuestDB).
+                try:
+                    dt_ns = pd.to_numeric(partition_df.get("datetime"), errors="coerce").dropna().astype("int64")
+                    first_ns = int(dt_ns.min()) if not dt_ns.empty else None
+                    last_ns = int(dt_ns.max()) if not dt_ns.empty else None
+                    from ghtrader.ticks_schema import row_hash_aggregates
+
+                    rh_agg = row_hash_aggregates(qdf.get("row_hash"))
+                    idx_rows.append(
+                        SymbolDayIndexRow(
+                            symbol=str(symbol),
+                            trading_day=str(dt.isoformat()),
                             ticks_lake="raw",
                             lake_version=str(lake_version),
+                            rows_total=int(len(partition_df)),
+                            first_datetime_ns=first_ns,
+                            last_datetime_ns=last_ns,
+                            l5_present=bool(_df_has_true_l5(partition_df)),
+                            row_hash_min=rh_agg["row_hash_min"],
+                            row_hash_max=rh_agg["row_hash_max"],
+                            row_hash_sum=rh_agg["row_hash_sum"],
+                            row_hash_sum_abs=rh_agg["row_hash_sum_abs"],
                         )
-                        questdb_backend.ingest_df(table=_QUESTDB_TICKS_RAW_TABLE, df=qdf)
-                    except Exception as e:
-                        log.warning("tq_ingest.questdb_ingest_failed", symbol=symbol, date=str(dt), error=str(e))
+                    )
+                except Exception:
+                    pass
 
-                # Write Parquet partition
-                write_ticks_partition(partition_df, data_dir, symbol, dt, lake_version=lake_version)
-                
                 row_counts[str(dt)] = len(partition_df)
                 total_rows += len(partition_df)
                 written_dates.add(dt)
+                existing_dates.add(dt)
                 
                 log.debug("tq_ingest.partition_written", symbol=symbol, date=str(dt), rows=len(partition_df))
 
-            # Mark any requested trading dates in this chunk that produced no ticks.
-            missing_in_chunk = set(chunk) - written_dates - existing_dates
-            _mark_no_data_dates(data_dir, symbol, missing_in_chunk, lake_version=lake_version)
+            if idx_rows:
+                try:
+                    upsert_symbol_day_index_rows(cfg=qcfg, rows=idx_rows, index_table=INDEX_TABLE_V2)
+                except Exception as e:
+                    log.warning("tq_ingest.questdb_index_upsert_failed", symbol=symbol, error=str(e))
+
+            # Mark any requested trading dates in this chunk that produced no ticks (QuestDB only).
+            missing_in_chunk = set(chunk) - written_dates - existing_dates - no_data_dates
+            # Do not mark today's trading day as no-data (keep it retriable).
+            try:
+                if today_trading is not None:
+                    missing_in_chunk = {d for d in missing_in_chunk if d != today_trading}
+            except Exception:
+                pass
+            if missing_in_chunk:
+                try:
+                    upsert_no_data_days(
+                        cfg=qcfg,
+                        symbol=symbol,
+                        trading_days=[d.isoformat() for d in sorted(missing_in_chunk)],
+                        ticks_lake="raw",
+                        lake_version=str(lake_version),
+                        reason="tqsdk_chunk_missing_days",
+                    )
+                    no_data_dates |= set(missing_in_chunk)
+                except Exception as e:
+                    log.warning("tq_ingest.questdb_no_data_upsert_failed", symbol=symbol, error=str(e))
     
     finally:
         api.close()
@@ -526,10 +640,12 @@ def run_live_recorder(
     lake_version: LakeVersion = "v2",
 ) -> None:
     """
-    Run live tick recorder that subscribes to symbols and appends to Parquet lake.
-    
+    Run live tick recorder that subscribes to symbols and ingests to QuestDB (canonical).
+
+    QuestDB is the single source of truth. Parquet export has been removed.
+
     This runs indefinitely (until interrupted) and periodically flushes accumulated
-    ticks to Parquet partitions.
+    ticks to QuestDB.
     
     Args:
         symbols: List of instrument codes to record
@@ -560,14 +676,17 @@ def run_live_recorder(
     # Track last seen datetime per symbol to avoid duplicates
     last_seen: dict[str, int] = {s: 0 for s in symbols}
 
-    # QuestDB canonical write-first/double-write (best-effort): prepare table for ingestion.
-    questdb_backend = _maybe_make_questdb_backend()
-    if questdb_backend is not None:
-        try:
-            questdb_backend.ensure_table(table=_QUESTDB_TICKS_RAW_TABLE, include_segment_metadata=False)
-        except Exception as e:
-            log.warning("tq_ingest.questdb_init_failed", table=_QUESTDB_TICKS_RAW_TABLE, error=str(e))
-            questdb_backend = None
+    # QuestDB-first: canonical tick storage + index maintenance.
+    questdb_backend = _make_questdb_backend_required()
+    # Ensure the canonical tick table supports derived-ticks provenance columns as well.
+    questdb_backend.ensure_table(table=_QUESTDB_TICKS_RAW_TABLE, include_segment_metadata=True)
+    qcfg = _make_questdb_query_cfg()
+    try:
+        from ghtrader.questdb_index import INDEX_TABLE_V2, ensure_index_tables
+
+        ensure_index_tables(cfg=qcfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
+    except Exception as e:
+        raise RuntimeError(f"QuestDB index init failed: {e}") from e
     
     try:
         while True:
@@ -612,14 +731,26 @@ def run_live_recorder(
             # Flush periodically
             now = time.time()
             if now - last_flush >= flush_interval_seconds:
-                _flush_buffers(buffers, data_dir, lake_version=lake_version, questdb_backend=questdb_backend)
+                _flush_buffers(
+                    buffers,
+                    data_dir,
+                    lake_version=lake_version,
+                    questdb_backend=questdb_backend,
+                    questdb_qcfg=qcfg,
+                )
                 last_flush = now
     
     except KeyboardInterrupt:
         log.info("tq_ingest.live_recorder_interrupted")
     finally:
         # Final flush
-        _flush_buffers(buffers, data_dir, lake_version=lake_version, questdb_backend=questdb_backend)
+        _flush_buffers(
+            buffers,
+            data_dir,
+            lake_version=lake_version,
+            questdb_backend=questdb_backend,
+            questdb_qcfg=qcfg,
+        )
         api.close()
         log.info("tq_ingest.live_recorder_stopped")
 
@@ -629,9 +760,12 @@ def _flush_buffers(
     data_dir: Path,
     *,
     lake_version: LakeVersion = "v2",
-    questdb_backend=None,
+    questdb_backend,
+    questdb_qcfg,
 ) -> None:
-    """Flush accumulated tick buffers to Parquet partitions."""
+    """Flush accumulated tick buffers to QuestDB (canonical)."""
+    from ghtrader.questdb_index import INDEX_TABLE_V2, SymbolDayIndexRow, get_symbol_day_index_row, upsert_symbol_day_index_rows
+
     for symbol, records in buffers.items():
         if not records:
             continue
@@ -666,19 +800,78 @@ def _flush_buffers(
         
         for dt, group_df in df.groupby("_date"):
             partition_df = group_df.drop(columns=["_date"])
-            # QuestDB canonical write (best-effort), then Parquet mirror.
-            if questdb_backend is not None:
-                try:
-                    qdf = _questdb_df_for_ticks(
-                        df=partition_df,
-                        trading_day=dt,
-                        ticks_lake="raw",
-                        lake_version=str(lake_version),
-                    )
-                    questdb_backend.ingest_df(table=_QUESTDB_TICKS_RAW_TABLE, df=qdf)
-                except Exception as e:
-                    log.warning("tq_ingest.questdb_ingest_failed", symbol=symbol, date=str(dt), error=str(e))
-            write_ticks_partition(partition_df, data_dir, symbol, dt, lake_version=lake_version)
+            qdf = _questdb_df_for_ticks(df=partition_df, trading_day=dt, ticks_lake="raw", lake_version=str(lake_version))
+            questdb_backend.ingest_df(table=_QUESTDB_TICKS_RAW_TABLE, df=qdf)
+
+            # Incremental index maintenance (merge with existing row).
+            td = str(dt.isoformat())
+            dt_ns = pd.to_numeric(partition_df.get("datetime"), errors="coerce").dropna().astype("int64")
+            new_first = int(dt_ns.min()) if not dt_ns.empty else None
+            new_last = int(dt_ns.max()) if not dt_ns.empty else None
+            new_rows = int(len(partition_df))
+            new_l5 = bool(_df_has_true_l5(partition_df))
+            from ghtrader.ticks_schema import row_hash_aggregates
+
+            new_rh = row_hash_aggregates(qdf.get("row_hash"))
+            new_rh_min = new_rh["row_hash_min"]
+            new_rh_max = new_rh["row_hash_max"]
+            new_rh_sum = new_rh["row_hash_sum"]
+            new_rh_sum_abs = new_rh["row_hash_sum_abs"]
+
+            prev = get_symbol_day_index_row(cfg=questdb_qcfg, symbol=symbol, trading_day=td, lake_version=str(lake_version), ticks_lake="raw", index_table=INDEX_TABLE_V2)
+            prev_rows = int(prev.get("rows_total") or 0) if isinstance(prev, dict) else 0
+            prev_first = int(prev.get("first_datetime_ns")) if isinstance(prev, dict) and prev.get("first_datetime_ns") is not None else None
+            prev_last = int(prev.get("last_datetime_ns")) if isinstance(prev, dict) and prev.get("last_datetime_ns") is not None else None
+            prev_l5 = bool(prev.get("l5_present", False)) if isinstance(prev, dict) else False
+            prev_rh_min = int(prev.get("row_hash_min")) if isinstance(prev, dict) and prev.get("row_hash_min") is not None else None
+            prev_rh_max = int(prev.get("row_hash_max")) if isinstance(prev, dict) and prev.get("row_hash_max") is not None else None
+            prev_rh_sum = int(prev.get("row_hash_sum")) if isinstance(prev, dict) and prev.get("row_hash_sum") is not None else None
+            prev_rh_sum_abs = int(prev.get("row_hash_sum_abs")) if isinstance(prev, dict) and prev.get("row_hash_sum_abs") is not None else None
+
+            merged_rows = prev_rows + new_rows
+            merged_first = new_first if prev_first is None else (prev_first if new_first is None else min(prev_first, new_first))
+            merged_last = new_last if prev_last is None else (prev_last if new_last is None else max(prev_last, new_last))
+            merged_l5 = bool(prev_l5 or new_l5)
+            merged_rh_min = new_rh_min if prev_rh_min is None else (prev_rh_min if new_rh_min is None else min(prev_rh_min, new_rh_min))
+            merged_rh_max = new_rh_max if prev_rh_max is None else (prev_rh_max if new_rh_max is None else max(prev_rh_max, new_rh_max))
+            try:
+                import numpy as np
+
+                def _merge_i64_sum(a: int | None, b: int | None) -> int | None:
+                    if a is None and b is None:
+                        return None
+                    return int(np.int64(a or 0) + np.int64(b or 0))
+
+                merged_rh_sum = _merge_i64_sum(prev_rh_sum, new_rh_sum)
+                merged_rh_sum_abs = _merge_i64_sum(prev_rh_sum_abs, new_rh_sum_abs)
+            except Exception:
+                merged_rh_sum = None if (prev_rh_sum is None and new_rh_sum is None) else int((prev_rh_sum or 0) + (new_rh_sum or 0))
+                merged_rh_sum_abs = None if (prev_rh_sum_abs is None and new_rh_sum_abs is None) else int((prev_rh_sum_abs or 0) + (new_rh_sum_abs or 0))
+
+            try:
+                upsert_symbol_day_index_rows(
+                    cfg=questdb_qcfg,
+                    rows=[
+                        SymbolDayIndexRow(
+                            symbol=str(symbol),
+                            trading_day=str(td),
+                            ticks_lake="raw",
+                            lake_version=str(lake_version),
+                            rows_total=int(merged_rows),
+                            first_datetime_ns=merged_first,
+                            last_datetime_ns=merged_last,
+                            l5_present=bool(merged_l5),
+                            row_hash_min=merged_rh_min,
+                            row_hash_max=merged_rh_max,
+                            row_hash_sum=merged_rh_sum,
+                            row_hash_sum_abs=merged_rh_sum_abs,
+                        )
+                    ],
+                    index_table=INDEX_TABLE_V2,
+                )
+            except Exception as e:
+                log.warning("tq_ingest.questdb_index_upsert_failed", symbol=symbol, date=str(td), error=str(e))
+
             log.debug("tq_ingest.flush", symbol=symbol, date=str(dt), rows=len(partition_df))
         
         # Clear buffer

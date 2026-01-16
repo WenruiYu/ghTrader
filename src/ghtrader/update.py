@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -10,6 +9,7 @@ from typing import Any
 
 import structlog
 
+from ghtrader.json_io import write_json_atomic as _write_json_atomic
 from ghtrader.trading_calendar import get_trading_calendar
 
 log = structlog.get_logger()
@@ -17,14 +17,6 @@ log = structlog.get_logger()
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _write_json_atomic(path: Path, obj: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f".tmp-{uuid.uuid4().hex}")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True, default=str)
-    tmp.replace(path)
 
 
 def _parse_iso_date_prefix(v: Any) -> date | None:
@@ -109,8 +101,7 @@ def run_update(
     Remote-aware daily Update:
     - Refresh contract catalog (network) by default.
     - Select active contracts + recently expired contracts (within last N trading days).
-    - For each candidate, download missing trading days into Parquet mirror (v2), and
-      double-write into QuestDB (best-effort, via tq_ingest).
+    - For each candidate, download missing trading days into QuestDB (canonical) via `tq_ingest`.
     """
     ex = str(exchange).upper().strip()
     v = str(var).lower().strip()
@@ -172,23 +163,36 @@ def run_update(
                 candidates.append(c)
             continue
 
-    # Compute expected ranges + local status (v2-only) with minimal L5 IO.
+    # PRD: QuestDB-first - fetch coverage from QuestDB index before computing statuses.
     from ghtrader.control.contract_status import compute_contract_statuses
+
+    syms = [str(c.get("symbol") or "").strip() for c in candidates if str(c.get("symbol") or "").strip()]
+    questdb_cov: dict[str, dict[str, Any]] | None = None
+    try:
+        from ghtrader.questdb_client import make_questdb_query_config_from_env
+        from ghtrader.questdb_index import INDEX_TABLE_V2, ensure_index_tables, query_contract_coverage_from_index
+
+        cfg = make_questdb_query_config_from_env()
+        ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
+        questdb_cov = query_contract_coverage_from_index(
+            cfg=cfg, symbols=syms, lake_version="v2", ticks_lake="raw", index_table=INDEX_TABLE_V2
+        )
+        log.info("update.questdb_coverage_ok", n_symbols=len(questdb_cov or {}))
+    except Exception as e:
+        log.warning("update.questdb_coverage_failed", error=str(e))
+        questdb_cov = None
 
     st = compute_contract_statuses(
         exchange=ex,
         var=v,
-        lake_version="v2",
         data_dir=data_dir,
-        runs_dir=runs_dir,
         contracts=candidates,
-        refresh_l5=False,
-        max_l5_scan_per_symbol=0,
+        questdb_cov_by_symbol=questdb_cov,
     )
     rows = list(st.get("contracts") or [])
 
-    # Select contracts that need action.
-    needs = [r for r in rows if str(r.get("status") or "") in {"not-downloaded", "incomplete", "stale"}] if only is None else rows
+    # Select contracts that need action (PRD status taxonomy: unindexed, not-downloaded, incomplete, stale).
+    needs = [r for r in rows if str(r.get("status") or "") in {"unindexed", "not-downloaded", "incomplete", "stale"}] if only is None else rows
 
     from ghtrader.tq_ingest import download_historical_ticks
 

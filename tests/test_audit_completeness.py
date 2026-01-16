@@ -1,17 +1,10 @@
 from __future__ import annotations
 
-import json
 from datetime import date
 from pathlib import Path
 from typing import Any
 
 import pytest
-
-
-def _touch_tick_day(data_dir: Path, symbol: str, day: date) -> None:
-    d = data_dir / "lake_v2" / "ticks" / f"symbol={symbol}" / f"date={day.isoformat()}"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "part-test.parquet").write_bytes(b"PAR1")
 
 
 def test_audit_completeness_reports_missing_days(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -21,12 +14,6 @@ def test_audit_completeness_reports_missing_days(tmp_path: Path, monkeypatch: py
     runs_dir = tmp_path / "runs"
 
     sym = "SHFE.cu2001"
-    _touch_tick_day(data_dir, sym, date(2020, 1, 6))
-    _touch_tick_day(data_dir, sym, date(2020, 1, 7))
-    _touch_tick_day(data_dir, sym, date(2020, 1, 10))
-    p_no = data_dir / "lake_v2" / "ticks" / f"symbol={sym}" / "_no_data_dates.json"
-    p_no.parent.mkdir(parents=True, exist_ok=True)
-    p_no.write_text(json.dumps(["2020-01-08"], indent=2))
 
     def fake_catalog(**kwargs: Any) -> dict[str, Any]:
         return {
@@ -40,10 +27,19 @@ def test_audit_completeness_reports_missing_days(tmp_path: Path, monkeypatch: py
 
     monkeypatch.setattr("ghtrader.tqsdk_catalog.get_contract_catalog", fake_catalog)
 
-    def fake_cov(**kwargs: Any) -> dict[str, Any]:
-        return {sym: {"first_tick_day": "2020-01-06", "last_tick_day": "2020-01-10", "tick_days": 5}}
+    # Expected trading days (patch calendar helper for hermetic unit test).
+    monkeypatch.setattr(
+        "ghtrader.trading_calendar.get_trading_days",
+        lambda **_kwargs: [date(2020, 1, 6), date(2020, 1, 7), date(2020, 1, 8), date(2020, 1, 9), date(2020, 1, 10)],
+    )
 
-    monkeypatch.setattr("ghtrader.questdb_queries.query_contract_coverage", fake_cov)
+    # QuestDB index coverage (present days).
+    def fake_cov(**kwargs: Any) -> dict[str, Any]:
+        _ = kwargs
+        return {sym: {"present_dates": {"2020-01-06", "2020-01-07", "2020-01-10"}}}
+
+    monkeypatch.setattr("ghtrader.questdb_index.query_contract_coverage_from_index", fake_cov)
+    monkeypatch.setattr("ghtrader.questdb_index.list_no_data_trading_days", lambda **_kwargs: [date(2020, 1, 8)])
 
     findings = audit_completeness(
         data_dir=data_dir,
@@ -56,9 +52,9 @@ def test_audit_completeness_reports_missing_days(tmp_path: Path, monkeypatch: py
     )
 
     codes = {f.code for f in findings}
-    assert "completeness_missing_trading_days" in codes
+    assert "missing_days" in codes
 
-    miss = next(f for f in findings if f.code == "completeness_missing_trading_days")
-    assert miss.extra and "missing_sample" in miss.extra
-    assert "2020-01-09" in (miss.extra.get("missing_sample") or [])
+    miss = next(f for f in findings if f.code == "missing_days")
+    assert miss.extra and "missing_days" in miss.extra
+    assert "2020-01-09" in (miss.extra.get("missing_days") or [])
 

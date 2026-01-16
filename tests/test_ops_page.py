@@ -20,7 +20,7 @@ def test_ops_page_renders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert r.status_code == 200
     html = r.text
     assert "Happy Path Pipeline" in html
-    assert "Sync cu to QuestDB" in html
+    assert "Build Schedule" in html
     assert "main_l5" in html
 
     # Legacy Ops pages redirect to consolidated page.

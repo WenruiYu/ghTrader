@@ -3,42 +3,32 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
-import pandas as pd
-import pytest
-
 from ghtrader.symbol_resolver import resolve_trading_symbol
 
 
-def _write_schedule(path: Path, rows: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_parquet(path, index=False)
+def test_resolve_trading_symbol_passthrough_specific_contract(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    assert resolve_trading_symbol(symbol="SHFE.cu2502", data_dir=data_dir, trading_day=date(2025, 1, 2)) == "SHFE.cu2502"
 
 
-def test_resolve_trading_symbol_falls_back_to_lake_v2_schedule_copy(tmp_path: Path) -> None:
+def test_resolve_trading_symbol_uses_questdb_schedule(monkeypatch, tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     alias = "KQ.m@SHFE.cu"
-    p_v2 = data_dir / "lake_v2" / "main_l5" / "ticks" / f"symbol={alias}" / "schedule.parquet"
 
-    _write_schedule(
-        p_v2,
-        rows=[
-            {"date": date(2025, 1, 1), "main_contract": "SHFE.cu2501"},
-            {"date": date(2025, 1, 2), "main_contract": "SHFE.cu2502"},
-        ],
-    )
+    monkeypatch.setattr("ghtrader.questdb_client.make_questdb_query_config_from_env", lambda: object())
 
-    resolved = resolve_trading_symbol(symbol=alias, data_dir=data_dir, trading_day=date(2025, 1, 2))
-    assert resolved == "SHFE.cu2502"
+    calls: dict[str, object] = {}
 
+    def fake_resolve_main_contract(*, exchange: str, variety: str, trading_day: date, **_kwargs):
+        calls["exchange"] = exchange
+        calls["variety"] = variety
+        calls["trading_day"] = trading_day
+        return "SHFE.cu2502", 0, "h"
 
-def test_resolve_trading_symbol_prefers_v2_when_both_schedule_copies_exist(tmp_path: Path) -> None:
-    data_dir = tmp_path / "data"
-    alias = "KQ.m@SHFE.cu"
-    p_v1 = data_dir / "lake" / "main_l5" / "ticks" / f"symbol={alias}" / "schedule.parquet"
-    p_v2 = data_dir / "lake_v2" / "main_l5" / "ticks" / f"symbol={alias}" / "schedule.parquet"
+    monkeypatch.setattr("ghtrader.questdb_main_schedule.resolve_main_contract", fake_resolve_main_contract)
 
-    _write_schedule(p_v1, rows=[{"date": date(2025, 1, 1), "main_contract": "SHFE.cu2501"}])
-    _write_schedule(p_v2, rows=[{"date": date(2025, 1, 1), "main_contract": "SHFE.cu9999"}])
-
-    assert resolve_trading_symbol(symbol=alias, data_dir=data_dir, trading_day=date(2025, 1, 1)) == "SHFE.cu9999"
+    assert resolve_trading_symbol(symbol=alias, data_dir=data_dir, trading_day=date(2025, 1, 2)) == "SHFE.cu2502"
+    assert calls["exchange"] == "SHFE"
+    assert calls["variety"] == "cu"
+    assert calls["trading_day"] == date(2025, 1, 2)
 

@@ -291,7 +291,7 @@ def run_paper_trading(
     models = {}
     for symbol in symbols:
         model_dir = artifacts_dir / symbol / model_name
-        model_files = list(model_dir.glob(f"model_h{horizon}.*"))
+        model_files = sorted([p for p in model_dir.glob(f"model_h{horizon}.*") if not p.name.endswith(".meta.json")])
         if model_files:
             models[symbol] = load_model(model_name, model_files[0])
             log.info("paper.model_loaded", symbol=symbol)
@@ -301,8 +301,21 @@ def run_paper_trading(
     if not models:
         raise RuntimeError("No models loaded")
     
-    # Create factor engines and calibrators for each symbol
-    factor_engines = {s: FactorEngine() for s in symbols}
+    # Create factor engines and calibrators for each symbol (prefer model metadata for parity).
+    enabled_factors: dict[str, list[str]] = {}
+    try:
+        from ghtrader.json_io import read_json
+
+        for s in symbols:
+            mdir = artifacts_dir / s / model_name
+            meta = read_json(mdir / f"model_h{horizon}.meta.json") or {}
+            ef = (meta or {}).get("enabled_factors") if isinstance(meta, dict) else None
+            if isinstance(ef, list) and ef and all(isinstance(x, str) and x.strip() for x in ef):
+                enabled_factors[s] = [str(x).strip() for x in ef if str(x).strip()]
+    except Exception:
+        enabled_factors = {}
+
+    factor_engines = {s: FactorEngine(enabled_factors=enabled_factors.get(s) or None) if enabled_factors.get(s) else FactorEngine() for s in symbols}
     calibrators = {s: OnlineCalibrator(lr=calibrator_lr) for s in symbols}
     label_buffers = {s: DelayedLabelBuffer(horizon_ticks=horizon) for s in symbols}
     

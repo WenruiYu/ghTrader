@@ -9,7 +9,62 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ghtrader.lake import TICK_COLUMN_NAMES, write_ticks_partition
+from ghtrader.ticks_schema import TICK_COLUMN_NAMES
+
+
+# ---------------------------------------------------------------------------
+# QuestDB test utilities
+# ---------------------------------------------------------------------------
+
+def _has_questdb() -> bool:
+    """Check if QuestDB is available for integration tests."""
+    return bool(os.environ.get("QUESTDB_HOST") or os.environ.get("GHTRADER_RUN_QUESTDB_TESTS", "").lower() == "true")
+
+
+@pytest.fixture
+def questdb_config():
+    """
+    QuestDB configuration for integration tests.
+    
+    Returns None if QuestDB is not available (tests should be skipped).
+    For unit tests that need to mock QuestDB, use the mock_questdb_* fixtures instead.
+    """
+    from ghtrader.questdb_client import QuestDBQueryConfig
+    
+    host = os.environ.get("QUESTDB_HOST", "localhost")
+    pg_port = int(os.environ.get("QUESTDB_PG_PORT", "8812"))
+    pg_user = os.environ.get("QUESTDB_PG_USER", "admin")
+    pg_password = os.environ.get("QUESTDB_PG_PASSWORD", "quest")
+    pg_dbname = os.environ.get("QUESTDB_PG_DBNAME", "qdb")
+    
+    return QuestDBQueryConfig(
+        host=host,
+        pg_port=pg_port,
+        pg_user=pg_user,
+        pg_password=pg_password,
+        pg_dbname=pg_dbname,
+    )
+
+
+@pytest.fixture
+def mock_questdb_connection(monkeypatch: pytest.MonkeyPatch):
+    """
+    Mock QuestDB connection for unit tests.
+    
+    This fixture patches the _connect function to return a mock connection
+    that can be used for unit testing without a real QuestDB instance.
+    """
+    from unittest.mock import MagicMock
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+
+    monkeypatch.setattr("ghtrader.questdb_queries._connect", lambda *args, **kwargs: mock_conn)
+    return mock_conn, mock_cursor
 
 
 def _has_tqsdk_creds() -> bool:
@@ -19,6 +74,7 @@ def _has_tqsdk_creds() -> bool:
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "integration: requires network/credentials")
     config.addinivalue_line("markers", "ddp_integration: requires torchrun multi-process")
+    config.addinivalue_line("markers", "questdb: requires QuestDB instance")
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -33,6 +89,12 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for item in items:
             if "ddp_integration" in item.keywords:
                 item.add_marker(skip_ddp)
+
+    if not _has_questdb():
+        skip_questdb = pytest.mark.skip(reason="Set GHTRADER_RUN_QUESTDB_TESTS=true or QUESTDB_HOST to enable QuestDB tests")
+        for item in items:
+            if "questdb" in item.keywords:
+                item.add_marker(skip_questdb)
 
 
 @pytest.fixture()
@@ -94,81 +156,4 @@ def synthetic_tick_dict(small_synthetic_tick_df: pd.DataFrame) -> dict[str, Any]
 @pytest.fixture()
 def synthetic_data_dir(tmp_path: Path) -> Path:
     return tmp_path / "data"
-
-
-@pytest.fixture()
-def synthetic_lake(synthetic_data_dir: Path, small_synthetic_tick_df: pd.DataFrame) -> tuple[Path, str, list[date]]:
-    """
-    Create a tiny Parquet lake with 2 day partitions for one symbol.
-    """
-    symbol = "SHFE.cu2501"
-    d0 = date(2025, 1, 1)
-    d1 = date(2025, 1, 2)
-    data_dir = synthetic_data_dir
-
-    df0 = small_synthetic_tick_df.copy()
-    df0["symbol"] = symbol
-    write_ticks_partition(df0, data_dir=data_dir, symbol=symbol, dt=d0, part_id="d0")
-
-    df1 = small_synthetic_tick_df.copy()
-    df1["symbol"] = symbol
-    df1["datetime"] = df1["datetime"].astype("int64") + 10_000_000_000  # shift 10s
-
-    # Make day-2 prices differ from day-1 so horizon=50 labels aren't a single class.
-    # For horizon=50 with 50 ticks/day, labels compare day1[i] to day2[i].
-    offset = np.sin(np.linspace(0, 4 * np.pi, len(df1))) * 20.0
-    for lvl in range(1, 6):
-        df1[f"bid_price{lvl}"] = df1[f"bid_price{lvl}"] + offset
-        df1[f"ask_price{lvl}"] = df1[f"ask_price{lvl}"] + offset
-    for col in ["last_price", "average", "highest", "lowest"]:
-        df1[col] = df1[col] + offset
-    write_ticks_partition(df1, data_dir=data_dir, symbol=symbol, dt=d1, part_id="d1")
-
-    return data_dir, symbol, [d0, d1]
-
-
-@pytest.fixture()
-def synthetic_lake_two_symbols(
-    synthetic_data_dir: Path, small_synthetic_tick_df: pd.DataFrame
-) -> tuple[Path, tuple[str, str], list[date]]:
-    """
-    Create a tiny Parquet lake with 2 day partitions for two different symbols,
-    so we can test roll-boundary behavior.
-    """
-    sym_a = "SHFE.cu2501"
-    sym_b = "SHFE.cu2502"
-    d0 = date(2025, 1, 1)
-    d1 = date(2025, 1, 2)
-    data_dir = synthetic_data_dir
-
-    # Day 1 for symbol A
-    df0a = small_synthetic_tick_df.copy()
-    df0a["symbol"] = sym_a
-    write_ticks_partition(df0a, data_dir=data_dir, symbol=sym_a, dt=d0, part_id="a-d0")
-
-    # Day 2 for symbol A (so we can test a no-roll schedule A->A)
-    df1a = small_synthetic_tick_df.copy()
-    df1a["symbol"] = sym_a
-    df1a["datetime"] = df1a["datetime"].astype("int64") + 10_000_000_000  # shift 10s
-    offset_a = np.sin(np.linspace(0, 4 * np.pi, len(df1a))) * 20.0
-    for lvl in range(1, 6):
-        df1a[f"bid_price{lvl}"] = df1a[f"bid_price{lvl}"] + offset_a
-        df1a[f"ask_price{lvl}"] = df1a[f"ask_price{lvl}"] + offset_a
-    for col in ["last_price", "average", "highest", "lowest"]:
-        df1a[col] = df1a[col] + offset_a
-    write_ticks_partition(df1a, data_dir=data_dir, symbol=sym_a, dt=d1, part_id="a-d1")
-
-    # Day 2 for symbol B (different underlying) so we can test a roll A->B
-    df1b = small_synthetic_tick_df.copy()
-    df1b["symbol"] = sym_b
-    df1b["datetime"] = df1b["datetime"].astype("int64") + 10_000_000_000  # shift 10s
-    offset = np.sin(np.linspace(0, 4 * np.pi, len(df1b))) * 20.0
-    for lvl in range(1, 6):
-        df1b[f"bid_price{lvl}"] = df1b[f"bid_price{lvl}"] + offset
-        df1b[f"ask_price{lvl}"] = df1b[f"ask_price{lvl}"] + offset
-    for col in ["last_price", "average", "highest", "lowest"]:
-        df1b[col] = df1b[col] + offset
-    write_ticks_partition(df1b, data_dir=data_dir, symbol=sym_b, dt=d1, part_id="b-d1")
-
-    return data_dir, (sym_a, sym_b), [d0, d1]
 

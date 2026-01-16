@@ -1,3 +1,9 @@
+"""
+Database benchmarking utilities for QuestDB performance testing.
+
+This module provides tools to benchmark QuestDB ingest and query performance.
+It reads sample ticks from QuestDB (canonical store).
+"""
 from __future__ import annotations
 
 import json
@@ -10,7 +16,7 @@ from typing import Any, Literal
 import pandas as pd
 import structlog
 
-from ghtrader.lake import LakeVersion, TicksLake, read_ticks_for_symbol_arrow
+from ghtrader.ticks_schema import LakeVersion, TicksLake
 
 log = structlog.get_logger()
 
@@ -58,23 +64,59 @@ def load_tick_sample(
     max_rows: int = 1_000_000,
 ) -> pd.DataFrame:
     """
-    Load a tick sample from the Parquet lake as a Pandas DataFrame.
-
-    This is intentionally a *sampling/benchmark* helper; callers should cap max_rows.
+    Load a tick sample from QuestDB for benchmarking.
     """
-    table = read_ticks_for_symbol_arrow(
-        data_dir,
-        symbol,
-        start_date=start_date,
-        end_date=end_date,
-        ticks_lake=ticks_lake,
-        lake_version=lake_version,
+    from ghtrader.questdb_client import make_questdb_query_config_from_env
+    from ghtrader.questdb_index import list_present_trading_days
+    from ghtrader.questdb_queries import fetch_ticks_for_symbol_day
+
+    _ = data_dir  # QuestDB is the canonical source
+
+    lv = str(lake_version).lower().strip() or "v2"
+    tl = str(ticks_lake).lower().strip() or "raw"
+    table = "ghtrader_ticks_main_l5_v2" if tl == "main_l5" else "ghtrader_ticks_raw_v2"
+    cfg = make_questdb_query_config_from_env()
+
+    days = sorted(
+        list_present_trading_days(
+            cfg=cfg,
+            symbol=str(symbol),
+            start_day=start_date,
+            end_day=end_date,
+            lake_version=lv,
+            ticks_lake=tl,
+        )
     )
-    if table.num_rows == 0:
+
+    frames: list[pd.DataFrame] = []
+    rows = 0
+    for d in days:
+        if rows >= int(max_rows):
+            break
+        df_day = fetch_ticks_for_symbol_day(
+            cfg=cfg,
+            table=table,
+            symbol=str(symbol),
+            trading_day=d.isoformat(),
+            lake_version=lv,
+            ticks_lake=tl,
+            limit=None,
+            order="asc",
+            include_provenance=(tl == "main_l5"),
+            connect_timeout_s=2,
+        )
+        if df_day.empty:
+            continue
+        frames.append(df_day)
+        rows += int(len(df_day))
+        if rows >= int(max_rows):
+            break
+
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if df.empty:
         return pd.DataFrame()
-    if int(table.num_rows) > int(max_rows):
-        table = table.slice(0, int(max_rows))
-    df = table.to_pandas()
+    if int(len(df)) > int(max_rows):
+        df = df.iloc[: int(max_rows)].copy()
 
     # Keep a compact subset that represents typical query patterns.
     cols = ["symbol", "datetime", "last_price", "bid_price1", "ask_price1", "volume", "open_interest"]

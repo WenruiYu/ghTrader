@@ -1952,7 +1952,7 @@ def train_model(
     lab_manifest = read_labels_manifest(data_dir, symbol)
     if not feat_manifest or not lab_manifest:
         raise ValueError(
-            "Missing features/labels manifest.json. "
+            "Missing QuestDB build metadata for features/labels. "
             "Run `ghtrader build` first (and re-run with --overwrite if needed)."
         )
     tl_f = str(feat_manifest.get("ticks_lake") or "")
@@ -2051,6 +2051,45 @@ def train_model(
     if (not ddp_active) or distu.is_rank0():
         model.save(model_path)
         log.info("train.saved", path=str(model_path))
+        # Persist non-secret model metadata for training-serving parity (PRD §5.12.6).
+        try:
+            from datetime import datetime, timezone
+
+            from ghtrader.json_io import write_json_atomic
+
+            meta_path = model_dir / f"model_h{horizon}.meta.json"
+            feat_q = dict(feat_manifest.get("questdb") or {}) if isinstance(feat_manifest, dict) else {}
+            lab_q = dict(lab_manifest.get("questdb") or {}) if isinstance(lab_manifest, dict) else {}
+
+            meta: dict[str, Any] = {
+                "schema_version": 1,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "symbol": str(symbol),
+                "model_type": str(model_type),
+                "horizon": int(horizon),
+                "n_features": int(len(feature_cols)),
+                # Canonical feature spec (model input order).
+                "enabled_factors": list(feature_cols),
+                # Provenance: which canonical tick source/features/labels build this model expects.
+                "ticks_lake": str(tl_f),
+                "lake_version": str(lv_f),
+                "feature_build_id": str(feat_q.get("build_id") or ""),
+                "label_build_id": str(lab_q.get("build_id") or ""),
+                "feature_schema_hash": str(feat_manifest.get("schema_hash") or "") if isinstance(feat_manifest, dict) else "",
+                # Labels build table does not currently store a schema hash; keep best-effort.
+                "label_schema_hash": str(lab_manifest.get("schema_hash") or "") if isinstance(lab_manifest, dict) else "",
+            }
+            if str(tl_f) == "main_l5":
+                # Required schedule provenance for roll-boundary safety.
+                sched = dict(feat_manifest.get("schedule") or {}) if isinstance(feat_manifest, dict) else {}
+                meta["schedule_hash"] = str(sched.get("hash") or "")
+                meta["l5_start_date"] = str(sched.get("l5_start_date") or "")
+                meta["schedule_end_date"] = str(sched.get("end_date") or "")
+
+            write_json_atomic(meta_path, meta)
+            log.info("train.saved_meta", path=str(meta_path))
+        except Exception as e:
+            log.warning("train.save_meta_failed", error=str(e))
 
     if ddp_active:
         # Wait for rank0 to finish writing.

@@ -55,22 +55,21 @@ def test_trade_run_writer_writes_files(tmp_path: Path):
     assert json.loads(snap_line)["account"]["balance"] == 1.0
 
 
-def test_maybe_roll_execution_symbol_uses_schedule(tmp_path: Path):
-    import pandas as pd
-
+def test_maybe_roll_execution_symbol_uses_schedule(tmp_path: Path, monkeypatch):
     from ghtrader.symbol_resolver import resolve_trading_symbol
     from ghtrader.trade import maybe_roll_execution_symbol
 
     data_dir = tmp_path / "data"
-    sched_dir = data_dir / "rolls" / "shfe_main_schedule" / "var=cu"
-    sched_dir.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(
-        {
-            "date": [date(2026, 1, 2), date(2026, 1, 3)],
-            "main_contract": ["SHFE.cu2602", "SHFE.cu2603"],
-        }
-    )
-    df.to_parquet(sched_dir / "schedule.parquet", index=False)
+    monkeypatch.setattr("ghtrader.questdb_client.make_questdb_query_config_from_env", lambda: object())
+
+    def fake_resolve_main_contract(*, exchange: str, variety: str, trading_day: date, **_kwargs):
+        assert exchange == "SHFE"
+        assert variety == "cu"
+        if trading_day >= date(2026, 1, 3):
+            return "SHFE.cu2603", 1, "h"
+        return "SHFE.cu2602", 0, "h"
+
+    monkeypatch.setattr("ghtrader.questdb_main_schedule.resolve_main_contract", fake_resolve_main_contract)
 
     alias = "KQ.m@SHFE.cu"
     old_td = date(2026, 1, 2)

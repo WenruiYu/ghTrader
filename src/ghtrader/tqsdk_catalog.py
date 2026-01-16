@@ -4,13 +4,13 @@ import json
 import lzma
 import os
 import time
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ghtrader.config import get_runs_dir, get_tqsdk_auth
+from ghtrader.json_io import read_json as _read_json, write_json_atomic as _write_json_atomic
 
 
 def _now_iso() -> str:
@@ -26,25 +26,6 @@ def _cache_path(*, exchange: str, var: str, runs_dir: Path | None = None) -> Pat
     ex = str(exchange).upper().strip()
     v = str(var).lower().strip()
     return _cache_root(runs_dir=runs_dir) / f"contracts_exchange={ex}_var={v}.json"
-
-
-def _read_json(path: Path) -> dict[str, Any] | None:
-    try:
-        if not path.exists():
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
-
-
-def _write_json_atomic(path: Path, obj: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f".tmp-{uuid.uuid4().hex}")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
-    tmp.replace(path)
 
 
 def _is_fresh(obj: dict[str, Any], *, ttl_s: float) -> bool:

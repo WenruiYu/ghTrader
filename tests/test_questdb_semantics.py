@@ -47,14 +47,18 @@ def test_query_contract_coverage_merges_base_and_l5(monkeypatch: pytest.MonkeyPa
     symbols = ["SHFE.cu2501", "SHFE.cu2502"]
 
     def fake_bounds(*, l5_only: bool, **kwargs):
+        # Base coverage comes from raw ticks; L5 coverage prefers the derived main_l5 ticks lake.
+        if str(kwargs.get("ticks_lake") or "") == "main_l5":
+            return {
+                "SHFE.cu2502": {"first_day": "2025-01-02", "last_day": "2025-01-03", "n_days": 2},
+            }
         if not l5_only:
             return {
                 "SHFE.cu2501": {"first_day": "2025-01-01", "last_day": "2025-01-03", "n_days": 3},
                 "SHFE.cu2502": {"first_day": "2025-01-02", "last_day": "2025-01-03", "n_days": 2},
             }
-        return {
-            "SHFE.cu2502": {"first_day": "2025-01-02", "last_day": "2025-01-03", "n_days": 2},
-        }
+        # Fallback raw-tick predicate path (not used in this test)
+        return {}
 
     monkeypatch.setattr(qq, "query_symbol_day_bounds", fake_bounds)
 

@@ -231,7 +231,7 @@ def _load_models(model_name: str, symbols: list[str], artifacts_dir: Path, horiz
     models: dict[str, Any] = {}
     for sym in symbols:
         model_dir = artifacts_dir / sym / model_name
-        model_files = list(model_dir.glob(f"model_h{horizon}.*"))
+        model_files = sorted([p for p in model_dir.glob(f"model_h{horizon}.*") if not p.name.endswith(".meta.json")])
         if not model_files:
             raise FileNotFoundError(f"No model found for {sym} {model_name} horizon={horizon} under {model_dir}")
         models[sym] = load_model(model_name, model_files[0])
@@ -327,9 +327,11 @@ def run_trade(cfg: TradeConfig, *, confirm_live: str | None = None) -> None:
     # - Best-effort in monitor-only mode (live monitoring should not be blocked by missing models).
     models: dict[str, Any] = {}
     signals_enabled: dict[str, bool] = {s: True for s in strategy_symbols}
+    model_meta: dict[str, dict[str, Any]] = {}
+    order_enabled = bool(cfg.mode != "paper" and (not cfg.monitor_only))
     for s in strategy_symbols:
         model_dir = cfg.artifacts_dir / s / cfg.model_name
-        model_files = list(model_dir.glob(f"model_h{cfg.horizon}.*"))
+        model_files = sorted([p for p in model_dir.glob(f"model_h{cfg.horizon}.*") if not p.name.endswith(".meta.json")])
         if not model_files:
             if bool(cfg.monitor_only):
                 signals_enabled[s] = False
@@ -352,7 +354,17 @@ def run_trade(cfg: TradeConfig, *, confirm_live: str | None = None) -> None:
                 )
                 continue
             raise FileNotFoundError(f"No model found for {s} {cfg.model_name} horizon={cfg.horizon} under {model_dir}")
-        models[s] = load_model(cfg.model_name, model_files[0])
+        model_path = model_files[0]
+        models[s] = load_model(cfg.model_name, model_path)
+        # Load model metadata sidecar (PRD §5.12.6). Required for order-enabled modes.
+        try:
+            from ghtrader.json_io import read_json
+
+            meta_path = model_dir / f"model_h{cfg.horizon}.meta.json"
+            meta = read_json(meta_path) or {}
+            model_meta[s] = dict(meta) if isinstance(meta, dict) else {}
+        except Exception:
+            model_meta[s] = {}
 
     # Feature state
     from ghtrader.features import DEFAULT_FACTORS, FactorEngine, read_features_manifest
@@ -362,18 +374,29 @@ def run_trade(cfg: TradeConfig, *, confirm_live: str | None = None) -> None:
         if not signals_enabled.get(s, True):
             enabled_factors[s] = []
             continue
+        meta = model_meta.get(s) or {}
+        ef = meta.get("enabled_factors")
+        if isinstance(ef, list) and ef and all(isinstance(x, str) and x.strip() for x in ef):
+            enabled_factors[s] = [str(x).strip() for x in ef if str(x).strip()]
+            continue
+
+        if order_enabled:
+            # Enforce training-serving parity without requiring QuestDB connectivity on the hot path.
+            model_dir = cfg.artifacts_dir / s / cfg.model_name
+            meta_path = model_dir / f"model_h{cfg.horizon}.meta.json"
+            raise RuntimeError(
+                f"Missing model metadata sidecar for {s}. Expected {meta_path}. "
+                "Re-train the model with `ghtrader train ...` to regenerate metadata."
+            )
+
+        # Best-effort fallback (non-order-enabled modes only).
         manifest = read_features_manifest(cfg.data_dir, s)
-        ef = manifest.get("enabled_factors")
-        if isinstance(ef, list) and ef and all(isinstance(x, str) and x for x in ef):
-            enabled_factors[s] = list(ef)
+        ef2 = manifest.get("enabled_factors") if isinstance(manifest, dict) else None
+        if isinstance(ef2, list) and ef2 and all(isinstance(x, str) and x.strip() for x in ef2):
+            enabled_factors[s] = [str(x).strip() for x in ef2 if str(x).strip()]
         else:
-            # For live order routing, require an explicit feature spec (manifest is source of truth).
-            if cfg.mode == "live" and (not cfg.monitor_only):
-                raise RuntimeError(
-                    f"Missing features manifest for {s}. Expected {cfg.data_dir}/features/symbol={s}/manifest.json"
-                )
             enabled_factors[s] = DEFAULT_FACTORS.copy()
-            log.warning("trade.features_manifest_missing", symbol=s)
+            log.warning("trade.features_spec_missing", symbol=s)
 
     # Validate online factor dimension against the trained model artifact (best-effort).
     for s in strategy_symbols:

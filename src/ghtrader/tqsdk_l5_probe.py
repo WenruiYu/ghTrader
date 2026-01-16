@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import time
-import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -10,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from ghtrader.config import get_runs_dir, get_tqsdk_auth
+from ghtrader.json_io import read_json as _read_json, write_json_atomic as _write_json_atomic
 from ghtrader.trading_calendar import get_trading_calendar
 
 
@@ -28,25 +27,6 @@ def _safe_symbol_name(symbol: str) -> str:
 
 def probe_cache_path(*, symbol: str, runs_dir: Path | None = None) -> Path:
     return _cache_root(runs_dir=runs_dir) / f"symbol={_safe_symbol_name(symbol)}.json"
-
-
-def _write_json_atomic(path: Path, obj: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f".tmp-{uuid.uuid4().hex}")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
-    tmp.replace(path)
-
-
-def _read_json(path: Path) -> dict[str, Any] | None:
-    try:
-        if not path.exists():
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
 
 
 def load_probe_result(*, symbol: str, runs_dir: Path | None = None) -> dict[str, Any] | None:
@@ -124,34 +104,32 @@ def _parse_date_any(x: object) -> date | None:
         return None
 
 
-def _local_last_date_v2(*, data_dir: Path, symbol: str) -> date | None:
+def _questdb_last_day(*, symbol: str) -> date | None:
     """
-    Return the maximum local partition date for a symbol (v2 raw ticks),
-    or None if the symbol has no local data.
+    Return the maximum trading_day present for a symbol from the QuestDB index (v2 raw ticks),
+    or None if unavailable.
     """
+    sym = str(symbol).strip()
+    if not sym:
+        return None
     try:
-        sym = str(symbol).strip()
-        if not sym:
+        from ghtrader.questdb_client import make_questdb_query_config_from_env
+        from ghtrader.questdb_index import INDEX_TABLE_V2, query_symbol_day_index_bounds
+
+        cfg = make_questdb_query_config_from_env()
+        b = query_symbol_day_index_bounds(
+            cfg=cfg,
+            symbols=[sym],
+            lake_version="v2",
+            ticks_lake="raw",
+            index_table=INDEX_TABLE_V2,
+            l5_only=False,
+            connect_timeout_s=2,
+        )
+        last_s = str((b.get(sym) or {}).get("last_day") or "").strip()
+        if not last_s:
             return None
-        base = data_dir / "lake_v2" / "ticks" / f"symbol={sym}"
-        if not base.exists():
-            return None
-        out: date | None = None
-        for p in base.iterdir():
-            if not p.is_dir():
-                continue
-            if not p.name.startswith("date="):
-                continue
-            ds = p.name.split("=", 1)[-1].strip()
-            if len(ds) != 10:
-                continue
-            try:
-                d = date.fromisoformat(ds)
-            except Exception:
-                continue
-            if out is None or d > out:
-                out = d
-        return out
+        return date.fromisoformat(last_s[:10])
     except Exception:
         return None
 
@@ -206,10 +184,10 @@ def probe_l5_for_symbol(
     # Auto probe-day selection: make expired contracts probe a day where ticks likely exist.
     probe_day_source = "explicit" if probe_day is not None else ""
     if probe_day is None:
-        local_last = _local_last_date_v2(data_dir=data_dir, symbol=sym)
-        if local_last is not None:
-            probe_day = local_last
-            probe_day_source = "local_max"
+        q_last = _questdb_last_day(symbol=sym)
+        if q_last is not None:
+            probe_day = q_last
+            probe_day_source = "questdb_max"
 
     # If still not decided, we'll try quote metadata once TqApi is available; otherwise fall back.
 
