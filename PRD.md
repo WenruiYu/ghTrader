@@ -20,6 +20,27 @@
 
 ---
 
+## 0) Code organization (source tree)
+
+ghTrader is organized by domain. The PRD expects the following package boundaries under `src/ghtrader/`:
+
+- `cli.py`: thin CLI entrypoint (delegates to `cli_commands/` command modules)
+- `cli_commands/`: CLI command implementations (subcommands grouped by domain)
+- `control/`: FastAPI control-plane (UI + APIs + job runner + SQLite stores + templates/static)
+- `tq/`: **TqSdk-only** provider implementation (the only place `tqsdk` is imported besides `config.py`)
+- `questdb/`: QuestDB query + schema + ingestion helpers (QuestDB is canonical store)
+- `data/`: data lifecycle (calendar, manifests, completeness, diagnose/repair/health, main-schedule/main-l5 builders)
+- `datasets/`: derived dataset builders (features/labels) and registries/validation
+- `trading/`: runtime trading modules (Gateway/StrategyRunner adapters + generic order planning)
+- `research/`: training/evaluation/benchmark/pipeline utilities
+- `util/`: small shared helpers (e.g. JSON IO)
+- `config.py`: environment/config loading and `TqAuth` construction
+- `data_provider.py`: provider interfaces (`DataProvider`, `ExecutionProvider`)
+
+This refactor is allowed to be breaking: module paths and imports may change as long as the PRD and tests are updated accordingly.
+
+---
+
 ## 1) Product overview
 
 ghTrader is a **research-only**, AI-centric quantitative trading R&D system for **SHFE copper (CU), gold (AU), and silver (AG)**.
@@ -77,7 +98,7 @@ A model family is considered “better” when, on walk-forward evaluation:
 
 ### 4.2 Core workflows
 
-- **Data workflow (QuestDB-first)**: `download`/`record` → `data verify` → `data fill-missing` (if needed) → `main-schedule` → `main-l5` → `build` (features/labels) → `train` → `backtest`/`benchmark`
+- **Data workflow (QuestDB-first)**: `download`/`record` → `data health` (diagnose + auto-repair) → (optional manual `data repair`) → `main-schedule` → `main-l5` → `build` (features/labels) → `train` → `backtest`/`benchmark`
 - **Continual workflow**: `daily-train` (scheduled) → gated promotion → rollback on regression
 - **Model research workflow**: `compare` and benchmarking reports across model families
 
@@ -104,7 +125,7 @@ ghTrader must explicitly support two classes of symbols (both may exist in Quest
   - We keep this data only as an auxiliary long-history reference; it is **not sufficient** for LOB/depth models.
 
 Implementation:
-- `src/ghtrader/tq_ingest.py` (`download_historical_ticks`)
+- `src/ghtrader/tq/ingest.py` (`download_historical_ticks`)
 
 #### 5.1.2 Trading calendar correctness + no-data day semantics
 
@@ -119,8 +140,8 @@ Requirements:
 - **No-data markers**:
   - For each symbol, persist trading dates that were attempted but returned **zero ticks**, so ingest completion is idempotent.
   - Store in QuestDB (canonical) table: `ghtrader_no_data_days_v2`
-    - Columns: `symbol`, `trading_day`, `lake_version`, `ticks_lake`, `reason`, `created_at`
-    - Uniqueness: `(symbol, trading_day, lake_version, ticks_lake)` (dedup/upsert).
+    - Columns: `symbol`, `trading_day`, `dataset_version`, `ticks_kind`, `reason`, `created_at`
+    - Uniqueness: `(symbol, trading_day, dataset_version, ticks_kind)` (dedup/upsert).
   - Missing-date computation must exclude both **present** days in `ghtrader_symbol_day_index_v2` and recorded no-data days.
 - **Chunk behavior**:
   - If a requested chunk yields no ticks, mark all dates in that chunk as no-data (unless already present in QuestDB).
@@ -145,7 +166,7 @@ While TqSdk is the current data provider, ghTrader should maintain a modular arc
 
 **Current implementation**:
 - TqSdk is the sole implementation of both interfaces
-- All TqSdk-specific code should be isolated in `src/ghtrader/tq_*.py` modules
+- All **direct `tqsdk` imports** must be isolated in `src/ghtrader/tq/` modules (and `src/ghtrader/config.py` for `TqAuth` construction only).
 - Core logic (features, models, evaluation) should not import TqSdk directly
 
 **Future extensibility**:
@@ -161,8 +182,10 @@ While TqSdk is the current data provider, ghTrader should maintain a modular arc
 
 Implementation:
 - `src/ghtrader/data_provider.py` (abstract interfaces, new module)
-- `src/ghtrader/tq_ingest.py` (TqSdk implementation for data)
-- `src/ghtrader/tq_runtime.py` (TqSdk implementation for execution)
+- `src/ghtrader/tq/ingest.py` (TqSdk implementation for data)
+- `src/ghtrader/tq/gateway.py` (AccountGateway; owns TqApi connectivity + persists `runs/gateway/` artifacts)
+- `src/ghtrader/tq/execution.py` (TqSdk execution primitives)
+- `src/ghtrader/tq/runtime.py` (TqSdk runtime helpers: auth/account creation, snapshot shaping, symbol/profile normalization)
 
 ### 5.2 Data ingest (live recorder)
 
@@ -172,30 +195,30 @@ Implementation:
 - Must update the QuestDB coverage/index tables for each `(symbol, trading_day)` batch as part of ingest.
 
 Implementation:
-- `src/ghtrader/tq_ingest.py` (`run_live_recorder`)
+- `src/ghtrader/tq/ingest.py` (`run_live_recorder`)
 
 ### 5.3 Tick storage (QuestDB-only)
 
 - **Canonical tick store**: QuestDB (daemon time-series DB) stores raw ticks for all contracts and derived datasets.
 - **Core tick tables (v2)**:
   - Canonical ticks table: `ghtrader_ticks_raw_v2`
-  - Provenance column `ticks_lake` distinguishes raw vs derived ticks (`raw|main_l5`).
+  - Provenance column `ticks_kind` distinguishes raw vs derived ticks (`raw|main_l5`).
 - **Schema**:
   - Must include full L5 columns even for L1-only sources; for `KQ.m@...` deeper levels are expected to be null/NaN.
   - Must store `datetime_ns` (int64 epoch-ns as provided by TqSdk) and a QuestDB `TIMESTAMP` column `ts` derived from it.
-  - Must store provenance columns `lake_version` and `ticks_lake`.
+  - Must store provenance columns `dataset_version` and `ticks_kind`.
 
 Implementation:
-- `src/ghtrader/serving_db.py` (QuestDB schema + ingestion)
+- `src/ghtrader/questdb/serving_db.py` (QuestDB schema + ingestion)
 
-#### 5.3.0.0 Lake/version selection (v2 only)
+#### 5.3.0.0 Dataset/version selection (v2 only)
 
-- There is no lake version toggle; all ingestion and downstream builds use **v2**.
-- All QuestDB tables and index rows must include `lake_version='v2'` for future-proofing, but mixing across versions is not supported.
+- There is no dataset version toggle; all ingestion and downstream builds use **v2**.
+- All QuestDB tables and index rows must include `dataset_version='v2'` for future-proofing, but mixing across versions is not supported.
 
 #### 5.3.0 Contract coverage + L5 availability index (QuestDB-backed)
 
-To make the data system robust (fill/verify/repair), ghTrader must be able to compute coverage from the canonical tick DB:
+To make the data system robust (diagnose/repair/health), ghTrader must be able to compute coverage from the canonical tick DB:
 
 - Per contract (symbol):
   - first/last tick day present (any ticks)
@@ -203,7 +226,7 @@ To make the data system robust (fill/verify/repair), ghTrader must be able to co
   - freshness for active contracts (behind latest trading day → `stale`)
 - This must be backed by a QuestDB-maintained index table (no full-table scans on dashboard paths):
   - `ghtrader_symbol_day_index_v2` with at least:
-    - `symbol`, `trading_day`, `lake_version`, `ticks_lake`
+    - `symbol`, `trading_day`, `dataset_version`, `ticks_kind`
     - `rows_total`, `first_datetime_ns`, `last_datetime_ns`
     - `l5_present` (boolean; true if any level2–5 price/vol values are non-null/non-NaN and >0)
 - The dashboard contract explorer must use this index (and `ghtrader_no_data_days_v2`) instead of local scans or akshare-driven active-ranges.
@@ -213,16 +236,34 @@ To make the data system robust (fill/verify/repair), ghTrader must be able to co
 ghTrader must provide first-class integrity tooling for the canonical QuestDB data system.
 
 Integrity requirements (QuestDB):
-- Tick ingestion must be idempotent using a deterministic row identity (`row_hash`) and provenance keys (`ticks_lake`, `lake_version`).
+- Tick ingestion must be idempotent using a deterministic row identity (`row_hash`) and provenance keys (`ticks_kind`, `dataset_version`).
 - The system must maintain `ghtrader_symbol_day_index_v2` as the authoritative coverage ledger.
 - The system must maintain `ghtrader_no_data_days_v2` to prevent infinite retries and to make “missing days” semantics explicit.
 - **Day manifest/checksums (QuestDB-native)**:
-  - For each `(symbol, trading_day, ticks_lake, lake_version)`, the system must persist deterministic per-day aggregates in `ghtrader_symbol_day_index_v2`:
+  - For each `(symbol, trading_day, ticks_kind, dataset_version)`, the system must persist deterministic per-day aggregates in `ghtrader_symbol_day_index_v2`:
     - `rows_total`, `first_datetime_ns`, `last_datetime_ns`, `l5_present`
     - `row_hash_min`, `row_hash_max`, `row_hash_sum` (and optionally `row_hash_sum_abs`)
   - These values define the canonical **day-manifest** used by `audit` to validate integrity without any file-based checksums.
 
-Audit command:
+Beyond day-level validation, ghTrader must also detect:
+- **Field-level quality issues** (see §5.3.0.5): per-field null/NaN rates, required-field completeness, and consecutive-missing segments.
+- **Intra-day gaps** (see §5.3.0.6): anomalous inter-tick gaps and abnormally-low tick counts for active trading hours.
+
+Unified validation + repair workflow (operator-facing):
+- `ghtrader data diagnose` runs comprehensive validation and produces a JSON report under `runs/control/reports/data_diagnose/`.
+  - Output must tier findings into:
+    - `auto_fixable` (index missing, day missing, stale catalog/cache)
+    - `manual_review` (field outliers, intra-day gaps, suspicious partitions)
+    - `unfixable` (corrupted partitions; mark for exclusion)
+- `ghtrader data repair --report <path>` applies automated repairs and logs provenance under `runs/control/reports/data_repair/`.
+  - Auto-repair examples:
+    - bootstrap/rebuild QuestDB index
+    - fill missing trading days via download
+    - refresh catalog cache
+  - Repairs must be **idempotent** and must not silently “fix” suspicious value outliers without an explicit operator decision.
+- `ghtrader data health` is a convenience wrapper (diagnose → auto-repair → summarize manual-review items).
+
+Audit command (deep integrity validation):
 - Must provide `ghtrader audit` which validates QuestDB-backed datasets and produces:
   - JSON report under `runs/audit/<run_id>.json`
   - exit code **0** if no errors, **1** if errors
@@ -246,7 +287,7 @@ Canonical ticks, features, labels, and schedules are stored in QuestDB.
   - Stores derived datasets:
     - `ghtrader_features_v2` (features)
     - `ghtrader_labels_v2` (labels)
-  - Ingestion must be idempotent and provenance-aware (`lake_version`, `ticks_lake`, `row_hash`).
+  - Ingestion must be idempotent and provenance-aware (`dataset_version`, `ticks_kind`, `row_hash`).
 
 - **No embedded file-based SQL engine**:
   - ghTrader does not ship a local SQL engine for file-based datasets. The dashboard explorer is QuestDB-only.
@@ -258,6 +299,62 @@ Canonical ticks, features, labels, and schedules are stored in QuestDB.
 
 QuestDB is the chosen canonical tick store for this phase.
 
+#### 5.3.0.5 Field-level Quality Validation (QuestDB-first)
+
+Day-level completeness is necessary but not sufficient for tick data. ghTrader must validate field-level completeness and quality within each `(symbol, trading_day, ticks_kind, dataset_version)` partition.
+
+Required field completeness:
+- For each partition, compute per-field null/NaN rates for critical fields.
+  - L1 required (all tick sources): `bid_price1`, `ask_price1`, `last_price`, `volume`, `open_interest`
+  - L5 required (specific contracts; when L5 is expected): `bid_price2..5`, `ask_price2..5`, `bid_volume2..5`, `ask_volume2..5`
+- Thresholds (defaults; configurable later):
+  - L1 null rate > 1% → **ERROR**
+  - L5 null rate > 5% → **WARNING** (because some sources may be depth-limited)
+
+Consecutive missing segments:
+- Detect runs of consecutive ticks where a critical field is null/NaN.
+- Threshold (default): >100 consecutive ticks with missing `bid_price1` → **ERROR**.
+
+Outlier pre-detection (flagging only; do not auto-correct):
+- Price jumps: \(|price[t] - price[t-1]| > k * rolling_std\) (k=5 default)
+- Volume spikes: \(volume[t] > k * rolling_median\) (k=10 default)
+- Spread anomalies: \((ask - bid) > k * historical_spread_p95\) (k=3 default)
+
+Storage (QuestDB):
+- Table: `ghtrader_field_quality_v2` (symbol/day-level quality ledger)
+  - columns include: `symbol`, `trading_day`, `ticks_kind`, `dataset_version`, `rows_total`
+  - per-field null rates (wide columns for L1 + an aggregate L5 null rate) and anomaly counters
+  - consecutive-missing metadata (JSON string)
+
+Implementation:
+- `src/ghtrader/data/field_quality.py`
+
+#### 5.3.0.6 Intra-day Gap Detection (QuestDB-first)
+
+For high-frequency strategies, missing ticks within a trading day can invalidate backtests and live signals even when day-level completeness passes.
+
+Inter-tick interval analysis:
+- Compute inter-tick interval statistics per `(symbol, trading_day)` using `datetime_ns`.
+- Detect anomalous gaps: interval > p99_threshold (default heuristic, e.g. >60s for normally active contracts).
+- Distinguish trading vs non-trading hours when possible (best-effort; do not block dashboard reads).
+
+Expected tick count modeling:
+- For liquid contracts, define a minimum expected tick count (heuristic or historical baseline) and flag abnormally low days.
+- Default baseline is adaptive: compare to recent historical distribution (p10/p50/p90) when available.
+
+Gap categorization:
+- Normal: known non-trading windows (exchange closure / lunch break) when calendar/session metadata is available.
+- Suspicious: unexplained >30s gaps during active hours.
+- Critical: >5min gaps during active hours.
+
+Storage (QuestDB):
+- Table: `ghtrader_tick_gaps_v2` (symbol/day-level gap ledger)
+  - interval stats (median/p95/p99/max)
+  - abnormal gap counts and largest-gap metadata
+
+Implementation:
+- `src/ghtrader/data/gap_detection.py`
+
 #### 5.3.1 Derived dataset: “main-with-depth” (materialized continuity with L5)
 
 Because `KQ.m@...` continuous symbols are L1-only, ghTrader must support a derived dataset that provides:
@@ -268,7 +365,7 @@ Because `KQ.m@...` continuous symbols are L1-only, ghTrader must support a deriv
 Definition:
 
 - The derived symbol is named like the continuous series (e.g. `KQ.m@SHFE.cu`), but it is **materialized** from L5 ticks of the underlying contract selected by the roll schedule (§5.3.2).
-- Output is written to QuestDB with `ticks_lake='main_l5'` and `lake_version='v2'` (stored in the canonical ticks table).
+- Output is written to QuestDB with `ticks_kind='main_l5'` and `dataset_version='v2'` (stored in the canonical ticks table).
 - Provenance must be recorded (schedule hash, underlying contracts used, row counts per day).
 
 Segment metadata contract (required for correctness):
@@ -287,9 +384,9 @@ Sequence semantics (critical for ML correctness):
   - Default behavior is to **exclude cross-boundary windows** rather than attempting price-splice or boundary token hacks.
 
 Builder semantics for derived ticks (critical):
-- When building features on derived main-with-depth ticks (`ghtrader_ticks_main_l5_v2`, `ticks_lake='main_l5'`):
+- When building features on derived main-with-depth ticks (`ghtrader_ticks_main_l5_v2`, `ticks_kind='main_l5'`):
   - rolling-window state (lookback tail) must be **reset** when the underlying contract changes between adjacent trading days.
-- When building labels on derived main-with-depth ticks (`ghtrader_ticks_main_l5_v2`, `ticks_lake='main_l5'`):
+- When building labels on derived main-with-depth ticks (`ghtrader_ticks_main_l5_v2`, `ticks_kind='main_l5'`):
   - cross-day lookahead must be **disabled** when the underlying changes between adjacent trading days (end-of-day labels become NaN rather than leaking).
 - Materialization must persist schedule provenance (QuestDB-first):
   - store `schedule_hash` and other provenance metadata (underlying contract, segment id) in the derived tick rows and/or a small QuestDB metadata table keyed by `schedule_hash`
@@ -366,7 +463,7 @@ Factors are organized into a structured taxonomy for maintainability and researc
 
 Features must be stored in QuestDB table `ghtrader_features_v2` (not as filesystem files) with:
 - Primary time column `ts` and `datetime_ns`
-- `symbol`, `trading_day`, `lake_version`, `ticks_lake`
+- `symbol`, `trading_day`, `dataset_version`, `ticks_kind`
 - Factor columns (wide schema) or a stable long-form schema (if wide is too dynamic)
 - Build metadata recorded in QuestDB (build id/config hash, factor set, lookback config)
 
@@ -459,8 +556,8 @@ Alternative data must be:
 - Validated for predictive value before production use
 
 Implementation:
-- `src/ghtrader/features.py` (`FactorEngine`)
-- `src/ghtrader/feature_store.py` (new module for registry/validation)
+- `src/ghtrader/datasets/features.py` (`FactorEngine`)
+- `src/ghtrader/datasets/feature_store.py` (new module for registry/validation)
 
 ### 5.5 Labels (event-time, multi-horizon)
 
@@ -534,7 +631,7 @@ All label types must:
 - Support incremental computation for new data
 
 Implementation:
-- `src/ghtrader/labels.py` (direction labels)
+- `src/ghtrader/datasets/labels.py` (direction labels)
 - `src/ghtrader/fill_labels.py` (fill probability labels, new module)
 - `src/ghtrader/execution_labels.py` (execution cost labels, new module)
 
@@ -632,7 +729,7 @@ Model selection criteria:
 - **Fill probability metrics**: For execution models - AUC, C-index, time-to-fill MAE
 
 Implementation:
-- `src/ghtrader/models.py`
+- `src/ghtrader/research/models.py`
 
 #### 5.6.1 Ensemble and Stacking Framework
 
@@ -678,7 +775,8 @@ Implementation:
 - Input: `[model_probs_or_logits] + [factor_vector]`.
 
 Implementation:
-- `src/ghtrader/online.py` (`OnlineCalibrator`, `DelayedLabelBuffer`, `run_paper_trading`)
+- `src/ghtrader/research/online.py` (`OnlineCalibrator`, `DelayedLabelBuffer`)
+- `src/ghtrader/tq/paper.py` (`run_paper_trading`)  # TqSdk-specific loop (see §5.1.3)
 - Drift detection via `src/ghtrader/anomaly.py` (see Section 5.14)
 
 ### 5.8 Evaluation and Simulation
@@ -691,7 +789,7 @@ ghTrader provides a unified evaluation and simulation framework spanning backtes
 - Supports paper trading evaluation against historical data
 - Fast iteration for strategy validation
 
-Implementation: `src/ghtrader/eval.py`
+Implementation: `src/ghtrader/tq/eval.py` (Tier1 TqBacktest harness; TqSdk-specific)
 
 #### 5.8.2 Tier2: Offline Micro-Sim
 
@@ -700,7 +798,7 @@ Implementation: `src/ghtrader/eval.py`
 - Configurable market impact models
 - Suitable for execution algorithm testing
 
-Implementation: `src/ghtrader/pipeline.py` (`OfflineMicroSim`)
+Implementation: `src/ghtrader/research/pipeline.py` (`OfflineMicroSim`)
 
 #### 5.8.3 Order Book Simulator (for RL training)
 
@@ -740,8 +838,8 @@ For counterfactual analysis and execution optimization:
 - **Counterfactual PnL estimation**: Estimate alternative strategy performance
 
 Implementation:
-- `src/ghtrader/eval.py` (Tier1)
-- `src/ghtrader/pipeline.py` (`OfflineMicroSim` for Tier2)
+- `src/ghtrader/tq/eval.py` (Tier1)
+- `src/ghtrader/research/pipeline.py` (`OfflineMicroSim` for Tier2)
 - `src/ghtrader/simulator.py` (new module for LOB simulation, market generation, multi-agent)
 
 ### 5.9 Continual training + promotion
@@ -756,7 +854,7 @@ Daily job must:
 6. Roll back on regression
 
 Implementation:
-- `src/ghtrader/pipeline.py` (`run_daily_pipeline`, `PromotionGate` in `eval.py`)
+- `src/ghtrader/research/pipeline.py` (`run_daily_pipeline`, `PromotionGate` in `eval.py`)
 
 ### 5.10 Benchmarking and comparisons
 
@@ -835,7 +933,7 @@ For models predicting order execution (KANFormer-style):
 - **Lift curves**: Improvement over baseline at various thresholds
 
 Implementation:
-- `src/ghtrader/benchmark.py`
+- `src/ghtrader/research/benchmark.py`
 - CLI commands: `benchmark`, `compare`
 
 ### 5.11 Control plane (headless ops dashboard; SSH-only)
@@ -879,47 +977,42 @@ Requirements:
         - `complete`: all expected trading days have data in QuestDB (present + no-data = expected)
         - `missing` (or `incomplete`): some expected trading days are neither present nor marked as no-data
         - `stale`: active contract but last tick is older than threshold (freshness check)
-        - `unindexed`: symbol has no rows in `ghtrader_symbol_day_index_v2` — index bootstrap is needed before Verify/Fill can compute meaningful completeness
+        - `unindexed`: symbol has no rows in `ghtrader_symbol_day_index_v2` — index bootstrap is needed before Diagnose/Health can compute meaningful completeness
       - **Index bootstrap** (operator action):
         - If the QuestDB symbol-day index is empty/underpopulated for an exchange/variety, the system must detect this and offer an explicit **Bootstrap Index** action.
         - Bootstrap scans the canonical ticks table and populates `ghtrader_symbol_day_index_v2` for the selected scope.
-        - Verify must **gate** on index health: refuse to run (or skip symbols) when `index_missing=true` to avoid misleading "everything is missing" results.
-        - Fill Missing has two modes:
-          - **Normal mode (index-backed)**: requires index health; refuses/skips `index_missing=true` symbols.
-          - **Init mode (new-variety seed)**: when `symbols_indexed==0` for an exchange/variety, Step 3 may enqueue per-symbol **`download`** jobs over inferred per-contract windows (clamped by optional Start/End overrides). This mode must be explicit and confirmed.
+        - Health must handle index bootstrap as an **auto-fixable** repair action:
+          - When the index is missing/incomplete, `data health` should bootstrap/rebuild the index first, then re-run diagnose so missing-day backfills can be computed correctly.
+        - New-variety seed (operator-confirmed):
+          - When there are effectively **no ticks yet** for a scope, the UI may offer an explicit **Seed (Download)** action that enqueues per-symbol `download` jobs over inferred per-contract windows (clamped by optional Start/End overrides).
       - Must include an integrated **Workflow stepper card** above the contracts table (replaces previous toolbar + options panel):
         - **Step 0 (Refresh)**: Refresh snapshot (shows snapshot time/source)
-        - **Step 1 (Index health)**: Index health + **Bootstrap Index** button (shows `index_missing X/Y` symbols)
-        - **Step 2 (Verify)**: Verify completeness (shows last verify summary; disabled if index unhealthy)
-        - **Step 3 (Fill Missing)**:
-          - Normal: Fill missing days (disabled until index healthy; confirm dialog)
-          - Init: when `symbols_indexed==0` and `symbols_unindexed>0`, allow **Init (Download)** to seed a brand-new variety by enqueueing per-symbol downloads over inferred windows (confirm dialog; respects Start/End clamps)
-        - **Step 4 (Update All)**: Update All (explicit description; confirm dialog) — daily forward-fill active + recently expired
-        - **Step 5 (Compute L5 start)**: Compute L5 start (PRD-required; shows last L5-start summary)
+        - **Step 1 (Health)**: Health check (runs diagnose + auto-repair; shows last diagnose/repair summaries)
+        - **Step 2 (Update All)**: Update All (explicit description; confirm dialog) — daily forward-fill active + recently expired
+        - **Step 3 (Compute L5 start)**: Compute L5 start (PRD-required; shows last L5-start summary)
         - Advanced options (collapsible): date overrides + refresh catalog toggle
         - Inline help: "What each step does" description (not just tooltips)
       - Action semantics (avoid duplicates/confusion):
         - **Refresh**: rebuild the cached Contracts snapshot (cache-first read paths; no heavy work on request path)
-        - **Bootstrap Index**: scan ticks table and populate index for selected exchange/var (enqueued job)
-        - **Verify**: compute expected vs present vs no-data (index-backed; skips unindexed symbols) and persist a report
-        - **Fill missing (normal)**: ingest missing days from TqSdk into QuestDB (index-backed; TqSdk-heavy; throttled; refuses unindexed symbols)
-        - **Fill missing (init / new-variety)**: when `symbols_indexed==0`, enqueue per-symbol `download` jobs over inferred per-contract windows (clamped by optional Start/End overrides)
+        - **Health**: run `data health` (diagnose → auto-repair → summarize manual-review items). Auto-repair includes index bootstrap and missing-days backfill when possible.
+        - **Bootstrap Index** (optional): scan ticks table and populate index for selected exchange/var (enqueued job)
+        - **Seed (Download)** (optional; explicit/confirmed): enqueue per-symbol `download` jobs over inferred per-contract windows for brand-new varieties
         - **Update All**: daily forward-fill active + recently expired (TqSdk-heavy; throttled)
   - **Models** (`/models`):
     - Tab 1: Model inventory (list trained artifacts with search/filter)
     - Tab 2: Training (train form + sweep form + active training jobs)
     - Tab 3: Benchmarks (benchmark/compare/backtest forms, results table)
   - **Trading** (`/trading`):
-    - Tab 1: Live status (KPIs, positions, signals, risk metrics, orders)
-    - Tab 2: Start trading (full form with safety warnings, presets)
-    - Tab 3: Run history (historical trading runs table)
+    - Tab 1: Live status (Gateway-first; KPIs, positions, signals/targets, risk metrics, orders)
+    - Tab 2: Start / Control (Gateway + Strategy desired-state; supervisors start/stop processes)
+    - Tab 3: Run history (strategy runs)
   - **Ops** (`/ops`):
     - Tab 1: Pipeline (happy path buttons, running ingest jobs)
     - Tab 2: Ingest (download, download-contract-range, record forms)
     - Tab 3: Schedule & Build (schedule, main_l5, features/labels forms)
     - Tab 4: Integrity (audit forms, recent reports)
     - Tab 5: Locks (active locks table with key reference)
-  - Legacy routes (`/ops/ingest`, `/ops/build`, etc.) may remain for API compatibility.
+  - `/ops` is the canonical entrypoint. Any older `/ops/*` routes must redirect to `/ops` (optionally with a tab anchor) and must not introduce a second “source of truth” UI.
 - **Job execution model**:
   - Long-running operations must run as **subprocess jobs** (not in-process), so they are cancellable and resilient to UI restarts.
   - Job history must **persist across dashboard restarts**.
@@ -943,12 +1036,12 @@ Requirements:
     - `build`, `train`, `benchmark`, `compare`, `backtest`, `paper`, `daily-train`, `sweep`
     - `main-schedule`, `main-l5`
     - `audit`
-    - completeness/integrity tooling (QuestDB-first):
-      - `data verify` (compute expected vs actual days using QuestDB index/no-data tables)
-      - `data fill-missing` (fill missing days from TqSdk into QuestDB)
+    - data integrity + repair tooling (QuestDB-first):
+      - `data diagnose` (comprehensive validation report; updates quality ledgers)
+      - `data repair` (execute a repair plan from a diagnose report)
+      - `data health` (diagnose + auto-repair + manual-review summary)
   - The `/ops` page must provide a “happy path” set of **pipeline buttons** that maps to the canonical workflow:
-    - **Verify completeness** (QuestDB index)
-    - **Fill missing** (QuestDB ingest)
+    - **Data health** (diagnose + auto-repair)
     - **Compute schedule** (OI rule; QuestDB-backed)
     - **Build main_l5 (L5 era only)**
     - **Build features/labels**
@@ -963,7 +1056,7 @@ Requirements:
     - Manual triggers must remain available (Data hub “Update” button, CLI `ghtrader update`).
 - **Observability**:
   - Must display data coverage (QuestDB index by symbol/trading_day, derived dataset coverage).
-    - Coverage UI is **v2-only** (QuestDB tables with `lake_version='v2'`).
+    - Coverage UI is **v2-only** (QuestDB tables with `dataset_version='v2'`).
   - Must display **ingest progress** for running/queued ingest jobs:
     - `download`: % complete over requested trading-day range (includes no-data markers)
     - `download-contract-range`: per-contract and overall % complete using trading calendar + no-data markers (no akshare active-ranges)
@@ -992,14 +1085,15 @@ Requirements:
         - missing-day count (excluding known-no-data days)
         - known-no-data day count (from `ghtrader_no_data_days_v2`)
     - Contract explorer actions:
-      - **Verify**: enqueue a completeness verification job (expected vs actual vs no-data) for the selected scope.
-      - **Fill missing**: enqueue ingest jobs to backfill missing trading days into QuestDB.
+      - **Diagnose**: enqueue `data diagnose` for the selected scope (expected vs actual vs no-data, plus quality checks).
+      - **Health**: enqueue `data health` (diagnose → auto-repair) for the selected scope.
+      - **Repair**: enqueue `data repair` from the latest diagnose report (manual selection when needed).
       - **Probe L5**: enqueue per-contract probe jobs (subprocess).
       - Optional integrity checks: quick checks + ability to run `audit`.
       - **Update**: check remote availability and fill forward (active + recently expired) and refresh QuestDB.
     - Bulk Fill/Probe must be **throttled** to avoid starting hundreds of TqSdk-heavy processes:
       - Use a queue/scheduler that runs at most `GHTRADER_MAX_PARALLEL_TQSDK_JOBS` (default **4**) concurrently.
-  - Progress UI must work for **already-running jobs** (no restart required) by using job logs + lake state.
+  - Progress UI must work for **already-running jobs** (no restart required) by using job logs + persisted artifact state (QuestDB index/no-data tables + `runs/` caches).
   - Performance: progress computation must be safe to refresh (use caching/TTL; avoid heavy scans every few seconds).
   - Network policy for dashboard read paths:
     - Default dashboard reads (page loads and `GET /api/...` used for UI rendering) must be **cache-only** and must **not** download external resources (holiday lists, catalogs, etc.).
@@ -1037,15 +1131,40 @@ Locking requirements:
 Canonical lock keys (minimum set):
 - `ticks:symbol=<SYM>` for `download`, `record`
 - `ticks_range:exchange=<EX>,var=<VAR>` for `download-contract-range`
-- `build:symbol=<SYM>,ticks_lake=<raw|main_l5>` for `build`
+- `build:symbol=<SYM>,ticks_kind=<raw|main_l5>` for `build`
 - `train:symbol=<SYM>,model=<M>,h=<H>` for `train`
 - `main_schedule:var=<VAR>` for `main-schedule`
 - `main_l5:symbol=<DERIVED>` for `main-l5`
-- `trade:account=<PROFILE>` for `trade` (one active run per broker account profile)
+- `trade:account=<PROFILE>` for AccountGateway (`ghtrader gateway run`) (one active process per broker account profile)
 
 Implementation:
 - `src/ghtrader/control/` (FastAPI app + job runner + SQLite store)
 - CLI command: `ghtrader dashboard`
+
+#### 5.11.3 Data Quality Monitoring Dashboard
+
+ghTrader must expose clear, low-latency visibility into data quality (QuestDB-first) so operators can detect gaps early and avoid training/backtesting on corrupted data.
+
+Quality KPI cards (cached; safe to refresh):
+- Overall completeness: % symbols with no missing trading days (expected vs index/no-data)
+- Field quality: weighted score from critical-field null rates (see §5.3.0.5)
+- Gap/anomaly count (recent): intra-day gap flags + outlier flags (see §5.3.0.6)
+- Freshness: last tick age for active contracts (minute-level)
+
+Per-symbol drill-down:
+- Table with columns: `symbol`, `min_day`, `max_day`, completeness%, field_quality_score, anomaly_count, status
+- Clicking a symbol shows:
+  - field null-rate breakdown (L1 + L5 aggregate)
+  - recent gap stats (p95/p99/max interval; largest gap)
+  - recent audit/diagnose findings and recommended next actions
+
+Actions:
+- Provide a “Health Check” action that enqueues `ghtrader data health` for a selected scope (exchange/var or symbol list).
+- Provide “View report” links to diagnose/repair JSON artifacts under `runs/control/reports/`.
+
+Implementation:
+- `src/ghtrader/control/templates/data.html` (new Quality tab)
+- APIs: `GET /api/data/quality-summary`, `GET /api/data/quality-detail/{symbol}`, and enqueue endpoints for diagnose/repair.
 
 ### 5.12 Account + trading (TqSdk; phased, safety-gated)
 
@@ -1053,6 +1172,51 @@ ghTrader must support **account monitoring and trading execution** using TqSdk i
 
 - **Phase 1 (safe)**: paper + simulated execution for research/validation.
 - **Phase 2 (gated)**: real account execution, explicitly enabled, with robust safety/risk controls.
+
+#### 5.12.0 Trading architecture: AccountGateway (OMS/EMS) + StrategyRunner (AI)
+
+To align with a mature quant system design while remaining AI-first and automation-first, ghTrader must separate:
+
+- **AccountGateway**: OMS/EMS responsibilities (account connectivity, order routing, reconciliation, risk, state).
+- **StrategyRunner**: AI responsibilities (model inference + feature parity, signal/target generation).
+
+Principles:
+
+- **AI-first automation**: core workflows must be automatable end-to-end (default path).
+- **Manual intervention is optional and explicit**: only the minimal set of operator actions needed for safety and incident response should be exposed (e.g. disarm live, cancel all, flatten), but these actions must be **visible, logged, and auditable**.
+- **Transparent state**: all components persist small, inspectable artifacts under `runs/` so the dashboard can be read-only and robust.
+- **Small blast radius**: one AccountGateway process per `account_profile` (see lock key `trade:account=<PROFILE>`).
+
+Components:
+
+- **AccountGateway** (per `account_profile`):
+  - Owns the **TqApi lifecycle** (connect/reconnect) and maintains live references for account/positions/orders/quotes.
+  - Enforces **risk controls** (PRD §5.12.4) and optional TqSdk defense-in-depth rules.
+  - Accepts **target updates** from StrategyRunner (or a manual override), and converts them to executor actions:
+    - `TargetPosTask` (default) OR
+    - direct `insert_order()`/`cancel_order()` (advanced).
+  - Must never mix `TargetPosTask` with `insert_order()` for the same (account,symbol).
+
+- **StrategyRunner** (one or more, per strategy):
+  - Must NOT import `tqsdk` directly; it consumes normalized market snapshots from AccountGateway.
+  - Loads model artifacts + `model_h{H}.meta.json` and enforces training-serving parity before producing targets.
+  - Emits **target positions** (net targets) and strategy-level events (signals/confidence/regime tags).
+
+IPC / state contract (file-based; local-only):
+
+- Base directory: `runs/gateway/account=<PROFILE>/`
+- Required files (schema-versioned):
+  - `desired.json`: operator- and dashboard-written desired configuration (mode, symbols, executor, risk limits, enablement gates).
+  - `targets.json`: StrategyRunner-written latest targets (per symbol) + metadata (ts, source, model, confidence).
+  - `commands.jsonl`: operator commands (append-only; cancel_all, flatten, disarm_live, restart, etc.). Each command must have a unique `command_id`.
+  - `state.json`: atomic, small “latest state” object for fast dashboard reads (last snapshot + recent events + health).
+  - `events.jsonl`: append-only events (gateway lifecycle + risk + execution + reconciliation).
+  - `snapshots.jsonl`: append-only account snapshots (same schema requirements as PRD §5.12.6, but stored under the gateway root).
+
+Dashboard responsibility:
+
+- Provide UI/API to view and modify `desired.json`, append `commands.jsonl`, and display `state.json` + recent `events.jsonl`.
+- Provide a **GatewaySupervisor** that ensures a gateway process is running for profiles whose `desired.mode != idle`.
 
 #### 5.12.1 Trading modes
 
@@ -1120,7 +1284,7 @@ Safety gate for live trading:
 
 Monitor-only live mode gate:
 - `--mode live --monitor-only` must **not** require `--confirm-live`.
-  It must still require broker credentials and must still log all snapshots/events to `runs/trading/...`.
+  It must still require broker credentials and must still log all snapshots/events to `runs/gateway/account=<PROFILE>/...`.
 
 Mandatory risk controls (must work even without TqSdk “professional” local risk features):
 
@@ -1198,37 +1362,27 @@ Schedule resolution sources (in priority order):
 
 #### 5.12.6 Observability + persistence
 
-Trading runners must persist:
+Trading runners must persist.
 
-- **Run config** (`runs/trading/<run_id>/run_config.json`):
-  - mode (`paper|sim|live`), `monitor_only`, sim account (`tqsim|tqkq`), executor (`targetpos|direct`)
-  - model name + symbols requested/resolved + binding (`requested_symbol -> execution_symbol`)
-  - risk limits + preflight flags
+##### 5.12.6.2 Gateway artifacts (`runs/gateway/`)
 
-- **Account snapshots** (`runs/trading/<run_id>/snapshots.jsonl`):
-  - Each line is a JSON object with `schema_version>=2`
-  - Required fields (best-effort; some may be `null` depending on account/provider):
-    - `ts` (UTC ISO)
-    - `account`: `balance`, `available`, `margin`, `float_profit`, `position_profit`, `risk_ratio`, **`equity`** (= `balance + float_profit` when both are available)
-    - `positions` per symbol (net/long/short, today/his splits when applicable)
-    - `orders_alive` (minimal fields for UI display)
-    - `account_meta` (non-secret hints for UI): mode, monitor_only, broker_configured
+AccountGateway must persist (per `account_profile`):
 
-- **Events** (`runs/trading/<run_id>/events.jsonl`):
-  - Each line is a JSON object with `ts` + `type`.
-  - Required event types for live monitoring UX:
-    - `startup_snapshot`, `preflight_failed`, `risk_kill`, `wait_update_failed`, `shutdown_signal`
-    - `roll` (continuous alias underlying change) + `roll_flatten_failed` (best-effort)
-    - `target_change` (signal/target updates; optional in monitor-only)
-    - `signals_disabled` (monitor-only may run without model artifacts; signals become optional)
-    - Order lifecycle (diff-based): `order_new`, `order_update`, `order_done`
-    - Trade fills (best-effort): `trade_fill`
+- Root: `runs/gateway/account=<PROFILE>/`
+- `desired.json`, `targets.json`, `commands.jsonl` (control-plane contract; see PRD §5.12.0)
+- `snapshots.jsonl`: account snapshots, same schema requirements as above (schema_version>=2; account/positions/orders_alive/account_meta)
+- `events.jsonl`: gateway lifecycle + execution + risk events (append-only)
+- `state.json`: atomic fast-read state (last snapshot + recent events + health + echo of effective config)
 
-- **Fast dashboard reads** (recommended):
-  - Maintain an atomic `runs/trading/<run_id>/state.json` with:
-    - `last_snapshot` (latest snapshot object)
-    - `recent_events` (tail N, e.g. 50)
-  - This avoids tail-reading large JSONL files in the dashboard.
+StrategyRunner should persist:
+
+- Stable per-profile surface for supervision/UI:
+  - `runs/strategy/account=<PROFILE>/desired.json` (desired config; dashboard-written)
+  - `runs/strategy/account=<PROFILE>/state.json` (fast-read; StrategyRunner-written)
+  - `runs/strategy/account=<PROFILE>/events.jsonl` (append-only; StrategyRunner-written)
+- Per-run audit trail:
+  - `runs/strategy/<run_id>/run_config.json` (model + horizons + symbols + thresholds + feature spec hash)
+  - `runs/strategy/<run_id>/events.jsonl` (signals/targets/parity failures/regime tags)
 
 Feature-spec correctness (required for live safety):
 - Online trading must enforce that the factor set/order used for inference matches the trained model’s expected feature shape.
@@ -1239,19 +1393,16 @@ Feature-spec correctness (required for live safety):
 Required implementation detail (to ensure training-serving parity in a QuestDB-first system):
 - `ghtrader train` must persist a small, non-secret model metadata sidecar next to the model weights:
   - Example filename: `model_h{H}.meta.json`
-  - Must include: `enabled_factors`, `ticks_lake`, `lake_version`, and QuestDB build provenance (`feature_build_id`, `label_build_id`, plus `schedule_hash` when `ticks_lake=main_l5`).
-  - `ghtrader trade` must read this sidecar and enforce parity without requiring QuestDB connectivity on the hot path.
-
-Write under: `runs/trading/<run_id>/...` so the dashboard can display “last known state” without attaching to the live process.
+- Must include: `enabled_factors`, `ticks_kind`, `dataset_version`, and QuestDB build provenance (`feature_build_id`, `label_build_id`, plus `schedule_hash` when `ticks_kind=main_l5`).
+  - Trading must read this sidecar and enforce parity without requiring QuestDB connectivity on the hot path.
 
 Dashboard read-only APIs (local-only via SSH forwarding):
-- `GET /api/trading/status`: last known active run + last snapshot + recent events (tail N)
-- `GET /api/trading/runs?limit=...`: list run history (run_id, last_ts, mode, balance/equity)
-- `GET /api/trading/run/{run_id}/tail?events=...&snapshots=...`: fetch recent lines for a specific run
-
-Implementation:
-- new modules: `src/ghtrader/tq_runtime.py`, `src/ghtrader/execution.py`, `src/ghtrader/symbol_resolver.py`
-- new CLI command: `ghtrader trade`
+- `GET /api/trading/console/status?account_profile=...`: unified console payload (gateway + strategy)
+- `GET /api/gateway/status?account_profile=...`: gateway state for a profile (reads `runs/gateway/account=<PROFILE>/state.json`)
+- `GET /api/gateway/list`: list gateway profiles + health summary (reads `runs/gateway/...`)
+- `GET /api/strategy/status?account_profile=...`: strategy stable state (reads `runs/strategy/account=<PROFILE>/state.json`)
+- `POST /api/strategy/desired`: upsert strategy desired state (writes `runs/strategy/account=<PROFILE>/desired.json`)
+- `GET /api/strategy/runs?limit=...`: list strategy run history (`runs/strategy/<run_id>/...`)
 
 ### 5.13 Market Regime Detection
 
@@ -1676,7 +1827,7 @@ Implementation (future):
   - Incremental builds must refuse to mix configurations if the stored build metadata/config hash does not match (require `--overwrite`).
 
 Implementation:
-- `src/ghtrader/pipeline.py` (`LatencyTracker`, `LatencyContext`)
+- `src/ghtrader/research/pipeline.py` (`LatencyTracker`, `LatencyContext`)
 
 #### Compute utilization (server-scale)
 
@@ -1701,7 +1852,7 @@ Given the target hardware (multi-CPU + **4 GPUs**), ghTrader uses a **hybrid sca
   - should be skipped unless `.env` credentials exist
 
 Current state:
-- `tests/` includes unit coverage for lake/labels/features/models/online/pipeline/cli.
+- `tests/` includes unit coverage for labels/features/models/online/pipeline/cli.
 
 CI requirements:
 - ghTrader must include a **GitHub Actions** workflow that runs on push/PR.
@@ -1740,26 +1891,21 @@ Implementation:
 
 ## 8) System architecture
 
-### 8.1 Repo layout (current)
+### 8.1 Repo layout (PRD)
 
 - `src/ghtrader/`
-  - `cli.py` (entrypoints)
+  - `cli.py` (thin entrypoint; delegates to `cli/` command modules)
+  - `cli/` (CLI command implementations grouped by domain)
   - `config.py` (dotenv + creds)
-  - `tq_ingest.py` (TqSdk download/record → QuestDB canonical ticks)
-  - `questdb_index.py` (QuestDB index + no-data tables; coverage ledger)
-  - `questdb_queries.py` (QuestDB read/query helpers; dashboard explorer support)
-  - `l5_detection.py` (unified L5 detection logic for DataFrames and SQL)
-  - `main_depth.py` (materialize main-with-depth ticks → QuestDB)
-  - `main_l5.py` (build main_l5 for L5-era only)
-  - `main_schedule_db.py` (roll schedule computation from QuestDB OI)
-  - `serving_db.py` (QuestDB ILP ingestion backend; tick table DDL)
-  - `features.py` (FactorEngine)
-  - `labels.py` (event-time labels)
-  - `models.py` (model zoo)
-  - `online.py` (online calibrator + paper loop)
-  - `eval.py` (TqBacktest harness + promotion gates)
-  - `pipeline.py` (daily pipeline, latency, microsim)
-  - `benchmark.py` (bench/compare)
+  - `data_provider.py` (provider interfaces)
+  - `control/` (FastAPI app + job runner + SQLite store + templates/static)
+  - `tq/` (TqSdk-only provider implementation: ingest/gateway/execution/runtime/eval/paper/catalog/probes)
+  - `questdb/` (QuestDB schema + ingestion + index/no-data ledger + query helpers)
+  - `data/` (calendar/manifests/completeness/diagnose+repair/update, plus main-schedule/main-l5 builders)
+  - `datasets/` (features/labels build logic)
+  - `trading/` (StrategyRunner/control + order planning)
+  - `research/` (models/online/eval/pipeline/benchmark/distributed utilities)
+  - `util/` (small helpers like JSON IO)
 - `tests/` (unit tests)
 - `data/` (local caches only; gitignored)
 - `runs/` (reports; gitignored)
@@ -1867,6 +2013,9 @@ Core commands:
 
 - `ghtrader download`
 - `ghtrader record`
+- `ghtrader data diagnose`
+- `ghtrader data repair`
+- `ghtrader data health`
 - `ghtrader build`
 - `ghtrader train`
 - `ghtrader backtest`
@@ -1875,6 +2024,7 @@ Core commands:
 - `ghtrader sweep`
 - `ghtrader benchmark`
 - `ghtrader compare`
+- `ghtrader audit`
 
 ---
 

@@ -4,7 +4,7 @@ import numpy as np
 
 
 def test_compute_mid_price_smoke(small_synthetic_tick_df):
-    from ghtrader.labels import compute_mid_price
+    from ghtrader.datasets.labels import compute_mid_price
 
     mid = compute_mid_price(small_synthetic_tick_df)
     assert len(mid) == len(small_synthetic_tick_df)
@@ -12,7 +12,7 @@ def test_compute_mid_price_smoke(small_synthetic_tick_df):
 
 
 def test_compute_multi_horizon_labels_smoke(small_synthetic_tick_df):
-    from ghtrader.labels import compute_multi_horizon_labels
+    from ghtrader.datasets.labels import compute_multi_horizon_labels
 
     out = compute_multi_horizon_labels(small_synthetic_tick_df, horizons=[10, 50], threshold_k=1, price_tick=1.0)
     assert list(out.columns) == ["mid", "label_10", "label_50"]

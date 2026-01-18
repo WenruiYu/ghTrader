@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from ghtrader.main_contract import normalize_contract_symbol
+from ghtrader.data.main_schedule import normalize_contract_symbol
 
 
 @pytest.mark.parametrize(

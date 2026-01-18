@@ -106,54 +106,45 @@ def test_api_models_benchmarks_lists_reports(tmp_path: Path, monkeypatch: pytest
     assert any(b["run_id"] == "run123" and b["model_type"] == "xgboost" and b["symbol"] == "KQ.m@SHFE.cu" for b in benches)
 
 
-def test_api_trading_status_schema_and_derivations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_api_trading_console_status_reads_gateway_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     client = _make_client(tmp_path, monkeypatch)
 
     runs_dir = tmp_path / "runs"
-    run_id = "20260114_000000"
-    run_dir = runs_dir / "trading" / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    (run_dir / "run_config.json").write_text(
-        json.dumps(
-            {
-                "created_at": "2026-01-14T00:00:00Z",
-                "mode": "paper",
-                "monitor_only": True,
-                "executor": "targetpos",
-                "model_name": "xgboost",
-                "symbols_requested": ["KQ.m@SHFE.cu"],
-                "symbols_resolved": ["SHFE.cu2602"],
-                "limits": {"max_abs_position": 1, "max_order_size": 1, "max_ops_per_sec": 10},
-            }
-        ),
-        encoding="utf-8",
-    )
+    gw_root = runs_dir / "gateway" / "account=default"
+    gw_root.mkdir(parents=True, exist_ok=True)
+    (gw_root / "desired.json").write_text(json.dumps({"desired": {"mode": "paper"}}), encoding="utf-8")
 
     snap = {
         "ts": "2026-01-14T00:00:01Z",
         "symbols": ["SHFE.cu2602"],
-        "account": {"balance": 100.0, "float_profit": 5.0, "position_profit": 0.0},
+        "account": {"balance": 100.0, "float_profit": 5.0, "position_profit": 0.0, "equity": 105.0},
         "positions": {"SHFE.cu2602": {"volume_long": 2, "volume_short": 1, "float_profit_long": 1.0, "float_profit_short": -0.5}},
         "orders_alive": [],
     }
-    (run_dir / "snapshots.jsonl").write_text(json.dumps(snap) + "\n", encoding="utf-8")
-    # Ensure "active" detection (mtime within 5 minutes)
+    (gw_root / "state.json").write_text(
+        json.dumps(
+            {
+                "updated_at": "2026-01-14T00:00:02Z",
+                "health": {"ok": True, "connected": True},
+                "effective": {"mode": "paper"},
+                "last_snapshot": snap,
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Ensure "running" detection (fresh mtime)
     now = time.time()
-    os.utime(run_dir / "snapshots.jsonl", (now, now))
+    os.utime(gw_root / "state.json", (now, now))
 
-    r = client.get("/api/trading/status")
+    r = client.get("/api/trading/console/status?account_profile=default")
     assert r.status_code == 200
     data = r.json()
     assert data["ok"] is True
-    assert data["active"] is True
-    assert data["run_id"] == run_id
-    assert data["mode"] == "paper"
-    assert data["model"] == "xgboost"
-    assert data["account"]["equity"] == pytest.approx(105.0)
-    assert data["pnl"] == pytest.approx(5.0)
-    assert data["position"]["symbol"] == "SHFE.cu2602"
-    assert int(data["position"]["volume"]) == 1
+    assert data["account_profile"] == "default"
+    assert data["gateway"]["exists"] is True
+    assert data["gateway"]["component_status"] == "running"
+    assert data["gateway"]["state"]["last_snapshot"]["account"]["equity"] == pytest.approx(105.0)
+    assert data["strategy"]["exists"] is False
 
 
 def test_base_template_has_ok_false_guard_and_ui_status_endpoint():

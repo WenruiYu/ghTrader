@@ -19,7 +19,6 @@ Usage:
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -119,13 +118,11 @@ def get_tqsdk_auth() -> Any:
     """
     # Ensure config is loaded
     load_config()
-    
-    # Add vendored tqsdk to path if needed
-    tqsdk_path = Path(__file__).parent.parent.parent.parent / "tqsdk-python"
-    if tqsdk_path.exists() and str(tqsdk_path) not in sys.path:
-        sys.path.insert(0, str(tqsdk_path))
-    
-    from tqsdk import TqAuth
+
+    try:
+        from tqsdk import TqAuth  # type: ignore
+    except Exception as e:
+        raise RuntimeError("tqsdk not installed. Install with: pip install tqsdk") from e
     
     user = get_env("TQSDK_USER", required=True)
     password = get_env("TQSDK_PASSWORD", required=True)

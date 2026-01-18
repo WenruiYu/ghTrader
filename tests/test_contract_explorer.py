@@ -6,7 +6,7 @@ import pytest
 
 
 def test_df_has_l5_detection():
-    from ghtrader.tqsdk_l5_probe import _df_has_l5
+    from ghtrader.tq.l5_probe import _df_has_l5
 
     df = pd.DataFrame({"bid_price2": [float("nan"), float("nan")], "ask_price2": [float("nan"), float("nan")]})
     assert _df_has_l5(df) is False
@@ -23,13 +23,13 @@ def test_contract_status_completeness_uses_questdb_present_dates(tmp_path: Path,
     PRD (QuestDB-first): contract completeness is computed from QuestDB index coverage,
     not from local lake partitions.
     """
-    from ghtrader.control.contract_status import compute_contract_statuses
+    from ghtrader.data.contract_status import compute_contract_statuses
 
     data_dir = tmp_path / "data"
 
     # Hermetic: avoid calendar downloads and QuestDB connections.
-    import ghtrader.control.contract_status as cs
-    import ghtrader.questdb_index as qix
+    import ghtrader.data.contract_status as cs
+    import ghtrader.questdb.index as qix
 
     monkeypatch.setattr(cs, "get_trading_calendar", lambda **_kwargs: [])
     monkeypatch.setattr(qix, "list_no_data_trading_days", lambda **_kwargs: set())
@@ -59,13 +59,13 @@ def test_contract_status_completeness_uses_questdb_present_dates(tmp_path: Path,
 
 
 def test_contract_status_prefers_questdb_bounds_for_expected_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from ghtrader.control.contract_status import compute_contract_statuses
+    from ghtrader.data.contract_status import compute_contract_statuses
 
     data_dir = tmp_path / "data"
 
     # Hermetic: avoid calendar downloads and QuestDB connections.
-    import ghtrader.control.contract_status as cs
-    import ghtrader.questdb_index as qix
+    import ghtrader.data.contract_status as cs
+    import ghtrader.questdb.index as qix
 
     monkeypatch.setattr(cs, "get_trading_calendar", lambda **_kwargs: [])
     monkeypatch.setattr(qix, "list_no_data_trading_days", lambda **_kwargs: set())
@@ -142,9 +142,9 @@ def test_tqsdk_scheduler_tick_respects_max_parallel(tmp_path: Path, monkeypatch)
     assert started2 == 0
 
 
-def test_tqsdk_scheduler_starts_data_fill_missing_jobs(tmp_path: Path, monkeypatch):
+def test_tqsdk_scheduler_starts_data_health_jobs(tmp_path: Path, monkeypatch):
     """
-    data fill-missing uses TqSdk and must be treated as scheduler-throttled heavy work.
+    data health can be TqSdk-heavy (auto-repair downloads) and must be scheduler-throttled.
     """
     from ghtrader.control.app import _tqsdk_scheduler_tick
     from ghtrader.control.db import JobStore
@@ -155,20 +155,23 @@ def test_tqsdk_scheduler_starts_data_fill_missing_jobs(tmp_path: Path, monkeypat
     store = JobStore(db_path)
     jm = JobManager(store=store, logs_dir=logs_dir)
 
-    # One queued fill-missing job (pid is NULL).
+    # One queued health job (pid is NULL).
     store.create_job(
-        job_id="qfill1",
-        title="data-fill-missing SHFE.cu",
+        job_id="qhealth1",
+        title="data-health SHFE.cu",
         command=[
             "python",
             "-m",
             "ghtrader.cli",
             "data",
-            "fill-missing",
+            "health",
             "--exchange",
             "SHFE",
             "--var",
             "cu",
+            "--thoroughness",
+            "standard",
+            "--auto-repair",
             "--refresh-catalog",
             "0",
             "--chunk-days",
@@ -180,7 +183,7 @@ def test_tqsdk_scheduler_starts_data_fill_missing_jobs(tmp_path: Path, monkeypat
         ],
         cwd=tmp_path,
         source="dashboard",
-        log_path=logs_dir / "job-qfill1.log",
+        log_path=logs_dir / "job-qhealth1.log",
     )
 
     started_ids: list[str] = []
@@ -194,13 +197,13 @@ def test_tqsdk_scheduler_starts_data_fill_missing_jobs(tmp_path: Path, monkeypat
 
     started = _tqsdk_scheduler_tick(store=store, jm=jm, max_parallel=4)
     assert started == 1
-    assert started_ids == ["qfill1"]
+    assert started_ids == ["qhealth1"]
 
 
 def test_pre20_quotes_filter_and_expire_datetime_iso(tmp_path: Path, monkeypatch):
     import lzma
 
-    from ghtrader import tqsdk_catalog
+    import ghtrader.tq.catalog as tqsdk_catalog
 
     # Create a fake expired_quotes.json.lzma
     pkg_dir = tmp_path / "tqsdk"

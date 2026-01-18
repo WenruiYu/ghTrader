@@ -26,7 +26,7 @@ IngestKind = Literal["download", "download_contract_range", "record", "unknown"]
 def _make_questdb_cfg():
     """Build QuestDB query config from environment."""
     try:
-        from ghtrader.questdb_client import make_questdb_query_config_from_env
+        from ghtrader.questdb.client import make_questdb_query_config_from_env
 
         return make_questdb_query_config_from_env()
     except Exception:
@@ -38,8 +38,8 @@ def _query_symbol_coverage_from_questdb(
     symbol: str,
     start_day: date,
     end_day: date,
-    lake_version: str = "v2",
-    ticks_lake: str = "raw",
+    dataset_version: str = "v2",
+    ticks_kind: str = "raw",
 ) -> dict[str, Any] | None:
     """
     Query symbol coverage from QuestDB index table.
@@ -51,7 +51,7 @@ def _query_symbol_coverage_from_questdb(
         return None
 
     try:
-        from ghtrader.questdb_index import (
+        from ghtrader.questdb.index import (
             INDEX_TABLE_V2,
             NO_DATA_TABLE_V2,
             list_no_data_trading_days,
@@ -63,8 +63,8 @@ def _query_symbol_coverage_from_questdb(
             symbol=symbol,
             start_day=start_day,
             end_day=end_day,
-            lake_version=lake_version,
-            ticks_lake=ticks_lake,
+            dataset_version=dataset_version,
+            ticks_kind=ticks_kind,
             index_table=INDEX_TABLE_V2,
         )
         no_data = list_no_data_trading_days(
@@ -72,8 +72,8 @@ def _query_symbol_coverage_from_questdb(
             symbol=symbol,
             start_day=start_day,
             end_day=end_day,
-            lake_version=lake_version,
-            ticks_lake=ticks_lake,
+            dataset_version=dataset_version,
+            ticks_kind=ticks_kind,
         )
 
         present_set = set(present)
@@ -149,7 +149,7 @@ def _load_calendar(data_dir: Path) -> list[date] | None:
     Uses the same cached source as ghtrader.trading_calendar.
     """
     try:
-        from ghtrader.trading_calendar import get_trading_calendar
+        from ghtrader.data.trading_calendar import get_trading_calendar
 
         cal = get_trading_calendar(data_dir=data_dir, refresh=False, allow_download=False)
         return cal if cal else None
@@ -232,6 +232,17 @@ def parse_ingest_log_tail(log_text: str) -> dict[str, Any]:
     for ln in reversed(lines):
         if "tq_ingest." not in ln:
             continue
+
+        # Best-effort error hint (values may contain spaces; keep the raw line).
+        # Capture only the most recent error line.
+        if "last_error_line" not in out and (
+            "tq_ingest.chunk_failed" in ln
+            or "tq_ingest.questdb_ingest_failed" in ln
+            or "tq_ingest.questdb_index_upsert_failed" in ln
+            or "tq_ingest.questdb_no_data_upsert_failed" in ln
+        ):
+            out["last_error_line"] = str(ln).strip()[-800:]
+
         event, kvs = _parse_structlog_console_kvs(ln)
         if not event:
             continue
@@ -344,7 +355,7 @@ def _detect_latest_contract_yymm_from_tqsdk(*, exchange: str, var: str) -> str |
     """
     try:
         from ghtrader.config import get_runs_dir
-        from ghtrader.tqsdk_catalog import get_contract_catalog
+        from ghtrader.tq.catalog import get_contract_catalog
 
         ex = str(exchange).upper().strip()
         v = str(var).lower().strip()
@@ -385,7 +396,7 @@ def compute_download_contract_range_status(
     end_date: date,
     data_dir: Path,
     log_hint: dict[str, Any] | None = None,
-    lake_version: str | None = None,
+    dataset_version: str | None = None,
 ) -> dict[str, Any]:
     """
     Compute progress for `ghtrader download-contract-range` using QuestDB index tables.
@@ -435,8 +446,8 @@ def compute_download_contract_range_status(
             symbol=tick_symbol,
             start_day=start_date,
             end_day=end_date,
-            lake_version=lake_version or "v2",
-            ticks_lake="raw",
+            dataset_version=dataset_version or "v2",
+            ticks_kind="raw",
         )
 
         if qdb_cov is not None:
@@ -490,7 +501,7 @@ def compute_download_contract_range_status(
         "kind": "download_contract_range",
         "exchange": ex,
         "var": var_l,
-        "lake_version": "v2",
+        "dataset_version": "v2",
         "start_date": start_iso,
         "end_date": end_iso,
         "start_contract": str(start_contract),
@@ -603,9 +614,10 @@ def ingest_status_for_job(
             end_date=d1,
             data_dir=data_dir,
             log_hint=log_hint,
-            lake_version=lv,
+            dataset_version=lv,
         )
         val["job_id"] = job_id
+        val["last_error_line"] = str(log_hint.get("last_error_line") or "")
         _cache_put(cache_key, val)
         return val
 
@@ -633,17 +645,21 @@ def ingest_status_for_job(
             symbol=symbol,
             start_day=d0,
             end_day=d1,
-            lake_version=lv,
-            ticks_lake="raw",
+            dataset_version=lv,
+            ticks_kind="raw",
         )
 
         if qdb_cov is not None:
             downloaded_set = {d.isoformat() for d in qdb_cov.get("present_dates", set())}
             no_data_effective = qdb_cov.get("no_data_days", 0)
+            min_dl = qdb_cov.get("first_day")
+            max_dl = qdb_cov.get("last_day")
         else:
             # QuestDB unavailable
             downloaded_set: set[str] = set()
             no_data_effective = 0
+            min_dl = None
+            max_dl = None
 
         done = int(len(downloaded_set) + no_data_effective)
         pct = float(done / expected) if expected > 0 else 0.0
@@ -658,7 +674,8 @@ def ingest_status_for_job(
             "symbol": symbol,
             "start_date": d0.isoformat(),
             "end_date": d1.isoformat(),
-            "lake_version": lv,
+            "dataset_version": lv,
+            "last_error_line": str(log_hint.get("last_error_line") or ""),
             "summary": {
                 "days_expected": int(expected),
                 "days_downloaded": int(len(downloaded_set)),
@@ -681,7 +698,7 @@ def ingest_status_for_job(
             "kind": "record",
             "job_id": job_id,
             "symbols": args.get("symbols"),
-            "lake_version": lv,
+            "dataset_version": lv,
             "current_symbol": log_hint.get("current_symbol"),
         }
 

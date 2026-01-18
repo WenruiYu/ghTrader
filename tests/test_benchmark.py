@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from ghtrader.benchmark import run_benchmark
-from ghtrader.features import FactorEngine
-from ghtrader.labels import build_labels_for_symbol
+from ghtrader.research.benchmark import run_benchmark
+from ghtrader.datasets.features import FactorEngine
+from ghtrader.datasets.labels import build_labels_for_symbol
 
 
 @pytest.mark.skip(reason="Requires QuestDB + tick data for read_features_for_symbol/read_labels_for_symbol")

@@ -8,6 +8,11 @@
     </div>
   </div>
 
+  <div class="tab-nav">
+    <button class="tab-nav-item active" data-tab="contracts">Contracts</button>
+    <button class="tab-nav-item" data-tab="quality">Quality</button>
+  </div>
+
   <!-- Contracts (QuestDB-first) -->
   <div class="tab-content active" id="tab-contracts">
     <div class="card">
@@ -141,71 +146,47 @@
             <div class="workflow-step-status text-xs" id="step0Status">--</div>
           </div>
 
-          <!-- Step 1: Index Health -->
+          <!-- Step 1: Health -->
           <div class="workflow-step" id="step1">
             <div class="workflow-step-header">
               <span class="workflow-step-num">1</span>
-              <span class="workflow-step-title">Index Health</span>
-              <button type="button" id="indexBootstrapBtn" class="btn btn-sm btn-secondary" title="Bootstrap QuestDB symbol-day index from ticks table">Bootstrap Index</button>
+              <span class="workflow-step-title">Health Check</span>
+              <button type="button" id="contractsHealthBtn" class="btn btn-sm btn-secondary" title="Run diagnose + auto-repair (index bootstrap + missing-days backfill)">Health</button>
+              <button type="button" id="contractsRepairBtn" class="btn btn-sm btn-secondary" title="Run auto-only repair from the latest diagnose report (if available)">Repair</button>
+              <button type="button" id="indexBootstrapBtn" class="btn btn-sm btn-secondary" title="Bootstrap QuestDB symbol-day index from ticks table (optional)">Bootstrap Index</button>
             </div>
             <div class="workflow-step-desc text-xs muted">
-              Ensure the QuestDB index is populated. If symbols show as "unindexed", run Bootstrap.
+              Diagnose data integrity and auto-repair what is safe (index bootstrap + missing-days backfill). Use Bootstrap Index if you want an explicit manual index rebuild.
             </div>
             <div class="workflow-step-status text-xs" id="step1Status">
               <span id="indexHealthStatus">--</span>
             </div>
           </div>
 
-          <!-- Step 2: Verify -->
+          <!-- Step 2: Update All -->
           <div class="workflow-step" id="step2">
             <div class="workflow-step-header">
               <span class="workflow-step-num">2</span>
-              <span class="workflow-step-title">Verify Completeness</span>
-              <button type="button" id="toolsVerifyBtn" class="btn btn-sm btn-secondary" title="Compute expected vs present days using QuestDB index and no-data tables">Verify</button>
-            </div>
-            <div class="workflow-step-desc text-xs muted">
-              Compute expected vs present days. Shows which contracts have missing data.
-            </div>
-            <div class="workflow-step-status text-xs" id="step2Status">--</div>
-          </div>
-
-          <!-- Step 3: Fill Missing -->
-          <div class="workflow-step" id="step3">
-            <div class="workflow-step-header">
-              <span class="workflow-step-num">3</span>
-              <span class="workflow-step-title">Fill Missing</span>
-              <button type="button" id="toolsFillBtn" class="btn btn-sm btn-secondary" title="Download missing days from TqSdk into QuestDB for all incomplete contracts">Fill Missing</button>
-            </div>
-            <div class="workflow-step-desc text-xs muted">
-              Download missing days from TqSdk into QuestDB. Requires healthy index (step 1). If nothing is indexed yet, Step 3 becomes Init (Download) to seed a new variety.
-            </div>
-            <div class="workflow-step-status text-xs" id="step3Status">--</div>
-          </div>
-
-          <!-- Step 4: Update All -->
-          <div class="workflow-step" id="step4">
-            <div class="workflow-step-header">
-              <span class="workflow-step-num">4</span>
               <span class="workflow-step-title">Update All</span>
               <button type="button" id="contractsUpdateAllBtn" class="btn btn-sm btn-secondary" title="Forward-fill active contracts and recently expired (last 10 days) from TqSdk">Update All</button>
             </div>
             <div class="workflow-step-desc text-xs muted">
               Daily forward-fill for active + recently expired contracts (last 10 days).
             </div>
-            <div class="workflow-step-status text-xs" id="step4Status">--</div>
+            <div class="workflow-step-status text-xs" id="step2Status">--</div>
           </div>
 
-          <!-- Step 5: Compute L5 Start -->
-          <div class="workflow-step" id="step5">
+          <!-- Step 3: Compute L5 Start -->
+          <div class="workflow-step" id="step3">
             <div class="workflow-step-header">
-              <span class="workflow-step-num">5</span>
+              <span class="workflow-step-num">3</span>
               <span class="workflow-step-title">Compute L5 Start</span>
               <button type="button" id="toolsL5StartBtn" class="btn btn-sm btn-secondary" title="Compute first L5 day for each symbol (for main_l5 builds)">Compute L5</button>
             </div>
             <div class="workflow-step-desc text-xs muted">
               Identify first L5 day per symbol for main_l5 dataset builds.
             </div>
-            <div class="workflow-step-status text-xs" id="step5Status">--</div>
+            <div class="workflow-step-status text-xs" id="step3Status">--</div>
           </div>
         </div>
 
@@ -231,14 +212,19 @@
             </div>
           </div>
 
-          <div class="split-pane">
+          <div class="grid3">
             <div class="card">
-              <h4 class="mb-2">Latest Verify Report</h4>
-              <div class="muted text-sm" id="toolsVerifyMeta">Not loaded.</div>
-              <pre class="mono text-xs" id="toolsVerifyJson" style="white-space:pre-wrap; margin-top:8px;">--</pre>
+              <h4 class="mb-2">Latest Diagnose Report</h4>
+              <div class="muted text-sm" id="toolsDiagnoseMeta">Not loaded.</div>
+              <pre class="mono text-xs" id="toolsDiagnoseJson" style="white-space:pre-wrap; margin-top:8px;">--</pre>
             </div>
             <div class="card">
-              <h4 class="mb-2">Latest L5 Report</h4>
+              <h4 class="mb-2">Latest Repair Report</h4>
+              <div class="muted text-sm" id="toolsRepairMeta">Not loaded.</div>
+              <pre class="mono text-xs" id="toolsRepairJson" style="white-space:pre-wrap; margin-top:8px;">--</pre>
+            </div>
+            <div class="card">
+              <h4 class="mb-2">Latest L5-start Report</h4>
               <div class="muted text-sm" id="toolsL5Meta">Not loaded.</div>
               <pre class="mono text-xs" id="toolsL5Json" style="white-space:pre-wrap; margin-top:8px;">--</pre>
             </div>
@@ -293,6 +279,93 @@
           <tr><td colspan="9" class="muted">Click Refresh to load.</td></tr>
         </tbody>
       </table>
+    </div>
+  </div>
+
+  <!-- Quality (QuestDB-first; field nulls + gaps + outliers) -->
+  <div class="tab-content" id="tab-quality">
+    <div class="card">
+      <div class="section-header mb-2">
+        <h3 class="mb-0">Quality</h3>
+        <div class="muted text-sm">Field null rates • Intraday gaps • Outliers</div>
+      </div>
+
+      <div class="kpi-grid mb-3">
+        <div class="kpi-card">
+          <div class="kpiLabel">Completeness</div>
+          <div class="kpiValue" id="qKpiCompleteness">--</div>
+          <div class="kpiSubtext mono text-xs" id="qKpiCompletenessSub">--</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpiLabel">Field Quality</div>
+          <div class="kpiValue" id="qKpiFieldQuality">--</div>
+          <div class="kpiSubtext mono text-xs" id="qKpiFieldQualitySub">--</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpiLabel">Anomalies (latest)</div>
+          <div class="kpiValue" id="qKpiAnomalies">--</div>
+          <div class="kpiSubtext mono text-xs" id="qKpiAnomaliesSub">--</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpiLabel">Freshness (active)</div>
+          <div class="kpiValue" id="qKpiFreshness">--</div>
+          <div class="kpiSubtext mono text-xs" id="qKpiFreshnessSub">--</div>
+        </div>
+      </div>
+
+      <div class="action-bar card-no-margin" style="margin-bottom:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+        <button type="button" class="btn btn-sm" id="qualityRefreshBtn" title="Refresh quality summary (cached 60s)">Refresh</button>
+        <button type="button" class="btn btn-sm btn-secondary" id="qualityDiagnoseBtn" title="Enqueue a diagnose job for this scope">Run Diagnose</button>
+        <span class="muted text-xs" id="qualityStatus">--</span>
+      </div>
+
+      <div class="grid3 mb-3">
+        <div>
+          <label class="text-sm">Search</label>
+          <input id="qualitySearch" placeholder="e.g. cu2602" />
+        </div>
+        <div>
+          <label class="text-sm">Limit</label>
+          <select id="qualityLimit" class="form-control">
+            <option value="100">100</option>
+            <option value="300" selected>300</option>
+            <option value="500">500</option>
+          </select>
+        </div>
+        <div style="display:flex; align-items:flex-end; gap:8px;">
+          <label style="margin:0; display:flex; align-items:center; gap:8px;">
+            <input type="checkbox" id="qualityOnlyIssues" />
+            <span class="text-sm">issues only</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="split-pane">
+        <div class="card" style="padding:0;">
+          <div class="tableWrap">
+            <table class="table table-compact" id="qualityTable">
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Status</th>
+                  <th>Missing</th>
+                  <th>Quality</th>
+                  <th>Anomalies</th>
+                  <th>Last tick</th>
+                </tr>
+              </thead>
+              <tbody id="qualityTbody">
+                <tr><td colspan="6" class="muted">Click Refresh.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <h4 class="mb-2">Detail</h4>
+          <div class="muted text-sm" id="qualityDetailMeta">Click a symbol to view detail.</div>
+          <pre class="mono text-xs" id="qualityDetailJson" style="white-space:pre-wrap; margin-top:8px;">--</pre>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -358,6 +431,8 @@
   const elTbody = document.getElementById("contractsTbody");
   const btnRefresh = document.getElementById("contractsRefreshBtn");
   const btnUpdateAll = document.getElementById("contractsUpdateAllBtn");
+  const btnHealth = document.getElementById("contractsHealthBtn");
+  const btnRepair = document.getElementById("contractsRepairBtn");
   const btnIndexBootstrap = document.getElementById("indexBootstrapBtn");
   const btnL5Start = document.getElementById("toolsL5StartBtn");
   const covToggleBtn = document.getElementById("coverageToggleBtn");
@@ -369,6 +444,7 @@
   let lastRows = [];
   let lastQuestdbOk = false;
   let lastCompleteness = null;
+  let _latestDiagnoseReportPath = null;
   window._contractsLoaded = false;
   let _advancedLoaded = false;
 
@@ -378,10 +454,10 @@
   const toolsStart = document.getElementById("toolsStart");
   const toolsEnd = document.getElementById("toolsEnd");
   const toolsRefreshCatalog = document.getElementById("toolsRefreshCatalog");
-  const toolsVerifyBtn = document.getElementById("toolsVerifyBtn");
-  const toolsFillBtn = document.getElementById("toolsFillBtn");
-  const toolsVerifyMeta = document.getElementById("toolsVerifyMeta");
-  const toolsVerifyJson = document.getElementById("toolsVerifyJson");
+  const toolsDiagnoseMeta = document.getElementById("toolsDiagnoseMeta");
+  const toolsDiagnoseJson = document.getElementById("toolsDiagnoseJson");
+  const toolsRepairMeta = document.getElementById("toolsRepairMeta");
+  const toolsRepairJson = document.getElementById("toolsRepairJson");
   const toolsL5Meta = document.getElementById("toolsL5Meta");
   const toolsL5Json = document.getElementById("toolsL5Json");
 
@@ -391,8 +467,6 @@
   const indexHealthStatus = document.getElementById("indexHealthStatus");
   const step2Status = document.getElementById("step2Status");
   const step3Status = document.getElementById("step3Status");
-  const step4Status = document.getElementById("step4Status");
-  const step5Status = document.getElementById("step5Status");
 
   function toggleAdvanced(open) {
     if (!advancedPanel || !advancedToggleBtn) return;
@@ -448,49 +522,9 @@
       }
     }
 
-    // Step 3: Fill Missing / Init mode
-    if (toolsFillBtn) {
-      const hasComp = !!completeness;
-      const indexed = hasComp ? (Number(completeness.symbols_indexed || 0) || 0) : 0;
-      const unindexed = hasComp ? (Number(completeness.symbols_unindexed || 0) || 0) : 0;
-      const indexHealthy = hasComp ? !!completeness.index_healthy : false; // missing completeness is unsafe
-      const initMode = hasComp && !indexHealthy && indexed === 0 && unindexed > 0;
-
-      toolsFillBtn.dataset.mode = initMode ? "init" : (indexHealthy ? "normal" : "blocked");
-      toolsFillBtn.textContent = initMode ? "Init (Download)" : "Fill Missing";
-      toolsFillBtn.disabled = !lastQuestdbOk || !hasComp || (!indexHealthy && !initMode);
-
-      if (!lastQuestdbOk) {
-        toolsFillBtn.title = "QuestDB offline";
-      } else if (!hasComp) {
-        toolsFillBtn.title = "Refresh snapshot first (step 0) to compute index health";
-      } else if (initMode) {
-        toolsFillBtn.title = "Init mode: enqueue per-symbol download jobs to seed a brand-new variety (requires confirm)";
-      } else if (!indexHealthy) {
-        toolsFillBtn.title = "Run Bootstrap Index first (step 1)";
-      } else {
-        toolsFillBtn.title = "Download missing days from TqSdk into QuestDB for all incomplete contracts";
-      }
-
-      if (step3Status) {
-        if (!lastQuestdbOk) step3Status.innerHTML = '<span class="pill pill-failed">QuestDB offline</span>';
-        else if (!hasComp) step3Status.innerHTML = '<span class="muted">Refresh snapshot to compute index health</span>';
-        else if (initMode) step3Status.innerHTML = '<span class="pill pill-running">init mode</span> ' + unindexed + ' symbols';
-        else if (!indexHealthy) step3Status.innerHTML = '<span class="muted">Requires Bootstrap Index</span>';
-        else step3Status.innerHTML = '<span class="muted">Click to run</span>';
-      }
-    }
-
-    // Step 2: Verify status from completeness
-    if (step2Status && completeness) {
-      const missing = completeness.symbols_missing || 0;
-      const complete = completeness.symbols_complete || 0;
-      step2Status.innerHTML = complete + ' complete, ' + missing + ' missing/incomplete';
-    }
-
-    // Step 4-5: show generic status
-    if (step4Status) step4Status.innerHTML = '<span class="muted">Click to run</span>';
-    if (step5Status) step5Status.innerHTML = '<span class="muted">Click to run</span>';
+    // Step 2-3: generic status
+    if (step2Status) step2Status.innerHTML = '<span class="muted">Click to run</span>';
+    if (step3Status) step3Status.innerHTML = '<span class="muted">Click to run</span>';
   }
 
   function row4(r) {
@@ -786,8 +820,8 @@
     lastQuestdbOk = !!(body.questdb && body.questdb.ok);
 
     // Disable DB-dependent actions when QuestDB is offline
-    if (toolsVerifyBtn) toolsVerifyBtn.disabled = !lastQuestdbOk;
-    if (toolsFillBtn) toolsFillBtn.disabled = !lastQuestdbOk;
+    if (btnHealth) btnHealth.disabled = !lastQuestdbOk;
+    if (btnRepair) btnRepair.disabled = !lastQuestdbOk;
     if (btnUpdateAll) btnUpdateAll.disabled = !lastQuestdbOk;
     if (btnIndexBootstrap) btnIndexBootstrap.disabled = !lastQuestdbOk;
     if (btnL5Start) btnL5Start.disabled = !lastQuestdbOk;
@@ -991,11 +1025,178 @@
     renderRows();
     refreshTable({ refresh: false, timeoutMs: 10000, label: "Loading contracts..." });
     if (advancedPanel && advancedPanel.style.display !== "none") loadToolsReports();
+    const qPane = document.getElementById("tab-quality");
+    if (qPane && qPane.classList.contains("active")) loadQualitySummary();
   }
   elExchange.addEventListener("change", () => onScopeChanged());
   elVar.addEventListener("change", () => onScopeChanged());
   elActiveFilter.addEventListener("change", () => renderRows());
   elOnlyMissing.addEventListener("change", () => renderRows());
+
+  // -------------------------------------------------------------------------
+  // Quality tab (QuestDB-first ledgers)
+  // -------------------------------------------------------------------------
+
+  const qRefreshBtn = document.getElementById("qualityRefreshBtn");
+  const qDiagnoseBtn = document.getElementById("qualityDiagnoseBtn");
+  const qStatus = document.getElementById("qualityStatus");
+  const qSearch = document.getElementById("qualitySearch");
+  const qLimit = document.getElementById("qualityLimit");
+  const qOnlyIssues = document.getElementById("qualityOnlyIssues");
+  const qTbody = document.getElementById("qualityTbody");
+  const qDetailMeta = document.getElementById("qualityDetailMeta");
+  const qDetailJson = document.getElementById("qualityDetailJson");
+
+  const qKpiCompleteness = document.getElementById("qKpiCompleteness");
+  const qKpiCompletenessSub = document.getElementById("qKpiCompletenessSub");
+  const qKpiFieldQuality = document.getElementById("qKpiFieldQuality");
+  const qKpiFieldQualitySub = document.getElementById("qKpiFieldQualitySub");
+  const qKpiAnomalies = document.getElementById("qKpiAnomalies");
+  const qKpiAnomaliesSub = document.getElementById("qKpiAnomaliesSub");
+  const qKpiFreshness = document.getElementById("qKpiFreshness");
+  const qKpiFreshnessSub = document.getElementById("qKpiFreshnessSub");
+
+  function setQualityStatus(msg) {
+    if (qStatus) qStatus.textContent = msg || "--";
+  }
+
+  function fmtPct(x) {
+    if (x === null || x === undefined) return "--";
+    const n = Number(x);
+    if (!isFinite(n)) return "--";
+    return n.toFixed(1) + "%";
+  }
+
+  function fmtAgeSec(sec) {
+    if (sec === null || sec === undefined) return "--";
+    const s = Number(sec);
+    if (!isFinite(s)) return "--";
+    if (s < 60) return Math.round(s) + "s";
+    if (s < 3600) return Math.round(s / 60) + "m";
+    return (s / 3600).toFixed(1) + "h";
+  }
+
+  function pillForStatus(st) {
+    const s = String(st || "");
+    if (s === "error") return '<span class="pill pill-failed">error</span>';
+    if (s === "warning") return '<span class="pill pill-running">warning</span>';
+    if (s === "ok") return '<span class="pill pill-succeeded">ok</span>';
+    return '<span class="pill">--</span>';
+  }
+
+  async function loadQualitySummary() {
+    if (!qTbody) return;
+    const ex = elExchange.value;
+    const v = elVar.value;
+    const q = (qSearch && qSearch.value) ? String(qSearch.value).trim() : "";
+    const lim = qLimit && qLimit.value ? Number(qLimit.value) : 300;
+    const onlyIssues = !!(qOnlyIssues && qOnlyIssues.checked);
+    setQualityStatus("Loading...");
+    try {
+      const url = window.ghTrader.withToken(
+        "/api/data/quality-summary?exchange=" + encodeURIComponent(ex) +
+        "&var=" + encodeURIComponent(v) +
+        "&limit=" + encodeURIComponent(String(lim || 300)) +
+        "&search=" + encodeURIComponent(q) +
+        "&issues_only=" + encodeURIComponent(String(onlyIssues))
+      );
+      const resp = await window.ghTrader.fetchApi(url);
+      const body = await resp.json();
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      if (!body || body.ok !== true) throw new Error(String((body && (body.error || body.detail)) || "failed"));
+
+      const k = body.kpis || {};
+      if (qKpiCompleteness) qKpiCompleteness.textContent = fmtPct(k.completeness_pct);
+      if (qKpiCompletenessSub) qKpiCompletenessSub.textContent = ex + "." + v;
+      if (qKpiFieldQuality) qKpiFieldQuality.textContent = fmtPct(k.field_quality_pct);
+      if (qKpiFieldQualitySub) qKpiFieldQualitySub.textContent = (body.sources && body.sources.field_quality_ok) ? "QuestDB ledger" : "ledger unavailable";
+      if (qKpiAnomalies) qKpiAnomalies.textContent = String(k.anomalies_total ?? "--");
+      if (qKpiAnomaliesSub) qKpiAnomaliesSub.textContent = "latest per symbol";
+      if (qKpiFreshness) qKpiFreshness.textContent = fmtAgeSec(k.freshness_max_age_sec);
+      if (qKpiFreshnessSub) qKpiFreshnessSub.textContent = "max age";
+
+      const rows = Array.isArray(body.rows) ? body.rows : [];
+      if (rows.length === 0) {
+        qTbody.innerHTML = '<tr><td colspan="6" class="muted">No rows.</td></tr>';
+      } else {
+        qTbody.innerHTML = rows.map((r) => {
+          const sym = esc(r.symbol);
+          const st = pillForStatus(r.status);
+          const miss = (r.missing_days === null || r.missing_days === undefined) ? "--" : String(r.missing_days);
+          const qScore = (r.field_quality_score === null || r.field_quality_score === undefined) ? "--" : (Number(r.field_quality_score).toFixed(1) + "%");
+          const gaps = r.gaps || {};
+          const outs = r.outliers || {};
+          const anomalies = Number((gaps.abnormal || 0) + (gaps.critical || 0) + (outs.price_jump || 0) + (outs.volume_spike || 0) + (outs.spread_anomaly || 0)) || 0;
+          const lastTick = r.last_tick_ts ? esc(r.last_tick_ts) : "--";
+          return (
+            '<tr data-symbol="' + sym + '" style="cursor:pointer;">' +
+              '<td class="mono">' + sym + '</td>' +
+              '<td>' + st + '</td>' +
+              '<td class="mono">' + esc(miss) + '</td>' +
+              '<td class="mono">' + esc(qScore) + '</td>' +
+              '<td class="mono">' + esc(String(anomalies)) + '</td>' +
+              '<td class="mono text-xs">' + lastTick + '</td>' +
+            '</tr>'
+          );
+        }).join("");
+      }
+      setQualityStatus("Loaded " + String(body.count || rows.length || 0) + " rows.");
+    } catch (e) {
+      setQualityStatus("Failed: " + String(e.message || e));
+      qTbody.innerHTML = '<tr><td colspan="6" class="muted">Failed to load.</td></tr>';
+    }
+  }
+
+  async function loadQualityDetail(symbol) {
+    if (!qDetailJson) return;
+    const sym = String(symbol || "").trim();
+    if (!sym) return;
+    if (qDetailMeta) qDetailMeta.textContent = "Loading " + sym + "...";
+    qDetailJson.textContent = "--";
+    try {
+      const url = window.ghTrader.withToken("/api/data/quality-detail/" + encodeURIComponent(sym) + "?limit=30");
+      const resp = await window.ghTrader.fetchApi(url);
+      const body = await resp.json();
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      if (!body || body.ok !== true) throw new Error(String((body && (body.error || body.detail)) || "failed"));
+      if (qDetailMeta) qDetailMeta.textContent = sym + " • field_quality " + (body.field_quality || []).length + " • gaps " + (body.tick_gaps || []).length;
+      qDetailJson.textContent = JSON.stringify(body, null, 2);
+    } catch (e) {
+      if (qDetailMeta) qDetailMeta.textContent = "Failed (" + String(e.message || e) + ")";
+      qDetailJson.textContent = "--";
+    }
+  }
+
+  if (qTbody) {
+    qTbody.addEventListener("click", (ev) => {
+      const tr = ev.target && ev.target.closest ? ev.target.closest("tr[data-symbol]") : null;
+      if (!tr) return;
+      const sym = tr.getAttribute("data-symbol");
+      loadQualityDetail(sym);
+    });
+  }
+
+  const loadQualityDebounced = window.ghTrader.debounce(loadQualitySummary, 150);
+  if (qSearch) qSearch.addEventListener("input", () => loadQualityDebounced());
+  if (qLimit) qLimit.addEventListener("change", () => loadQualitySummary());
+  if (qOnlyIssues) qOnlyIssues.addEventListener("change", () => loadQualitySummary());
+  if (qRefreshBtn) qRefreshBtn.addEventListener("click", () => loadQualitySummary());
+  if (qDiagnoseBtn) {
+    qDiagnoseBtn.addEventListener("click", async () => {
+      try {
+        const ex = elExchange.value;
+        const v = elVar.value;
+        setQualityStatus("Enqueuing diagnose job...");
+        const body = await window.ghTrader.postJson("/api/data/diagnose", { exchange: ex, var: v, thoroughness: "standard" });
+        const jobId = (body.enqueued && body.enqueued[0]) ? body.enqueued[0] : null;
+        setQualityStatus("Diagnose enqueued" + (jobId ? (" (" + jobId + ")") : "") + ". Check Jobs.");
+        window.ghTrader.toast("Diagnose job enqueued", "success");
+      } catch (e) {
+        setQualityStatus("Failed: " + String(e.message || e));
+        window.ghTrader.toast("Failed: " + e.message, "error");
+      }
+    });
+  }
 
   // -------------------------------------------------------------------------
   // Advanced panel (date overrides + latest reports)
@@ -1014,44 +1215,76 @@
     const ex = elExchange.value;
     const v = elVar.value;
 
-    // Verify report
-    if (toolsVerifyMeta) toolsVerifyMeta.textContent = "Loading...";
-    if (toolsVerifyJson) toolsVerifyJson.textContent = "--";
+    _latestDiagnoseReportPath = null;
+
+    // Diagnose report
+    if (toolsDiagnoseMeta) toolsDiagnoseMeta.textContent = "Loading...";
+    if (toolsDiagnoseJson) toolsDiagnoseJson.textContent = "--";
     try {
       const url = window.ghTrader.withToken(
-        "/api/data/verify?exchange=" + encodeURIComponent(ex) + "&var=" + encodeURIComponent(v) + "&limit=1"
+        "/api/data/reports?kind=diagnose&exchange=" + encodeURIComponent(ex) + "&var=" + encodeURIComponent(v) + "&limit=1"
       );
       const resp = await window.ghTrader.fetchApi(url);
       const body = await resp.json();
       if (!resp.ok) throw new Error("HTTP " + resp.status);
-      if (!body || body.ok !== true) throw new Error(String((body && (body.error || body.detail)) || "failed"));
-      const rep = (body.reports && body.reports[0]) ? body.reports[0] : null;
-      if (!rep) {
-        if (toolsVerifyMeta) toolsVerifyMeta.textContent = "No reports yet.";
-        if (toolsVerifyJson) toolsVerifyJson.textContent = "--";
+      if (body && body.ok === false && String(body.error || "") === "no_reports") {
+        if (toolsDiagnoseMeta) toolsDiagnoseMeta.textContent = "No reports yet.";
+        if (toolsDiagnoseJson) toolsDiagnoseJson.textContent = "--";
       } else {
-        const summary = rep.summary || {};
-        const gen = rep.generated_at || rep._path || "--";
-        const msg = "generated " + String(gen) +
-          " • missing_days " + String(summary.missing_days || 0) +
-          " • symbols_with_missing " + String(summary.symbols_with_missing || 0);
-        if (toolsVerifyMeta) toolsVerifyMeta.textContent = msg;
-        if (toolsVerifyJson) {
-          toolsVerifyJson.textContent = JSON.stringify({
-            generated_at: rep.generated_at,
-            exchange: rep.exchange,
-            var: rep.var,
-            lake_version: rep.lake_version,
-            index_table: rep.index_table,
-            no_data_table: rep.no_data_table,
-            summary: rep.summary,
-            path: rep._path,
-          }, null, 2);
+        if (!body || body.ok !== true) throw new Error(String((body && (body.error || body.detail)) || "failed"));
+        const rep = (body.reports && body.reports[0]) ? body.reports[0] : null;
+        if (!rep) {
+          if (toolsDiagnoseMeta) toolsDiagnoseMeta.textContent = "No reports yet.";
+          if (toolsDiagnoseJson) toolsDiagnoseJson.textContent = "--";
+        } else {
+          _latestDiagnoseReportPath = rep._path || null;
+          const s = rep.summary || {};
+          const f = (s && s.findings) ? s.findings : {};
+          const msg = "generated " + String(rep.generated_at || rep._path || "--") +
+            " • auto_fixable " + String(f.auto_fixable || 0) +
+            " • manual_review " + String(f.manual_review || 0) +
+            " • unfixable " + String(f.unfixable || 0);
+          if (toolsDiagnoseMeta) toolsDiagnoseMeta.textContent = msg;
+          if (toolsDiagnoseJson) toolsDiagnoseJson.textContent = JSON.stringify(rep, null, 2);
         }
       }
     } catch (e) {
-      if (toolsVerifyMeta) toolsVerifyMeta.textContent = "Failed to load (" + String(e.message || e) + ")";
-      if (toolsVerifyJson) toolsVerifyJson.textContent = "--";
+      if (toolsDiagnoseMeta) toolsDiagnoseMeta.textContent = "Failed to load (" + String(e.message || e) + ")";
+      if (toolsDiagnoseJson) toolsDiagnoseJson.textContent = "--";
+    }
+
+    // Repair report
+    if (toolsRepairMeta) toolsRepairMeta.textContent = "Loading...";
+    if (toolsRepairJson) toolsRepairJson.textContent = "--";
+    try {
+      const url = window.ghTrader.withToken(
+        "/api/data/reports?kind=repair&exchange=" + encodeURIComponent(ex) + "&var=" + encodeURIComponent(v) + "&limit=1"
+      );
+      const resp = await window.ghTrader.fetchApi(url);
+      const body = await resp.json();
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      if (body && body.ok === false && String(body.error || "") === "no_reports") {
+        if (toolsRepairMeta) toolsRepairMeta.textContent = "No reports yet.";
+        if (toolsRepairJson) toolsRepairJson.textContent = "--";
+      } else {
+        if (!body || body.ok !== true) throw new Error(String((body && (body.error || body.detail)) || "failed"));
+        const rep = (body.reports && body.reports[0]) ? body.reports[0] : null;
+        if (!rep) {
+          if (toolsRepairMeta) toolsRepairMeta.textContent = "No reports yet.";
+          if (toolsRepairJson) toolsRepairJson.textContent = "--";
+        } else {
+          const result = rep.result || {};
+          const ok = (result.ok === true) ? "ok" : ((result.ok === false) ? "failed" : "--");
+          const finished = result.finished_at || rep.result_path || rep.plan_path || "--";
+          const actions = Array.isArray(result.actions) ? result.actions.length : 0;
+          const msg = "finished " + String(finished) + " • " + ok + " • actions " + String(actions);
+          if (toolsRepairMeta) toolsRepairMeta.textContent = msg;
+          if (toolsRepairJson) toolsRepairJson.textContent = JSON.stringify(rep, null, 2);
+        }
+      }
+    } catch (e) {
+      if (toolsRepairMeta) toolsRepairMeta.textContent = "Failed to load (" + String(e.message || e) + ")";
+      if (toolsRepairJson) toolsRepairJson.textContent = "--";
     }
 
     // L5-start report
@@ -1079,7 +1312,7 @@
             generated_at: rep.generated_at,
             exchange: rep.exchange,
             var: rep.var,
-            lake_version: rep.lake_version,
+            dataset_version: rep.dataset_version,
             index_table: rep.index_table,
             variety_first_l5_day: rep.variety_first_l5_day,
             symbols: rep.symbols,
@@ -1094,89 +1327,97 @@
     }
   }
 
-  // Step 2: Verify
-  if (toolsVerifyBtn) {
-    toolsVerifyBtn.addEventListener("click", async () => {
-      try {
-        const ex = elExchange.value;
-        const v = elVar.value;
-        const start = _readDateInput(toolsStart);
-        const end = _readDateInput(toolsEnd);
-        const refresh = !!(toolsRefreshCatalog && toolsRefreshCatalog.checked);
-        setStatus("Enqueuing verify job...");
-        const body = await window.ghTrader.postJson("/api/data/enqueue-verify", { exchange: ex, var: v, start: start, end: end, refresh_catalog: refresh });
-        const jobId = (body.enqueued && body.enqueued[0]) ? body.enqueued[0] : null;
-        setStatus("Verify job enqueued" + (jobId ? (" (" + jobId + ")") : "") + ". Check Jobs.");
-        window.ghTrader.toast("Verify job enqueued", "success");
-      } catch (e) {
-        setStatus("Error: " + String(e.message || e));
-        window.ghTrader.toast("Failed: " + e.message, "error");
-      }
-    });
-  }
-
-  // Step 3: Fill Missing
-  if (toolsFillBtn) {
-    toolsFillBtn.addEventListener("click", async () => {
+  // Step 1: Health
+  if (btnHealth) {
+    btnHealth.addEventListener("click", async () => {
       try {
         if (!lastQuestdbOk) {
           window.ghTrader.toast("QuestDB is offline. Fix QuestDB first.", "error");
           return;
         }
-        if (!lastCompleteness) {
-          window.ghTrader.toast("Completeness not available yet. Refresh snapshot (step 0) first.", "error");
-          return;
-        }
-
-        const indexed = Number(lastCompleteness.symbols_indexed || 0) || 0;
-        const unindexed = Number(lastCompleteness.symbols_unindexed || 0) || 0;
-        const indexHealthy = !!lastCompleteness.index_healthy;
-        const initMode = (!indexHealthy && indexed === 0 && unindexed > 0);
-        if (!indexHealthy && !initMode) {
-          window.ghTrader.toast("Index is unhealthy. Run Bootstrap Index first (step 1).", "error");
-          return;
-        }
-
         const ex = elExchange.value;
         const v = elVar.value;
         const start = _readDateInput(toolsStart);
         const end = _readDateInput(toolsEnd);
         const refresh = !!(toolsRefreshCatalog && toolsRefreshCatalog.checked);
+        const msg =
+          "Health will run diagnose + auto-repair for this scope.\n\n" +
+          "Target: " + ex + "." + v + "\n" +
+          (start ? ("Start: " + start + "\n") : "") +
+          (end ? ("End: " + end + "\n") : "") +
+          (refresh ? "Catalog: refresh from TqSdk\n" : "Catalog: use cached\n") +
+          "\nProceed?";
+        if (!window.confirm(msg)) return;
 
-        if (initMode) {
-          const clampStart = start || "(inferred per contract)";
-          const clampEnd = end || "(inferred per contract)";
-          const msg =
-            "Init mode will enqueue per-symbol download jobs to seed a brand-new variety.\n\n" +
-            "Target: " + ex + "." + v + "\n" +
-            "Jobs: up to " + unindexed + " symbols (dedupes queued/running)\n" +
-            "Start clamp: " + clampStart + "\n" +
-            "End clamp: " + clampEnd + "\n" +
-            (refresh ? "Catalog: refresh from TqSdk\n" : "Catalog: use cached\n") +
-            "\nProceed?";
-          if (!window.confirm(msg)) return;
-
-          setStatus("Enqueuing init download jobs...");
-          const body = await window.ghTrader.postJson("/api/data/enqueue-fill-missing", { exchange: ex, var: v, start: start, end: end, refresh_catalog: refresh, init_mode: true });
-          const enq = Array.isArray(body.enqueued) ? body.enqueued : [];
-          const sk = Array.isArray(body.skipped) ? body.skipped : [];
-          const nEnq = enq.length;
-          const nSk = sk.length;
-          setStatus("Init download enqueued: " + nEnq + (nSk ? (", skipped " + nSk) : "") + ". Check Jobs.");
-          window.ghTrader.toast("Init download jobs enqueued (" + nEnq + ")", "success");
-        } else {
-          setStatus("Enqueuing fill-missing job...");
-          const body = await window.ghTrader.postJson("/api/data/enqueue-fill-missing", { exchange: ex, var: v, start: start, end: end, refresh_catalog: refresh, init_mode: false });
-          const jobId = (body.enqueued && body.enqueued[0]) ? body.enqueued[0] : null;
-          setStatus("Fill-missing job enqueued" + (jobId ? (" (" + jobId + ")") : "") + ". Check Jobs.");
-          window.ghTrader.toast("Fill-missing job enqueued", "success");
-        }
+        setStatus("Enqueuing health job...");
+        const body = await window.ghTrader.postJson("/api/data/health", {
+          exchange: ex,
+          var: v,
+          thoroughness: "standard",
+          start: start,
+          end: end,
+          refresh_catalog: refresh,
+          auto_repair: true,
+          dry_run: false,
+          chunk_days: 5
+        });
+        const jobId = (body.enqueued && body.enqueued[0]) ? body.enqueued[0] : null;
+        setStatus("Health job enqueued" + (jobId ? (" (" + jobId + ")") : "") + ". Check Jobs.");
+        window.ghTrader.toast("Health job enqueued", "success");
       } catch (e) {
         setStatus("Error: " + String(e.message || e));
         window.ghTrader.toast("Failed: " + e.message, "error");
       }
     });
   }
+
+  if (btnRepair) {
+    btnRepair.addEventListener("click", async () => {
+      try {
+        if (!lastQuestdbOk) {
+          window.ghTrader.toast("QuestDB is offline. Fix QuestDB first.", "error");
+          return;
+        }
+        if (!_latestDiagnoseReportPath) {
+          await loadToolsReports();
+        }
+        if (!_latestDiagnoseReportPath) {
+          window.ghTrader.toast("No diagnose report found yet. Run Health first.", "error");
+          return;
+        }
+        const refresh = !!(toolsRefreshCatalog && toolsRefreshCatalog.checked);
+        const msg =
+          "Repair will run auto-only actions from the latest diagnose report:\n\n" +
+          String(_latestDiagnoseReportPath) + "\n\nProceed?";
+        if (!window.confirm(msg)) return;
+
+        setStatus("Enqueuing repair job...");
+        const body = await window.ghTrader.postJson("/api/data/repair", {
+          report_path: _latestDiagnoseReportPath,
+          auto_only: true,
+          dry_run: false,
+          refresh_catalog: refresh,
+          chunk_days: 5
+        });
+        const jobId = (body.enqueued && body.enqueued[0]) ? body.enqueued[0] : null;
+        setStatus("Repair job enqueued" + (jobId ? (" (" + jobId + ")") : "") + ". Check Jobs.");
+        window.ghTrader.toast("Repair job enqueued", "success");
+      } catch (e) {
+        setStatus("Error: " + String(e.message || e));
+        window.ghTrader.toast("Failed: " + e.message, "error");
+      }
+    });
+  }
+
+  // Tabs
+  window.ghTrader.initTabs({
+    updateHash: true,
+    onTab: function(tabId) {
+      if (String(tabId || "") === "quality") {
+        loadQualitySummary();
+      }
+    }
+  });
 
   // Contracts is the primary workflow: load immediately on page load.
   setTimeout(loadContractsSnapshot, 0);

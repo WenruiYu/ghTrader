@@ -21,12 +21,12 @@ from ghtrader.control import auth
 from ghtrader.control.db import JobStore
 from ghtrader.control.jobs import JobManager, JobSpec, python_module_argv
 from ghtrader.control.views import build_router
-from ghtrader.json_io import read_json as _read_json, write_json_atomic as _write_json_atomic
+from ghtrader.util.json_io import read_json as _read_json, write_json_atomic as _write_json_atomic
 
 log = structlog.get_logger()
 
 _TQSDK_HEAVY_SUBCOMMANDS = {"download", "download-contract-range", "record", "probe-l5", "update", "account"}
-_TQSDK_HEAVY_DATA_SUBCOMMANDS = {"fill-missing"}
+_TQSDK_HEAVY_DATA_SUBCOMMANDS = {"repair", "health"}
 
 _UI_STATUS_TTL_S = 5.0
 _ui_status_at: float = 0.0
@@ -49,9 +49,14 @@ _data_coverage_cache_key: str = ""
 _data_coverage_payload: dict[str, Any] | None = None
 _data_coverage_lock = threading.Lock()
 
+_DATA_QUALITY_TTL_S = 60.0
+_data_quality_at: float = 0.0
+_data_quality_cache_key: str = ""
+_data_quality_payload: dict[str, Any] | None = None
+_data_quality_lock = threading.Lock()
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+
+from ghtrader.util.time import now_iso as _now_iso
 
 
 def _iter_symbol_dirs(root: Path) -> set[str]:
@@ -150,8 +155,8 @@ def _job_subcommand2(argv: list[str]) -> tuple[str | None, str | None]:
     Best-effort extraction of `ghtrader <subcommand> [subcommand2]` from argv.
 
     Examples:
-    - python -m ghtrader.cli data fill-missing ...
-    - ghtrader data fill-missing ...
+    - python -m ghtrader.cli data health ...
+    - ghtrader data repair ...
     """
     try:
         for i, t in enumerate(argv):
@@ -179,7 +184,7 @@ def _is_tqsdk_heavy_job(argv: list[str]) -> bool:
     s2 = sub2 or ""
     if s1 in _TQSDK_HEAVY_SUBCOMMANDS:
         return True
-    # Nested CLI groups (e.g., `ghtrader data fill-missing`) still use TqSdk and must be throttled.
+    # Nested CLI groups (e.g., `ghtrader data health`) may use TqSdk and must be throttled.
     if s1 == "data" and s2 in _TQSDK_HEAVY_DATA_SUBCOMMANDS:
         return True
     return False
@@ -344,7 +349,7 @@ def _write_accounts_env_atomic(*, runs_dir: Path, env: dict[str, str]) -> None:
 
 def _canonical_profile(p: str) -> str:
     try:
-        from ghtrader.tq_runtime import canonical_account_profile
+        from ghtrader.tq.runtime import canonical_account_profile
 
         return canonical_account_profile(p)
     except Exception:
@@ -596,7 +601,7 @@ def _daily_update_tick(*, app: FastAPI) -> None:
         return
 
     # Determine "today trading day" (UTC) so we enqueue at most once per trading day.
-    from ghtrader.trading_calendar import get_trading_calendar
+    from ghtrader.data.trading_calendar import get_trading_calendar
 
     # Dashboard scheduler: avoid network in control-plane threads unless explicitly requested elsewhere.
     cal = get_trading_calendar(data_dir=data_dir, refresh=False, allow_download=False)
@@ -710,6 +715,270 @@ def _tqsdk_scheduler_tick(*, store: JobStore, jm: JobManager, max_parallel: int)
     return started
 
 
+def _gateway_supervisor_enabled() -> bool:
+    """
+    Whether the dashboard should supervise AccountGateway processes.
+
+    Disabled by default during pytest to avoid background process management in unit tests.
+    """
+    if str(os.environ.get("GHTRADER_DISABLE_GATEWAY_SUPERVISOR", "")).strip().lower() in {"1", "true", "yes"}:
+        return False
+    if ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")) and str(
+        os.environ.get("GHTRADER_ENABLE_GATEWAY_SUPERVISOR_IN_TESTS", "")
+    ).strip().lower() not in {"1", "true", "yes"}:
+        return False
+    return True
+
+
+def _is_gateway_job(argv: list[str]) -> bool:
+    sub1, sub2 = _job_subcommand2(argv)
+    return bool((sub1 or "") == "gateway" and (sub2 or "") in {"run"})
+
+
+def _scan_gateway_desired(*, runs_dir: Path) -> dict[str, str]:
+    """
+    Return mapping {profile -> desired_mode} for gateway profiles.
+
+    Source: runs/gateway/account=<profile>/desired.json
+    """
+    root = runs_dir / "gateway"
+    out: dict[str, str] = {}
+    try:
+        if not root.exists():
+            return out
+        for d in [p for p in root.iterdir() if p.is_dir() and p.name.startswith("account=")]:
+            prof = d.name.split("=", 1)[-1] if "=" in d.name else d.name
+            desired = _read_json(d / "desired.json") or {}
+            cfg = desired.get("desired") if isinstance(desired.get("desired"), dict) else desired
+            mode = str((cfg or {}).get("mode") or "idle").strip().lower()
+            if prof:
+                out[str(prof)] = mode
+    except Exception:
+        return {}
+    return out
+
+
+def _strategy_supervisor_enabled() -> bool:
+    """
+    Whether the dashboard should supervise StrategyRunner processes.
+
+    Disabled by default during pytest to avoid background process management in unit tests.
+    """
+    if str(os.environ.get("GHTRADER_DISABLE_STRATEGY_SUPERVISOR", "")).strip().lower() in {"1", "true", "yes"}:
+        return False
+    if ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")) and str(
+        os.environ.get("GHTRADER_ENABLE_STRATEGY_SUPERVISOR_IN_TESTS", "")
+    ).strip().lower() not in {"1", "true", "yes"}:
+        return False
+    return True
+
+
+def _is_strategy_job(argv: list[str]) -> bool:
+    sub1, sub2 = _job_subcommand2(argv)
+    return bool((sub1 or "") == "strategy" and (sub2 or "") in {"run"})
+
+
+def _scan_strategy_desired(*, runs_dir: Path) -> dict[str, dict[str, Any]]:
+    """
+    Return mapping {profile -> desired_config_dict} for strategies.
+
+    Source: runs/strategy/account=<profile>/desired.json
+    """
+    root = runs_dir / "strategy"
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        if not root.exists():
+            return out
+        for d in [p for p in root.iterdir() if p.is_dir() and p.name.startswith("account=")]:
+            prof = d.name.split("=", 1)[-1] if "=" in d.name else d.name
+            desired = _read_json(d / "desired.json") or {}
+            cfg = desired.get("desired") if isinstance(desired.get("desired"), dict) else desired
+            cfg = cfg if isinstance(cfg, dict) else {}
+            if prof:
+                out[str(prof)] = dict(cfg)
+    except Exception:
+        return {}
+    return out
+
+
+def _strategy_supervisor_tick(*, store: JobStore, jm: Any, runs_dir: Path) -> dict[str, int]:
+    """
+    Run one StrategySupervisor tick.
+
+    Exposed for unit tests (pass fake `jm` to avoid launching subprocesses).
+    """
+    desired_by_profile = _scan_strategy_desired(runs_dir=runs_dir)
+
+    active_jobs = store.list_active_jobs()
+    active_strategy: dict[str, Any] = {}
+    for j in active_jobs:
+        if not _is_strategy_job(j.command):
+            continue
+        prof = _argv_opt(j.command, "--account") or ""
+        try:
+            from ghtrader.tq.runtime import canonical_account_profile
+
+            prof = canonical_account_profile(prof)
+        except Exception:
+            prof = str(prof).strip().lower() or "default"
+        active_strategy[prof] = j
+
+    stopped = 0
+    started = 0
+
+    # Stop strategies whose desired mode is explicitly idle.
+    for prof, job in active_strategy.items():
+        cfg = desired_by_profile.get(prof) or {}
+        dm = str(cfg.get("mode") or "idle").strip().lower()
+        if dm in {"", "idle"}:
+            try:
+                if bool(jm.cancel_job(job.id)):
+                    stopped += 1
+            except Exception:
+                pass
+
+    # Start at most one strategy per tick.
+    for prof, cfg in desired_by_profile.items():
+        dm = str(cfg.get("mode") or "idle").strip().lower()
+        if dm in {"", "idle"}:
+            continue
+        if prof in active_strategy:
+            continue
+
+        symbols: list[str] = []
+        raw_syms = cfg.get("symbols")
+        if isinstance(raw_syms, list):
+            symbols = [str(s).strip() for s in raw_syms if str(s).strip()]
+        if not symbols:
+            continue
+
+        model_name = str(cfg.get("model_name") or "xgboost").strip() or "xgboost"
+        horizon = str(cfg.get("horizon") or "50").strip()
+        threshold_up = str(cfg.get("threshold_up") or "0.6").strip()
+        threshold_down = str(cfg.get("threshold_down") or "0.6").strip()
+        position_size = str(cfg.get("position_size") or "1").strip()
+        artifacts_dir = str(cfg.get("artifacts_dir") or "artifacts").strip()
+        poll_interval_sec = str(cfg.get("poll_interval_sec") or "0.5").strip()
+
+        argv = python_module_argv(
+            "ghtrader.cli",
+            "strategy",
+            "run",
+            "--account",
+            prof,
+            "--model",
+            model_name,
+            "--horizon",
+            horizon,
+            "--threshold-up",
+            threshold_up,
+            "--threshold-down",
+            threshold_down,
+            "--position-size",
+            position_size,
+            "--artifacts-dir",
+            artifacts_dir,
+            "--runs-dir",
+            str(runs_dir),
+            "--poll-interval-sec",
+            poll_interval_sec,
+        )
+        for s in symbols:
+            argv += ["--symbols", s]
+        title = f"strategy {prof} {model_name} h={horizon}"
+        try:
+            jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+            started += 1
+        except Exception:
+            pass
+        break
+
+    return {"started": int(started), "stopped": int(stopped)}
+
+
+def _start_strategy_supervisor(app: FastAPI) -> None:
+    if getattr(app.state, "_strategy_supervisor_started", False):
+        return
+    app.state._strategy_supervisor_started = True
+
+    def _loop() -> None:
+        while True:
+            try:
+                store = app.state.job_store
+                jm = app.state.job_manager
+                runs_dir = get_runs_dir()
+                _strategy_supervisor_tick(store=store, jm=jm, runs_dir=runs_dir)
+            except Exception as e:
+                log.warning("strategy_supervisor.tick_failed", error=str(e))
+            time.sleep(float(os.environ.get("GHTRADER_STRATEGY_SUPERVISOR_POLL_SECONDS", "2.0")))
+
+    t = threading.Thread(target=_loop, name="strategy-supervisor", daemon=True)
+    t.start()
+
+
+def _start_gateway_supervisor(app: FastAPI) -> None:
+    if getattr(app.state, "_gateway_supervisor_started", False):
+        return
+    app.state._gateway_supervisor_started = True
+
+    def _loop() -> None:
+        while True:
+            try:
+                store = app.state.job_store
+                jm = app.state.job_manager
+                runs_dir = get_runs_dir()
+                desired_by_profile = _scan_gateway_desired(runs_dir=runs_dir)
+
+                active_jobs = store.list_active_jobs()
+                active_gateway: dict[str, Any] = {}
+                for j in active_jobs:
+                    if not _is_gateway_job(j.command):
+                        continue
+                    prof = _argv_opt(j.command, "--account") or ""
+                    try:
+                        from ghtrader.tq.runtime import canonical_account_profile
+
+                        prof = canonical_account_profile(prof)
+                    except Exception:
+                        prof = str(prof).strip().lower() or "default"
+                    active_gateway[prof] = j
+
+                # Stop gateways whose desired mode is explicitly idle.
+                for prof, job in active_gateway.items():
+                    dm = str(desired_by_profile.get(prof) or "").strip().lower()
+                    if dm == "idle":
+                        try:
+                            jm.cancel_job(job.id)
+                        except Exception:
+                            pass
+
+                # Start at most one gateway per tick to avoid a thundering herd.
+                for prof, dm in desired_by_profile.items():
+                    dm2 = str(dm or "").strip().lower()
+                    if dm2 in {"", "idle"}:
+                        continue
+                    if prof in active_gateway:
+                        continue
+                    argv = python_module_argv(
+                        "ghtrader.cli",
+                        "gateway",
+                        "run",
+                        "--account",
+                        prof,
+                        "--runs-dir",
+                        str(runs_dir),
+                    )
+                    title = f"gateway {prof}"
+                    jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+                    break
+            except Exception as e:
+                log.warning("gateway_supervisor.tick_failed", error=str(e))
+            time.sleep(float(os.environ.get("GHTRADER_GATEWAY_SUPERVISOR_POLL_SECONDS", "2.0")))
+
+    t = threading.Thread(target=_loop, name="gateway-supervisor", daemon=True)
+    t.start()
+
+
 def _control_root(runs_dir: Path) -> Path:
     return runs_dir / "control"
 
@@ -728,6 +997,14 @@ def create_app() -> Any:
     jm = JobManager(store=store, logs_dir=_logs_dir(runs_dir))
     jm.reconcile()
 
+    # Apply persisted dashboard settings before starting background schedulers.
+    try:
+        from ghtrader.control.settings import apply_tqsdk_scheduler_settings_from_disk
+
+        apply_tqsdk_scheduler_settings_from_disk(runs_dir=runs_dir)
+    except Exception:
+        pass
+
     app = FastAPI(title="ghTrader Control", version="0.1.0")
     app.state.job_store = store
     app.state.job_manager = jm
@@ -735,6 +1012,10 @@ def create_app() -> Any:
         _start_tqsdk_scheduler(app)
     if _daily_update_enabled():
         _start_daily_update_scheduler(app)
+    if _gateway_supervisor_enabled():
+        _start_gateway_supervisor(app)
+    if _strategy_supervisor_enabled():
+        _start_strategy_supervisor(app)
 
     # Static assets (CSS)
     static_dir = Path(__file__).parent / "static"
@@ -810,12 +1091,19 @@ def create_app() -> Any:
             lv = "v2"
             tl = "raw" if k == "ticks" else "main_l5"
             try:
-                from ghtrader.questdb_index import INDEX_TABLE_V2, ensure_index_tables, query_index_coverage_rows
-                from ghtrader.questdb_client import make_questdb_query_config_from_env
+                from ghtrader.questdb.index import INDEX_TABLE_V2, ensure_index_tables, query_index_coverage_rows
+                from ghtrader.questdb.client import make_questdb_query_config_from_env
 
                 cfg = make_questdb_query_config_from_env()
                 ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
-                rows2 = query_index_coverage_rows(cfg=cfg, lake_version=lv, ticks_lake=tl, limit=lim, search=q, index_table=INDEX_TABLE_V2)
+                rows2 = query_index_coverage_rows(
+                    cfg=cfg,
+                    dataset_version=lv,
+                    ticks_kind=tl,
+                    limit=lim,
+                    search=q,
+                    index_table=INDEX_TABLE_V2,
+                )
                 out2 = [{"symbol": r.get("symbol"), "n_dates": r.get("n_days"), "min_date": r.get("min_day"), "max_date": r.get("max_day")} for r in rows2]
                 payload2 = {"ok": True, "kind": k, "count": len(out2), "rows": out2, "source": "questdb_index", "generated_at": _now_iso()}
                 with _data_coverage_lock:
@@ -836,15 +1124,15 @@ def create_app() -> Any:
             try:
                 from datetime import date as _date
 
-                from ghtrader.questdb_features_labels import FEATURE_BUILDS_TABLE_V2, LABEL_BUILDS_TABLE_V2
-                from ghtrader.questdb_client import connect_pg as _connect, make_questdb_query_config_from_env
+                from ghtrader.questdb.features_labels import FEATURE_BUILDS_TABLE_V2, LABEL_BUILDS_TABLE_V2
+                from ghtrader.questdb.client import connect_pg as _connect, make_questdb_query_config_from_env
 
                 cfg = make_questdb_query_config_from_env()
                 bt = FEATURE_BUILDS_TABLE_V2 if k == "features" else LABEL_BUILDS_TABLE_V2
                 sql = f"""
                 SELECT symbol, first_day, last_day
                 FROM {bt}
-                WHERE lake_version = 'v2'
+                WHERE dataset_version = 'v2'
                 LATEST ON ts PARTITION BY symbol
                 LIMIT {int(lim)}
                 """
@@ -891,10 +1179,403 @@ def create_app() -> Any:
 
         raise HTTPException(status_code=400, detail="invalid kind")
 
-    @app.post("/api/data/enqueue-verify", response_class=JSONResponse)
-    async def api_data_enqueue_verify(request: Request) -> dict[str, Any]:
+    @app.get("/api/data/quality-summary", response_class=JSONResponse)
+    def api_data_quality_summary(
+        request: Request, exchange: str = "SHFE", var: str = "cu", limit: int = 300, search: str = "", issues_only: bool = False
+    ) -> dict[str, Any]:
         """
-        Enqueue a QuestDB completeness verification job (runs `ghtrader data verify ...`).
+        Return per-symbol data quality summary (QuestDB-first, cached).
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        ex = str(exchange).upper().strip() or "SHFE"
+        v = str(var).lower().strip() or "cu"
+        lim = max(1, min(int(limit or 300), 500))
+        q = str(search or "").strip().lower()
+        only_issues = bool(issues_only)
+
+        global _data_quality_at, _data_quality_cache_key, _data_quality_payload
+        now = time.time()
+        cache_key = f"{ex}|{v}|{lim}|{q}|{int(only_issues)}"
+        with _data_quality_lock:
+            if (
+                isinstance(_data_quality_payload, dict)
+                and _data_quality_cache_key == cache_key
+                and (now - float(_data_quality_at)) <= float(_DATA_QUALITY_TTL_S)
+            ):
+                return dict(_data_quality_payload)
+
+        runs_dir = get_runs_dir()
+        snap_path = runs_dir / "control" / "cache" / "contracts_snapshot" / f"contracts_exchange={ex}_var={v}.json"
+        snap = _read_json(snap_path) if snap_path.exists() else None
+        snap = dict(snap) if isinstance(snap, dict) else {}
+
+        contracts = snap.get("contracts") if isinstance(snap.get("contracts"), list) else []
+        comp_summary = None
+        try:
+            comp = snap.get("completeness") if isinstance(snap.get("completeness"), dict) else {}
+            comp_summary = comp.get("summary") if isinstance(comp.get("summary"), dict) else None
+        except Exception:
+            comp_summary = None
+
+        # Base rows (from cached snapshot; safe to load).
+        base_rows: list[dict[str, Any]] = []
+        freshness_max_age_sec: float | None = None
+        for r in contracts:
+            if not isinstance(r, dict):
+                continue
+            sym = str(r.get("symbol") or "").strip()
+            if not sym:
+                continue
+            if q and q not in sym.lower():
+                continue
+
+            comp = r.get("completeness") if isinstance(r.get("completeness"), dict) else {}
+            qc = r.get("questdb_coverage") if isinstance(r.get("questdb_coverage"), dict) else {}
+            missing_days = comp.get("missing_days")
+            expected_days = comp.get("expected_days")
+            present_days = comp.get("present_days")
+            status = str(r.get("status") or "").strip() or None
+            last_tick_age_sec = r.get("last_tick_age_sec")
+            try:
+                if r.get("expired") is False and last_tick_age_sec is not None:
+                    age = float(last_tick_age_sec)
+                    if freshness_max_age_sec is None or age > freshness_max_age_sec:
+                        freshness_max_age_sec = age
+            except Exception:
+                pass
+
+            base_rows.append(
+                {
+                    "symbol": sym,
+                    "status": status,
+                    "last_tick_ts": str(qc.get("last_tick_ts") or "").strip() or None,
+                    "last_tick_day": str(qc.get("last_tick_day") or "").strip() or None,
+                    "missing_days": (int(missing_days) if missing_days is not None else None),
+                    "expected_days": (int(expected_days) if expected_days is not None else None),
+                    "present_days": (int(present_days) if present_days is not None else None),
+                    "last_tick_age_sec": (float(last_tick_age_sec) if last_tick_age_sec is not None else None),
+                }
+            )
+            if len(base_rows) >= lim:
+                break
+
+        # Join latest QuestDB quality ledgers when available.
+        fq_by_sym: dict[str, dict[str, Any]] = {}
+        gaps_by_sym: dict[str, dict[str, Any]] = {}
+        fq_ok = False
+        gaps_ok = False
+        try:
+            from ghtrader.questdb.client import connect_pg as _connect, make_questdb_query_config_from_env
+
+            cfg = make_questdb_query_config_from_env()
+            syms = [r["symbol"] for r in base_rows if str(r.get("symbol") or "").strip()]
+            if syms:
+                placeholders = ", ".join(["%s"] * len(syms))
+                fq_sql = (
+                    "SELECT symbol, trading_day, rows_total, "
+                    "bid_price1_null_rate, ask_price1_null_rate, last_price_null_rate, volume_null_rate, open_interest_null_rate, "
+                    "l5_fields_null_rate, price_jump_outliers, volume_spike_outliers, spread_anomaly_outliers, updated_at "
+                    "FROM ghtrader_field_quality_v2 "
+                    f"WHERE symbol IN ({placeholders}) AND ticks_kind='raw' AND dataset_version='v2' "
+                    "LATEST ON ts PARTITION BY symbol"
+                )
+                gaps_sql = (
+                    "SELECT symbol, trading_day, tick_count_actual, tick_count_expected_min, tick_count_expected_max, "
+                    "median_interval_ms, p95_interval_ms, p99_interval_ms, max_interval_ms, "
+                    "abnormal_gaps_count, critical_gaps_count, largest_gap_duration_ms, updated_at "
+                    "FROM ghtrader_tick_gaps_v2 "
+                    f"WHERE symbol IN ({placeholders}) AND ticks_kind='raw' AND dataset_version='v2' "
+                    "LATEST ON ts PARTITION BY symbol"
+                )
+                with _connect(cfg, connect_timeout_s=2) as conn:
+                    with conn.cursor() as cur:
+                        try:
+                            cur.execute(fq_sql, syms)
+                            for row in cur.fetchall() or []:
+                                s = str(row[0] or "").strip()
+                                if not s:
+                                    continue
+                                fq_by_sym[s] = {
+                                    "trading_day": str(row[1] or "").strip() or None,
+                                    "rows_total": (int(row[2]) if row[2] is not None else None),
+                                    "bid_price1_null_rate": (float(row[3]) if row[3] is not None else None),
+                                    "ask_price1_null_rate": (float(row[4]) if row[4] is not None else None),
+                                    "last_price_null_rate": (float(row[5]) if row[5] is not None else None),
+                                    "volume_null_rate": (float(row[6]) if row[6] is not None else None),
+                                    "open_interest_null_rate": (float(row[7]) if row[7] is not None else None),
+                                    "l5_fields_null_rate": (float(row[8]) if row[8] is not None else None),
+                                    "price_jump_outliers": (int(row[9]) if row[9] is not None else 0),
+                                    "volume_spike_outliers": (int(row[10]) if row[10] is not None else 0),
+                                    "spread_anomaly_outliers": (int(row[11]) if row[11] is not None else 0),
+                                    "updated_at": str(row[12] or "").strip() or None,
+                                }
+                            fq_ok = True
+                        except Exception:
+                            fq_ok = False
+                        try:
+                            cur.execute(gaps_sql, syms)
+                            for row in cur.fetchall() or []:
+                                s = str(row[0] or "").strip()
+                                if not s:
+                                    continue
+                                gaps_by_sym[s] = {
+                                    "trading_day": str(row[1] or "").strip() or None,
+                                    "tick_count_actual": (int(row[2]) if row[2] is not None else None),
+                                    "tick_count_expected_min": (int(row[3]) if row[3] is not None else None),
+                                    "tick_count_expected_max": (int(row[4]) if row[4] is not None else None),
+                                    "median_interval_ms": (int(row[5]) if row[5] is not None else None),
+                                    "p95_interval_ms": (int(row[6]) if row[6] is not None else None),
+                                    "p99_interval_ms": (int(row[7]) if row[7] is not None else None),
+                                    "max_interval_ms": (int(row[8]) if row[8] is not None else None),
+                                    "abnormal_gaps_count": (int(row[9]) if row[9] is not None else 0),
+                                    "critical_gaps_count": (int(row[10]) if row[10] is not None else 0),
+                                    "largest_gap_duration_ms": (int(row[11]) if row[11] is not None else None),
+                                    "updated_at": str(row[12] or "").strip() or None,
+                                }
+                            gaps_ok = True
+                        except Exception:
+                            gaps_ok = False
+        except Exception:
+            fq_ok = False
+            gaps_ok = False
+
+        # Compute derived metrics + per-symbol table.
+        out_rows: list[dict[str, Any]] = []
+        quality_scores: list[float] = []
+        anomalies_total = 0
+        for r in base_rows:
+            sym = str(r.get("symbol") or "").strip()
+            fq = fq_by_sym.get(sym) or {}
+            gp = gaps_by_sym.get(sym) or {}
+
+            rates = [
+                fq.get("bid_price1_null_rate"),
+                fq.get("ask_price1_null_rate"),
+                fq.get("last_price_null_rate"),
+                fq.get("volume_null_rate"),
+                fq.get("open_interest_null_rate"),
+            ]
+            rates2 = [float(x) for x in rates if isinstance(x, (int, float))]
+            score = None
+            if rates2:
+                m = float(sum(rates2)) / float(len(rates2))
+                score = float(max(0.0, min(1.0, 1.0 - m)))
+                quality_scores.append(score)
+
+            outliers = int(fq.get("price_jump_outliers") or 0) + int(fq.get("volume_spike_outliers") or 0) + int(fq.get("spread_anomaly_outliers") or 0)
+            gaps = int(gp.get("abnormal_gaps_count") or 0) + int(gp.get("critical_gaps_count") or 0)
+            anomalies = int(outliers + gaps)
+            anomalies_total += int(anomalies)
+
+            # Simple status classification.
+            st = "ok"
+            try:
+                if (fq.get("bid_price1_null_rate") is not None and float(fq.get("bid_price1_null_rate") or 0.0) > 0.01) or (
+                    fq.get("ask_price1_null_rate") is not None and float(fq.get("ask_price1_null_rate") or 0.0) > 0.01
+                ):
+                    st = "error"
+                elif int(gp.get("critical_gaps_count") or 0) > 0:
+                    st = "warning"
+                elif anomalies > 0:
+                    st = "warning"
+            except Exception:
+                st = "unknown"
+
+            if only_issues and st not in {"warning", "error"}:
+                continue
+
+            out_rows.append(
+                {
+                    "symbol": sym,
+                    "status": st,
+                    "last_tick_ts": r.get("last_tick_ts"),
+                    "missing_days": r.get("missing_days"),
+                    "expected_days": r.get("expected_days"),
+                    "present_days": r.get("present_days"),
+                    "field_quality_score": (round(score * 100.0, 2) if isinstance(score, (int, float)) else None),
+                    "l1_null_rates": {k: fq.get(k) for k in ["bid_price1_null_rate", "ask_price1_null_rate", "last_price_null_rate", "volume_null_rate", "open_interest_null_rate"]},
+                    "l5_fields_null_rate": fq.get("l5_fields_null_rate"),
+                    "outliers": {
+                        "price_jump": int(fq.get("price_jump_outliers") or 0),
+                        "volume_spike": int(fq.get("volume_spike_outliers") or 0),
+                        "spread_anomaly": int(fq.get("spread_anomaly_outliers") or 0),
+                    },
+                    "gaps": {
+                        "abnormal": int(gp.get("abnormal_gaps_count") or 0),
+                        "critical": int(gp.get("critical_gaps_count") or 0),
+                        "largest_gap_duration_ms": gp.get("largest_gap_duration_ms"),
+                        "p99_interval_ms": gp.get("p99_interval_ms"),
+                        "max_interval_ms": gp.get("max_interval_ms"),
+                    },
+                    "ledger_days": {
+                        "field_quality_day": fq.get("trading_day"),
+                        "tick_gaps_day": gp.get("trading_day"),
+                    },
+                }
+            )
+
+        completeness_pct = None
+        try:
+            if isinstance(comp_summary, dict):
+                total = float(comp_summary.get("symbols_total") or comp_summary.get("symbols") or 0.0)
+                complete = float(comp_summary.get("symbols_complete") or 0.0)
+                if total > 0:
+                    completeness_pct = (complete / total) * 100.0
+        except Exception:
+            completeness_pct = None
+
+        field_quality_pct = None
+        try:
+            if quality_scores:
+                field_quality_pct = (float(sum(quality_scores)) / float(len(quality_scores))) * 100.0
+        except Exception:
+            field_quality_pct = None
+
+        payload = {
+            "ok": True,
+            "exchange": ex,
+            "var": v,
+            "generated_at": _now_iso(),
+            "kpis": {
+                "completeness_pct": completeness_pct,
+                "field_quality_pct": field_quality_pct,
+                "anomalies_total": int(anomalies_total),
+                "freshness_max_age_sec": freshness_max_age_sec,
+            },
+            "sources": {
+                "contracts_snapshot": str(snap_path) if snap_path.exists() else None,
+                "field_quality_ok": bool(fq_ok),
+                "tick_gaps_ok": bool(gaps_ok),
+            },
+            "count": int(len(out_rows)),
+            "rows": out_rows,
+        }
+        with _data_quality_lock:
+            _data_quality_payload = dict(payload)
+            _data_quality_cache_key = cache_key
+            _data_quality_at = time.time()
+        return payload
+
+    @app.get("/api/data/quality-detail/{symbol}", response_class=JSONResponse)
+    def api_data_quality_detail(request: Request, symbol: str, limit: int = 30) -> dict[str, Any]:
+        """
+        Return recent quality ledger rows for a symbol (best-effort).
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        sym = str(symbol or "").strip()
+        if not sym or len(sym) > 64:
+            raise HTTPException(status_code=400, detail="invalid symbol")
+        lim = max(1, min(int(limit or 30), 200))
+
+        fq_rows: list[dict[str, Any]] = []
+        gap_rows: list[dict[str, Any]] = []
+        repair_rows: list[dict[str, Any]] = []
+        errors: list[str] = []
+
+        try:
+            from ghtrader.questdb.client import connect_pg as _connect, make_questdb_query_config_from_env
+
+            cfg = make_questdb_query_config_from_env()
+            with _connect(cfg, connect_timeout_s=2) as conn:
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute(
+                            "SELECT trading_day, rows_total, bid_price1_null_rate, ask_price1_null_rate, last_price_null_rate, volume_null_rate, open_interest_null_rate, "
+                            "l5_fields_null_rate, price_jump_outliers, volume_spike_outliers, spread_anomaly_outliers, consecutive_gaps_metadata, updated_at "
+                            "FROM ghtrader_field_quality_v2 "
+                            "WHERE symbol=%s AND ticks_kind='raw' AND dataset_version='v2' "
+                            "ORDER BY ts DESC LIMIT %s",
+                            [sym, lim],
+                        )
+                        for r in cur.fetchall() or []:
+                            fq_rows.append(
+                                {
+                                    "trading_day": str(r[0] or "").strip() or None,
+                                    "rows_total": (int(r[1]) if r[1] is not None else None),
+                                    "bid_price1_null_rate": (float(r[2]) if r[2] is not None else None),
+                                    "ask_price1_null_rate": (float(r[3]) if r[3] is not None else None),
+                                    "last_price_null_rate": (float(r[4]) if r[4] is not None else None),
+                                    "volume_null_rate": (float(r[5]) if r[5] is not None else None),
+                                    "open_interest_null_rate": (float(r[6]) if r[6] is not None else None),
+                                    "l5_fields_null_rate": (float(r[7]) if r[7] is not None else None),
+                                    "price_jump_outliers": (int(r[8]) if r[8] is not None else 0),
+                                    "volume_spike_outliers": (int(r[9]) if r[9] is not None else 0),
+                                    "spread_anomaly_outliers": (int(r[10]) if r[10] is not None else 0),
+                                    "consecutive_gaps_metadata": str(r[11] or "").strip(),
+                                    "updated_at": str(r[12] or "").strip() or None,
+                                }
+                            )
+                    except Exception as e:
+                        errors.append(f"field_quality: {e}")
+                    try:
+                        cur.execute(
+                            "SELECT trading_day, tick_count_actual, tick_count_expected_min, tick_count_expected_max, median_interval_ms, p95_interval_ms, p99_interval_ms, "
+                            "max_interval_ms, abnormal_gaps_count, critical_gaps_count, largest_gap_duration_ms, updated_at "
+                            "FROM ghtrader_tick_gaps_v2 "
+                            "WHERE symbol=%s AND ticks_kind='raw' AND dataset_version='v2' "
+                            "ORDER BY ts DESC LIMIT %s",
+                            [sym, lim],
+                        )
+                        for r in cur.fetchall() or []:
+                            gap_rows.append(
+                                {
+                                    "trading_day": str(r[0] or "").strip() or None,
+                                    "tick_count_actual": (int(r[1]) if r[1] is not None else None),
+                                    "tick_count_expected_min": (int(r[2]) if r[2] is not None else None),
+                                    "tick_count_expected_max": (int(r[3]) if r[3] is not None else None),
+                                    "median_interval_ms": (int(r[4]) if r[4] is not None else None),
+                                    "p95_interval_ms": (int(r[5]) if r[5] is not None else None),
+                                    "p99_interval_ms": (int(r[6]) if r[6] is not None else None),
+                                    "max_interval_ms": (int(r[7]) if r[7] is not None else None),
+                                    "abnormal_gaps_count": (int(r[8]) if r[8] is not None else 0),
+                                    "critical_gaps_count": (int(r[9]) if r[9] is not None else 0),
+                                    "largest_gap_duration_ms": (int(r[10]) if r[10] is not None else None),
+                                    "updated_at": str(r[11] or "").strip() or None,
+                                }
+                            )
+                    except Exception as e:
+                        errors.append(f"tick_gaps: {e}")
+                    try:
+                        cur.execute(
+                            "SELECT run_id, action_kind, status, trading_day, details, created_at "
+                            "FROM ghtrader_repair_log_v2 "
+                            "WHERE symbol=%s "
+                            "ORDER BY ts DESC LIMIT %s",
+                            [sym, lim],
+                        )
+                        for r in cur.fetchall() or []:
+                            repair_rows.append(
+                                {
+                                    "run_id": str(r[0] or "").strip(),
+                                    "action_kind": str(r[1] or "").strip(),
+                                    "status": str(r[2] or "").strip(),
+                                    "trading_day": str(r[3] or "").strip() or None,
+                                    "details": str(r[4] or "").strip(),
+                                    "created_at": str(r[5] or "").strip() or None,
+                                }
+                            )
+                    except Exception as e:
+                        errors.append(f"repair_log: {e}")
+        except Exception as e:
+            errors.append(str(e))
+
+        return {
+            "ok": True,
+            "symbol": sym,
+            "generated_at": _now_iso(),
+            "field_quality": fq_rows,
+            "tick_gaps": gap_rows,
+            "repair_log": repair_rows,
+            "errors": errors,
+        }
+
+    @app.post("/api/data/diagnose", response_class=JSONResponse)
+    async def api_data_enqueue_diagnose(request: Request) -> dict[str, Any]:
+        """
+        Enqueue a data diagnose job (runs `ghtrader data diagnose ...`).
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -902,15 +1583,12 @@ def create_app() -> Any:
 
         runs_dir = get_runs_dir()
         data_dir = get_data_dir()
-
         ex = str(payload.get("exchange") or "SHFE").upper().strip()
         v = str(payload.get("var") or "cu").lower().strip()
         refresh_catalog = bool(payload.get("refresh_catalog", False))
-
-        symbols: list[str] = []
-        raw_syms = payload.get("symbols")
-        if isinstance(raw_syms, list):
-            symbols = [str(s).strip() for s in raw_syms if str(s).strip()]
+        thoroughness = str(payload.get("thoroughness") or "standard").strip().lower()
+        if thoroughness not in {"quick", "standard", "comprehensive"}:
+            thoroughness = "standard"
 
         start = str(payload.get("start") or "").strip()
         end = str(payload.get("end") or "").strip()
@@ -918,11 +1596,13 @@ def create_app() -> Any:
         argv = python_module_argv(
             "ghtrader.cli",
             "data",
-            "verify",
+            "diagnose",
             "--exchange",
             ex,
             "--var",
             v,
+            "--thoroughness",
+            thoroughness,
             "--refresh-catalog",
             ("1" if refresh_catalog else "0"),
             "--data-dir",
@@ -930,23 +1610,20 @@ def create_app() -> Any:
             "--runs-dir",
             str(runs_dir),
         )
-        for s in symbols:
-            argv += ["--symbol", s]
         if start:
             argv += ["--start", start]
         if end:
             argv += ["--end", end]
 
-        title = f"data-verify {ex}.{v}" + (f" {start}..{end}" if (start or end) else "")
+        title = f"data-diagnose {ex}.{v} ({thoroughness})"
         store = request.app.state.job_store
         jm = request.app.state.job_manager
 
-        # Dedupe: avoid enqueuing duplicate verify jobs for the same scope.
+        # Dedupe: avoid duplicate queued/active diagnose jobs for the same scope.
         try:
             active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=2000)
             for j in active:
                 if str(j.title or "").startswith(title):
-                    # If an older verify job was enqueued (pid is NULL), start it now so it doesn't stay queued forever.
                     if j.pid is None and str(j.status or "") == "queued":
                         started = jm.start_queued_job(j.id) or j
                         return {"ok": True, "enqueued": [started.id], "count": 1, "deduped": True, "started": bool(started.pid)}
@@ -954,18 +1631,14 @@ def create_app() -> Any:
         except Exception:
             pass
 
-        # Verify is index-backed and light: start immediately (do not leave it queued).
+        # Diagnose is DB-heavy but not TqSdk-heavy: start immediately.
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
 
-    @app.post("/api/data/enqueue-fill-missing", response_class=JSONResponse)
-    async def api_data_enqueue_fill_missing(request: Request) -> dict[str, Any]:
+    @app.post("/api/data/repair", response_class=JSONResponse)
+    async def api_data_enqueue_repair(request: Request) -> dict[str, Any]:
         """
-        Enqueue a QuestDB fill-missing job (runs `ghtrader data fill-missing ...`).
-
-        Supports an explicit init-mode for brand-new varieties:
-        - init_mode=false (default): enqueue one `data fill-missing` job (index-backed)
-        - init_mode=true: enqueue per-symbol `download` jobs over inferred per-contract windows
+        Enqueue a data repair job (runs `ghtrader data repair ...`).
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -974,149 +1647,103 @@ def create_app() -> Any:
         runs_dir = get_runs_dir()
         data_dir = get_data_dir()
 
-        ex = str(payload.get("exchange") or "SHFE").upper().strip()
-        v = str(payload.get("var") or "cu").lower().strip()
+        report_path = str(payload.get("report_path") or "").strip()
+        if not report_path:
+            raise HTTPException(status_code=400, detail="report_path is required")
+        rp = Path(report_path).expanduser()
+        try:
+            rp_abs = rp.resolve()
+        except Exception:
+            rp_abs = rp
+        try:
+            if str(rp_abs).startswith(str(runs_dir.resolve())) is False:  # type: ignore[union-attr]
+                raise HTTPException(status_code=400, detail="report_path must be under runs/")
+        except Exception:
+            # If resolve fails, still require a conservative prefix match.
+            if "runs" not in str(rp_abs):
+                raise HTTPException(status_code=400, detail="report_path must be under runs/")
+
+        auto_only = bool(payload.get("auto_only", True))
+        dry_run = bool(payload.get("dry_run", False))
         refresh_catalog = bool(payload.get("refresh_catalog", False))
-        init_mode = bool(payload.get("init_mode", False))
         chunk_days = int(payload.get("chunk_days") or 5)
-
-        symbols: list[str] = []
-        raw_syms = payload.get("symbols")
-        if isinstance(raw_syms, list):
-            symbols = [str(s).strip() for s in raw_syms if str(s).strip()]
-
-        start = str(payload.get("start") or "").strip()
-        end = str(payload.get("end") or "").strip()
-
-        store = request.app.state.job_store
-        jm = request.app.state.job_manager
-
-        if init_mode:
-            from datetime import date
-
-            from ghtrader.control.contract_status import infer_contract_date_range
-            from ghtrader.tqsdk_catalog import get_contract_catalog
-
-            def _parse_day(s: Any) -> date | None:
-                if s in (None, ""):
-                    return None
-                try:
-                    ss = str(s).strip()
-                except Exception:
-                    return None
-                if not ss:
-                    return None
-                try:
-                    return date.fromisoformat(ss[:10])
-                except Exception:
-                    return None
-
-            start_override = _parse_day(start) if start else None
-            end_override = _parse_day(end) if end else None
-
-            # Catalog is cache-only unless explicitly refreshed by the operator.
-            if refresh_catalog:
-                cat = get_contract_catalog(exchange=ex, var=v, runs_dir=runs_dir, refresh=True)
-            else:
-                cat = get_contract_catalog(exchange=ex, var=v, runs_dir=runs_dir, refresh=False, allow_stale_cache=True, offline=True)
-            if not bool(cat and cat.get("ok", False)):
-                return {"ok": False, "mode": "init", "error": str((cat or {}).get("error") or "catalog_unavailable")}
-
-            contracts = list(cat.get("contracts") or [])
-
-            # Dedupe: skip symbols that already have a queued/running download job.
-            existing_download_syms: set[str] = set()
-            try:
-                active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=5000)
-                for j in active:
-                    cmd = list(getattr(j, "command", []) or [])
-                    if "download" not in cmd:
-                        continue
-                    if "--symbol" not in cmd:
-                        continue
-                    try:
-                        si = cmd.index("--symbol")
-                        sym0 = str(cmd[si + 1]).strip() if (si + 1) < len(cmd) else ""
-                    except Exception:
-                        sym0 = ""
-                    if sym0:
-                        existing_download_syms.add(sym0)
-            except Exception:
-                pass
-
-            enqueued: list[str] = []
-            skipped: list[dict[str, Any]] = []
-            today = date.today()
-
-            # Only init via catalog contracts (symbols payload is ignored in init_mode).
-            for c in contracts:
-                sym = str((c or {}).get("symbol") or "").strip()
-                if not sym:
-                    continue
-
-                if sym in existing_download_syms:
-                    skipped.append({"symbol": sym, "reason": "deduped"})
-                    continue
-
-                s0 = _parse_day((c or {}).get("open_date"))
-                s1 = _parse_day((c or {}).get("expire_datetime"))
-                if s0 is None or s1 is None:
-                    inf0, inf1 = infer_contract_date_range(sym)
-                    if s0 is None:
-                        s0 = inf0
-                    if s1 is None:
-                        s1 = inf1
-
-                # Never request future dates (prevents incorrectly marking future days as no-data).
-                if s1 is not None and s1 > today:
-                    s1 = today
-
-                # Clamp with optional global overrides from the UI.
-                if start_override is not None:
-                    s0 = start_override if s0 is None else max(s0, start_override)
-                if end_override is not None:
-                    s1 = end_override if s1 is None else min(s1, end_override)
-
-                if s0 is None or s1 is None or s1 < s0:
-                    skipped.append(
-                        {
-                            "symbol": sym,
-                            "reason": "missing_date_range",
-                            "start": (s0.isoformat() if s0 else None),
-                            "end": (s1.isoformat() if s1 else None),
-                        }
-                    )
-                    continue
-
-                argv_dl = python_module_argv(
-                    "ghtrader.cli",
-                    "download",
-                    "--symbol",
-                    sym,
-                    "--start",
-                    s0.isoformat(),
-                    "--end",
-                    s1.isoformat(),
-                    "--data-dir",
-                    str(data_dir),
-                    "--chunk-days",
-                    str(int(max(1, min(chunk_days, 60)))),
-                )
-                title_dl = f"download {sym} {s0.isoformat()}..{s1.isoformat()}"
-                rec = jm.enqueue_job(JobSpec(title=title_dl, argv=argv_dl, cwd=Path.cwd()))
-                enqueued.append(rec.id)
-                existing_download_syms.add(sym)  # dedupe within this request
-
-            return {"ok": True, "mode": "init", "enqueued": enqueued, "skipped": skipped, "count": len(enqueued)}
 
         argv = python_module_argv(
             "ghtrader.cli",
             "data",
-            "fill-missing",
+            "repair",
+            "--report",
+            str(rp_abs),
+            "--data-dir",
+            str(data_dir),
+            "--runs-dir",
+            str(runs_dir),
+            "--chunk-days",
+            str(int(max(1, min(chunk_days, 60)))),
+            "--refresh-catalog",
+            ("1" if refresh_catalog else "0"),
+        )
+        if auto_only:
+            argv += ["--auto-only"]
+        else:
+            argv += ["--no-auto-only"]
+        if dry_run:
+            argv += ["--dry-run"]
+
+        title = f"data-repair {rp_abs.name}"
+        store = request.app.state.job_store
+        jm = request.app.state.job_manager
+
+        # Dedupe: avoid enqueuing duplicate queued repair jobs for the same report.
+        try:
+            active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=5000)
+            for j in active:
+                cmd = list(getattr(j, "command", []) or [])
+                if "data" in cmd and "repair" in cmd and str(rp_abs) in cmd:
+                    return {"ok": True, "enqueued": [j.id], "count": 1, "deduped": True}
+        except Exception:
+            pass
+
+        # Repair can be TqSdk-heavy (downloads): enqueue to respect scheduler.
+        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
+
+    @app.post("/api/data/health", response_class=JSONResponse)
+    async def api_data_enqueue_health(request: Request) -> dict[str, Any]:
+        """
+        Enqueue a data health job (runs `ghtrader data health ...`).
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        payload = await request.json()
+
+        runs_dir = get_runs_dir()
+        data_dir = get_data_dir()
+        ex = str(payload.get("exchange") or "SHFE").upper().strip()
+        v = str(payload.get("var") or "cu").lower().strip()
+        refresh_catalog = bool(payload.get("refresh_catalog", False))
+        thoroughness = str(payload.get("thoroughness") or "standard").strip().lower()
+        if thoroughness not in {"quick", "standard", "comprehensive"}:
+            thoroughness = "standard"
+
+        # Health can run diagnose-only or diagnose+auto-repair.
+        auto_repair = bool(payload.get("auto_repair", True))
+        dry_run = bool(payload.get("dry_run", False))
+        chunk_days = int(payload.get("chunk_days") or 5)
+
+        start = str(payload.get("start") or "").strip()
+        end = str(payload.get("end") or "").strip()
+
+        argv = python_module_argv(
+            "ghtrader.cli",
+            "data",
+            "health",
             "--exchange",
             ex,
             "--var",
             v,
+            "--thoroughness",
+            thoroughness,
             "--refresh-catalog",
             ("1" if refresh_catalog else "0"),
             "--chunk-days",
@@ -1126,25 +1753,33 @@ def create_app() -> Any:
             "--runs-dir",
             str(runs_dir),
         )
-        for s in symbols:
-            argv += ["--symbol", s]
+        argv += ["--auto-repair"] if auto_repair else ["--no-auto-repair"]
+        if dry_run:
+            argv += ["--dry-run"]
         if start:
             argv += ["--start", start]
         if end:
             argv += ["--end", end]
 
-        title = f"data-fill-missing {ex}.{v}" if not symbols else (f"data-fill-missing {symbols[0]}" if len(symbols) == 1 else f"data-fill-missing {len(symbols)} symbols")
+        title = f"data-health {ex}.{v} ({thoroughness})"
+        if auto_repair:
+            title += " auto"
+        if start or end:
+            title += f" {start or ''}..{end or ''}".strip()
 
-        # Dedupe: avoid duplicate queued fill jobs for the same title/scope.
+        store = request.app.state.job_store
+        jm = request.app.state.job_manager
+
+        # Dedupe: avoid duplicate queued/active health jobs for the same scope.
         try:
-            active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=5000)
+            active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=2000)
             for j in active:
                 if str(j.title or "").startswith(title):
                     return {"ok": True, "enqueued": [j.id], "count": 1, "deduped": True}
         except Exception:
             pass
 
-        # Fill-missing is TqSdk-heavy: enqueue and let the scheduler throttle concurrency.
+        # Health may be TqSdk-heavy (auto-repair downloads): enqueue to respect scheduler.
         rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
 
@@ -1155,7 +1790,7 @@ def create_app() -> Any:
 
         This scans the canonical ticks table and populates `ghtrader_symbol_day_index_v2`
         for the selected exchange/variety. Required when the index is empty or incomplete
-        before Verify/Fill can compute meaningful completeness.
+        before Diagnose/Health can compute meaningful completeness.
 
         Payload:
         - exchange: SHFE (default)
@@ -1299,32 +1934,78 @@ def create_app() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
 
-    @app.get("/api/data/verify", response_class=JSONResponse)
-    def api_data_verify(request: Request, exchange: str = "SHFE", var: str = "cu", limit: int = 1) -> dict[str, Any]:
+    @app.get("/api/data/reports", response_class=JSONResponse)
+    def api_data_reports(
+        request: Request,
+        kind: str = "diagnose",
+        exchange: str = "SHFE",
+        var: str = "cu",
+        limit: int = 5,
+    ) -> dict[str, Any]:
         """
-        Return the most recent data-verify report(s) written under runs/control/reports/data_verify/.
+        Return recent data reports written under runs/control/reports/.
+
+        kind:
+        - diagnose: runs/control/reports/data_diagnose/diagnose_exchange=..._var=..._*.json
+        - repair: runs/control/reports/data_repair/repair_*.plan.json (+ optional .result.json)
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
+        k = str(kind or "").strip().lower()
         ex = str(exchange).upper().strip() or "SHFE"
         v = str(var).lower().strip() or "cu"
-        lim = max(1, min(int(limit or 1), 20))
+        lim = max(1, min(int(limit or 5), 50))
 
         rd = get_runs_dir()
-        rep_dir = rd / "control" / "reports" / "data_verify"
-        if not rep_dir.exists():
-            return {"ok": False, "error": "no_reports", "exchange": ex, "var": v, "reports": []}
 
-        pat = f"verify_exchange={ex}_var={v}_*.json"
-        paths = sorted(rep_dir.glob(pat), key=lambda p: p.stat().st_mtime_ns, reverse=True)[:lim]
-        reports: list[dict[str, Any]] = []
-        for p in paths:
-            obj = _read_json(p)
-            if obj:
-                obj = dict(obj)
-                obj["_path"] = str(p)
-                reports.append(obj)
-        return {"ok": True, "exchange": ex, "var": v, "count": int(len(reports)), "reports": reports}
+        if k == "diagnose":
+            rep_dir = rd / "control" / "reports" / "data_diagnose"
+            if not rep_dir.exists():
+                return {"ok": False, "error": "no_reports", "kind": k, "exchange": ex, "var": v, "reports": []}
+            pat = f"diagnose_exchange={ex}_var={v}_*.json"
+            paths = sorted(rep_dir.glob(pat), key=lambda p: p.stat().st_mtime_ns, reverse=True)[:lim]
+            reports: list[dict[str, Any]] = []
+            for p in paths:
+                obj = _read_json(p)
+                if obj:
+                    obj = dict(obj)
+                    obj["_path"] = str(p)
+                    reports.append(obj)
+            return {"ok": True, "kind": k, "exchange": ex, "var": v, "count": int(len(reports)), "reports": reports}
+
+        if k == "repair":
+            rep_dir = rd / "control" / "reports" / "data_repair"
+            if not rep_dir.exists():
+                return {"ok": False, "error": "no_reports", "kind": k, "exchange": ex, "var": v, "reports": []}
+            plan_paths = sorted(rep_dir.glob("repair_*.plan.json"), key=lambda p: p.stat().st_mtime_ns, reverse=True)
+            reports2: list[dict[str, Any]] = []
+            for p in plan_paths:
+                plan = _read_json(p)
+                if not isinstance(plan, dict):
+                    continue
+                if str(plan.get("exchange") or "").upper().strip() != ex:
+                    continue
+                if str(plan.get("var") or "").lower().strip() != v:
+                    continue
+                run_id = str(plan.get("run_id") or "").strip()
+                res_path = rep_dir / f"repair_{run_id}.result.json" if run_id else None
+                res_obj = _read_json(res_path) if (res_path and res_path.exists()) else None
+                reports2.append(
+                    {
+                        "run_id": run_id or None,
+                        "exchange": ex,
+                        "var": v,
+                        "plan": plan,
+                        "result": res_obj,
+                        "plan_path": str(p),
+                        "result_path": (str(res_path) if res_path else None),
+                    }
+                )
+                if len(reports2) >= lim:
+                    break
+            return {"ok": True, "kind": k, "exchange": ex, "var": v, "count": int(len(reports2)), "reports": reports2}
+
+        raise HTTPException(status_code=400, detail="kind must be one of: diagnose, repair")
 
     @app.get("/api/data/l5-start", response_class=JSONResponse)
     def api_data_l5_start(request: Request, exchange: str = "SHFE", var: str = "cu", limit: int = 1) -> dict[str, Any]:
@@ -1439,8 +2120,8 @@ def create_app() -> Any:
                     expected_symbols = 0
                     idx_check_err = ""
                     try:
-                        from ghtrader.questdb_client import make_questdb_query_config_from_env
-                        from ghtrader.questdb_index import INDEX_TABLE_V2, ensure_index_tables, list_symbols_from_index
+                        from ghtrader.questdb.client import make_questdb_query_config_from_env
+                        from ghtrader.questdb.index import INDEX_TABLE_V2, ensure_index_tables, list_symbols_from_index
 
                         # Best-effort expected symbol count (from previous snapshot), so we can detect
                         # "partially populated" index tables (not just fully empty).
@@ -1463,8 +2144,8 @@ def create_app() -> Any:
                         ensure_index_tables(cfg=qcfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
                         got = list_symbols_from_index(
                             cfg=qcfg,
-                            lake_version=lv,
-                            ticks_lake="raw",
+                            dataset_version=lv,
+                            ticks_kind="raw",
                             prefix=f"{ex}.{v}",
                             index_table=INDEX_TABLE_V2,
                             limit=10000,
@@ -1572,7 +2253,7 @@ def create_app() -> Any:
             "error": "contracts_snapshot_building",
             "exchange": ex,
             "var": v,
-            "lake_version": lv,
+            "dataset_version": lv,
             "snapshot_job": job_info,
         }
 
@@ -1597,7 +2278,7 @@ def create_app() -> Any:
         v = str(payload.get("var") or "cu").lower().strip()
 
         if not symbols and scope == "all":
-            from ghtrader.tqsdk_catalog import get_contract_catalog
+            from ghtrader.tq.catalog import get_contract_catalog
 
             cat = get_contract_catalog(exchange=ex, var=v, runs_dir=runs_dir, refresh=False)
             if not bool(cat.get("ok", False)):
@@ -1645,8 +2326,8 @@ def create_app() -> Any:
         lv = "v2"
 
         if not symbols and scope in {"missing", "all"}:
-            from ghtrader.control.contract_status import compute_contract_statuses
-            from ghtrader.tqsdk_catalog import get_contract_catalog
+            from ghtrader.data.contract_status import compute_contract_statuses
+            from ghtrader.tq.catalog import get_contract_catalog
 
             cat = get_contract_catalog(exchange=ex, var=v, runs_dir=runs_dir, refresh=False)
             if not bool(cat.get("ok", False)):
@@ -1656,12 +2337,16 @@ def create_app() -> Any:
             scope_syms = [str(c.get("symbol") or "").strip() for c in (cat.get("contracts") or []) if str(c.get("symbol") or "").strip()]
             scope_cov: dict[str, dict[str, Any]] | None = None
             try:
-                from ghtrader.questdb_client import make_questdb_query_config_from_env
-                from ghtrader.questdb_index import INDEX_TABLE_V2, ensure_index_tables, query_contract_coverage_from_index
+                from ghtrader.questdb.client import make_questdb_query_config_from_env
+                from ghtrader.questdb.index import INDEX_TABLE_V2, ensure_index_tables, query_contract_coverage_from_index
                 cfg = make_questdb_query_config_from_env()
                 ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
                 scope_cov = query_contract_coverage_from_index(
-                    cfg=cfg, symbols=scope_syms, lake_version=lv, ticks_lake="raw", index_table=INDEX_TABLE_V2
+                    cfg=cfg,
+                    symbols=scope_syms,
+                    dataset_version=lv,
+                    ticks_kind="raw",
+                    index_table=INDEX_TABLE_V2,
                 )
             except Exception:
                 scope_cov = None
@@ -1686,8 +2371,8 @@ def create_app() -> Any:
         manual_end = str(payload.get("end") or "").strip() or None
 
         # Build a lookup of expected ranges using local active-ranges cache (no network).
-        from ghtrader.control.contract_status import compute_contract_statuses
-        from ghtrader.tqsdk_catalog import get_contract_catalog
+        from ghtrader.data.contract_status import compute_contract_statuses
+        from ghtrader.tq.catalog import get_contract_catalog
 
         cat2 = get_contract_catalog(exchange=ex, var=v, runs_dir=runs_dir, refresh=False)
         by_catalog_sym = {str(r.get("symbol") or "").strip(): r for r in (cat2.get("contracts") or []) if str(r.get("symbol") or "").strip()}
@@ -1697,16 +2382,16 @@ def create_app() -> Any:
         cov: dict[str, dict[str, Any]] = {}
         questdb_ok = False
         try:
-            from ghtrader.questdb_client import make_questdb_query_config_from_env
-            from ghtrader.questdb_index import INDEX_TABLE_V2, ensure_index_tables, query_contract_coverage_from_index
+            from ghtrader.questdb.client import make_questdb_query_config_from_env
+            from ghtrader.questdb.index import INDEX_TABLE_V2, ensure_index_tables, query_contract_coverage_from_index
 
             cfg = make_questdb_query_config_from_env()
             ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
             cov = query_contract_coverage_from_index(
                 cfg=cfg,
                 symbols=[str(r.get("symbol") or "").strip() for r in contracts_for_ranges if str(r.get("symbol") or "").strip()],
-                lake_version=lv,
-                ticks_lake="raw",
+                dataset_version=lv,
+                ticks_kind="raw",
                 index_table=INDEX_TABLE_V2,
             )
             questdb_ok = True
@@ -1867,6 +2552,85 @@ def create_app() -> Any:
         ok = jm.cancel_job(job_id)
         return {"ok": bool(ok)}
 
+    @app.post("/api/jobs/cancel-batch", response_class=JSONResponse)
+    async def api_cancel_jobs_batch(request: Request) -> dict[str, Any]:
+        """
+        Batch cancel jobs by kind/status.
+
+        Intended for dashboard UX (e.g. cancel all download jobs).
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        payload = await request.json()
+        kinds_raw = payload.get("kinds")
+        statuses_raw = payload.get("statuses")
+        include_unstarted_queued = bool(payload.get("include_unstarted_queued", False))
+
+        if kinds_raw is None:
+            kinds: set[str] = set()
+        elif isinstance(kinds_raw, list) and all(isinstance(x, str) for x in kinds_raw):
+            kinds = {str(x).strip() for x in kinds_raw if str(x).strip()}
+        else:
+            raise HTTPException(status_code=400, detail="kinds must be list[str]")
+
+        if statuses_raw is None:
+            statuses = {"running", "queued"}
+        elif isinstance(statuses_raw, list) and all(isinstance(x, str) for x in statuses_raw):
+            statuses = {str(x).strip().lower() for x in statuses_raw if str(x).strip()}
+        else:
+            raise HTTPException(status_code=400, detail="statuses must be list[str]")
+
+        # Default: cancel ingest downloads (safe conservative default).
+        if not kinds:
+            kinds = {"download", "download_contract_range"}
+
+        from ghtrader.control.ingest_status import parse_ingest_command
+
+        matched: list[str] = []
+        cancelled: list[str] = []
+        failed: list[dict[str, Any]] = []
+
+        # Consider the recent job window; active jobs should be near the top.
+        jobs = store.list_jobs(limit=2000)
+        for job in jobs:
+            st = str(job.status or "").lower().strip()
+            if st not in statuses:
+                continue
+
+            # Determine kind from argv; if unknown, skip.
+            desc = parse_ingest_command(list(job.command or []))
+            kind = str(desc.get("kind") or "unknown")
+            if kind not in kinds:
+                continue
+
+            # Skip unstarted queued jobs unless explicitly requested.
+            if st == "queued" and job.pid is None and not include_unstarted_queued:
+                continue
+
+            matched.append(job.id)
+
+            ok = False
+            try:
+                ok = bool(jm.cancel_job(job.id))
+            except Exception as e:
+                ok = False
+                failed.append({"job_id": job.id, "error": str(e), "kind": kind, "status": st})
+            if ok:
+                cancelled.append(job.id)
+            else:
+                failed.append({"job_id": job.id, "error": "cancel_failed", "kind": kind, "status": st})
+
+        return {
+            "ok": True,
+            "kinds": sorted(list(kinds)),
+            "statuses": sorted(list(statuses)),
+            "matched": int(len(matched)),
+            "cancelled": int(len(cancelled)),
+            "failed": failed,
+            "job_ids": {"matched": matched, "cancelled": cancelled},
+        }
+
     @app.get("/api/jobs/{job_id}/log", response_class=PlainTextResponse)
     def api_job_log(request: Request, job_id: str, max_bytes: int = 64000) -> str:
         if not auth.is_authorized(request):
@@ -1902,12 +2666,16 @@ def create_app() -> Any:
             raise HTTPException(status_code=404, detail="Job not found")
         from ghtrader.control.ingest_status import ingest_status_for_job
 
-        status = ingest_status_for_job(
-            job_id=job.id,
-            command=job.command,
-            log_path=job.log_path,
-            default_data_dir=get_data_dir(),
-        )
+        try:
+            status = ingest_status_for_job(
+                job_id=job.id,
+                command=job.command,
+                log_path=job.log_path,
+                default_data_dir=get_data_dir(),
+            )
+        except Exception as e:
+            # Never wedge the dashboard UI on ingest-status computation failures.
+            status = {"kind": "unknown", "job_id": job.id, "error": str(e)}
         # Attach minimal job metadata for UI convenience.
         status.update(
             {
@@ -1934,12 +2702,15 @@ def create_app() -> Any:
             kind = parse_ingest_command(job.command).get("kind")
             if kind not in {"download", "download_contract_range", "record"}:
                 continue
-            status = ingest_status_for_job(
-                job_id=job.id,
-                command=job.command,
-                log_path=job.log_path,
-                default_data_dir=get_data_dir(),
-            )
+            try:
+                status = ingest_status_for_job(
+                    job_id=job.id,
+                    command=job.command,
+                    log_path=job.log_path,
+                    default_data_dir=get_data_dir(),
+                )
+            except Exception as e:
+                status = {"kind": "unknown", "job_id": job.id, "error": str(e)}
             status.update(
                 {
                     "job_status": job.status,
@@ -1974,8 +2745,8 @@ def create_app() -> Any:
             raise HTTPException(status_code=400, detail="query is required")
 
         try:
-            from ghtrader.questdb_client import make_questdb_query_config_from_env
-            from ghtrader.questdb_queries import query_sql_read_only
+            from ghtrader.questdb.client import make_questdb_query_config_from_env
+            from ghtrader.questdb.queries import query_sql_read_only
 
             cfg = make_questdb_query_config_from_env()
             cols, rows = query_sql_read_only(cfg=cfg, query=query, limit=int(limit), connect_timeout_s=2)
@@ -2014,7 +2785,7 @@ def create_app() -> Any:
         # QuestDB reachability
         questdb_ok = False
         try:
-            from ghtrader.questdb_client import connect_pg, make_questdb_query_config_from_env
+            from ghtrader.questdb.client import connect_pg, make_questdb_query_config_from_env
 
             cfg = make_questdb_query_config_from_env()
             with connect_pg(cfg, connect_timeout_s=1) as conn:
@@ -2030,14 +2801,14 @@ def create_app() -> Any:
         data_status = "unknown"
         try:
             if questdb_ok:
-                from ghtrader.questdb_client import make_questdb_query_config_from_env
-                from ghtrader.questdb_index import INDEX_TABLE_V2, list_symbols_from_index
+                from ghtrader.questdb.client import make_questdb_query_config_from_env
+                from ghtrader.questdb.index import INDEX_TABLE_V2, list_symbols_from_index
 
                 cfg = make_questdb_query_config_from_env()
                 syms = list_symbols_from_index(
                     cfg=cfg,
-                    lake_version="v2",
-                    ticks_lake="raw",
+                    dataset_version="v2",
+                    ticks_kind="raw",
                     index_table=INDEX_TABLE_V2,
                     limit=200000,
                     connect_timeout_s=1,
@@ -2096,8 +2867,8 @@ def create_app() -> Any:
         # Check schedule exists (QuestDB canonical table)
         try:
             if questdb_ok:
-                from ghtrader.questdb_client import connect_pg, make_questdb_query_config_from_env
-                from ghtrader.questdb_main_schedule import MAIN_SCHEDULE_TABLE_V2
+                from ghtrader.questdb.client import connect_pg, make_questdb_query_config_from_env
+                from ghtrader.questdb.main_schedule import MAIN_SCHEDULE_TABLE_V2
 
                 cfg = make_questdb_query_config_from_env()
                 with connect_pg(cfg, connect_timeout_s=1) as conn:
@@ -2115,15 +2886,15 @@ def create_app() -> Any:
         # Check main_l5 exists (QuestDB index)
         try:
             if questdb_ok:
-                from ghtrader.questdb_client import connect_pg, make_questdb_query_config_from_env
-                from ghtrader.questdb_index import INDEX_TABLE_V2
+                from ghtrader.questdb.client import connect_pg, make_questdb_query_config_from_env
+                from ghtrader.questdb.index import INDEX_TABLE_V2
 
                 cfg = make_questdb_query_config_from_env()
                 with connect_pg(cfg, connect_timeout_s=1) as conn:
                     with conn.cursor() as cur:
                         cur.execute(
                             f"SELECT count(DISTINCT symbol) FROM {INDEX_TABLE_V2} "
-                            "WHERE ticks_lake=%s AND lake_version=%s AND rows_total > 0",
+                            "WHERE ticks_kind=%s AND dataset_version=%s AND rows_total > 0",
                             ["main_l5", "v2"],
                         )
                         n = int((cur.fetchone() or [0])[0] or 0)
@@ -2135,13 +2906,13 @@ def create_app() -> Any:
         # Check features/labels builds exist (QuestDB build tables)
         try:
             if questdb_ok:
-                from ghtrader.questdb_client import connect_pg, make_questdb_query_config_from_env
-                from ghtrader.questdb_features_labels import FEATURE_BUILDS_TABLE_V2
+                from ghtrader.questdb.client import connect_pg, make_questdb_query_config_from_env
+                from ghtrader.questdb.features_labels import FEATURE_BUILDS_TABLE_V2
 
                 cfg = make_questdb_query_config_from_env()
                 with connect_pg(cfg, connect_timeout_s=1) as conn:
                     with conn.cursor() as cur:
-                        cur.execute(f"SELECT count(DISTINCT symbol) FROM {FEATURE_BUILDS_TABLE_V2} WHERE lake_version='v2'")
+                        cur.execute(f"SELECT count(DISTINCT symbol) FROM {FEATURE_BUILDS_TABLE_V2} WHERE dataset_version='v2'")
                         n = int((cur.fetchone() or [0])[0] or 0)
                 if n > 0:
                     pipeline["build"] = {"state": "ok", "text": f"{n} symbols"}
@@ -2409,356 +3180,63 @@ def create_app() -> Any:
         out = _read_jsonl_tail(path, max_lines=1)
         return out[-1] if out else None
 
-    @app.get("/api/trading/status", response_class=JSONResponse)
-    def api_trading_status(request: Request, account_profile: str = "") -> dict[str, Any]:
-        """
-        Get current trading run status from runs/trading/.
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-        runs_dir = get_runs_dir()
-        trading_dir = runs_dir / "trading"
-
-        profile_filter = ""
-        try:
-            from ghtrader.tq_runtime import canonical_account_profile
-
-            ap = str(account_profile or "").strip()
-            profile_filter = canonical_account_profile(ap) if ap else ""
-        except Exception:
-            profile_filter = str(account_profile or "").strip() or ""
-
-        live_enabled = False
-        try:
-            from ghtrader.config import is_live_enabled
-
-            live_enabled = bool(is_live_enabled())
-        except Exception:
-            live_enabled = False
-
-        result: dict[str, Any] = {
-            "ok": True,
-            "active": False,
-            "live_enabled": bool(live_enabled),
-            "mode": "idle",
-            "monitor_only": None,
-            "account_profile": None,
-            "run_id": None,
-            "snapshot_ts": None,
-            "executor": None,
-            "model": None,
-            "model_name": None,
-            "symbols": [],
-            "symbols_requested": [],
-            "symbols_resolved": [],
-            "account": None,
-            "positions": None,
-            "position": None,
-            "orders_alive": None,
-            "recent_events": [],
-            "pnl": None,
-            "risk": None,
-            "broker_configured": None,
-        }
-
-        try:
-            if not trading_dir.exists():
-                return result
-
-            # Find most recent run with recent activity.
-            runs = sorted([d for d in trading_dir.iterdir() if d.is_dir()], key=lambda x: x.name, reverse=True)
-            if not runs:
-                return result
-
-            import time as t
-
-            latest = None
-            for d in runs:
-                # Prefer state.json for activity timestamp if present; else snapshots.jsonl.
-                sf = d / "state.json"
-                if not sf.exists():
-                    sf = d / "snapshots.jsonl"
-                    if not sf.exists():
-                        continue
-                try:
-                    if (t.time() - float(sf.stat().st_mtime)) < 300.0:
-                        if profile_filter:
-                            cfg0 = _read_json_file(d / "run_config.json") or {}
-                            try:
-                                from ghtrader.tq_runtime import canonical_account_profile
-
-                                p0 = canonical_account_profile(str(cfg0.get("account_profile") or "default"))
-                            except Exception:
-                                p0 = str(cfg0.get("account_profile") or "default")
-                            if p0 != profile_filter:
-                                continue
-                        latest = d
-                        break
-                except Exception:
-                    continue
-
-            if latest is None:
-                return result
-
-            snapshots_file = latest / "snapshots.jsonl"
-            config_file = latest / "run_config.json"
-            events_file = latest / "events.jsonl"
-            state_file = latest / "state.json"
-
-            result["active"] = True
-            result["run_id"] = latest.name
-
-            # Read config
-            if config_file.exists():
-                try:
-                    config = json.loads(config_file.read_text())
-                    result["mode"] = config.get("mode", "unknown") or "unknown"
-                    result["monitor_only"] = bool(config.get("monitor_only")) if ("monitor_only" in config) else None
-                    try:
-                        from ghtrader.tq_runtime import canonical_account_profile
-
-                        result["account_profile"] = canonical_account_profile(str(config.get("account_profile") or "default"))
-                    except Exception:
-                        result["account_profile"] = config.get("account_profile") or "default"
-                    result["executor"] = config.get("executor") or None
-                    result["model_name"] = config.get("model_name") or None
-                    # Backwards-compat field for UI
-                    result["model"] = result.get("model_name")
-                    sy_req = config.get("symbols_requested")
-                    sy_res = config.get("symbols_resolved")
-                    if isinstance(sy_req, list):
-                        result["symbols_requested"] = [str(x) for x in sy_req if str(x)]
-                    if isinstance(sy_res, list):
-                        result["symbols_resolved"] = [str(x) for x in sy_res if str(x)]
-                    result["symbols"] = list(result.get("symbols_requested") or result.get("symbols_resolved") or [])
-                    limits = config.get("limits") if isinstance(config.get("limits"), dict) else {}
-                    result["risk"] = {
-                        "max_position": limits.get("max_abs_position"),
-                        "max_order_size": limits.get("max_order_size"),
-                        "max_ops_per_sec": limits.get("max_ops_per_sec"),
-                        "max_daily_loss": limits.get("max_daily_loss"),
-                        "enforce_trading_time": limits.get("enforce_trading_time"),
-                    }
-                except Exception:
-                    pass
-
-            # Prefer state.json for last snapshot + recent events; fallback to JSONL tails.
-            state = _read_json_file(state_file) if state_file.exists() else None
-            last_snapshot = None
-            if isinstance(state, dict):
-                ls = state.get("last_snapshot")
-                if isinstance(ls, dict):
-                    last_snapshot = ls
-                evs = state.get("recent_events")
-                if isinstance(evs, list):
-                    result["recent_events"] = [e for e in evs if isinstance(e, dict)][-50:]
-
-            if last_snapshot is None:
-                last_snapshot = _read_last_jsonl_obj(snapshots_file) if snapshots_file.exists() else None
-            if not result.get("recent_events"):
-                result["recent_events"] = _read_jsonl_tail(events_file, max_lines=50) if events_file.exists() else []
-
-            if isinstance(last_snapshot, dict):
-                result["snapshot_ts"] = last_snapshot.get("ts")
-                meta = last_snapshot.get("account_meta") if isinstance(last_snapshot.get("account_meta"), dict) else {}
-                if isinstance(meta, dict) and ("broker_configured" in meta):
-                    result["broker_configured"] = bool(meta.get("broker_configured"))
-                    if isinstance(meta, dict) and ("account_profile" in meta) and not result.get("account_profile"):
-                        try:
-                            from ghtrader.tq_runtime import canonical_account_profile
-
-                            result["account_profile"] = canonical_account_profile(str(meta.get("account_profile") or "default"))
-                        except Exception:
-                            result["account_profile"] = meta.get("account_profile") or "default"
-
-                acct = last_snapshot.get("account") if isinstance(last_snapshot.get("account"), dict) else None
-                if acct is not None:
-                    acct2 = dict(acct)
-                    # Back-compat: compute equity if missing.
-                    if "equity" not in acct2:
-                        bal = acct2.get("balance")
-                        fp = acct2.get("float_profit")
-                        try:
-                            if bal is not None and fp is not None:
-                                acct2["equity"] = float(bal) + float(fp)
-                            else:
-                                acct2["equity"] = None
-                        except Exception:
-                            acct2["equity"] = None
-                    result["account"] = acct2
-                    # Default P&L: float_profit if present else position_profit.
-                    try:
-                        if acct2.get("float_profit") is not None:
-                            result["pnl"] = float(acct2.get("float_profit"))
-                        elif acct2.get("position_profit") is not None:
-                            result["pnl"] = float(acct2.get("position_profit"))
-                    except Exception:
-                        pass
-
-                pos = last_snapshot.get("positions") if isinstance(last_snapshot.get("positions"), dict) else None
-                if pos is not None:
-                    result["positions"] = pos
-
-                    # Back-compat: a single "position" summary for the primary execution symbol.
-                    primary = None
-                    sy_res = list(result.get("symbols_resolved") or [])
-                    sy_req = list(result.get("symbols_requested") or [])
-                    if sy_res:
-                        primary = sy_res[0]
-                    elif sy_req:
-                        primary = sy_req[0]
-                    else:
-                        sy_snap = last_snapshot.get("symbols")
-                        if isinstance(sy_snap, list) and sy_snap:
-                            primary = str(sy_snap[0])
-                    if primary and isinstance(pos.get(primary), dict) and ("error" not in pos.get(primary)):
-                        p0 = dict(pos.get(primary) or {})
-                        try:
-                            vlong = int(p0.get("volume_long", 0) or 0)
-                            vshort = int(p0.get("volume_short", 0) or 0)
-                            net = int(vlong) - int(vshort)
-                        except Exception:
-                            vlong = 0
-                            vshort = 0
-                            net = 0
-                        result["position"] = {"symbol": primary, "volume": net, "volume_long": vlong, "volume_short": vshort}
-
-                orders = last_snapshot.get("orders_alive")
-                if isinstance(orders, list):
-                    result["orders_alive"] = orders
-
-        except Exception as e:
-            log.warning("api_trading_status.error", error=str(e))
-            result["ok"] = False
-            result["error"] = str(e)
-
-        return result
-
-    @app.get("/api/trading/runs", response_class=JSONResponse)
-    def api_trading_runs(request: Request, limit: int = 50) -> dict[str, Any]:
-        """
-        List recent trading runs under runs/trading/.
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-        runs_dir = get_runs_dir()
-        trading_dir = runs_dir / "trading"
-        lim = max(1, min(int(limit or 50), 200))
-        if not trading_dir.exists():
-            return {"ok": True, "runs": []}
-
-        out: list[dict[str, Any]] = []
-        for d in sorted([p for p in trading_dir.iterdir() if p.is_dir()], key=lambda x: x.name, reverse=True)[:lim]:
-            cfg = _read_json_file(d / "run_config.json") or {}
-            st = _read_json_file(d / "state.json") or {}
-            last = st.get("last_snapshot") if isinstance(st.get("last_snapshot"), dict) else _read_last_jsonl_obj(d / "snapshots.jsonl")
-            last = last if isinstance(last, dict) else {}
-            acct = last.get("account") if isinstance(last.get("account"), dict) else {}
-            try:
-                from ghtrader.tq_runtime import canonical_account_profile
-
-                ap = canonical_account_profile(str(cfg.get("account_profile") or "default"))
-            except Exception:
-                ap = str(cfg.get("account_profile") or "default")
-            out.append(
-                {
-                    "run_id": d.name,
-                    "account_profile": ap,
-                    "mode": cfg.get("mode"),
-                    "monitor_only": cfg.get("monitor_only"),
-                    "last_ts": last.get("ts"),
-                    "balance": acct.get("balance"),
-                    "equity": acct.get("equity"),
-                }
-            )
-        return {"ok": True, "runs": out}
-
     @app.get("/api/accounts", response_class=JSONResponse)
     def api_accounts(request: Request) -> dict[str, Any]:
         """
-        List broker account profiles (runs/control/accounts.env) + last verification + active/latest run summary.
+        List broker account profiles (runs/control/accounts.env) + last verification + gateway/strategy summary.
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
         runs_dir = get_runs_dir()
-        trading_dir = runs_dir / "trading"
         verify_dir = runs_dir / "control" / "cache" / "accounts"
+        gateway_root = runs_dir / "gateway"
+        strategy_root = runs_dir / "strategy"
 
         env = _read_accounts_env_values(runs_dir=runs_dir)
         profiles: list[str] = ["default"]
         for p in _parse_profiles_csv(env.get("GHTRADER_TQ_ACCOUNT_PROFILES", "")):
-            if p not in profiles:
-                profiles.append(p)
-
-        # Pre-scan trading runs once.
-        runs: list[dict[str, Any]] = []
-        try:
-            if trading_dir.exists():
-                for d in [p for p in trading_dir.iterdir() if p.is_dir()]:
-                    cfg = _read_json_file(d / "run_config.json") or {}
-                    ap = _canonical_profile(str(cfg.get("account_profile") or "default"))
-
-                    st = _read_json_file(d / "state.json") or {}
-                    last = st.get("last_snapshot") if isinstance(st.get("last_snapshot"), dict) else _read_last_jsonl_obj(d / "snapshots.jsonl")
-                    last = last if isinstance(last, dict) else {}
-                    acct = last.get("account") if isinstance(last.get("account"), dict) else {}
-
-                    # Active heuristic: state.json (or snapshots.jsonl) touched in last 5 minutes.
-                    active = False
-                    try:
-                        sf = d / "state.json"
-                        if not sf.exists():
-                            sf = d / "snapshots.jsonl"
-                        if sf.exists():
-                            active = (time.time() - float(sf.stat().st_mtime)) < 300.0
-                    except Exception:
-                        active = False
-
-                    runs.append(
-                        {
-                            "run_id": d.name,
-                            "account_profile": ap,
-                            "mode": cfg.get("mode"),
-                            "monitor_only": cfg.get("monitor_only"),
-                            "last_ts": last.get("ts"),
-                            "balance": acct.get("balance"),
-                            "equity": acct.get("equity"),
-                            "active": bool(active),
-                        }
-                    )
-        except Exception:
-            runs = []
-
-        # Index runs by profile (newest first by run_id lexicographic).
-        runs.sort(key=lambda r: str(r.get("run_id") or ""), reverse=True)
-
-        by_profile: dict[str, list[dict[str, Any]]] = {p: [] for p in profiles}
-        for r in runs:
-            p = str(r.get("account_profile") or "default")
-            if p not in by_profile:
-                by_profile[p] = []
-            by_profile[p].append(r)
+            cp = _canonical_profile(p)
+            if cp and cp not in profiles:
+                profiles.append(cp)
 
         out_profiles: list[dict[str, Any]] = []
         for p in profiles:
+            p = _canonical_profile(p)
             vals = _accounts_env_get_profile_values(env=env, profile=p)
             broker_id = str(vals.get("broker_id") or "")
             acc = str(vals.get("account_id") or "")
             configured = _accounts_env_is_configured(env=env, profile=p)
             verify = _read_json_file(verify_dir / f"account={p}.json") if verify_dir.exists() else None
 
-            active_run = None
-            latest_run = None
-            rs = by_profile.get(p) or []
-            for r in rs:
-                if bool(r.get("active")):
-                    active_run = r
-                    break
-            if rs:
-                latest_run = rs[0]
+            gw_root = gateway_root / f"account={p}"
+            st_root = strategy_root / f"account={p}"
+            gw_state_path = gw_root / "state.json"
+            st_state_path = st_root / "state.json"
+            gw_desired_path = gw_root / "desired.json"
+            st_desired_path = st_root / "desired.json"
+
+            gw_desired = _read_json_file(gw_desired_path) if gw_desired_path.exists() else None
+            st_desired = _read_json_file(st_desired_path) if st_desired_path.exists() else None
+
+            gw_age = _artifact_age_sec(gw_state_path) if gw_state_path.exists() else None
+            st_age = _artifact_age_sec(st_state_path) if st_state_path.exists() else None
+
+            gw_cfg = (
+                gw_desired.get("desired")
+                if isinstance(gw_desired, dict) and isinstance(gw_desired.get("desired"), dict)
+                else (gw_desired or {})
+            )
+            st_cfg = (
+                st_desired.get("desired")
+                if isinstance(st_desired, dict) and isinstance(st_desired.get("desired"), dict)
+                else (st_desired or {})
+            )
+            gw_mode = str((gw_cfg or {}).get("mode") or "idle")
+            st_mode = str((st_cfg or {}).get("mode") or "idle")
+
+            gw_status = _status_from_desired_and_state(root_exists=gw_root.exists(), desired_mode=gw_mode, state_age=gw_age)
+            st_status = _status_from_desired_and_state(root_exists=st_root.exists(), desired_mode=st_mode, state_age=st_age)
 
             out_profiles.append(
                 {
@@ -2767,8 +3245,8 @@ def create_app() -> Any:
                     "broker_id": broker_id,
                     "account_id_masked": _mask_account_id(acc) if acc else "",
                     "verify": verify,
-                    "active_run": active_run,
-                    "latest_run": latest_run,
+                    "gateway": {"exists": bool(gw_root.exists()), "status": gw_status, "desired_mode": gw_mode, "state_age_sec": gw_age},
+                    "strategy": {"exists": bool(st_root.exists()), "status": st_status, "desired_mode": st_mode, "state_age_sec": st_age},
                 }
             )
 
@@ -2869,34 +3347,395 @@ def create_app() -> Any:
         rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return {"ok": True, "enqueued": [rec.id], "count": 1}
 
-    @app.get("/api/trading/run/{run_id}/tail", response_class=JSONResponse)
-    def api_trading_run_tail(
-        request: Request,
-        run_id: str,
-        events: int = 50,
-        snapshots: int = 5,
-    ) -> dict[str, Any]:
+    # ---------------------------------------------------------------------
+    # Gateway (AccountGateway; OMS/EMS per account profile)
+    # ---------------------------------------------------------------------
+
+    @app.get("/api/gateway/status", response_class=JSONResponse)
+    def api_gateway_status(request: Request, account_profile: str = "default") -> dict[str, Any]:
         """
-        Read-only tail API for a specific run's snapshots/events.
+        Read gateway state for a broker account profile (runs/gateway/account=<PROFILE>/).
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
-        if "/" in run_id or "\\" in run_id:
-            raise HTTPException(status_code=400, detail="invalid run id")
 
         runs_dir = get_runs_dir()
-        root = runs_dir / "trading" / run_id
+        try:
+            from ghtrader.tq.runtime import canonical_account_profile
+
+            prof = canonical_account_profile(str(account_profile or "default"))
+        except Exception:
+            prof = str(account_profile or "default").strip() or "default"
+
+        root = runs_dir / "gateway" / f"account={prof}"
+        st = _read_json_file(root / "state.json") if root.exists() else None
+        desired = _read_json_file(root / "desired.json") if root.exists() else None
+        targets = _read_json_file(root / "targets.json") if root.exists() else None
+
+        return {
+            "ok": True,
+            "account_profile": prof,
+            "root": str(root),
+            "exists": bool(root.exists()),
+            "state": st,
+            "desired": desired,
+            "targets": targets,
+            "generated_at": _now_iso(),
+        }
+
+    @app.get("/api/gateway/list", response_class=JSONResponse)
+    def api_gateway_list(request: Request, limit: int = 200) -> dict[str, Any]:
+        """
+        List gateway profiles + summary state.
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        runs_dir = get_runs_dir()
+        root = runs_dir / "gateway"
+        lim = max(1, min(int(limit or 200), 500))
+
+        rows: list[dict[str, Any]] = []
+        try:
+            if root.exists():
+                for d in sorted([p for p in root.iterdir() if p.is_dir() and p.name.startswith("account=")], key=lambda x: x.name)[:lim]:
+                    prof = d.name.split("=", 1)[-1] if "=" in d.name else d.name
+                    st = _read_json_file(d / "state.json") if (d / "state.json").exists() else None
+                    desired = _read_json_file(d / "desired.json") if (d / "desired.json").exists() else None
+                    health = st.get("health") if isinstance(st, dict) and isinstance(st.get("health"), dict) else {}
+                    effective = st.get("effective") if isinstance(st, dict) and isinstance(st.get("effective"), dict) else {}
+                    rows.append(
+                        {
+                            "account_profile": str(prof),
+                            "root": str(d),
+                            "health": health,
+                            "effective": effective,
+                            "desired": desired.get("desired") if isinstance(desired, dict) else desired,
+                            "updated_at": (st or {}).get("updated_at") if isinstance(st, dict) else None,
+                        }
+                    )
+        except Exception as e:
+            return {"ok": False, "error": str(e), "profiles": [], "generated_at": _now_iso()}
+
+        return {"ok": True, "profiles": rows, "generated_at": _now_iso()}
+
+    @app.post("/api/gateway/desired", response_class=JSONResponse)
+    async def api_gateway_desired(request: Request) -> dict[str, Any]:
+        """
+        Upsert gateway desired.json for a profile.
+
+        Payload:
+          {account_profile, desired: {mode, symbols, executor, sim_account, confirm_live, max_abs_position, ...}}
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        payload = await request.json()
+        ap = str(payload.get("account_profile") or "default").strip() or "default"
+        desired_in = payload.get("desired") if isinstance(payload.get("desired"), dict) else {}
+
+        try:
+            from ghtrader.tq.gateway import GatewayDesired, write_gateway_desired
+            from ghtrader.tq.runtime import canonical_account_profile
+
+            prof = canonical_account_profile(ap)
+            d = GatewayDesired(
+                mode=str(desired_in.get("mode") or "idle").strip(),  # type: ignore[arg-type]
+                symbols=list(desired_in.get("symbols")) if isinstance(desired_in.get("symbols"), list) else None,
+                executor=str(desired_in.get("executor") or "targetpos").strip().lower() in {"direct"} and "direct" or "targetpos",  # type: ignore[arg-type]
+                sim_account=str(desired_in.get("sim_account") or "tqsim").strip().lower() in {"tqkq"} and "tqkq" or "tqsim",  # type: ignore[arg-type]
+                confirm_live=str(desired_in.get("confirm_live") or "").strip(),
+                max_abs_position=max(0, int(desired_in.get("max_abs_position") or 1)),
+                max_order_size=max(1, int(desired_in.get("max_order_size") or 1)),
+                max_ops_per_sec=max(1, int(desired_in.get("max_ops_per_sec") or 10)),
+                max_daily_loss=(float(desired_in.get("max_daily_loss")) if str(desired_in.get("max_daily_loss") or "").strip() else None),
+                enforce_trading_time=bool(desired_in.get("enforce_trading_time")) if ("enforce_trading_time" in desired_in) else True,
+            )
+            write_gateway_desired(runs_dir=get_runs_dir(), profile=prof, desired=d)
+            return {"ok": True, "account_profile": prof}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"gateway_desired_failed: {e}")
+
+    @app.post("/api/gateway/command", response_class=JSONResponse)
+    async def api_gateway_command(request: Request) -> dict[str, Any]:
+        """
+        Append an operator command to runs/gateway/account=<PROFILE>/commands.jsonl.
+
+        Payload:
+          {account_profile, type, params?}
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        payload = await request.json()
+        ap = str(payload.get("account_profile") or "default").strip() or "default"
+        cmd_type = str(payload.get("type") or "").strip()
+        if not cmd_type:
+            raise HTTPException(status_code=400, detail="missing type")
+
+        try:
+            from ghtrader.tq.gateway import commands_path
+            from ghtrader.tq.runtime import canonical_account_profile
+
+            prof = canonical_account_profile(ap)
+            p = commands_path(runs_dir=get_runs_dir(), profile=prof)
+            p.parent.mkdir(parents=True, exist_ok=True)
+
+            cmd = {
+                "ts": _now_iso(),
+                "command_id": uuid.uuid4().hex[:12],
+                "account_profile": prof,
+                "type": cmd_type,
+                "params": payload.get("params") if isinstance(payload.get("params"), dict) else {},
+            }
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(json.dumps(cmd, ensure_ascii=False, default=str) + "\n")
+            return {"ok": True, "account_profile": prof, "command_id": cmd["command_id"]}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"gateway_command_failed: {e}")
+
+    # ---------------------------------------------------------------------
+    # Strategy (AI StrategyRunner; consumes gateway state, writes targets)
+    # ---------------------------------------------------------------------
+
+    def _artifact_age_sec(p: Path) -> float | None:
+        try:
+            return float(time.time() - float(p.stat().st_mtime))
+        except Exception:
+            return None
+
+    def _health_error(state: Any) -> str:
+        try:
+            if isinstance(state, dict) and isinstance(state.get("health"), dict):
+                return str(state["health"].get("error") or "")
+        except Exception:
+            return ""
+        return ""
+
+    def _status_from_desired_and_state(*, root_exists: bool, desired_mode: str, state_age: float | None) -> str:
+        """
+        Shared status mapping used by the Trading Console.
+
+        Statuses: not_initialized | desired_idle | starting | running | degraded
+        """
+        if not bool(root_exists):
+            return "not_initialized"
+        dm = str(desired_mode or "").strip().lower()
+        if dm in {"", "idle"}:
+            if state_age is not None and float(state_age) < 15.0:
+                return "running"
+            return "desired_idle"
+        # desired is non-idle
+        if state_age is None:
+            return "starting"
+        return "running" if float(state_age) < 15.0 else "degraded"
+
+    @app.get("/api/strategy/status", response_class=JSONResponse)
+    def api_strategy_status(request: Request, account_profile: str = "default") -> dict[str, Any]:
+        """
+        Read StrategyRunner stable state for a profile (runs/strategy/account=<PROFILE>/...).
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        runs_dir = get_runs_dir()
+        try:
+            from ghtrader.tq.runtime import canonical_account_profile
+
+            prof = canonical_account_profile(str(account_profile or "default"))
+        except Exception:
+            prof = str(account_profile or "default").strip() or "default"
+
+        root = runs_dir / "strategy" / f"account={prof}"
+        st_path = root / "state.json"
+        desired_path = root / "desired.json"
+        state = _read_json_file(st_path) if st_path.exists() else None
+        desired = _read_json_file(desired_path) if desired_path.exists() else None
+        targets = _read_json_file((runs_dir / "gateway" / f"account={prof}" / "targets.json"))  # strategy output surface
+
+        age = _artifact_age_sec(st_path) if st_path.exists() else None
+        desired_cfg = desired.get("desired") if isinstance(desired, dict) and isinstance(desired.get("desired"), dict) else (desired or {})
+        desired_mode = str((desired_cfg or {}).get("mode") or "idle")
+        status = _status_from_desired_and_state(root_exists=root.exists(), desired_mode=desired_mode, state_age=age)
+
+        active_job_id = None
+        try:
+            store2: JobStore = request.app.state.job_store
+            for j in store2.list_active_jobs():
+                if _is_strategy_job(j.command):
+                    ap = _argv_opt(j.command, "--account") or ""
+                    try:
+                        from ghtrader.tq.runtime import canonical_account_profile
+
+                        ap = canonical_account_profile(ap)
+                    except Exception:
+                        ap = str(ap).strip().lower() or "default"
+                    if ap == prof:
+                        active_job_id = j.id
+                        break
+        except Exception:
+            active_job_id = None
+
+        return {
+            "ok": True,
+            "account_profile": prof,
+            "root": str(root),
+            "exists": bool(root.exists()),
+            "status": status,
+            "state_age_sec": age,
+            "error": _health_error(state),
+            "active_job_id": active_job_id,
+            "desired": desired,
+            "state": state,
+            "targets": targets,
+            "generated_at": _now_iso(),
+        }
+
+    @app.post("/api/strategy/desired", response_class=JSONResponse)
+    async def api_strategy_desired(request: Request) -> dict[str, Any]:
+        """
+        Upsert StrategyRunner desired.json for a profile.
+
+        Payload:
+          {account_profile, desired: {mode, symbols, model_name, horizon, threshold_up, threshold_down, position_size, artifacts_dir, poll_interval_sec}}
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        payload = await request.json()
+        ap = str(payload.get("account_profile") or "default").strip() or "default"
+        desired_in = payload.get("desired") if isinstance(payload.get("desired"), dict) else {}
+
+        try:
+            from ghtrader.trading.strategy_control import StrategyDesired, write_strategy_desired
+            from ghtrader.tq.runtime import canonical_account_profile
+
+            prof = canonical_account_profile(ap)
+            d = StrategyDesired(
+                mode=str(desired_in.get("mode") or "idle").strip().lower() in {"run", "running", "active", "on"} and "run" or "idle",  # type: ignore[arg-type]
+                symbols=list(desired_in.get("symbols")) if isinstance(desired_in.get("symbols"), list) else None,
+                model_name=str(desired_in.get("model_name") or "xgboost").strip() or "xgboost",
+                horizon=int(desired_in.get("horizon") or 50),
+                threshold_up=float(desired_in.get("threshold_up") or 0.6),
+                threshold_down=float(desired_in.get("threshold_down") or 0.6),
+                position_size=int(desired_in.get("position_size") or 1),
+                artifacts_dir=str(desired_in.get("artifacts_dir") or "artifacts").strip() or "artifacts",
+                poll_interval_sec=float(desired_in.get("poll_interval_sec") or 0.5),
+            )
+            write_strategy_desired(runs_dir=get_runs_dir(), profile=prof, desired=d)
+            return {"ok": True, "account_profile": prof}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"strategy_desired_failed: {e}")
+
+    @app.get("/api/strategy/runs", response_class=JSONResponse)
+    def api_strategy_runs(request: Request, account_profile: str = "", limit: int = 50) -> dict[str, Any]:
+        """
+        List recent strategy runs under runs/strategy/<run_id>/ (excludes account=<profile> stable dirs).
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        runs_dir = get_runs_dir()
+        root = runs_dir / "strategy"
+        lim = max(1, min(int(limit or 50), 200))
+
+        profile_filter = ""
+        if str(account_profile or "").strip():
+            try:
+                from ghtrader.tq.runtime import canonical_account_profile
+
+                profile_filter = canonical_account_profile(str(account_profile))
+            except Exception:
+                profile_filter = str(account_profile).strip().lower()
+
         if not root.exists():
-            raise HTTPException(status_code=404, detail="run not found")
+            return {"ok": True, "runs": []}
 
-        ev_n = max(0, min(int(events or 0), 500))
-        sn_n = max(0, min(int(snapshots or 0), 200))
+        out: list[dict[str, Any]] = []
+        try:
+            dirs = [p for p in root.iterdir() if p.is_dir() and not p.name.startswith("account=")]
+            # Newest first (run_id is timestamp-prefixed in current implementation).
+            dirs = sorted(dirs, key=lambda x: x.name, reverse=True)[:lim]
+            for d in dirs:
+                cfg = _read_json_file(d / "run_config.json") or {}
+                ap = str(cfg.get("account_profile") or "").strip()
+                if ap:
+                    try:
+                        from ghtrader.tq.runtime import canonical_account_profile
 
-        cfg = _read_json_file(root / "run_config.json")
-        state = _read_json_file(root / "state.json")
-        evs = _read_jsonl_tail(root / "events.jsonl", max_lines=ev_n) if ev_n > 0 else []
-        snaps = _read_jsonl_tail(root / "snapshots.jsonl", max_lines=sn_n) if sn_n > 0 else []
-        return {"ok": True, "run_id": run_id, "config": cfg, "state": state, "events": evs, "snapshots": snaps}
+                        ap = canonical_account_profile(ap)
+                    except Exception:
+                        ap = ap.strip().lower()
+                if profile_filter and ap != profile_filter:
+                    continue
+                last_ev = _read_last_jsonl_obj(d / "events.jsonl") if (d / "events.jsonl").exists() else None
+                out.append(
+                    {
+                        "run_id": d.name,
+                        "account_profile": ap or None,
+                        "symbols": cfg.get("symbols"),
+                        "model_name": cfg.get("model_name"),
+                        "horizon": cfg.get("horizon"),
+                        "position_size": cfg.get("position_size"),
+                        "threshold_up": cfg.get("threshold_up"),
+                        "threshold_down": cfg.get("threshold_down"),
+                        "created_at": cfg.get("created_at"),
+                        "last_event_ts": (last_ev or {}).get("ts") if isinstance(last_ev, dict) else None,
+                    }
+                )
+        except Exception as e:
+            return {"ok": False, "error": str(e), "runs": []}
+
+        return {"ok": True, "runs": out}
+
+    @app.get("/api/trading/console/status", response_class=JSONResponse)
+    def api_trading_console_status(request: Request, account_profile: str = "default") -> dict[str, Any]:
+        """
+        Unified Trading Console status (Gateway-first):
+        - gateway: runs/gateway/account=<profile>/...
+        - strategy: runs/strategy/account=<profile>/...
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        runs_dir = get_runs_dir()
+        try:
+            from ghtrader.tq.runtime import canonical_account_profile
+
+            prof = canonical_account_profile(str(account_profile or "default"))
+        except Exception:
+            prof = str(account_profile or "default").strip() or "default"
+
+        live_enabled = False
+        try:
+            from ghtrader.config import is_live_enabled
+
+            live_enabled = bool(is_live_enabled())
+        except Exception:
+            live_enabled = False
+
+        # Compose from existing endpoints (keep behavior consistent and minimize duplication).
+        gw = api_gateway_status(request, account_profile=prof)
+        st = api_strategy_status(request, account_profile=prof)
+
+        # Add derived component statuses for clarity.
+        try:
+            gw_root = Path(str(gw.get("root") or ""))
+            gw_state_path = gw_root / "state.json" if str(gw.get("root") or "") else None
+            gw_age = _artifact_age_sec(gw_state_path) if (gw_state_path and gw_state_path.exists()) else None
+            gw_desired = gw.get("desired") if isinstance(gw.get("desired"), dict) else {}
+            gw_cfg = gw_desired.get("desired") if isinstance(gw_desired.get("desired"), dict) else gw_desired
+            gw_mode = str((gw_cfg or {}).get("mode") or "idle")
+            gw_status = _status_from_desired_and_state(root_exists=bool(gw.get("exists")), desired_mode=gw_mode, state_age=gw_age)
+        except Exception:
+            gw_status = "unknown"
+            gw_age = None
+
+        return {
+            "ok": True,
+            "account_profile": prof,
+            "live_enabled": bool(live_enabled),
+            "gateway": {**gw, "component_status": gw_status, "state_age_sec": gw_age},
+            "strategy": st,
+            "generated_at": _now_iso(),
+        }
 
     return app
 

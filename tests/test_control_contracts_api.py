@@ -21,7 +21,7 @@ def test_api_contracts_without_snapshot_returns_building(tmp_path: Path, monkeyp
     monkeypatch.delenv("TQSDK_PASSWORD", raising=False)
 
     # Keep the test hermetic: simulate empty/unavailable QuestDB index discovery.
-    import ghtrader.questdb_index as qix
+    import ghtrader.questdb.index as qix
 
     monkeypatch.setattr(qix, "ensure_index_tables", lambda **kwargs: None)
     monkeypatch.setattr(qix, "list_symbols_from_index", lambda **kwargs: [])
@@ -63,7 +63,7 @@ def test_api_contracts_serves_fresh_snapshot_without_network(tmp_path: Path, mon
         "ok": True,
         "exchange": "SHFE",
         "var": "cu",
-        "lake_version": "v2",
+        "dataset_version": "v2",
         "contracts": [{"symbol": "SHFE.cu2001", "expired": True}],
         "questdb": {"ok": False},
         "snapshot_cached_at": "t",
@@ -72,7 +72,7 @@ def test_api_contracts_serves_fresh_snapshot_without_network(tmp_path: Path, mon
     snap_path.write_text(json.dumps(snap), encoding="utf-8")
 
     # If any code attempts holiday download, fail the test.
-    import ghtrader.trading_calendar as tc
+    import ghtrader.data.trading_calendar as tc
 
     monkeypatch.setattr(tc, "_fetch_holidays_raw", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("holiday download attempted")))
 
@@ -99,7 +99,7 @@ def test_api_contracts_mode_cache_returns_snapshot_without_spawning_job(tmp_path
         "ok": True,
         "exchange": "SHFE",
         "var": "cu",
-        "lake_version": "v2",
+        "dataset_version": "v2",
         "contracts": [{"symbol": "SHFE.cu2001"}],
         "questdb": {"ok": False},
         "snapshot_cached_at": "t",
@@ -173,7 +173,7 @@ def test_api_contracts_mode_cache_refresh_bootstraps_index_when_empty(tmp_path: 
     monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
 
     # Simulate an empty QuestDB index so the refresh path requests a bootstrap.
-    import ghtrader.questdb_index as qix
+    import ghtrader.questdb.index as qix
 
     monkeypatch.setattr(qix, "ensure_index_tables", lambda **kwargs: None)
     monkeypatch.setattr(qix, "list_symbols_from_index", lambda **kwargs: [])
@@ -228,7 +228,7 @@ def test_api_contracts_mode_cache_returns_stale_snapshot_and_enqueues_rebuild(tm
         "ok": True,
         "exchange": "SHFE",
         "var": "cu",
-        "lake_version": "v2",
+        "dataset_version": "v2",
         "contracts": [{"symbol": "SHFE.cu2001"}],
         "questdb": {"ok": False},
         "snapshot_cached_at": "t",
@@ -284,7 +284,7 @@ def test_api_contracts_returns_snapshot_with_stale_catalog_info(tmp_path: Path, 
         "ok": True,
         "exchange": "SHFE",
         "var": "cu",
-        "lake_version": "v2",
+        "dataset_version": "v2",
         "contracts": [{"symbol": "SHFE.cu2001", "expired": True}],
         "questdb": {"ok": False},
         "catalog_ok": False,
@@ -321,7 +321,7 @@ def test_api_contracts_snapshot_contains_questdb_coverage(tmp_path: Path, monkey
         "ok": True,
         "exchange": "SHFE",
         "var": "cu",
-        "lake_version": "v2",
+        "dataset_version": "v2",
         "contracts": [
             {
                 "symbol": "SHFE.cu2001",
@@ -384,7 +384,7 @@ def test_api_contracts_snapshot_includes_questdb_only_symbols(tmp_path: Path, mo
         "ok": True,
         "exchange": "SHFE",
         "var": "cu",
-        "lake_version": "v2",
+        "dataset_version": "v2",
         "contracts": [
             {"symbol": "SHFE.cu2001", "expired": True},
             {"symbol": "SHFE.cu1601", "expired": True, "catalog_source": "questdb_index"},
@@ -461,7 +461,7 @@ def test_api_contracts_snapshot_marks_stale_with_tick_lag(tmp_path: Path, monkey
         "ok": True,
         "exchange": "SHFE",
         "var": "cu",
-        "lake_version": "v2",
+        "dataset_version": "v2",
         "contracts": [
             {
                 "symbol": "SHFE.cu2604",
@@ -510,7 +510,7 @@ def test_api_contracts_snapshot_marks_unindexed_status(tmp_path: Path, monkeypat
         "ok": True,
         "exchange": "SHFE",
         "var": "cu",
-        "lake_version": "v2",
+        "dataset_version": "v2",
         "contracts": [
             {"symbol": "SHFE.cu2501", "expired": True, "status": "complete", "index_missing": False},
             {"symbol": "SHFE.cu2502", "expired": True, "status": "unindexed", "index_missing": True},
@@ -556,12 +556,12 @@ def test_contracts_snapshot_build_includes_completeness_summary_when_index_empty
     completeness.summary (index_healthy/bootstrapping signals) so the UI doesn't treat the index as healthy.
     """
     # Keep the builder hermetic: no external network.
-    import ghtrader.trading_calendar as tc
+    import ghtrader.data.trading_calendar as tc
 
     monkeypatch.setattr(tc, "get_holidays", lambda **kwargs: set())
 
     # Fake a cached catalog for the requested scope.
-    import ghtrader.tqsdk_catalog as cat
+    import ghtrader.tq.catalog as cat
 
     monkeypatch.setattr(
         cat,
@@ -581,13 +581,13 @@ def test_contracts_snapshot_build_includes_completeness_summary_when_index_empty
     )
 
     # Simulate "index empty": coverage query returns no rows, but QuestDB itself is reachable.
-    import ghtrader.questdb_index as qix
+    import ghtrader.questdb.index as qix
 
     monkeypatch.setattr(qix, "ensure_index_tables", lambda **kwargs: None)
     monkeypatch.setattr(qix, "list_symbols_from_index", lambda **kwargs: [])
     monkeypatch.setattr(qix, "query_contract_coverage_from_index", lambda **kwargs: {})
 
-    import ghtrader.questdb_queries as qq
+    import ghtrader.questdb.queries as qq
 
     monkeypatch.setattr(qq, "query_contract_last_coverage", lambda **kwargs: {})
 

@@ -12,6 +12,7 @@ from fastapi.templating import Jinja2Templates
 from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
 from ghtrader.control import auth
 from ghtrader.control.jobs import JobSpec, python_module_argv
+from ghtrader.control.settings import get_tqsdk_scheduler_state, set_tqsdk_scheduler_max_parallel
 from ghtrader.control.system_info import cpu_mem_info, disk_usage, gpu_info
 
 
@@ -26,23 +27,6 @@ def build_router() -> Any:
 
     def _token_qs(request: Request) -> str:
         return auth.token_query_string(request)
-
-    def _read_last_jsonl_line(path: Path, *, max_bytes: int = 64 * 1024) -> dict[str, Any] | None:
-        if not path.exists():
-            return None
-        try:
-            with open(path, "rb") as f:
-                f.seek(0, 2)
-                size = f.tell()
-                offset = max(0, size - max_bytes)
-                f.seek(offset)
-                chunk = f.read().decode("utf-8", errors="ignore")
-            lines = [ln for ln in chunk.splitlines() if ln.strip()]
-            if not lines:
-                return None
-            return json.loads(lines[-1])
-        except Exception:
-            return None
 
     @router.get("/")
     def index(request: Request):
@@ -122,45 +106,6 @@ def build_router() -> Any:
         jobs = store.list_jobs(limit=50)
         running = [j for j in jobs if j.status == "running"]
 
-        # Trading runs
-        runs_dir = get_runs_dir()
-        trading_dir = runs_dir / "trading"
-        runs: list[dict[str, Any]] = []
-        try:
-            if trading_dir.exists():
-                for p in sorted([d for d in trading_dir.iterdir() if d.is_dir()], key=lambda x: x.name, reverse=True)[:50]:
-                    state = None
-                    try:
-                        sf = p / "state.json"
-                        if sf.exists():
-                            state = json.loads(sf.read_text(encoding="utf-8"))
-                    except Exception:
-                        state = None
-                    last = None
-                    if isinstance(state, dict) and isinstance(state.get("last_snapshot"), dict):
-                        last = state.get("last_snapshot")
-                    else:
-                        last = _read_last_jsonl_line(p / "snapshots.jsonl")
-                    cfg = {}
-                    try:
-                        cf = p / "run_config.json"
-                        if cf.exists():
-                            cfg = json.loads(cf.read_text(encoding="utf-8"))
-                    except Exception:
-                        cfg = {}
-                    runs.append(
-                        {
-                            "run_id": p.name,
-                            "last_ts": (last or {}).get("ts", ""),
-                            "balance": ((last or {}).get("account") or {}).get("balance", ""),
-                            "mode": cfg.get("mode", ""),
-                            "account_profile": cfg.get("account_profile", "default") or "default",
-                            "monitor_only": bool(cfg.get("monitor_only")) if ("monitor_only" in cfg) else None,
-                        }
-                    )
-        except Exception:
-            runs = []
-
         return templates.TemplateResponse(
             request,
             "trading.html",
@@ -169,7 +114,6 @@ def build_router() -> Any:
                 "title": "Trading",
                 "token_qs": _token_qs(request),
                 "running_count": len(running),
-                "runs": runs,
             },
         )
 
@@ -181,13 +125,14 @@ def build_router() -> Any:
     def ops(request: Request):
         _require_auth(request)
         store = request.app.state.job_store
+        runs_dir = get_runs_dir()
 
         jobs = store.list_jobs(limit=200)
         running_count = len([j for j in jobs if j.status == "running"])
         queued_count = len([j for j in jobs if j.status == "queued"])
         recent_count = len(jobs)
 
-        # Ingest statuses (same as legacy /ops/ingest page)
+        # Ingest statuses
         ingest_statuses: list[dict[str, Any]] = []
         try:
             from ghtrader.control.ingest_status import ingest_status_for_job, parse_ingest_command
@@ -217,46 +162,7 @@ def build_router() -> Any:
         except Exception:
             ingest_statuses = []
 
-        # Trading runs (same as legacy /ops/trading page)
-        runs_dir = get_runs_dir()
-        trading_dir = runs_dir / "trading"
-        runs: list[dict[str, Any]] = []
-        try:
-            if trading_dir.exists():
-                for p in sorted([d for d in trading_dir.iterdir() if d.is_dir()], key=lambda x: x.name, reverse=True)[:50]:
-                    state = None
-                    try:
-                        sf = p / "state.json"
-                        if sf.exists():
-                            state = json.loads(sf.read_text(encoding="utf-8"))
-                    except Exception:
-                        state = None
-                    last = None
-                    if isinstance(state, dict) and isinstance(state.get("last_snapshot"), dict):
-                        last = state.get("last_snapshot")
-                    else:
-                        last = _read_last_jsonl_line(p / "snapshots.jsonl")
-                    cfg = {}
-                    try:
-                        cf = p / "run_config.json"
-                        if cf.exists():
-                            cfg = json.loads(cf.read_text(encoding="utf-8"))
-                    except Exception:
-                        cfg = {}
-                    runs.append(
-                        {
-                            "run_id": p.name,
-                            "last_ts": (last or {}).get("ts", ""),
-                            "balance": ((last or {}).get("account") or {}).get("balance", ""),
-                            "mode": cfg.get("mode", ""),
-                            "account_profile": cfg.get("account_profile", "default") or "default",
-                            "monitor_only": bool(cfg.get("monitor_only")) if ("monitor_only" in cfg) else None,
-                        }
-                    )
-        except Exception:
-            runs = []
-
-        # Locks (same as legacy /ops/locks page)
+        # Locks
         locks = []
         try:
             from ghtrader.control.locks import LockStore
@@ -265,7 +171,7 @@ def build_router() -> Any:
         except Exception:
             locks = []
 
-        # Audit reports (same as legacy /ops/integrity page)
+        # Audit reports
         reports = []
         try:
             reports_dir = runs_dir / "audit"
@@ -316,6 +222,9 @@ def build_router() -> Any:
         default_schedule_start = "2015-01-01"
         default_schedule_end = datetime.now().date().isoformat()
 
+        # TqSdk scheduler settings (max parallel heavy jobs)
+        tqsdk_scheduler = get_tqsdk_scheduler_state(runs_dir=runs_dir)
+
         return templates.TemplateResponse(
             request,
             "ops.html",
@@ -327,12 +236,12 @@ def build_router() -> Any:
                 "queued_count": queued_count,
                 "recent_count": recent_count,
                 "ingest_statuses": ingest_statuses,
-                "runs": runs,
                 "locks": locks,
                 "reports": reports,
                 "questdb": questdb,
                 "default_schedule_start": default_schedule_start,
                 "default_schedule_end": default_schedule_end,
+                "tqsdk_scheduler": tqsdk_scheduler,
             },
         )
 
@@ -360,31 +269,6 @@ def build_router() -> Any:
     def ops_trading(request: Request):
         _require_auth(request)
         return RedirectResponse(url=f"/trading{_token_qs(request)}", status_code=303)
-
-    @router.get("/ops/trading/run/{run_id}")
-    def ops_trading_run(request: Request, run_id: str):
-        _require_auth(request)
-        if "/" in run_id or "\\" in run_id:
-            raise HTTPException(status_code=400, detail="invalid run id")
-        root = get_runs_dir() / "trading" / run_id
-        if not root.exists():
-            raise HTTPException(status_code=404, detail="run not found")
-        last = _read_last_jsonl_line(root / "snapshots.jsonl")
-        return templates.TemplateResponse(
-            request,
-            "trading_run.html",
-            {
-                "request": request,
-                "title": f"Trading {run_id}",
-                "token_qs": _token_qs(request),
-                "run_id": run_id,
-                "root": str(root),
-                "config_path": str(root / "run_config.json"),
-                "snapshots_path": str(root / "snapshots.jsonl"),
-                "events_path": str(root / "events.jsonl"),
-                "last_snapshot": json.dumps(last or {}, indent=2, default=str),
-            },
-        )
 
     @router.get("/ops/locks")
     def ops_locks(request: Request):
@@ -433,7 +317,8 @@ def build_router() -> Any:
         )
         title = f"download {symbol} {start_date}->{end_date}"
         jm = request.app.state.job_manager
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        # Download is TqSdk-heavy; enqueue to respect max-parallel scheduler.
+        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
     @router.post("/ops/ingest/download_contract_range")
@@ -472,7 +357,8 @@ def build_router() -> Any:
             argv += ["--end-date", end_date]
         title = f"download-contract-range {var} {start_contract}->{end_contract}"
         jm = request.app.state.job_manager
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        # Contract-range backfill is TqSdk-heavy; enqueue to respect max-parallel scheduler.
+        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
     @router.post("/ops/ingest/update_variety")
@@ -523,6 +409,25 @@ def build_router() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
+    # ---------------------------------------------------------------------
+    # Dashboard settings
+    # ---------------------------------------------------------------------
+
+    @router.post("/ops/settings/tqsdk_scheduler")
+    async def ops_settings_tqsdk_scheduler(request: Request):
+        _require_auth(request)
+        form = await request.form()
+        max_parallel = form.get("max_parallel")
+        persist_raw = str(form.get("persist") or "1").strip().lower()
+        persist = persist_raw not in {"0", "false", "no", "off"}
+
+        try:
+            set_tqsdk_scheduler_max_parallel(runs_dir=get_runs_dir(), max_parallel=max_parallel, persist=bool(persist))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        return RedirectResponse(url=f"/ops{_token_qs(request)}#ingest", status_code=303)
+
     @router.post("/ops/build/build")
     async def ops_build_build(request: Request):
         _require_auth(request)
@@ -530,7 +435,7 @@ def build_router() -> Any:
         symbol = str(form.get("symbol") or "").strip()
         horizons = str(form.get("horizons") or "10,50,200").strip()
         threshold_k = str(form.get("threshold_k") or "1").strip()
-        ticks_lake = str(form.get("ticks_lake") or "raw").strip()
+        ticks_kind = str(form.get("ticks_kind") or "raw").strip()
         overwrite = str(form.get("overwrite") or "false").strip().lower() == "true"
         data_dir = str(form.get("data_dir") or "data").strip()
         if not symbol:
@@ -546,11 +451,11 @@ def build_router() -> Any:
             horizons,
             "--threshold-k",
             threshold_k,
-            "--ticks-lake",
-            ticks_lake,
+            "--ticks-kind",
+            ticks_kind,
             "--overwrite" if overwrite else "--no-overwrite",
         )
-        title = f"build {symbol} ticks_lake={ticks_lake} overwrite={overwrite}"
+        title = f"build {symbol} ticks_kind={ticks_kind} overwrite={overwrite}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -849,98 +754,6 @@ def build_router() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
-    @router.post("/ops/trading/trade")
-    async def ops_trading_trade(request: Request):
-        _require_auth(request)
-        form = await request.form()
-        mode = str(form.get("mode") or "paper").strip()
-        monitor_only = str(form.get("monitor_only") or "").strip().lower() in {"true", "1", "yes", "on"}
-        account_profile = str(form.get("account_profile") or form.get("account") or "default").strip() or "default"
-        sim_account = str(form.get("sim_account") or "tqsim").strip()
-        executor = str(form.get("executor") or "targetpos").strip()
-        model = str(form.get("model") or "").strip()
-        symbols = str(form.get("symbols") or "").strip()
-        horizon = str(form.get("horizon") or "50").strip()
-        threshold_up = str(form.get("threshold_up") or "0.6").strip()
-        threshold_down = str(form.get("threshold_down") or "0.6").strip()
-        position_size = str(form.get("position_size") or "1").strip()
-        data_dir = str(form.get("data_dir") or "data").strip()
-        artifacts_dir = str(form.get("artifacts_dir") or "artifacts").strip()
-        runs_dir = str(form.get("runs_dir") or "runs").strip()
-        max_position = str(form.get("max_position") or "1").strip()
-        max_order_size = str(form.get("max_order_size") or "1").strip()
-        max_ops_per_sec = str(form.get("max_ops_per_sec") or "10").strip()
-        max_daily_loss = str(form.get("max_daily_loss") or "").strip()
-        enforce_trading_time = str(form.get("enforce_trading_time") or "true").strip().lower() == "true"
-        tp_price = str(form.get("tp_price") or "ACTIVE").strip()
-        tp_offset_priority = str(form.get("tp_offset_priority") or "今昨,开").strip()
-        direct_price_mode = str(form.get("direct_price_mode") or "ACTIVE").strip()
-        direct_advanced = str(form.get("direct_advanced") or "").strip()
-        confirm_live = str(form.get("confirm_live") or "").strip()
-        snapshot_interval_sec = str(form.get("snapshot_interval_sec") or "10").strip()
-
-        if not model or not symbols:
-            raise HTTPException(status_code=400, detail="model/symbols required")
-
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "trade",
-            "--mode",
-            mode,
-            "--monitor-only" if monitor_only else "--no-monitor-only",
-            "--account",
-            account_profile,
-            "--sim-account",
-            sim_account,
-            "--executor",
-            executor,
-            "--model",
-            model,
-            "--data-dir",
-            data_dir,
-            "--artifacts-dir",
-            artifacts_dir,
-            "--runs-dir",
-            runs_dir,
-            "--horizon",
-            horizon,
-            "--threshold-up",
-            threshold_up,
-            "--threshold-down",
-            threshold_down,
-            "--position-size",
-            position_size,
-            "--max-position",
-            max_position,
-            "--max-order-size",
-            max_order_size,
-            "--max-ops-per-sec",
-            max_ops_per_sec,
-            "--tp-price",
-            tp_price,
-            "--tp-offset-priority",
-            tp_offset_priority,
-            "--direct-price-mode",
-            direct_price_mode,
-            "--snapshot-interval-sec",
-            snapshot_interval_sec,
-        )
-        if not enforce_trading_time:
-            argv.append("--no-enforce-trading-time")
-        if max_daily_loss:
-            argv += ["--max-daily-loss", max_daily_loss]
-        if direct_advanced:
-            argv += ["--direct-advanced", direct_advanced]
-        if confirm_live:
-            argv += ["--confirm-live", confirm_live]
-        for s in [s.strip() for s in symbols.split(",") if s.strip()]:
-            argv += ["--symbols", s]
-
-        title = f"trade {account_profile} {mode} {executor} {model}"
-        jm = request.app.state.job_manager
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
-
     @router.post("/ops/integrity/audit")
     async def ops_integrity_audit(request: Request):
         _require_auth(request)
@@ -1189,7 +1002,7 @@ def build_router() -> Any:
                 "title": "Data Hub",
                 "token_qs": _token_qs(request),
                 "running_count": len(running),
-                "lake_version": lv,
+                "dataset_version": lv,
                 "ticks_v2": [],
                 "main_l5_v2": [],
                 "features": [],
@@ -1243,8 +1056,8 @@ def build_router() -> Any:
             err = "Query is required."
         else:
             try:
-                from ghtrader.questdb_client import make_questdb_query_config_from_env
-                from ghtrader.questdb_queries import query_sql_read_only
+                from ghtrader.questdb.client import make_questdb_query_config_from_env
+                from ghtrader.questdb.queries import query_sql_read_only
 
                 cfg = make_questdb_query_config_from_env()
                 columns, rows = query_sql_read_only(cfg=cfg, query=query, limit=int(limit), connect_timeout_s=2)

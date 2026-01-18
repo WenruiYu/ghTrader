@@ -22,9 +22,9 @@
     <div><b>Waiting locks:</b> <span class="mono">{{ (job.waiting_locks or []) | join(",") }}</span></div>
     <div><b>Held locks:</b> <span class="mono">{{ (job.held_locks or []) | join(",") }}</span></div>
 
-    {% if job.status == "running" %}
+    {% if job.status in ["queued", "running"] %}
       <form method="post" action="/jobs/{{ job.id }}/cancel{{ token_qs }}">
-        <button class="btn btn-danger btn-sm" type="submit">Cancel (SIGTERM)</button>
+        <button class="btn btn-danger btn-sm" type="submit">Cancel</button>
       </form>
     {% endif %}
   </div>
@@ -34,6 +34,7 @@
     <div><b>Kind:</b> <span class="mono" id="ingestKind"></span></div>
     <div><b>Current:</b> <span class="mono" id="ingestCurrent"></span></div>
     <div><b>Progress:</b> <span class="mono" id="ingestProgress"></span></div>
+    <div id="ingestLastErrorRow" style="display:none;"><b>Last error:</b> <span class="mono text-xs" id="ingestLastError"></span></div>
     <div class="muted">For full details, see <a href="/ops/ingest{{ token_qs }}">Ingest</a>.</div>
   </div>
 
@@ -71,20 +72,45 @@
       const ingestKind = document.getElementById("ingestKind");
       const ingestCurrent = document.getElementById("ingestCurrent");
       const ingestProgress = document.getElementById("ingestProgress");
+      const ingestLastErrorRow = document.getElementById("ingestLastErrorRow");
+      const ingestLastError = document.getElementById("ingestLastError");
       const pill = document.getElementById("jobStatusPill");
       const autoScroll = document.getElementById("autoScroll");
       const pausePolling = document.getElementById("pausePolling");
       const pollMs = document.getElementById("pollMs");
 
       const jobId = "{{ job.id }}";
-      let isRunning = ("{{ job.status }}" === "running");
+      let isActive = (("{{ job.status }}" === "running") || ("{{ job.status }}" === "queued"));
       let logTimer = null;
       let statusTimer = null;
       let ingestTimer = null;
 
+      // Ingest speed/ETA (best-effort, computed from ingest_status deltas)
+      let ingestLastAtMs = null;
+      let ingestLastDone = null;
+      let ingestFirstAtMs = null;
+      let ingestFirstDone = null;
+
       function fmtPct(x) {
         if (x === null || x === undefined) return "-";
         return (Math.round(x * 1000) / 10).toFixed(1) + "%";
+      }
+
+      function fmtDurationSec(sec) {
+        const s = Math.max(0, Math.floor(sec || 0));
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const ss = s % 60;
+        if (h > 0) return h + "h" + String(m).padStart(2, "0") + "m";
+        if (m > 0) return m + "m" + String(ss).padStart(2, "0") + "s";
+        return ss + "s";
+      }
+
+      function fmtSpeedDaysPerMin(x) {
+        if (x === null || x === undefined) return "";
+        const v = Number(x);
+        if (!isFinite(v) || v <= 0) return "";
+        return (Math.round(v * 100) / 100).toFixed(2) + " days/min";
       }
 
       async function copyText(s) {
@@ -125,21 +151,87 @@
           }
           ingestCard.style.display = "block";
           ingestKind.textContent = s.kind || "";
+          if (ingestLastErrorRow && ingestLastError) {
+            const le = String(s.last_error_line || "").trim();
+            if (le) {
+              ingestLastErrorRow.style.display = "block";
+              ingestLastError.textContent = le;
+            } else {
+              ingestLastErrorRow.style.display = "none";
+              ingestLastError.textContent = "";
+            }
+          }
 
           if (s.kind === "download_contract_range") {
             ingestCurrent.textContent = s.current_symbol || "";
             const sum = s.summary || {};
+            const done = (sum.days_done_total ?? null);
+            const expected = (sum.days_expected_total ?? null);
+            const nowMs = Date.now();
+            if (ingestFirstAtMs === null && done !== null) { ingestFirstAtMs = nowMs; ingestFirstDone = done; }
+            let speedText = "";
+            let etaText = "";
+            if (done !== null) {
+              if (ingestLastAtMs !== null && ingestLastDone !== null) {
+                const dtSec = (nowMs - ingestLastAtMs) / 1000.0;
+                const dd = Number(done) - Number(ingestLastDone);
+                const sp = (dtSec > 0) ? (dd / dtSec) * 60.0 : 0;
+                const spTxt = fmtSpeedDaysPerMin(sp);
+                if (spTxt) speedText = spTxt;
+                if (expected !== null && sp > 0) {
+                  const rem = Math.max(0, Number(expected) - Number(done));
+                  etaText = "ETA " + fmtDurationSec((rem / sp) * 60.0);
+                }
+              } else if (ingestFirstAtMs !== null && ingestFirstDone !== null) {
+                const dtSec = (nowMs - ingestFirstAtMs) / 1000.0;
+                const dd = Number(done) - Number(ingestFirstDone);
+                const sp = (dtSec > 0) ? (dd / dtSec) * 60.0 : 0;
+                const spTxt = fmtSpeedDaysPerMin(sp);
+                if (spTxt) speedText = spTxt;
+              }
+            }
+            ingestLastAtMs = nowMs; ingestLastDone = done;
+            const extra = [speedText, etaText].filter(Boolean).join(", ");
             ingestProgress.textContent =
               fmtPct(sum.pct) +
               " days " + (sum.days_done_total ?? "") + "/" + (sum.days_expected_total ?? "") +
-              " contracts " + (sum.contracts_done ?? "") + "/" + (sum.contracts_total ?? "");
+              " contracts " + (sum.contracts_done ?? "") + "/" + (sum.contracts_total ?? "") +
+              (extra ? (" (" + extra + ")") : "");
           } else if (s.kind === "download") {
             ingestCurrent.textContent = s.symbol || "";
             const sum = s.summary || {};
+            const done = (sum.days_done ?? null);
+            const expected = (sum.days_expected ?? null);
+            const nowMs = Date.now();
+            if (ingestFirstAtMs === null && done !== null) { ingestFirstAtMs = nowMs; ingestFirstDone = done; }
+            let speedText = "";
+            let etaText = "";
+            if (done !== null) {
+              if (ingestLastAtMs !== null && ingestLastDone !== null) {
+                const dtSec = (nowMs - ingestLastAtMs) / 1000.0;
+                const dd = Number(done) - Number(ingestLastDone);
+                const sp = (dtSec > 0) ? (dd / dtSec) * 60.0 : 0;
+                const spTxt = fmtSpeedDaysPerMin(sp);
+                if (spTxt) speedText = spTxt;
+                if (expected !== null && sp > 0) {
+                  const rem = Math.max(0, Number(expected) - Number(done));
+                  etaText = "ETA " + fmtDurationSec((rem / sp) * 60.0);
+                }
+              } else if (ingestFirstAtMs !== null && ingestFirstDone !== null) {
+                const dtSec = (nowMs - ingestFirstAtMs) / 1000.0;
+                const dd = Number(done) - Number(ingestFirstDone);
+                const sp = (dtSec > 0) ? (dd / dtSec) * 60.0 : 0;
+                const spTxt = fmtSpeedDaysPerMin(sp);
+                if (spTxt) speedText = spTxt;
+              }
+            }
+            ingestLastAtMs = nowMs; ingestLastDone = done;
+            const extra = [speedText, etaText].filter(Boolean).join(", ");
             ingestProgress.textContent =
               fmtPct(sum.pct) +
               " days " + (sum.days_done ?? "") + "/" + (sum.days_expected ?? "") +
-              (s.chunk_idx ? (" chunk_idx=" + s.chunk_idx) : "");
+              (s.chunk_idx ? (" chunk_idx=" + s.chunk_idx) : "") +
+              (extra ? (" (" + extra + ")") : "");
           } else {
             ingestCurrent.textContent = s.current_symbol || "";
             ingestProgress.textContent = "-";
@@ -157,11 +249,11 @@
           if (!j) return;
           const st = j.status || "";
           setPill(st);
-          if (st !== "running") {
-            isRunning = false;
-            stopPolling();
+          if (st === "running" || st === "queued") {
+            isActive = true;
           } else {
-            isRunning = true;
+            isActive = false;
+            stopPolling();
           }
         } catch (e) {}
       }
@@ -190,7 +282,7 @@
           stopPolling();
           return;
         }
-        if (!isRunning) return;
+        if (!isActive) return;
         startPolling();
       }
 
@@ -199,11 +291,11 @@
           if (pausePolling.checked) {
             stopPolling();
           } else {
-            if (isRunning) startPolling();
+            if (isActive) startPolling();
           }
         });
       }
-      if (pollMs) pollMs.addEventListener("change", () => { if (isRunning) startPolling(); });
+      if (pollMs) pollMs.addEventListener("change", () => { if (isActive) startPolling(); });
       document.addEventListener("visibilitychange", maybePauseForVisibility);
 
       const btnCopyId = document.getElementById("copyJobId");
@@ -213,8 +305,8 @@
       if (btnCopyCmd) btnCopyCmd.addEventListener("click", () => copyText(document.getElementById("jobCommand").textContent));
       if (btnCopyLog) btnCopyLog.addEventListener("click", () => copyText(document.getElementById("jobLogPath").textContent));
 
-      // Start polling if running; otherwise do one-time fetch.
-      if (isRunning) {
+      // Start polling if active (queued/running); otherwise do one-time fetch.
+      if (isActive) {
         startPolling();
       } else {
         tick();

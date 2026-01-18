@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ghtrader.features import FactorEngine, MicropriceFactor
+from ghtrader.datasets.features import FactorEngine, MicropriceFactor
 
 
 def test_microprice_factor(small_synthetic_tick_df):

@@ -103,7 +103,7 @@
           <input type="hidden" name="symbol" value="KQ.m@SHFE.cu"/>
           <input type="hidden" name="horizons" value="10,50,200"/>
           <input type="hidden" name="threshold_k" value="1"/>
-          <input type="hidden" name="ticks_lake" value="main_l5"/>
+          <input type="hidden" name="ticks_kind" value="main_l5"/>
           <input type="hidden" name="overwrite" value="false"/>
           <input type="hidden" name="data_dir" value="data"/>
           <button type="submit" class="btn btn-secondary" style="width:100%;">3) Build Features/Labels</button>
@@ -114,7 +114,12 @@
     </div>
 
     <div class="card">
-      <h3 class="mb-2">Running Ingest Jobs</h3>
+      <div class="section-header mb-2" style="align-items:center;">
+        <h3 class="mb-0">Running Ingest Jobs</h3>
+        <div class="flex gap-2">
+          <button type="button" class="btn btn-sm btn-danger" id="cancelAllDownloadsBtn">Cancel all downloads</button>
+        </div>
+      </div>
       <div class="tableWrap">
         <table class="table table-compact" id="ingestJobsTable">
           <thead>
@@ -203,15 +208,49 @@
         </div>
       </div>
 
-      <div class="card">
-        <h3 class="mb-2">Ingest Tips</h3>
-        <ul class="muted text-sm" style="padding-left:18px; margin:0;">
-          <li style="margin-bottom:8px;"><strong>Symbol format:</strong> <code class="mono">EXCHANGE.instrumentYYMM</code> (e.g., SHFE.cu2602)</li>
-          <li style="margin-bottom:8px;"><strong>Contract range:</strong> Use for bulk backfill of a variety (all cu contracts)</li>
-          <li style="margin-bottom:8px;"><strong>Lake:</strong> v2-only (trading-day partitioning)</li>
-          <li style="margin-bottom:8px;"><strong>Chunk days:</strong> Smaller chunks = more resilient to interrupts</li>
-          <li><strong>Live recorder:</strong> Subscribes to ticks and appends to QuestDB in real-time</li>
-        </ul>
+      <div>
+        <div class="card">
+          <h3 class="mb-2">TqSdk Scheduler</h3>
+          <p class="muted text-sm mb-2">
+            Control how many <strong>TqSdk-heavy</strong> jobs the dashboard scheduler starts in parallel (download/record/update/data repair/data health).
+            Changes apply immediately to queued jobs.
+          </p>
+          <form class="form" method="post" action="/ops/settings/tqsdk_scheduler{{ token_qs }}">
+            <div class="grid2">
+              <div>
+                <label>Max parallel jobs</label>
+                <input name="max_parallel" type="number" min="1" max="64" value="{{ tqsdk_scheduler.max_parallel }}"/>
+              </div>
+              <div>
+                <label>Persist</label>
+                <select name="persist">
+                  <option value="1" selected>yes (survive restart)</option>
+                  <option value="0">no (runtime only)</option>
+                </select>
+              </div>
+            </div>
+            <button type="submit" class="btn btn-secondary" style="width:100%;">Apply</button>
+          </form>
+          <div class="muted text-xs" style="margin-top:10px;">
+            Current source: <span class="mono">{{ tqsdk_scheduler.source }}</span>.
+            Env: <span class="mono">{{ tqsdk_scheduler.env_value or "-" }}</span>.
+            Persisted: <span class="mono">{% if tqsdk_scheduler.persisted_value is not none %}{{ tqsdk_scheduler.persisted_value }}{% else %}-{% endif %}</span>.
+          </div>
+          <div class="muted text-xs" style="margin-top:6px;">
+            Settings file: <span class="mono">{{ tqsdk_scheduler.settings_path }}</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3 class="mb-2">Ingest Tips</h3>
+          <ul class="muted text-sm" style="padding-left:18px; margin:0;">
+            <li style="margin-bottom:8px;"><strong>Symbol format:</strong> <code class="mono">EXCHANGE.instrumentYYMM</code> (e.g., SHFE.cu2602)</li>
+            <li style="margin-bottom:8px;"><strong>Contract range:</strong> Use for bulk backfill of a variety (all cu contracts)</li>
+            <li style="margin-bottom:8px;"><strong>Dataset:</strong> v2-only (trading-day partitioning)</li>
+            <li style="margin-bottom:8px;"><strong>Chunk days:</strong> Smaller chunks = more resilient to interrupts</li>
+            <li><strong>Live recorder:</strong> Subscribes to ticks and appends to QuestDB in real-time</li>
+          </ul>
+        </div>
       </div>
     </div>
   </div>
@@ -262,8 +301,8 @@
           <form class="form" method="post" action="/ops/build/build{{ token_qs }}">
             <div class="grid2">
               <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu"/></div>
-              <div><label>Ticks lake</label>
-                <select name="ticks_lake"><option value="raw">raw</option><option value="main_l5" selected>main_l5</option></select>
+              <div><label>Ticks kind</label>
+                <select name="ticks_kind"><option value="raw">raw</option><option value="main_l5" selected>main_l5</option></select>
               </div>
             </div>
             <div class="grid2">
@@ -389,7 +428,7 @@
           <tbody>
             <tr><td class="mono">ticks:symbol=X</td><td>download, record</td><td>Per-symbol tick ingest</td></tr>
             <tr><td class="mono">ticks_range:exchange=X,var=Y</td><td>download-contract-range</td><td>Variety-wide backfill</td></tr>
-            <tr><td class="mono">build:symbol=X,ticks_lake=Y</td><td>build</td><td>Feature/label build</td></tr>
+            <tr><td class="mono">build:symbol=X,ticks_kind=Y</td><td>build</td><td>Feature/label build</td></tr>
             <tr><td class="mono">train:symbol=X,model=M,h=H</td><td>train</td><td>Model training</td></tr>
             <tr><td class="mono">main_schedule:var=X</td><td>main-schedule</td><td>Schedule computation</td></tr>
             <tr><td class="mono">main_l5:symbol=X</td><td>main-l5</td><td>Derived dataset build</td></tr>
@@ -408,6 +447,55 @@
 
   // Ingest jobs auto-refresh
   const tokenQs = "{{ token_qs }}";
+  const ingestSpeedState = new Map(); // job_id -> { atMs, daysDone }
+
+  function fmtDurationSec(sec) {
+    const s = Math.max(0, Math.floor(sec || 0));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const ss = s % 60;
+    if (h > 0) return h + "h" + String(m).padStart(2, "0") + "m";
+    if (m > 0) return m + "m" + String(ss).padStart(2, "0") + "s";
+    return ss + "s";
+  }
+
+  function fmtSpeedDaysPerMin(x) {
+    const v = Number(x);
+    if (!isFinite(v) || v <= 0) return "";
+    return v.toFixed(2) + " days/min";
+  }
+  
+  function speedAndEtaForStatus(s) {
+    const kind = String(s.kind || "");
+    const sum = s.summary || {};
+    let done = null;
+    let expected = null;
+    if (kind === "download_contract_range") {
+      done = (sum.days_done_total ?? null);
+      expected = (sum.days_expected_total ?? null);
+    } else if (kind === "download") {
+      done = (sum.days_done ?? null);
+      expected = (sum.days_expected ?? null);
+    } else {
+      return { speedText: "", etaText: "" };
+    }
+    if (done === null || done === undefined) return { speedText: "", etaText: "" };
+    const jobId = String(s.job_id || "");
+    const nowMs = Date.now();
+    const prev = ingestSpeedState.get(jobId);
+    ingestSpeedState.set(jobId, { atMs: nowMs, daysDone: Number(done) });
+    if (!prev) return { speedText: "", etaText: "" };
+    const dtSec = (nowMs - Number(prev.atMs || 0)) / 1000.0;
+    const dd = Number(done) - Number(prev.daysDone || 0);
+    const sp = (dtSec > 0) ? (dd / dtSec) * 60.0 : 0;
+    const speedText = fmtSpeedDaysPerMin(sp);
+    let etaText = "";
+    if (speedText && expected !== null && expected !== undefined && sp > 0) {
+      const rem = Math.max(0, Number(expected) - Number(done));
+      etaText = "ETA " + fmtDurationSec((rem / sp) * 60.0);
+    }
+    return { speedText, etaText };
+  }
   
   async function refreshIngestJobs() {
     try {
@@ -429,9 +517,11 @@
                         s.kind === "download" ? (s.symbol || "") : (s.current_symbol || "");
         const pct = s.summary && s.summary.pct !== null ? s.summary.pct : null;
         const pctText = pct !== null ? (pct * 100).toFixed(1) + "%" : "-";
+        const se = speedAndEtaForStatus(s);
+        const extra = [se.speedText, se.etaText].filter(Boolean).join(", ");
         const pctBar = pct !== null ? 
           '<div class="progressBar"><div style="width:' + (pct * 100).toFixed(1) + '%"></div></div>' +
-          '<div class="mono text-xs" style="margin-top:4px;">' + pctText + '</div>' : '-';
+          '<div class="mono text-xs" style="margin-top:4px;">' + pctText + (extra ? (' · ' + extra) : '') + '</div>' : '-';
         
         return [
           '<tr>',
@@ -447,6 +537,31 @@
     } catch (e) {
       // Ignore errors
     }
+  }
+
+  // Bulk cancel downloads
+  const cancelAllBtn = document.getElementById("cancelAllDownloadsBtn");
+  if (cancelAllBtn) {
+    cancelAllBtn.addEventListener("click", async () => {
+      if (!window.confirm("Cancel ALL download jobs (download + download-contract-range)?")) return;
+      try {
+        const resp = await window.ghTrader.postJson("/api/jobs/cancel-batch", {
+          kinds: ["download", "download_contract_range"],
+          statuses: ["running", "queued"],
+          include_unstarted_queued: true,
+        });
+        if (!resp.ok) {
+          const data = await resp.json().catch(() => ({}));
+          window.alert("Cancel failed: " + (data.detail || resp.status));
+          return;
+        }
+        const data = await resp.json().catch(() => ({}));
+        window.alert("Cancelled: " + (data.cancelled || 0) + " / matched: " + (data.matched || 0));
+        refreshIngestJobs();
+      } catch (e) {
+        window.alert("Cancel failed: " + (e && e.message ? e.message : String(e)));
+      }
+    });
   }
   
   // Initial refresh and auto-refresh every 10s

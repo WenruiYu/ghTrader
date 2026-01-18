@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from ghtrader.serving_db import QuestDBBackend, ServingDBConfig
+from ghtrader.questdb.serving_db import QuestDBBackend, ServingDBConfig
 
 
 def test_questdb_backend_ingest_uses_sender_from_conf(monkeypatch) -> None:
@@ -51,8 +51,8 @@ def test_questdb_backend_ingest_uses_sender_from_conf(monkeypatch) -> None:
             "datetime_ns": [1],
             "trading_day": ["2026-01-01"],
             "row_hash": [1],
-            "ticks_lake": ["raw"],
-            "lake_version": ["v2"],
+            "ticks_kind": ["raw"],
+            "dataset_version": ["v2"],
         }
     )
 

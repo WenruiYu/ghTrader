@@ -45,10 +45,10 @@ def test_parse_ingest_command_download_variants(tmp_path: Path) -> None:
     assert out2["kind"] == "download"
     assert out2["args"]["symbol"] == "SHFE.cu2602"
 
-    cmd3 = cmd2 + ["--lake-version", "v2"]
+    cmd3 = cmd2 + ["--dataset-version", "v2"]
     out3 = parse_ingest_command(cmd3)
     assert out3["kind"] == "download"
-    assert out3["args"]["lake_version"] == "v2"
+    assert out3["args"]["dataset_version"] == "v2"
 
 
 def test_parse_ingest_command_download_contract_range(tmp_path: Path) -> None:
@@ -85,9 +85,9 @@ def test_parse_ingest_command_download_contract_range(tmp_path: Path) -> None:
     assert out["args"]["start_date"] == "2015-01-01"
     assert out["args"]["end_date"] == "2015-01-08"
 
-    cmd2 = cmd + ["--lake-version", "v2"]
+    cmd2 = cmd + ["--dataset-version", "v2"]
     out2 = parse_ingest_command(cmd2)
-    assert out2["args"]["lake_version"] == "v2"
+    assert out2["args"]["dataset_version"] == "v2"
 
 
 def test_parse_log_tail_extracts_current_symbol_and_chunk() -> None:
@@ -166,10 +166,10 @@ def test_compute_range_progress_v2_without_questdb(tmp_path: Path, monkeypatch: 
         end_date=d1,
         data_dir=data_dir,
         log_hint={},
-        lake_version="v2",
+        dataset_version="v2",
     )
     assert status["kind"] == "download_contract_range"
-    assert status["lake_version"] == "v2"
+    assert status["dataset_version"] == "v2"
     assert status["summary"]["days_expected_total"] == 8
     # Without QuestDB, days_done is 0
     assert status["summary"]["days_done_total"] == 0

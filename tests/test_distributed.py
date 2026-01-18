@@ -4,7 +4,7 @@ import os
 
 import numpy as np
 
-import ghtrader.distributed as distu
+import ghtrader.research.distributed as distu
 
 
 def test_is_rank0_default_true(monkeypatch):

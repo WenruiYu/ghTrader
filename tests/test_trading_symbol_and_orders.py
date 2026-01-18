@@ -7,7 +7,7 @@ import pytest
 
 
 def test_resolve_symbol_passthrough(tmp_path: Path):
-    from ghtrader.symbol_resolver import resolve_trading_symbol
+    from ghtrader.trading.symbol_resolver import resolve_trading_symbol
 
     data_dir = tmp_path / "data"
     sym = "SHFE.cu2602"
@@ -15,11 +15,11 @@ def test_resolve_symbol_passthrough(tmp_path: Path):
 
 
 def test_resolve_continuous_symbol_prefers_rolls_schedule(tmp_path: Path):
-    from ghtrader.symbol_resolver import resolve_trading_symbol
+    from ghtrader.trading.symbol_resolver import resolve_trading_symbol
 
     data_dir = tmp_path / "data"
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr("ghtrader.questdb_client.make_questdb_query_config_from_env", lambda: object())
+    monkeypatch.setattr("ghtrader.questdb.client.make_questdb_query_config_from_env", lambda: object())
 
     def fake_resolve_main_contract(*, exchange: str, variety: str, trading_day: date, **_kwargs):
         assert exchange == "SHFE"
@@ -28,7 +28,7 @@ def test_resolve_continuous_symbol_prefers_rolls_schedule(tmp_path: Path):
             return "SHFE.cu2503", 1, "h"
         return "SHFE.cu2502", 0, "h"
 
-    monkeypatch.setattr("ghtrader.questdb_main_schedule.resolve_main_contract", fake_resolve_main_contract)
+    monkeypatch.setattr("ghtrader.questdb.main_schedule.resolve_main_contract", fake_resolve_main_contract)
 
     assert resolve_trading_symbol(symbol="KQ.m@SHFE.cu", data_dir=data_dir, trading_day=date(2025, 1, 2)) == "SHFE.cu2502"
     assert resolve_trading_symbol(symbol="KQ.m@SHFE.cu", data_dir=data_dir, trading_day=date(2025, 1, 4)) == "SHFE.cu2503"
@@ -36,7 +36,7 @@ def test_resolve_continuous_symbol_prefers_rolls_schedule(tmp_path: Path):
 
 
 def test_plan_direct_orders_shfe_close_today_split():
-    from ghtrader.execution import plan_direct_orders_to_target
+    from ghtrader.trading.execution import plan_direct_orders_to_target
 
     # Close a 5-lot long on SHFE: 2 today + 3 history
     intents = plan_direct_orders_to_target(
@@ -55,7 +55,7 @@ def test_plan_direct_orders_shfe_close_today_split():
 
 
 def test_plan_direct_orders_cross_zero_split_close_then_open():
-    from ghtrader.execution import plan_direct_orders_to_target
+    from ghtrader.trading.execution import plan_direct_orders_to_target
 
     # From short 5 (1 today + 4 his) to long 2: buy close 5 then buy open 2
     intents = plan_direct_orders_to_target(
@@ -75,7 +75,7 @@ def test_plan_direct_orders_cross_zero_split_close_then_open():
 
 
 def test_plan_direct_orders_respects_max_order_size():
-    from ghtrader.execution import plan_direct_orders_to_target
+    from ghtrader.trading.execution import plan_direct_orders_to_target
 
     # Need buy 7, but max order size is 3 -> should split opens
     intents = plan_direct_orders_to_target(

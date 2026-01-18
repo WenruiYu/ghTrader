@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.egg-info/
 .coverage
 coverage.xml
 
@@ -24,6 +25,7 @@ artifacts/
 *.log
 *.tmp
 
-
+# --- Optional third-party checkouts (not part of ghTrader) ---
 akshare/
 tqsdk-python/
+

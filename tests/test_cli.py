@@ -21,7 +21,7 @@ def test_cli_contracts_snapshot_build_default_is_last_only(monkeypatch: pytest.M
     Default contracts snapshot build must not run full QuestDB bounds/day-count scans.
     """
     # Fake catalog so we don't require TqSdk or caches.
-    import ghtrader.tqsdk_catalog as cat
+    import ghtrader.tq.catalog as cat
 
     monkeypatch.setattr(
         cat,
@@ -37,7 +37,7 @@ def test_cli_contracts_snapshot_build_default_is_last_only(monkeypatch: pytest.M
     )
 
     # Ensure the full (ticks-table) coverage query is NOT called.
-    import ghtrader.questdb_queries as qq
+    import ghtrader.questdb.queries as qq
 
     monkeypatch.setattr(qq, "query_contract_coverage", lambda **kwargs: (_ for _ in ()).throw(AssertionError("full coverage query called")))
 
@@ -65,17 +65,17 @@ def test_cli_contracts_snapshot_build_default_is_last_only(monkeypatch: pytest.M
     monkeypatch.setattr(qq, "query_contract_last_coverage", fake_last_cov)
 
     # Ensure snapshot build does NOT call local/parquet status computation.
-    import ghtrader.control.contract_status as cs
+    import ghtrader.data.contract_status as cs
 
     monkeypatch.setattr(cs, "compute_contract_statuses", lambda **kwargs: (_ for _ in ()).throw(AssertionError("compute_contract_statuses called")))
 
     # Ensure snapshot build does NOT attempt holiday downloads (cache-only trading-day logic).
-    import ghtrader.trading_calendar as tc
+    import ghtrader.data.trading_calendar as tc
 
     monkeypatch.setattr(tc, "_fetch_holidays_raw", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("holiday download attempted")))
 
     # Ensure snapshot build does NOT attempt QuestDB full scans by default.
-    import ghtrader.questdb_index as qix
+    import ghtrader.questdb.index as qix
 
     monkeypatch.setattr(qix, "bootstrap_symbol_day_index_from_ticks", lambda **kwargs: (_ for _ in ()).throw(AssertionError("index bootstrap called")))
 
@@ -85,7 +85,7 @@ def test_cli_contracts_snapshot_build_default_is_last_only(monkeypatch: pytest.M
     monkeypatch.setattr(qix, "list_symbols_from_index", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("questdb unavailable")))
 
     # Avoid probe cache reads.
-    import ghtrader.tqsdk_l5_probe as lp
+    import ghtrader.tq.l5_probe as lp
 
     monkeypatch.setattr(lp, "load_probe_result", lambda **kwargs: None)
 
@@ -132,7 +132,7 @@ def test_infer_contract_date_range_shfe_cu():
     """Test date inference for SHFE copper contracts."""
     from datetime import date
 
-    from ghtrader.control.contract_status import infer_contract_date_range
+    from ghtrader.data.contract_status import infer_contract_date_range
 
     # SHFE.cu2602 -> Feb 2026 expiry
     start, end = infer_contract_date_range("SHFE.cu2602")
@@ -152,7 +152,7 @@ def test_infer_contract_date_range_shfe_cu():
 
 def test_infer_contract_date_range_invalid():
     """Test date inference returns None for invalid symbols."""
-    from ghtrader.control.contract_status import infer_contract_date_range
+    from ghtrader.data.contract_status import infer_contract_date_range
 
     # Invalid formats
     assert infer_contract_date_range("") == (None, None)
@@ -168,16 +168,21 @@ def test_infer_contract_date_range_invalid():
 
 
 # ---------------------------------------------------------------------------
-# fill-missing edge case tests
+# data completeness edge case tests
 # ---------------------------------------------------------------------------
 
 
-def test_verify_completeness_payload_skipped_symbols_tracking(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Test that _verify_completeness_payload tracks skipped symbols with reasons."""
-    from ghtrader.cli import _verify_completeness_payload
+def test_compute_day_level_completeness_keeps_inferred_window_for_explicit_symbol(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    When explicit symbols are provided and catalog/QuestDB bounds are missing, date inference should still
+    produce a window and the symbol should appear in the per-symbol contracts rows (not skipped).
+    """
+    from ghtrader.data.completeness import compute_day_level_completeness
 
     # Mock catalog to return empty
-    import ghtrader.tqsdk_catalog as cat
+    import ghtrader.tq.catalog as cat
 
     monkeypatch.setattr(
         cat,
@@ -186,7 +191,7 @@ def test_verify_completeness_payload_skipped_symbols_tracking(monkeypatch: pytes
     )
 
     # Mock QuestDB to return no coverage
-    import ghtrader.questdb_index as qix
+    import ghtrader.questdb.index as qix
 
     monkeypatch.setattr(qix, "ensure_index_tables", lambda **kwargs: None)
     monkeypatch.setattr(qix, "query_contract_coverage_from_index", lambda **kwargs: {})
@@ -194,7 +199,7 @@ def test_verify_completeness_payload_skipped_symbols_tracking(monkeypatch: pytes
     monkeypatch.setattr(qix, "fetch_no_data_days_by_symbol", lambda **kwargs: {})
 
     # Mock trading calendar
-    import ghtrader.trading_calendar as tc
+    import ghtrader.data.trading_calendar as tc
 
     monkeypatch.setattr(tc, "get_trading_calendar", lambda **kwargs: [])
     monkeypatch.setattr(tc, "get_trading_days", lambda **kwargs: [])
@@ -206,38 +211,32 @@ def test_verify_completeness_payload_skipped_symbols_tracking(monkeypatch: pytes
 
     # Test with a symbol that has no catalog data and no QuestDB data
     # The date inference should kick in for SHFE contract format
-    result = _verify_completeness_payload(
+    result = compute_day_level_completeness(
         exchange="SHFE",
         variety="cu",
         symbols=["SHFE.cu2602"],
+        contracts=None,
         start_override=None,
         end_override=None,
         refresh_catalog=False,
+        allow_download_calendar=False,
         data_dir=data_dir,
         runs_dir=runs_dir,
     )
 
-    # With date inference, the symbol should be in contracts, not skipped
     assert result["ok"] is True
-    # Either the symbol is in contracts (date inferred) or skipped_symbols has details
-    if result.get("skipped_symbols"):
-        skipped = result["skipped_symbols"]
-        assert len(skipped) <= 1
-        if skipped:
-            assert skipped[0]["symbol"] == "SHFE.cu2602"
-            assert "reason" in skipped[0]
-    else:
-        # Date inference worked
-        assert len(result.get("contracts", [])) == 1
-        assert result["contracts"][0]["symbol"] == "SHFE.cu2602"
+    assert result.get("symbols") == ["SHFE.cu2602"]
+    rows = result.get("contracts") or []
+    assert len(rows) == 1
+    assert rows[0].get("symbol") == "SHFE.cu2602"
 
 
-def test_verify_completeness_payload_explicit_symbols_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Test that only explicitly provided symbols are processed when symbols are given."""
-    from ghtrader.cli import _verify_completeness_payload
+def test_compute_day_level_completeness_explicit_symbols_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Only explicitly provided symbols should be processed when symbols are given."""
+    from ghtrader.data.completeness import compute_day_level_completeness
 
     # Mock catalog with multiple contracts
-    import ghtrader.tqsdk_catalog as cat
+    import ghtrader.tq.catalog as cat
 
     monkeypatch.setattr(
         cat,
@@ -253,14 +252,14 @@ def test_verify_completeness_payload_explicit_symbols_only(monkeypatch: pytest.M
     )
 
     # Mock QuestDB
-    import ghtrader.questdb_index as qix
+    import ghtrader.questdb.index as qix
 
     monkeypatch.setattr(qix, "ensure_index_tables", lambda **kwargs: None)
     monkeypatch.setattr(qix, "query_contract_coverage_from_index", lambda **kwargs: {})
     monkeypatch.setattr(qix, "fetch_present_days_by_symbol", lambda **kwargs: {})
     monkeypatch.setattr(qix, "fetch_no_data_days_by_symbol", lambda **kwargs: {})
 
-    import ghtrader.trading_calendar as tc
+    import ghtrader.data.trading_calendar as tc
 
     monkeypatch.setattr(tc, "get_trading_calendar", lambda **kwargs: [])
     monkeypatch.setattr(tc, "get_trading_days", lambda **kwargs: [])
@@ -271,13 +270,15 @@ def test_verify_completeness_payload_explicit_symbols_only(monkeypatch: pytest.M
     runs_dir.mkdir(parents=True, exist_ok=True)
 
     # When explicit symbols are provided, only those should be processed
-    result = _verify_completeness_payload(
+    result = compute_day_level_completeness(
         exchange="SHFE",
         variety="cu",
         symbols=["SHFE.cu2602"],  # Only one symbol
+        contracts=None,
         start_override=None,
         end_override=None,
         refresh_catalog=False,
+        allow_download_calendar=False,
         data_dir=data_dir,
         runs_dir=runs_dir,
     )
@@ -286,7 +287,7 @@ def test_verify_completeness_payload_explicit_symbols_only(monkeypatch: pytest.M
     assert result["symbols"] == ["SHFE.cu2602"]
 
 
-def test_verify_completeness_payload_marks_index_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_compute_day_level_completeness_marks_index_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """
     PRD: If QuestDB index has no rows for a symbol, verify must not treat all days as missing.
 
@@ -294,10 +295,10 @@ def test_verify_completeness_payload_marks_index_missing(monkeypatch: pytest.Mon
     """
     from datetime import date
 
-    from ghtrader.cli import _verify_completeness_payload
+    from ghtrader.data.completeness import compute_day_level_completeness
 
     # Provide catalog metadata so expected date window is deterministic (no date.today() clamping).
-    import ghtrader.tqsdk_catalog as cat
+    import ghtrader.tq.catalog as cat
 
     monkeypatch.setattr(
         cat,
@@ -316,7 +317,7 @@ def test_verify_completeness_payload_marks_index_missing(monkeypatch: pytest.Mon
     )
 
     # QuestDB index returns no coverage for this symbol -> index_missing
-    import ghtrader.questdb_index as qix
+    import ghtrader.questdb.index as qix
 
     monkeypatch.setattr(qix, "ensure_index_tables", lambda **kwargs: None)
     monkeypatch.setattr(qix, "query_contract_coverage_from_index", lambda **kwargs: {})
@@ -324,7 +325,7 @@ def test_verify_completeness_payload_marks_index_missing(monkeypatch: pytest.Mon
     monkeypatch.setattr(qix, "fetch_no_data_days_by_symbol", lambda **kwargs: {})
 
     # Trading days: provide a non-empty set so a naive impl would mark all as missing.
-    import ghtrader.trading_calendar as tc
+    import ghtrader.data.trading_calendar as tc
 
     monkeypatch.setattr(tc, "get_trading_calendar", lambda **kwargs: None)
     monkeypatch.setattr(tc, "get_trading_days", lambda *args, **kwargs: [date(2025, 1, 1), date(2025, 1, 2), date(2025, 1, 10)])
@@ -334,13 +335,15 @@ def test_verify_completeness_payload_marks_index_missing(monkeypatch: pytest.Mon
     data_dir.mkdir(parents=True, exist_ok=True)
     runs_dir.mkdir(parents=True, exist_ok=True)
 
-    result = _verify_completeness_payload(
+    result = compute_day_level_completeness(
         exchange="SHFE",
         variety="cu",
         symbols=["SHFE.cu2501"],
+        contracts=None,
         start_override=None,
         end_override=None,
         refresh_catalog=False,
+        allow_download_calendar=False,
         data_dir=data_dir,
         runs_dir=runs_dir,
     )
@@ -357,6 +360,7 @@ def test_verify_completeness_payload_marks_index_missing(monkeypatch: pytest.Mon
     assert row.get("present_days") is None
     assert row.get("missing_days") is None
 
+    # Index-missing is represented on the per-symbol row (not as a skipped symbol).
     skipped = result.get("skipped_symbols") or []
-    assert any(s.get("symbol") == "SHFE.cu2501" and s.get("reason") == "index_missing" for s in skipped)
+    assert not any(s.get("symbol") == "SHFE.cu2501" and s.get("reason") == "index_missing" for s in skipped)
 

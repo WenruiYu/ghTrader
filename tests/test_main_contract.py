@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from ghtrader.main_contract import compute_shfe_main_schedule_from_daily
+from ghtrader.data.main_schedule import compute_shfe_main_schedule_from_daily
 
 
 def test_shfe_main_schedule_switch_rule_next_day_effect():

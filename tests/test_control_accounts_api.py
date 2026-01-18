@@ -10,59 +10,35 @@ import pytest
 from fastapi.testclient import TestClient
 
 
-def _write_run(
+def _write_gateway(
     *,
     runs_dir: Path,
-    run_id: str,
-    account_profile: str,
-    active: bool,
-    mode: str = "live",
-    monitor_only: bool = True,
-    last_ts: str = "2026-01-01T00:00:00Z",
-    balance: float = 100.0,
-    equity: float = 110.0,
+    profile: str,
+    desired_mode: str,
+    state: dict | None,
+    state_mtime: float | None,
 ) -> None:
-    root = runs_dir / "trading" / run_id
+    root = runs_dir / "gateway" / f"account={profile}"
     root.mkdir(parents=True, exist_ok=True)
-    (root / "run_config.json").write_text(
-        json.dumps(
-            {
-                "created_at": "2026-01-01T00:00:00Z",
-                "mode": mode,
-                "monitor_only": bool(monitor_only),
-                "account_profile": account_profile,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    (root / "state.json").write_text(
-        json.dumps(
-            {
-                "updated_at": "2026-01-01T00:00:00Z",
-                "run_id": run_id,
-                "last_snapshot": {
-                    "schema_version": 2,
-                    "ts": last_ts,
-                    "account_meta": {"account_profile": account_profile, "broker_configured": True},
-                    "account": {"balance": balance, "float_profit": 0.0, "equity": equity},
-                    "positions": {},
-                    "orders_alive": [],
-                },
-                "recent_events": [],
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    # Control the active heuristic via mtime.
-    sf = root / "state.json"
-    now = time.time()
-    ts = now if active else (now - 600.0)
-    os.utime(sf, (ts, ts))
+    (root / "desired.json").write_text(json.dumps({"desired": {"mode": desired_mode}}, indent=2), encoding="utf-8")
+    if state is not None:
+        sf = root / "state.json"
+        sf.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        if state_mtime is not None:
+            os.utime(sf, (state_mtime, state_mtime))
 
 
-def test_api_trading_status_filters_by_account_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _write_strategy(*, runs_dir: Path, profile: str, desired_mode: str, state_mtime: float | None) -> None:
+    root = runs_dir / "strategy" / f"account={profile}"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "desired.json").write_text(json.dumps({"desired": {"mode": desired_mode}}, indent=2), encoding="utf-8")
+    if state_mtime is not None:
+        sf = root / "state.json"
+        sf.write_text("{}", encoding="utf-8")
+        os.utime(sf, (state_mtime, state_mtime))
+
+
+def test_api_trading_console_status_filters_by_account_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
@@ -76,26 +52,39 @@ def test_api_trading_status_filters_by_account_profile(tmp_path: Path, monkeypat
     monkeypatch.setenv("TQ_ACCOUNT_PASSWORD_ALT", "P1")
 
     runs_dir = tmp_path / "runs"
-    _write_run(runs_dir=runs_dir, run_id="20260101_000001", account_profile="default", active=True)
-    _write_run(runs_dir=runs_dir, run_id="20260101_000002", account_profile="alt", active=True)
+    now = time.time()
+    _write_gateway(
+        runs_dir=runs_dir,
+        profile="default",
+        desired_mode="paper",
+        state={"last_snapshot": {"account": {"balance": 100.0, "equity": 110.0}}},
+        state_mtime=now,
+    )
+    _write_gateway(
+        runs_dir=runs_dir,
+        profile="alt",
+        desired_mode="paper",
+        state={"last_snapshot": {"account": {"balance": 200.0, "equity": 210.0}}},
+        state_mtime=now,
+    )
 
     mod = importlib.import_module("ghtrader.control.app")
     importlib.reload(mod)
     client = TestClient(mod.app)
 
-    r = client.get("/api/trading/status?account_profile=alt")
+    r = client.get("/api/trading/console/status?account_profile=alt")
     assert r.status_code == 200
     data = r.json()
-    assert data["active"] is True
-    assert data["run_id"] == "20260101_000002"
     assert data["account_profile"] == "alt"
+    assert data["gateway"]["exists"] is True
+    assert data["gateway"]["state"]["last_snapshot"]["account"]["balance"] == pytest.approx(200.0)
 
-    r2 = client.get("/api/trading/status?account_profile=default")
+    r2 = client.get("/api/trading/console/status?account_profile=default")
     assert r2.status_code == 200
     data2 = r2.json()
-    assert data2["active"] is True
-    assert data2["run_id"] == "20260101_000001"
     assert data2["account_profile"] == "default"
+    assert data2["gateway"]["exists"] is True
+    assert data2["gateway"]["state"]["last_snapshot"]["account"]["balance"] == pytest.approx(100.0)
 
 
 def test_api_accounts_aggregates_profiles_runs_and_verify_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -122,8 +111,11 @@ def test_api_accounts_aggregates_profiles_runs_and_verify_cache(tmp_path: Path, 
         encoding="utf-8",
     )
 
-    _write_run(runs_dir=runs_dir, run_id="20260101_000010", account_profile="default", active=False, last_ts="2026-01-01T00:10:00Z")
-    _write_run(runs_dir=runs_dir, run_id="20260101_000020", account_profile="alt", active=True, last_ts="2026-01-01T00:20:00Z")
+    now = time.time()
+    _write_gateway(runs_dir=runs_dir, profile="default", desired_mode="idle", state=None, state_mtime=None)
+    _write_gateway(runs_dir=runs_dir, profile="alt", desired_mode="paper", state={"health": {"ok": True}}, state_mtime=now)
+    _write_strategy(runs_dir=runs_dir, profile="default", desired_mode="idle", state_mtime=None)
+    _write_strategy(runs_dir=runs_dir, profile="alt", desired_mode="run", state_mtime=(now - 600.0))
 
     verify_dir = runs_dir / "control" / "cache" / "accounts"
     verify_dir.mkdir(parents=True, exist_ok=True)
@@ -146,6 +138,12 @@ def test_api_accounts_aggregates_profiles_runs_and_verify_cache(tmp_path: Path, 
     assert profs["alt"]["broker_id"] == "B1"
 
     assert profs["alt"]["verify"] is not None
-    assert profs["alt"]["active_run"]["run_id"] == "20260101_000020"
-    assert profs["default"]["latest_run"]["run_id"] == "20260101_000010"
+    assert profs["default"]["gateway"]["exists"] is True
+    assert profs["default"]["gateway"]["status"] == "desired_idle"
+    assert profs["default"]["strategy"]["exists"] is True
+    assert profs["default"]["strategy"]["status"] == "desired_idle"
+    assert profs["alt"]["gateway"]["exists"] is True
+    assert profs["alt"]["gateway"]["status"] == "running"
+    assert profs["alt"]["strategy"]["exists"] is True
+    assert profs["alt"]["strategy"]["status"] == "degraded"
 

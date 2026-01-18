@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from ghtrader.tqsdk_l5_probe import probe_l5_for_symbol
+from ghtrader.tq.l5_probe import probe_l5_for_symbol
 
 
 def _install_fake_tqsdk(monkeypatch, *, api_cls: type) -> None:
@@ -25,7 +25,7 @@ def test_probe_l5_auto_uses_questdb_last_day(
     sym = "SHFE.cu2404"
     d0 = date(2024, 4, 15)
 
-    import ghtrader.tqsdk_l5_probe as mod
+    import ghtrader.tq.l5_probe as mod
 
     # Avoid network calendar download; weekday-only fallback is fine for this unit test.
     monkeypatch.setattr(mod, "get_trading_calendar", lambda *, data_dir, refresh=False: [])
@@ -81,7 +81,7 @@ def test_probe_l5_auto_uses_quote_expire_when_no_local_data(monkeypatch, synthet
     sym = "SHFE.cu1999"
     expire_day = date(2019, 12, 16)
 
-    import ghtrader.tqsdk_l5_probe as mod
+    import ghtrader.tq.l5_probe as mod
 
     monkeypatch.setattr(mod, "get_trading_calendar", lambda *, data_dir, refresh=False: [])
     monkeypatch.setattr(mod, "get_tqsdk_auth", lambda: None)

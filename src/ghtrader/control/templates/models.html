@@ -273,6 +273,17 @@
         </div>
 
         <div class="card">
+          <h3 class="mb-2">Paper (online calibrator)</h3>
+          <div class="muted text-sm mb-2">No real orders are sent. For research/validation only.</div>
+          <form class="form" method="post" action="/ops/eval/paper{{ token_qs }}">
+            <div><label>Model</label><input name="model" value="xgboost"/></div>
+            <div><label>Symbols (comma-separated)</label><input name="symbols" placeholder="KQ.m@SHFE.cu"/></div>
+            <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
+            <button type="submit">Run Paper</button>
+          </form>
+        </div>
+
+        <div class="card">
           <h3 class="mb-2">Daily Train</h3>
           <form class="form" method="post" action="/ops/eval/daily_train{{ token_qs }}">
             <div><label>Symbols (comma-separated)</label><input name="symbols" placeholder="KQ.m@SHFE.cu"/></div>

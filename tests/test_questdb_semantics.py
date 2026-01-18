@@ -10,7 +10,7 @@ def test_compute_shfe_main_schedule_from_daily_switch_rule():
     """
     The schedule for day T is decided using end-of-day OI from day T-1.
     """
-    from ghtrader.main_contract import compute_shfe_main_schedule_from_daily
+    from ghtrader.data.main_schedule import compute_shfe_main_schedule_from_daily
 
     daily = pd.DataFrame(
         [
@@ -42,13 +42,13 @@ def test_compute_shfe_main_schedule_from_daily_switch_rule():
 
 
 def test_query_contract_coverage_merges_base_and_l5(monkeypatch: pytest.MonkeyPatch):
-    import ghtrader.questdb_queries as qq
+    import ghtrader.questdb.queries as qq
 
     symbols = ["SHFE.cu2501", "SHFE.cu2502"]
 
     def fake_bounds(*, l5_only: bool, **kwargs):
-        # Base coverage comes from raw ticks; L5 coverage prefers the derived main_l5 ticks lake.
-        if str(kwargs.get("ticks_lake") or "") == "main_l5":
+        # Base coverage comes from raw ticks; L5 coverage prefers the derived main_l5 ticks kind.
+        if str(kwargs.get("ticks_kind") or "") == "main_l5":
             return {
                 "SHFE.cu2502": {"first_day": "2025-01-02", "last_day": "2025-01-03", "n_days": 2},
             }
@@ -66,8 +66,8 @@ def test_query_contract_coverage_merges_base_and_l5(monkeypatch: pytest.MonkeyPa
         cfg=qq.QuestDBQueryConfig(host="x", pg_port=0, pg_user="u", pg_password="p", pg_dbname="d"),
         table="t",
         symbols=symbols,
-        lake_version="v2",
-        ticks_lake="raw",
+        dataset_version="v2",
+        ticks_kind="raw",
     )
 
     assert cov["SHFE.cu2501"]["first_tick_day"] == "2025-01-01"

@@ -60,8 +60,6 @@ pip install -e ".[dev,control,questdb]"
 # Install TqSdk (required for data download/backtest)
 # Option A (recommended): install from PyPI
 pip install tqsdk
-# Option B (advanced): if you have a local checkout at ./tqsdk-python, install it editable instead
-# pip install -e ./tqsdk-python
 
 # Optional: add tabular baselines (xgboost/lightgbm)
 # pip install -e ".[tabular]"
@@ -158,7 +156,6 @@ ghTrader/
   PRD.md                 # Canonical requirements/spec (single source of truth)
   pyproject.toml         # Dependencies, entrypoints, formatting
   .gitignore             # Ignore data/, runs/, artifacts/, secrets
-  tqsdk-python/          # (optional) Local checkout of TqSdk source for patching; otherwise install `tqsdk` via pip
   src/ghtrader/
     __init__.py
     cli.py               # CLI entrypoint (download, record, build, train, backtest, paper)

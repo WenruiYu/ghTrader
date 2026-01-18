@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ghtrader.ticks_schema import TICK_COLUMN_NAMES
+from ghtrader.data.ticks_schema import TICK_COLUMN_NAMES
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +29,7 @@ def questdb_config():
     Returns None if QuestDB is not available (tests should be skipped).
     For unit tests that need to mock QuestDB, use the mock_questdb_* fixtures instead.
     """
-    from ghtrader.questdb_client import QuestDBQueryConfig
+    from ghtrader.questdb.client import QuestDBQueryConfig
     
     host = os.environ.get("QUESTDB_HOST", "localhost")
     pg_port = int(os.environ.get("QUESTDB_PG_PORT", "8812"))
@@ -63,7 +63,7 @@ def mock_questdb_connection(monkeypatch: pytest.MonkeyPatch):
     mock_conn.__enter__ = MagicMock(return_value=mock_conn)
     mock_conn.__exit__ = MagicMock(return_value=False)
 
-    monkeypatch.setattr("ghtrader.questdb_queries._connect", lambda *args, **kwargs: mock_conn)
+    monkeypatch.setattr("ghtrader.questdb.queries._connect", lambda *args, **kwargs: mock_conn)
     return mock_conn, mock_cursor
 
 

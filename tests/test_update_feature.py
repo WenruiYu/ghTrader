@@ -12,7 +12,7 @@ def test_run_update_selects_active_and_recent_expired(monkeypatch: pytest.Monkey
     Unit test: update.run_update selects candidates (active + recently expired) and
     calls tq_ingest.download_historical_ticks with computed expected ranges.
     """
-    from ghtrader import update as upd
+    from ghtrader.data import update as upd
 
     data_dir = tmp_path / "data"
     runs_dir = tmp_path / "runs"
@@ -40,7 +40,7 @@ def test_run_update_selects_active_and_recent_expired(monkeypatch: pytest.Monkey
             ],
         }
 
-    monkeypatch.setattr("ghtrader.tqsdk_catalog.get_contract_catalog", fake_catalog)
+    monkeypatch.setattr("ghtrader.tq.catalog.get_contract_catalog", fake_catalog)
 
     # Capture the candidate list passed into compute_contract_statuses
     seen_candidates: list[str] = []
@@ -57,14 +57,14 @@ def test_run_update_selects_active_and_recent_expired(monkeypatch: pytest.Monkey
             ],
         }
 
-    monkeypatch.setattr("ghtrader.control.contract_status.compute_contract_statuses", fake_compute_contract_statuses)
+    monkeypatch.setattr("ghtrader.data.contract_status.compute_contract_statuses", fake_compute_contract_statuses)
 
     calls: list[tuple[str, str, str]] = []
 
     def fake_download_historical_ticks(*, symbol: str, start_date: date, end_date: date, data_dir: Path, chunk_days: int, **_kw: Any) -> None:
         calls.append((symbol, start_date.isoformat(), end_date.isoformat()))
 
-    monkeypatch.setattr("ghtrader.tq_ingest.download_historical_ticks", fake_download_historical_ticks)
+    monkeypatch.setattr("ghtrader.tq.ingest.download_historical_ticks", fake_download_historical_ticks)
 
     out_path, report = upd.run_update(exchange="SHFE", var="cu", data_dir=data_dir, runs_dir=runs_dir, recent_expired_trading_days=10)
 

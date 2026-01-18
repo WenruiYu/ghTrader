@@ -63,7 +63,7 @@ def test_load_config_loads_accounts_env(tmp_path: Path, monkeypatch: pytest.Monk
     assert os.environ.get("TQ_ACCOUNT_ID_TG_1") == "12345678"
     assert os.environ.get("TQ_ACCOUNT_PASSWORD_TG_1") == "pw"
 
-    from ghtrader.tq_runtime import list_account_profiles_from_env
+    from ghtrader.tq.runtime import list_account_profiles_from_env
 
     assert "tg_1" in list_account_profiles_from_env()
 
@@ -258,4 +258,79 @@ def test_control_api_ingest_status_endpoints(tmp_path: Path, monkeypatch: pytest
     assert r2.status_code == 200
     jobs = r2.json()["jobs"]
     assert any(j.get("job_id") == job_id for j in jobs)
+
+
+def test_control_api_jobs_cancel_batch_downloads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+
+    mod = importlib.import_module("ghtrader.control.app")
+    importlib.reload(mod)
+    app = mod.app
+    client = TestClient(app)
+
+    store = app.state.job_store
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Two queued jobs with no pid (unstarted)
+    dl_id = "dlq123"
+    dl_cmd = [
+        sys.executable,
+        "-m",
+        "ghtrader.cli",
+        "download",
+        "--symbol",
+        "SHFE.cu2502",
+        "--start",
+        "2025-01-02",
+        "--end",
+        "2025-01-07",
+        "--data-dir",
+        str(data_dir),
+        "--chunk-days",
+        "5",
+    ]
+    store.create_job(job_id=dl_id, title="download SHFE.cu2502", command=dl_cmd, cwd=tmp_path, source="dashboard")
+
+    rec_id = "recq123"
+    rec_cmd = [
+        sys.executable,
+        "-m",
+        "ghtrader.cli",
+        "record",
+        "--symbols",
+        "SHFE.cu2502",
+        "--data-dir",
+        str(data_dir),
+    ]
+    store.create_job(job_id=rec_id, title="record SHFE.cu2502", command=rec_cmd, cwd=tmp_path, source="dashboard")
+
+    # Default behavior: do not cancel unstarted queued jobs unless requested
+    r0 = client.post("/api/jobs/cancel-batch", json={"kinds": ["download"]})
+    assert r0.status_code == 200
+    out0 = r0.json()
+    assert out0["ok"] is True
+    assert out0["matched"] == 0
+    assert out0["cancelled"] == 0
+    assert (store.get_job(dl_id).status) == "queued"  # type: ignore[union-attr]
+    assert (store.get_job(rec_id).status) == "queued"  # type: ignore[union-attr]
+
+    # When include_unstarted_queued is true, queued downloads should be cancelled (record should remain queued)
+    r1 = client.post(
+        "/api/jobs/cancel-batch",
+        json={"kinds": ["download", "download_contract_range"], "statuses": ["queued", "running"], "include_unstarted_queued": True},
+    )
+    assert r1.status_code == 200
+    out1 = r1.json()
+    assert out1["ok"] is True
+    assert out1["matched"] == 1
+    assert out1["cancelled"] == 1
+
+    j_dl = store.get_job(dl_id)
+    j_rec = store.get_job(rec_id)
+    assert j_dl is not None and j_dl.status == "cancelled"
+    assert j_rec is not None and j_rec.status == "queued"
 

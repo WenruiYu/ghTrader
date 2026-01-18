@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
-from ghtrader.trading_calendar import get_trading_days, is_trading_day
+from ghtrader.data.trading_calendar import get_trading_days, is_trading_day
 
 
 def test_trading_days_excludes_weekend(tmp_path: Path):

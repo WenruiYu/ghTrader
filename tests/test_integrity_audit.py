@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from ghtrader.audit import audit_ticks_index_vs_table
+from ghtrader.data.audit import audit_ticks_index_vs_table
 
 
 def test_audit_ticks_index_vs_table_no_findings_when_match(monkeypatch: pytest.MonkeyPatch) -> None:
-    import ghtrader.audit as aud
-    import ghtrader.questdb_index as qix
+    import ghtrader.data.audit as aud
+    import ghtrader.questdb.index as qix
 
     monkeypatch.setattr(qix, "ensure_index_tables", lambda **_kwargs: None)
 
@@ -32,8 +32,8 @@ def test_audit_ticks_index_vs_table_no_findings_when_match(monkeypatch: pytest.M
 
     findings = audit_ticks_index_vs_table(
         ticks_table="ghtrader_ticks_raw_v2",
-        ticks_lake="raw",
-        lake_version="v2",
+        ticks_kind="raw",
+        dataset_version="v2",
         symbols=["SHFE.cu2501"],
         index_table="ghtrader_symbol_day_index_v2",
     )
@@ -41,8 +41,8 @@ def test_audit_ticks_index_vs_table_no_findings_when_match(monkeypatch: pytest.M
 
 
 def test_audit_ticks_index_vs_table_reports_checksum_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
-    import ghtrader.audit as aud
-    import ghtrader.questdb_index as qix
+    import ghtrader.data.audit as aud
+    import ghtrader.questdb.index as qix
 
     monkeypatch.setattr(qix, "ensure_index_tables", lambda **_kwargs: None)
 
@@ -70,8 +70,8 @@ def test_audit_ticks_index_vs_table_reports_checksum_mismatch(monkeypatch: pytes
 
     findings = audit_ticks_index_vs_table(
         ticks_table="ghtrader_ticks_raw_v2",
-        ticks_lake="raw",
-        lake_version="v2",
+        ticks_kind="raw",
+        dataset_version="v2",
         symbols=["SHFE.cu2501"],
         index_table="ghtrader_symbol_day_index_v2",
     )
@@ -79,8 +79,8 @@ def test_audit_ticks_index_vs_table_reports_checksum_mismatch(monkeypatch: pytes
 
 
 def test_audit_ticks_index_vs_table_reports_index_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    import ghtrader.audit as aud
-    import ghtrader.questdb_index as qix
+    import ghtrader.data.audit as aud
+    import ghtrader.questdb.index as qix
 
     monkeypatch.setattr(qix, "ensure_index_tables", lambda **_kwargs: None)
 
@@ -103,8 +103,8 @@ def test_audit_ticks_index_vs_table_reports_index_missing(monkeypatch: pytest.Mo
 
     findings = audit_ticks_index_vs_table(
         ticks_table="ghtrader_ticks_raw_v2",
-        ticks_lake="raw",
-        lake_version="v2",
+        ticks_kind="raw",
+        dataset_version="v2",
         symbols=["SHFE.cu2501"],
         index_table="ghtrader_symbol_day_index_v2",
     )

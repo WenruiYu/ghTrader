@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ghtrader.feature_store import (
+from ghtrader.datasets.feature_store import (
     FeatureDefinition,
     FeatureRegistry,
     FeatureValue,
@@ -31,7 +31,7 @@ from ghtrader.feature_store import (
     get_feature_registry,
     get_online_feature_store,
 )
-from ghtrader.features import (
+from ghtrader.datasets.features import (
     Factor,
     SpreadFactor,
     MidPriceFactor,
@@ -589,7 +589,7 @@ def test_global_online_store_singleton():
 
 def test_staleness_monitor_check_feature():
     """Test staleness monitor check_feature method."""
-    from ghtrader.feature_store import StalenessMonitor
+    from ghtrader.datasets.feature_store import StalenessMonitor
 
     store = OnlineFeatureStore()
     registry = FeatureRegistry()
@@ -613,7 +613,7 @@ def test_staleness_monitor_check_feature():
 
 def test_staleness_monitor_event_emission():
     """Test that staleness monitor emits events on state changes."""
-    from ghtrader.feature_store import StalenessEvent, StalenessMonitor
+    from ghtrader.datasets.feature_store import StalenessEvent, StalenessMonitor
 
     store = OnlineFeatureStore()
     registry = FeatureRegistry()
@@ -645,7 +645,7 @@ def test_staleness_monitor_event_emission():
 
 def test_staleness_monitor_summary():
     """Test staleness summary generation."""
-    from ghtrader.feature_store import StalenessMonitor
+    from ghtrader.datasets.feature_store import StalenessMonitor
 
     store = OnlineFeatureStore()
     registry = FeatureRegistry()
@@ -669,7 +669,7 @@ def test_staleness_monitor_summary():
 
 def test_staleness_monitor_event_history():
     """Test event history tracking."""
-    from ghtrader.feature_store import StalenessMonitor
+    from ghtrader.datasets.feature_store import StalenessMonitor
 
     store = OnlineFeatureStore()
     registry = FeatureRegistry()

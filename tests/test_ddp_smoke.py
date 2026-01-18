@@ -23,7 +23,7 @@ def test_ddp_training_smoke(tmp_path: Path):
     script.write_text(
         """
 import numpy as np
-from ghtrader.models import DeepLOBModel
+from ghtrader.research.models import DeepLOBModel
 
 X = np.random.randn(200, 11).astype("float32")
 y = np.random.randint(0, 3, size=200).astype("int64")

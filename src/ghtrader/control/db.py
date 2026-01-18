@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from ghtrader.util.time import now_iso as _now_iso
 
 
 @dataclass(frozen=True)
@@ -254,6 +253,41 @@ class JobStore:
                   AND pid IS NULL
                 """,
                 (now, int(pid), str(started_at), str(log_path) if log_path is not None else None, str(job_id)),
+            )
+            con.commit()
+            return bool(cur.rowcount == 1)
+
+    def try_mark_finished(self, *, job_id: str, status: str, exit_code: int, finished_at: str) -> bool:
+        """
+        Atomically finalize a job if it is still running/queued.
+
+        This prevents background waiters from overwriting a terminal status written by:
+        - operator actions (cancel)
+        - child processes (which may update their own status in the shared DB)
+        """
+        status_norm = str(status or "").strip().lower() or "failed"
+        if status_norm not in {"succeeded", "failed", "cancelled"}:
+            status_norm = "failed"
+        now = _now_iso()
+        with self._connect() as con:
+            cur = con.execute(
+                "UPDATE jobs SET status=?, exit_code=?, finished_at=?, updated_at=? "
+                "WHERE id=? AND status IN ('running','queued')",
+                (status_norm, int(exit_code), str(finished_at), now, str(job_id)),
+            )
+            con.commit()
+            return bool(cur.rowcount == 1)
+
+    def try_mark_failed(self, *, job_id: str, error: str, finished_at: str) -> bool:
+        """
+        Atomically mark a job failed with error if it is still running/queued.
+        """
+        now = _now_iso()
+        with self._connect() as con:
+            cur = con.execute(
+                "UPDATE jobs SET status='failed', error=?, finished_at=?, updated_at=? "
+                "WHERE id=? AND status IN ('running','queued')",
+                (str(error), str(finished_at), now, str(job_id)),
             )
             con.commit()
             return bool(cur.rowcount == 1)

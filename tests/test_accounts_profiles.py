@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from ghtrader.tq_runtime import (
+from ghtrader.tq.runtime import (
     canonical_account_profile,
     is_trade_account_configured,
     list_account_profiles_from_env,

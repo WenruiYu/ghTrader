@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ghtrader.pipeline import LatencyContext, LatencyTracker
+from ghtrader.research.pipeline import LatencyContext, LatencyTracker
 
 
 def test_latency_tracker_records_and_stats():

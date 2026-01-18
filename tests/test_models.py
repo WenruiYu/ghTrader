@@ -3,8 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import ghtrader.distributed as distu
-from ghtrader.models import DeepLOBModel, TCNModel, TLOBModel, SSMModel, TickSequenceDataset, create_model
+import ghtrader.research.distributed as distu
+from ghtrader.research.models import DeepLOBModel, TCNModel, TLOBModel, SSMModel, TickSequenceDataset, create_model
 
 
 class TestModelFactory:

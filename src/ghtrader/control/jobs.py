@@ -19,8 +19,7 @@ from ghtrader.control.db import JobRecord, JobStore
 log = structlog.get_logger()
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from ghtrader.util.time import now_iso as _now_iso
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -146,16 +145,10 @@ class JobManager:
         def _waiter() -> None:
             try:
                 exit_code = proc.wait()
-                # The child process is responsible for writing final status in the shared job DB.
-                # This waiter is best-effort backup and must not override an already-final status
-                # (e.g. cancelled or succeeded written by the child).
-                current = self.store.get_job(job_id)
-                if current is None or current.status not in {"running", "queued"}:
-                    return
                 status = "succeeded" if exit_code == 0 else "failed"
-                self.store.update_job(job_id, status=status, exit_code=int(exit_code), finished_at=_now_iso())
+                self.store.try_mark_finished(job_id=job_id, status=status, exit_code=int(exit_code), finished_at=_now_iso())
             except Exception as e:
-                self.store.update_job(job_id, status="failed", finished_at=_now_iso(), error=str(e))
+                self.store.try_mark_failed(job_id=job_id, error=str(e), finished_at=_now_iso())
 
         t = threading.Thread(target=_waiter, name=f"job-wait-{job_id}", daemon=True)
         t.start()
@@ -240,13 +233,10 @@ class JobManager:
         def _waiter() -> None:
             try:
                 exit_code = proc.wait()
-                current = self.store.get_job(job_id)
-                if current is None or current.status not in {"running", "queued"}:
-                    return
                 status = "succeeded" if exit_code == 0 else "failed"
-                self.store.update_job(job_id, status=status, exit_code=int(exit_code), finished_at=_now_iso())
+                self.store.try_mark_finished(job_id=job_id, status=status, exit_code=int(exit_code), finished_at=_now_iso())
             except Exception as e:
-                self.store.update_job(job_id, status="failed", finished_at=_now_iso(), error=str(e))
+                self.store.try_mark_failed(job_id=job_id, error=str(e), finished_at=_now_iso())
 
         t = threading.Thread(target=_waiter, name=f"job-wait-{job_id}", daemon=True)
         t.start()
@@ -255,7 +245,18 @@ class JobManager:
 
     def cancel_job(self, job_id: str) -> bool:
         job = self.store.get_job(job_id)
-        if job is None or job.pid is None:
+        if job is None:
+            return False
+
+        # Allow cancelling an unstarted queued job (pid is NULL).
+        if job.pid is None:
+            if str(job.status or "").strip().lower() == "queued":
+                try:
+                    self.store.update_job(job_id, status="cancelled", finished_at=_now_iso())
+                    return True
+                except Exception as e:
+                    self.store.update_job(job_id, error=f"cancel failed: {e}")
+                    return False
             return False
 
         pid = int(job.pid)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ghtrader.online import DelayedLabelBuffer, OnlineCalibrator
+from ghtrader.research.online import DelayedLabelBuffer, OnlineCalibrator
 
 
 def test_online_calibrator_predict_proba_shape():

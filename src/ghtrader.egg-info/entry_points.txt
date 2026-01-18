@@ -1,2 +1,0 @@
-[console_scripts]
-ghtrader = ghtrader.cli:entrypoint

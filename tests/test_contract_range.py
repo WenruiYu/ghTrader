@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ghtrader.tq_ingest import _iter_contract_yymms
+from ghtrader.tq.ingest import _iter_contract_yymms
 
 
 def test_iter_contract_yymms_inclusive_months():

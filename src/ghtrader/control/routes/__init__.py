@@ -1,0 +1,26 @@
+"""
+API route modules for the ghTrader control dashboard.
+
+Each module defines an APIRouter that is mounted in app.py.
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter
+
+from .health import router as health_router
+from .jobs import router as jobs_router
+from .accounts import router as accounts_router
+
+
+def build_api_router() -> APIRouter:
+    """Build combined API router from all sub-routers."""
+    api = APIRouter(prefix="/api")
+    api.include_router(jobs_router)
+    api.include_router(accounts_router)
+    return api
+
+
+def build_root_router() -> APIRouter:
+    """Build router for root-level routes (like /health)."""
+    return health_router

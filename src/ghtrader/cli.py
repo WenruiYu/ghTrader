@@ -26,7 +26,7 @@ import click
 import structlog
 
 from ghtrader.config import get_runs_dir, load_config
-from ghtrader.json_io import read_json as _read_json_shared, write_json_atomic as _write_json_atomic_shared
+from ghtrader.util.json_io import read_json as _read_json_shared, write_json_atomic as _write_json_atomic_shared
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -129,7 +129,7 @@ def main(ctx: click.Context, verbose: bool) -> None:
 def download(ctx: click.Context, symbol: str, start: datetime, end: datetime,
              data_dir: str, chunk_days: int) -> None:
     """Download historical L5 ticks for a symbol into QuestDB (canonical)."""
-    from ghtrader.tq_ingest import download_historical_ticks
+    from ghtrader.tq.ingest import download_historical_ticks
 
     log = structlog.get_logger()
     _acquire_locks([f"ticks:symbol={symbol}"])
@@ -141,7 +141,7 @@ def download(ctx: click.Context, symbol: str, start: datetime, end: datetime,
         end_date=end.date(),
         data_dir=Path(data_dir),
         chunk_days=int(chunk_days),
-        lake_version=lv,  # type: ignore[arg-type]
+        dataset_version=lv,  # type: ignore[arg-type]
     )
     log.info("download.done", symbol=symbol)
 
@@ -172,7 +172,7 @@ def download_contract_range(
     chunk_days: int,
 ) -> None:
     """Exhaustively backfill L5 ticks for a YYMM contract range (no akshare)."""
-    from ghtrader.tq_ingest import download_contract_range as _download_contract_range
+    from ghtrader.tq.ingest import download_contract_range as _download_contract_range
 
     log = structlog.get_logger()
     _acquire_locks([f"ticks_range:exchange={exchange},var={variety.lower()}"])
@@ -196,7 +196,7 @@ def download_contract_range(
         chunk_days=chunk_days,
         start_date=start_date.date() if start_date else None,
         end_date=end_date.date() if end_date else None,
-        lake_version="v2",
+        dataset_version="v2",
     )
     log.info("download_contract_range.done")
 
@@ -241,7 +241,7 @@ def update(
     """Check remote contract updates and fill forward (active + recently expired)."""
     import json
 
-    from ghtrader.update import run_update as _run_update
+    from ghtrader.data.update import run_update as _run_update
 
     _ = ctx
     log = structlog.get_logger()
@@ -284,8 +284,8 @@ def data_status(ctx: click.Context, exchange: str, variety: str | None, as_json:
     """Show data status overview from QuestDB index."""
     import json as json_mod
 
-    from ghtrader.questdb_client import make_questdb_query_config_from_env
-    from ghtrader.questdb_index import INDEX_TABLE_V2, ensure_index_tables
+    from ghtrader.questdb.client import make_questdb_query_config_from_env
+    from ghtrader.questdb.index import INDEX_TABLE_V2, ensure_index_tables
 
     log = structlog.get_logger()
 
@@ -308,7 +308,7 @@ def data_status(ctx: click.Context, exchange: str, variety: str | None, as_json:
         sum(rows_total) AS total_rows,
         max(CASE WHEN l5_present THEN 1 ELSE 0 END) AS has_l5
     FROM {INDEX_TABLE_V2}
-    WHERE symbol LIKE %s AND lake_version = 'v2' AND ticks_lake = 'raw'
+    WHERE symbol LIKE %s AND dataset_version = 'v2' AND ticks_kind = 'raw'
     GROUP BY symbol
     ORDER BY symbol
     """
@@ -370,14 +370,14 @@ def data_rebuild_index(
     """Rebuild QuestDB index tables from tick data."""
     import json as json_mod
 
-    from ghtrader.questdb_client import make_questdb_query_config_from_env
-    from ghtrader.questdb_index import (
+    from ghtrader.questdb.client import make_questdb_query_config_from_env
+    from ghtrader.questdb.index import (
         INDEX_TABLE_V2,
         bootstrap_symbol_day_index_from_ticks,
         bootstrap_symbol_day_index_parallel,
         ensure_index_tables,
     )
-    from ghtrader.tqsdk_catalog import get_contract_catalog
+    from ghtrader.tq.catalog import get_contract_catalog
 
     log = structlog.get_logger()
 
@@ -404,8 +404,8 @@ def data_rebuild_index(
             cfg=cfg,
             ticks_table="ghtrader_ticks_raw_v2",
             symbols=contracts,
-            lake_version="v2",
-            ticks_lake="raw",
+            dataset_version="v2",
+            ticks_kind="raw",
             index_table=INDEX_TABLE_V2,
             n_workers=workers,
         )
@@ -414,8 +414,8 @@ def data_rebuild_index(
             cfg=cfg,
             ticks_table="ghtrader_ticks_raw_v2",
             symbols=contracts,
-            lake_version="v2",
-            ticks_lake="raw",
+            dataset_version="v2",
+            ticks_kind="raw",
             index_table=INDEX_TABLE_V2,
         )
 
@@ -459,14 +459,14 @@ def data_index_bootstrap(
     """
     import json as json_mod
 
-    from ghtrader.questdb_client import make_questdb_query_config_from_env
-    from ghtrader.questdb_index import (
+    from ghtrader.questdb.client import make_questdb_query_config_from_env
+    from ghtrader.questdb.index import (
         INDEX_TABLE_V2,
         bootstrap_symbol_day_index_from_ticks,
         bootstrap_symbol_day_index_parallel,
         ensure_index_tables,
     )
-    from ghtrader.tqsdk_catalog import get_contract_catalog
+    from ghtrader.tq.catalog import get_contract_catalog
 
     log = structlog.get_logger()
 
@@ -493,8 +493,8 @@ def data_index_bootstrap(
             cfg=cfg,
             ticks_table="ghtrader_ticks_raw_v2",
             symbols=contracts,
-            lake_version="v2",
-            ticks_lake="raw",
+            dataset_version="v2",
+            ticks_kind="raw",
             index_table=INDEX_TABLE_V2,
             n_workers=workers,
         )
@@ -503,8 +503,8 @@ def data_index_bootstrap(
             cfg=cfg,
             ticks_table="ghtrader_ticks_raw_v2",
             symbols=contracts,
-            lake_version="v2",
-            ticks_lake="raw",
+            dataset_version="v2",
+            ticks_kind="raw",
             index_table=INDEX_TABLE_V2,
         )
 
@@ -559,16 +559,16 @@ def contracts_snapshot_build(
     import threading
     from datetime import timezone, timedelta
 
-    from ghtrader.questdb_client import make_questdb_query_config_from_env
-    from ghtrader.questdb_index import (
+    from ghtrader.questdb.client import make_questdb_query_config_from_env
+    from ghtrader.questdb.index import (
         INDEX_TABLE_V2,
         bootstrap_symbol_day_index_from_ticks,
         ensure_index_tables,
         list_symbols_from_index,
         query_contract_coverage_from_index,
     )
-    from ghtrader.tqsdk_catalog import get_contract_catalog
-    from ghtrader.tqsdk_l5_probe import load_probe_result
+    from ghtrader.tq.catalog import get_contract_catalog
+    from ghtrader.tq.l5_probe import load_probe_result
 
     _ = ctx
     log = structlog.get_logger()
@@ -585,7 +585,7 @@ def contracts_snapshot_build(
         "contracts_snapshot_build.start",
         exchange=ex,
         var=v,
-        lake_version=lv,
+        dataset_version=lv,
         refresh_catalog=bool(refresh_cat),
         questdb_full=bool(q_full),
         data_dir=str(dd),
@@ -649,8 +649,8 @@ def contracts_snapshot_build(
         ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
         idx_syms = list_symbols_from_index(
             cfg=cfg,
-            lake_version=lv,
-            ticks_lake="raw",
+            dataset_version=lv,
+            ticks_kind="raw",
             prefix=f"{ex}.{v}",
             index_table=INDEX_TABLE_V2,
             connect_timeout_s=2,
@@ -680,7 +680,7 @@ def contracts_snapshot_build(
             "error": err_msg,
             "exchange": ex,
             "var": v,
-            "lake_version": lv,
+            "dataset_version": lv,
             "contracts": [],
             "catalog_ok": False,
             "catalog_error": err_msg,
@@ -702,12 +702,12 @@ def contracts_snapshot_build(
     t_db_latest0 = time.time()
     try:
         ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
-        cov_latest = query_contract_coverage_from_index(cfg=cfg, symbols=syms, lake_version=lv, ticks_lake="raw", index_table=INDEX_TABLE_V2)
+        cov_latest = query_contract_coverage_from_index(cfg=cfg, symbols=syms, dataset_version=lv, ticks_kind="raw", index_table=INDEX_TABLE_V2)
         questdb_info = {"ok": True, "table": tbl, "index_table": INDEX_TABLE_V2, "coverage_mode": "index"}
         if not cov_latest:
             # Bootstrap may not have been run yet. Fall back to a fast "last-only" query so the UI still
             # shows freshness while the index gets populated by ingest or an explicit bootstrap job.
-            from ghtrader.questdb_queries import query_contract_last_coverage
+            from ghtrader.questdb.queries import query_contract_last_coverage
 
             try:
                 win_days = int(os.environ.get("GHTRADER_CONTRACTS_QUESTDB_LAST_WINDOW_DAYS", "60") or "60")
@@ -720,8 +720,8 @@ def contracts_snapshot_build(
                 cfg=cfg,
                 table=tbl,
                 symbols=syms,
-                lake_version=lv,
-                ticks_lake="raw",
+                dataset_version=lv,
+                ticks_kind="raw",
                 recent_days=recent_days,
             )
             questdb_info["coverage_mode"] = "index_empty_fallback_latest"
@@ -732,7 +732,7 @@ def contracts_snapshot_build(
         cov_latest = {}
         questdb_info = {"ok": False, "table": tbl, "index_table": INDEX_TABLE_V2, "coverage_mode": "index", "error": index_err}
         try:
-            from ghtrader.questdb_queries import query_contract_last_coverage
+            from ghtrader.questdb.queries import query_contract_last_coverage
 
             try:
                 win_days = int(os.environ.get("GHTRADER_CONTRACTS_QUESTDB_LAST_WINDOW_DAYS", "60") or "60")
@@ -745,8 +745,8 @@ def contracts_snapshot_build(
                 cfg=cfg,
                 table=tbl,
                 symbols=syms,
-                lake_version=lv,
-                ticks_lake="raw",
+                dataset_version=lv,
+                ticks_kind="raw",
                 recent_days=recent_days,
             )
             questdb_info = {
@@ -830,7 +830,7 @@ def contracts_snapshot_build(
     cal0 = []
     today_trading = None
     try:
-        from ghtrader.trading_calendar import get_trading_calendar
+        from ghtrader.data.trading_calendar import get_trading_calendar
 
         cal0 = get_trading_calendar(data_dir=dd, refresh=False, allow_download=False)
         today0 = datetime.now(timezone.utc).date()
@@ -849,16 +849,21 @@ def contracts_snapshot_build(
     t_comp0 = time.time()
     if bool(questdb_info.get("ok")):
         try:
-            comp_payload = _verify_completeness_payload(
+            from ghtrader.data.completeness import compute_day_level_completeness
+
+            comp_payload = compute_day_level_completeness(
                 exchange=ex,
                 variety=v,
                 symbols=syms,
+                contracts=None,
                 start_override=None,
                 end_override=None,
                 refresh_catalog=False,
-                allow_download=False,
+                allow_download_calendar=False,
                 data_dir=dd,
                 runs_dir=rd,
+                cfg=cfg,
+                include_day_sets=False,
             )
             for rr in comp_payload.get("contracts") or []:
                 if isinstance(rr, dict) and str(rr.get("symbol") or "").strip():
@@ -1071,7 +1076,7 @@ def contracts_snapshot_build(
         "ok": True,
         "exchange": ex,
         "var": v,
-        "lake_version": lv,
+        "dataset_version": lv,
         "contracts": contracts_rows,
         "questdb": questdb_info,
         "catalog_ok": bool(catalog_ok),
@@ -1137,8 +1142,8 @@ def contracts_snapshot_build(
                     cfg=cfg,
                     ticks_table=tbl,
                     symbols=syms,
-                    lake_version=lv,
-                    ticks_lake="raw",
+                    dataset_version=lv,
+                    ticks_kind="raw",
                     index_table=INDEX_TABLE_V2,
                 )
                 boot_ok = bool(boot.get("ok", False))
@@ -1161,14 +1166,14 @@ def contracts_snapshot_build(
             )
 
             if boot_ok:
-                cov_full = query_contract_coverage_from_index(cfg=cfg, symbols=syms, lake_version=lv, ticks_lake="raw", index_table=INDEX_TABLE_V2)
+                cov_full = query_contract_coverage_from_index(cfg=cfg, symbols=syms, dataset_version=lv, ticks_kind="raw", index_table=INDEX_TABLE_V2)
                 try:
                     cov_cache_path = _questdb_cov_cache_path(table=tbl)
                     payload = {
                         "ok": True,
                         "exchange": ex,
                         "var": v,
-                        "lake_version": lv,
+                        "dataset_version": lv,
                         "table": str(tbl),
                         "index_table": str(INDEX_TABLE_V2),
                         "index_bootstrap": boot,
@@ -1194,16 +1199,21 @@ def contracts_snapshot_build(
                 log.info("contracts_snapshot_build.stage_start", stage="completeness", phase="full", mode="index_no_data", n_symbols=int(len(syms)))
                 t_comp2_0 = time.time()
                 try:
-                    comp_payload2 = _verify_completeness_payload(
+                    from ghtrader.data.completeness import compute_day_level_completeness
+
+                    comp_payload2 = compute_day_level_completeness(
                         exchange=ex,
                         variety=v,
                         symbols=syms,
+                        contracts=None,
                         start_override=None,
                         end_override=None,
                         refresh_catalog=False,
-                        allow_download=False,
+                        allow_download_calendar=False,
                         data_dir=dd,
                         runs_dir=rd,
+                        cfg=cfg,
+                        include_day_sets=False,
                     )
                     for rr in comp_payload2.get("contracts") or []:
                         if isinstance(rr, dict) and str(rr.get("symbol") or "").strip():
@@ -1242,7 +1252,7 @@ def contracts_snapshot_build(
                     "ok": True,
                     "exchange": ex,
                     "var": v,
-                    "lake_version": lv,
+                    "dataset_version": lv,
                     "contracts": contracts_rows2,
                     "questdb": questdb_info2,
                     "catalog_ok": bool(catalog_ok),
@@ -1297,13 +1307,7 @@ def contracts_snapshot_build(
 # ---------------------------------------------------------------------------
 
 
-def _last_trading_day_leq(cal: list[date], d: date) -> date | None:
-    from bisect import bisect_right
-
-    if not cal:
-        return d if d.weekday() < 5 else None
-    i = bisect_right(cal, d)
-    return cal[i - 1] if i > 0 else None
+from ghtrader.data.trading_calendar import last_trading_day_leq as _last_trading_day_leq
 
 
 def _trading_days_between(cal: list[date], start: date, end: date) -> list[date]:
@@ -1333,8 +1337,8 @@ def _verify_completeness_payload(
 ) -> dict[str, Any]:
     from datetime import timedelta, timezone
 
-    from ghtrader.questdb_client import make_questdb_query_config_from_env
-    from ghtrader.questdb_index import (
+    from ghtrader.questdb.client import make_questdb_query_config_from_env
+    from ghtrader.questdb.index import (
         INDEX_TABLE_V2,
         NO_DATA_TABLE_V2,
         ensure_index_tables,
@@ -1342,8 +1346,8 @@ def _verify_completeness_payload(
         fetch_present_days_by_symbol,
         query_contract_coverage_from_index,
     )
-    from ghtrader.tqsdk_catalog import get_contract_catalog
-    from ghtrader.trading_calendar import get_trading_calendar, get_trading_days
+    from ghtrader.tq.catalog import get_contract_catalog
+    from ghtrader.data.trading_calendar import get_trading_calendar, get_trading_days
 
     ex = str(exchange).upper().strip() or "SHFE"
     v = str(variety).lower().strip() or "cu"
@@ -1383,7 +1387,7 @@ def _verify_completeness_payload(
     ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, no_data_table=NO_DATA_TABLE_V2, connect_timeout_s=2)
 
     # Coverage bounds (fast; index-backed).
-    cov = query_contract_coverage_from_index(cfg=cfg, symbols=syms, lake_version=lv, ticks_lake="raw", index_table=INDEX_TABLE_V2)
+    cov = query_contract_coverage_from_index(cfg=cfg, symbols=syms, dataset_version=lv, ticks_kind="raw", index_table=INDEX_TABLE_V2)
 
     # Trading calendar (cached; may download holidays only when explicitly allowed).
     cal = get_trading_calendar(data_dir=data_dir, refresh=False, allow_download=bool(allow_download))
@@ -1437,7 +1441,7 @@ def _verify_completeness_payload(
 
         # Last-resort fallback: infer date range from contract symbol (SHFE YYMM convention)
         if expected_first is None or expected_last is None:
-            from ghtrader.control.contract_status import infer_contract_date_range
+            from ghtrader.data.contract_status import infer_contract_date_range
 
             inferred_start, inferred_end = infer_contract_date_range(sym)
             if expected_first is None and inferred_start is not None:
@@ -1482,7 +1486,7 @@ def _verify_completeness_payload(
             "ok": True,
             "exchange": ex,
             "var": v,
-            "lake_version": lv,
+            "dataset_version": lv,
             "index_table": INDEX_TABLE_V2,
             "no_data_table": NO_DATA_TABLE_V2,
             "symbols": syms,
@@ -1510,8 +1514,12 @@ def _verify_completeness_payload(
     g0 = min(w[0] for w in windows.values())
     g1 = max(w[1] for w in windows.values())
 
-    present_by = fetch_present_days_by_symbol(cfg=cfg, symbols=list(windows.keys()), start_day=g0, end_day=g1, lake_version=lv, ticks_lake="raw", index_table=INDEX_TABLE_V2)
-    no_data_by = fetch_no_data_days_by_symbol(cfg=cfg, symbols=list(windows.keys()), start_day=g0, end_day=g1, lake_version=lv, ticks_lake="raw", no_data_table=NO_DATA_TABLE_V2)
+    present_by = fetch_present_days_by_symbol(
+        cfg=cfg, symbols=list(windows.keys()), start_day=g0, end_day=g1, dataset_version=lv, ticks_kind="raw", index_table=INDEX_TABLE_V2
+    )
+    no_data_by = fetch_no_data_days_by_symbol(
+        cfg=cfg, symbols=list(windows.keys()), start_day=g0, end_day=g1, dataset_version=lv, ticks_kind="raw", no_data_table=NO_DATA_TABLE_V2
+    )
 
     rows_out: list[dict[str, Any]] = []
     missing_total = 0
@@ -1540,7 +1548,7 @@ def _verify_completeness_payload(
         qc.pop("present_dates", None)  # never include bulky per-day sets in reports/snapshots
 
         # If the symbol-day index doesn't cover this symbol yet, we cannot compute completeness safely.
-        # Mark as index_missing instead of treating all days as missing (prevents destructive fill-missing runs).
+        # Mark as index_missing instead of treating all days as missing (prevents destructive repair/health runs).
         index_missing = not bool(qc)
         if index_missing:
             skipped_symbols.append(
@@ -1619,7 +1627,7 @@ def _verify_completeness_payload(
         "ok": True,
         "exchange": ex,
         "var": v,
-        "lake_version": lv,
+        "dataset_version": lv,
         "index_table": INDEX_TABLE_V2,
         "no_data_table": NO_DATA_TABLE_V2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1646,22 +1654,24 @@ def _verify_completeness_payload(
     }
 
 
-@data_group.command("verify")
+@data_group.command("diagnose")
 @click.option("--exchange", default="SHFE", show_default=True, help="Exchange (e.g. SHFE)")
 @click.option("--var", "variety", default="cu", show_default=True, help="Variety code (e.g. cu)")
 @click.option("--symbol", "-s", "symbols", multiple=True, help="Optional symbol(s) (default: all in catalog)")
+@click.option("--thoroughness", default="standard", show_default=True, type=click.Choice(["quick", "standard", "comprehensive"]), help="Validation thoroughness")
 @click.option("--start", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional expected start override (YYYY-MM-DD)")
 @click.option("--end", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional expected end override (YYYY-MM-DD)")
 @click.option("--refresh-catalog", default=0, type=int, show_default=True, help="Refresh catalog cache (network) (0/1)")
 @click.option("--data-dir", default="data", show_default=True, help="Data directory root")
 @click.option("--runs-dir", default="runs", show_default=True, help="Runs directory root")
-@click.option("--json", "as_json", is_flag=True, help="Print full JSON payload")
+@click.option("--json", "as_json", is_flag=True, help="Print full JSON report")
 @click.pass_context
-def data_verify(
+def data_diagnose(
     ctx: click.Context,
     exchange: str,
     variety: str,
     symbols: tuple[str, ...],
+    thoroughness: str,
     start: datetime | None,
     end: datetime | None,
     refresh_catalog: int,
@@ -1670,13 +1680,13 @@ def data_verify(
     as_json: bool,
 ) -> None:
     """
-    Verify QuestDB completeness using `ghtrader_symbol_day_index_v2` + `ghtrader_no_data_days_v2`.
+    Diagnose data integrity and quality (QuestDB-first).
+
+    Writes a report under runs/control/reports/data_diagnose/.
     """
     import json
 
     _ = ctx
-    log = structlog.get_logger()
-
     ex = str(exchange).upper().strip() or "SHFE"
     v = str(variety).lower().strip() or "cu"
     dd = Path(data_dir)
@@ -1686,182 +1696,190 @@ def data_verify(
     s1 = end.date() if end else None
     refresh_cat = bool(int(refresh_catalog or 0))
 
-    log.info("data.verify.start", exchange=ex, var=v, symbols=len(syms), start=str(s0) if s0 else "", end=str(s1) if s1 else "", refresh_catalog=bool(refresh_cat))
-    payload = _verify_completeness_payload(
+    from ghtrader.data.diagnose import run_diagnose, write_diagnose_report
+
+    rep = run_diagnose(
         exchange=ex,
-        variety=v,
-        symbols=syms,
-        start_override=s0,
-        end_override=s1,
+        var=v,
+        symbols=syms if syms else None,
+        thoroughness=str(thoroughness),
+        start=s0,
+        end=s1,
         refresh_catalog=bool(refresh_cat),
+        allow_download_calendar=True,
         data_dir=dd,
         runs_dir=rd,
     )
+    out_path = write_diagnose_report(report=rep, runs_dir=rd)
 
-    out_dir = rd / "control" / "reports" / "data_verify"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    run_id = uuid.uuid4().hex[:12]
-    out_path = out_dir / f"verify_exchange={ex}_var={v}_{run_id}.json"
-    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    tmp.replace(out_path)
-
-    summary = dict(payload.get("summary") or {})
+    summary = dict(rep.summary or {})
+    summary["ok"] = True
     summary["report_path"] = str(out_path)
-    summary["ok"] = bool(payload.get("ok", False))
+    summary["run_id"] = str(rep.run_id)
     click.echo(json.dumps(summary, ensure_ascii=False, indent=2, default=str, sort_keys=True))
-
     if as_json:
-        click.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str, sort_keys=True))
+        click.echo(json.dumps(rep.to_dict(), ensure_ascii=False, indent=2, default=str, sort_keys=True))
 
 
-@data_group.command("fill-missing")
-@click.option("--exchange", default="SHFE", show_default=True, help="Exchange (e.g. SHFE)")
-@click.option("--var", "variety", default="cu", show_default=True, help="Variety code (e.g. cu)")
-@click.option("--symbol", "-s", "symbols", multiple=True, help="Optional symbol(s) (default: all in catalog)")
-@click.option("--start", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional expected start override (YYYY-MM-DD)")
-@click.option("--end", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional expected end override (YYYY-MM-DD)")
-@click.option("--refresh-catalog", default=0, type=int, show_default=True, help="Refresh catalog cache (network) (0/1)")
+@data_group.command("repair")
+@click.option("--report", "report_path", required=True, help="Diagnose report JSON path")
+@click.option("--auto-only/--no-auto-only", default=True, show_default=True, help="Execute only auto-fixable actions")
+@click.option("--dry-run/--no-dry-run", default=False, show_default=True, help="Plan only (no changes)")
+@click.option("--refresh-catalog", default=0, type=int, show_default=True, help="Refresh catalog cache (network) before repairs (0/1)")
 @click.option("--chunk-days", default=5, type=int, show_default=True, help="Days per download chunk")
 @click.option("--data-dir", default="data", show_default=True, help="Data directory root")
 @click.option("--runs-dir", default="runs", show_default=True, help="Runs directory root")
 @click.pass_context
-def data_fill_missing(
+def data_repair(
     ctx: click.Context,
-    exchange: str,
-    variety: str,
-    symbols: tuple[str, ...],
-    start: datetime | None,
-    end: datetime | None,
+    report_path: str,
+    auto_only: bool,
+    dry_run: bool,
     refresh_catalog: int,
     chunk_days: int,
     data_dir: str,
     runs_dir: str,
 ) -> None:
     """
-    Fill missing days (expected vs index/no-data) by downloading from TqSdk into QuestDB.
+    Execute a repair plan generated from a diagnose report.
     """
     import json
-    from datetime import timezone
-
-    from ghtrader.tq_ingest import download_historical_ticks
 
     _ = ctx
-    log = structlog.get_logger()
+    dd = Path(data_dir)
+    rd = Path(runs_dir)
+    rp = Path(str(report_path)).expanduser().resolve()
+    if not rp.exists():
+        raise click.ClickException(f"Report not found: {rp}")
 
+    from ghtrader.data.repair import execute_repair_plan, generate_repair_plan, load_diagnose_report
+
+    rep = load_diagnose_report(rp)
+    plan = generate_repair_plan(report=rep, include_refresh_catalog=bool(int(refresh_catalog or 0)), chunk_days=int(chunk_days))
+    res = execute_repair_plan(plan=plan, dry_run=bool(dry_run), auto_only=bool(auto_only), data_dir=dd, runs_dir=rd)
+    out = {"ok": bool(res.ok), "run_id": str(res.run_id), "actions": res.actions}
+    click.echo(json.dumps(out, ensure_ascii=False, indent=2, default=str, sort_keys=True))
+    if not bool(res.ok):
+        raise SystemExit(1)
+
+
+@data_group.command("health")
+@click.option("--exchange", default="SHFE", show_default=True, help="Exchange (e.g. SHFE)")
+@click.option("--var", "variety", default="cu", show_default=True, help="Variety code (e.g. cu)")
+@click.option("--thoroughness", default="standard", show_default=True, type=click.Choice(["quick", "standard", "comprehensive"]), help="Validation thoroughness")
+@click.option("--start", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional expected start override (YYYY-MM-DD)")
+@click.option("--end", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional expected end override (YYYY-MM-DD)")
+@click.option("--auto-repair/--no-auto-repair", default=False, show_default=True, help="If enabled, run auto-repair after diagnose")
+@click.option("--dry-run/--no-dry-run", default=False, show_default=True, help="If auto-repair, plan only (no changes)")
+@click.option("--refresh-catalog", default=0, type=int, show_default=True, help="Refresh catalog cache (network) (0/1)")
+@click.option("--chunk-days", default=5, type=int, show_default=True, help="Days per download chunk")
+@click.option("--data-dir", default="data", show_default=True, help="Data directory root")
+@click.option("--runs-dir", default="runs", show_default=True, help="Runs directory root")
+@click.pass_context
+def data_health(
+    ctx: click.Context,
+    exchange: str,
+    variety: str,
+    thoroughness: str,
+    start: datetime | None,
+    end: datetime | None,
+    auto_repair: bool,
+    dry_run: bool,
+    refresh_catalog: int,
+    chunk_days: int,
+    data_dir: str,
+    runs_dir: str,
+) -> None:
+    """
+    Convenience workflow: diagnose → (optional) auto-repair → summarize manual-review items.
+    """
+    import json
+
+    _ = ctx
     ex = str(exchange).upper().strip() or "SHFE"
     v = str(variety).lower().strip() or "cu"
     dd = Path(data_dir)
     rd = Path(runs_dir)
-    syms = [str(s).strip() for s in symbols if str(s).strip()]
+    refresh_cat = bool(int(refresh_catalog or 0))
     s0 = start.date() if start else None
     s1 = end.date() if end else None
-    refresh_cat = bool(int(refresh_catalog or 0))
 
-    log.info("data.fill_missing.start", exchange=ex, var=v, symbols=len(syms), start=str(s0) if s0 else "", end=str(s1) if s1 else "", refresh_catalog=bool(refresh_cat))
-    payload = _verify_completeness_payload(
+    from ghtrader.data.diagnose import run_diagnose, write_diagnose_report
+    from ghtrader.data.repair import execute_repair_plan, generate_repair_plan
+
+    rep = run_diagnose(
         exchange=ex,
-        variety=v,
-        symbols=syms,
-        start_override=s0,
-        end_override=s1,
+        var=v,
+        symbols=None,
+        thoroughness=str(thoroughness),
+        start=s0,
+        end=s1,
         refresh_catalog=bool(refresh_cat),
+        allow_download_calendar=True,
         data_dir=dd,
         runs_dir=rd,
     )
+    diag_path = write_diagnose_report(report=rep, runs_dir=rd)
 
-    # Check for symbols skipped due to missing date range
-    skipped_by_range = [s for s in (payload.get("skipped_symbols") or []) if s.get("reason") in ("no_catalog_or_questdb_data", "missing_start_date", "missing_end_date", "missing_date_range")]
-    if skipped_by_range:
-        # If explicit symbols were provided but couldn't determine date range
-        if syms and not (s0 and s1):
-            for s in skipped_by_range:
-                log.error(
-                    "data.fill_missing.no_date_range",
-                    symbol=s.get("symbol"),
-                    reason=s.get("reason"),
-                    has_catalog_data=s.get("has_catalog_data"),
-                    has_questdb_data=s.get("has_questdb_data"),
-                    hint="Provide --start and --end dates, or use --refresh-catalog 1 to fetch catalog metadata",
-                )
-            click.echo(json.dumps({
-                "ok": False,
-                "error": "cannot_determine_date_range",
-                "skipped_symbols": skipped_by_range,
-                "hint": "Provide --start YYYY-MM-DD and --end YYYY-MM-DD, or use --refresh-catalog 1",
-            }, indent=2))
-            raise SystemExit(1)
-        else:
-            # Log warning but continue (symbols from catalog may have been skipped)
-            for s in skipped_by_range:
-                log.warning(
-                    "data.fill_missing.skipped_symbol",
-                    symbol=s.get("symbol"),
-                    reason=s.get("reason"),
-                )
-
-    filled: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
-
-    # Warn if many symbols are unindexed (PRD: index_missing symbols must be skipped)
-    index_missing_count = sum(1 for r in (payload.get("contracts") or []) if isinstance(r, dict) and r.get("index_missing") is True)
-    skipped_from_verify = payload.get("skipped_symbols") or []
-    index_missing_from_skipped = sum(1 for s in skipped_from_verify if s.get("reason") == "index_missing")
-    total_index_missing = index_missing_count + index_missing_from_skipped
-    if total_index_missing > 0:
-        log.warning(
-            "data.fill_missing.index_missing_symbols",
-            count=total_index_missing,
-            hint="Run 'ghtrader data index-bootstrap' to populate the QuestDB index first",
-        )
-
-    for r in payload.get("contracts") or []:
-        if not isinstance(r, dict):
-            continue
-        sym = str(r.get("symbol") or "").strip()
-
-        # PRD: refuse unindexed symbols to avoid misleading "everything is missing" results
-        if r.get("index_missing") is True:
-            skipped.append({"symbol": sym, "reason": "index_missing", "hint": "Run 'ghtrader data index-bootstrap' first"})
-            continue
-
-        mf = str(r.get("missing_first") or "").strip()
-        ml = str(r.get("missing_last") or "").strip()
-        miss_n = int(r.get("missing_days") or 0) if r.get("missing_days") is not None else 0
-        if not sym or miss_n <= 0 or not mf or not ml:
-            continue
-        try:
-            d0 = date.fromisoformat(mf)
-            d1 = date.fromisoformat(ml)
-        except Exception:
-            skipped.append({"symbol": sym, "reason": "invalid_missing_range"})
-            continue
-
-        _acquire_locks([f"ticks:symbol={sym}"])
-        log.info("data.fill_missing.symbol_start", symbol=sym, start=str(d0), end=str(d1), missing_days=miss_n)
-        try:
-            download_historical_ticks(
-                symbol=sym,
-                start_date=d0,
-                end_date=d1,
-                data_dir=dd,
-                chunk_days=int(chunk_days),
-                lake_version="v2",  # type: ignore[arg-type]
-            )
-            filled.append({"symbol": sym, "start": d0.isoformat(), "end": d1.isoformat(), "missing_days": miss_n})
-        except Exception as e:
-            skipped.append({"symbol": sym, "reason": "download_failed", "error": str(e)})
-
-    out = {
+    out: dict[str, Any] = {
         "ok": True,
         "exchange": ex,
         "var": v,
-        "filled": filled,
-        "skipped": skipped,
-        "count": int(len(filled)),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "diagnose_report_path": str(diag_path),
+        "run_id": str(rep.run_id),
+        "findings": {
+            "auto_fixable": int(len(rep.auto_fixable or [])),
+            "manual_review": int(len(rep.manual_review or [])),
+            "unfixable": int(len(rep.unfixable or [])),
+        },
+        "manual_review_codes": sorted({str(f.code) for f in (rep.manual_review or []) if str(f.code)}),
     }
+
+    if bool(auto_repair):
+        if rep.unfixable:
+            out["ok"] = False
+            out["error"] = "unfixable_findings"
+            out["hint"] = "Resolve unfixable findings before auto-repair"
+        else:
+            plan = generate_repair_plan(report=rep, include_refresh_catalog=bool(refresh_cat), chunk_days=int(chunk_days))
+            res = execute_repair_plan(plan=plan, dry_run=bool(dry_run), auto_only=True, data_dir=dd, runs_dir=rd)
+            out["repair_run_id"] = str(plan.run_id)
+            out["repair_ok"] = bool(res.ok)
+            out["repair_actions"] = res.actions
+            if not bool(res.ok):
+                out["ok"] = False
+            else:
+                # If we bootstrapped the index, re-run a quick diagnose and run a second repair pass
+                # so missing-days backfills can be computed after the index becomes available.
+                did_bootstrap = any(a.kind == "bootstrap_index" for a in (plan.actions or []))
+                if did_bootstrap and not bool(dry_run):
+                    rep2 = run_diagnose(
+                        exchange=ex,
+                        var=v,
+                        symbols=None,
+                        thoroughness="quick",
+                        start=s0,
+                        end=s1,
+                        refresh_catalog=False,
+                        allow_download_calendar=True,
+                        data_dir=dd,
+                        runs_dir=rd,
+                    )
+                    diag_path2 = write_diagnose_report(report=rep2, runs_dir=rd)
+                    out["diagnose_report_path_after_bootstrap"] = str(diag_path2)
+                    if not rep2.unfixable:
+                        plan2 = generate_repair_plan(report=rep2, include_refresh_catalog=False, chunk_days=int(chunk_days))
+                        if any(a.kind != "bootstrap_index" for a in (plan2.actions or [])):
+                            res2 = execute_repair_plan(plan=plan2, dry_run=False, auto_only=True, data_dir=dd, runs_dir=rd)
+                            out["repair_run_id_2"] = str(plan2.run_id)
+                            out["repair_ok_2"] = bool(res2.ok)
+                            out["repair_actions_2"] = res2.actions
+                            if not bool(res2.ok):
+                                out["ok"] = False
+
     click.echo(json.dumps(out, ensure_ascii=False, indent=2, default=str, sort_keys=True))
+    if not bool(out.get("ok", False)):
+        raise SystemExit(1)
 
 
 @data_group.command("l5-start")
@@ -1889,9 +1907,9 @@ def data_l5_start(
     import json
     from datetime import timezone
 
-    from ghtrader.questdb_client import make_questdb_query_config_from_env
-    from ghtrader.questdb_index import INDEX_TABLE_V2, ensure_index_tables, query_contract_coverage_from_index
-    from ghtrader.tqsdk_catalog import get_contract_catalog
+    from ghtrader.questdb.client import make_questdb_query_config_from_env
+    from ghtrader.questdb.index import INDEX_TABLE_V2, ensure_index_tables, query_contract_coverage_from_index
+    from ghtrader.tq.catalog import get_contract_catalog
 
     _ = ctx
     log = structlog.get_logger()
@@ -1917,7 +1935,7 @@ def data_l5_start(
 
     cfg = make_questdb_query_config_from_env()
     ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
-    cov = query_contract_coverage_from_index(cfg=cfg, symbols=syms, lake_version="v2", ticks_lake="raw", index_table=INDEX_TABLE_V2)
+    cov = query_contract_coverage_from_index(cfg=cfg, symbols=syms, dataset_version="v2", ticks_kind="raw", index_table=INDEX_TABLE_V2)
 
     rows: list[dict[str, Any]] = []
     firsts: list[str] = []
@@ -1935,7 +1953,7 @@ def data_l5_start(
         "ok": True,
         "exchange": ex,
         "var": v,
-        "lake_version": "v2",
+        "dataset_version": "v2",
         "index_table": INDEX_TABLE_V2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "catalog": {"ok": bool(cat.get("ok", False)), "cached_at": cat.get("cached_at"), "source": cat.get("source")},
@@ -1991,7 +2009,7 @@ def probe_l5(ctx: click.Context, symbols: tuple[str, ...], data_dir: str, probe_
     """
     import json
 
-    from ghtrader.tqsdk_l5_probe import probe_l5_for_symbol
+    from ghtrader.tq.l5_probe import probe_l5_for_symbol
 
     log = structlog.get_logger()
     sym_list = [str(s).strip() for s in symbols if str(s).strip()]
@@ -2040,7 +2058,7 @@ def account_group(ctx: click.Context) -> None:
 def account_list(as_json: bool) -> None:
     import json
 
-    from ghtrader.tq_runtime import is_trade_account_configured, list_account_profiles_from_env
+    from ghtrader.tq.runtime import is_trade_account_configured, list_account_profiles_from_env
 
     profiles = list_account_profiles_from_env()
     out = [{"profile": p, "configured": bool(is_trade_account_configured(profile=p))} for p in profiles]
@@ -2069,7 +2087,7 @@ def account_verify(ctx: click.Context, account_profile: str, timeout_sec: float,
     from datetime import timezone
 
     from ghtrader.config import get_runs_dir
-    from ghtrader.tq_runtime import (
+    from ghtrader.tq.runtime import (
         canonical_account_profile,
         create_tq_account,
         create_tq_api,
@@ -2181,6 +2199,121 @@ def account_verify(ctx: click.Context, account_profile: str, timeout_sec: float,
 
 
 # ---------------------------------------------------------------------------
+# gateway (AccountGateway; OMS/EMS per account profile)
+# ---------------------------------------------------------------------------
+
+
+@main.group("gateway")
+@click.pass_context
+def gateway_group(ctx: click.Context) -> None:
+    """AccountGateway (OMS/EMS): per-account-profile gateway process."""
+    _ = ctx
+
+
+@gateway_group.command("run")
+@click.option("--account", "account_profile", default="default", show_default=True, type=str, help="Account profile to run")
+@click.option("--runs-dir", default="runs", show_default=True, type=str, help="Runs directory root")
+@click.option("--snapshot-interval-sec", default=10.0, show_default=True, type=float, help="Snapshot interval (seconds)")
+@click.option("--poll-interval-sec", default=0.5, show_default=True, type=float, help="wait_update polling interval (seconds)")
+@click.pass_context
+def gateway_run(
+    ctx: click.Context,
+    account_profile: str,
+    runs_dir: str,
+    snapshot_interval_sec: float,
+    poll_interval_sec: float,
+) -> None:
+    """
+    Run the AccountGateway loop for a broker account profile.
+
+    This process owns TqApi connectivity and persists transparent artifacts under:
+      runs/gateway/account=<PROFILE>/
+    """
+    from ghtrader.tq.gateway import run_gateway
+    from ghtrader.tq.runtime import canonical_account_profile
+
+    _ = ctx
+    prof = canonical_account_profile(account_profile)
+    _acquire_locks([f"trade:account={prof}"])
+    run_gateway(
+        account_profile=prof,
+        runs_dir=Path(runs_dir),
+        snapshot_interval_sec=float(snapshot_interval_sec),
+        poll_interval_sec=float(poll_interval_sec),
+    )
+
+
+# ---------------------------------------------------------------------------
+# strategy (AI StrategyRunner; consumes gateway market snapshots)
+# ---------------------------------------------------------------------------
+
+
+@main.group("strategy")
+@click.pass_context
+def strategy_group(ctx: click.Context) -> None:
+    """AI StrategyRunner: reads gateway state, writes targets."""
+    _ = ctx
+
+
+@strategy_group.command("run")
+@click.option("--account", "account_profile", default="default", show_default=True, type=str, help="Account profile to bind targets to")
+@click.option(
+    "--symbols",
+    "-s",
+    required=True,
+    multiple=True,
+    help="Execution symbols (can specify multiple). Must match gateway subscribed symbols.",
+)
+@click.option(
+    "--model",
+    "model_name",
+    default="xgboost",
+    show_default=True,
+    type=click.Choice(["logistic", "xgboost", "lightgbm", "deeplob", "transformer", "tcn", "tlob", "ssm"]),
+    help="Model type",
+)
+@click.option("--horizon", default=50, show_default=True, type=int, help="Label horizon")
+@click.option("--threshold-up", default=0.6, show_default=True, type=float, help="Long threshold")
+@click.option("--threshold-down", default=0.6, show_default=True, type=float, help="Short threshold")
+@click.option("--position-size", default=1, show_default=True, type=int, help="Target position size")
+@click.option("--artifacts-dir", default="artifacts", show_default=True, type=str, help="Artifacts directory")
+@click.option("--runs-dir", default="runs", show_default=True, type=str, help="Runs directory")
+@click.option("--poll-interval-sec", default=0.5, show_default=True, type=float, help="Poll interval (seconds)")
+@click.pass_context
+def strategy_run(
+    ctx: click.Context,
+    account_profile: str,
+    symbols: tuple[str, ...],
+    model_name: str,
+    horizon: int,
+    threshold_up: float,
+    threshold_down: float,
+    position_size: int,
+    artifacts_dir: str,
+    runs_dir: str,
+    poll_interval_sec: float,
+) -> None:
+    from ghtrader.trading.strategy_runner import StrategyConfig, run_strategy_runner
+    from ghtrader.tq.runtime import canonical_account_profile
+
+    _ = ctx
+    prof = canonical_account_profile(account_profile)
+    cfg = StrategyConfig(
+        account_profile=prof,
+        symbols=[str(s).strip() for s in symbols if str(s).strip()],
+        model_name=model_name,  # type: ignore[arg-type]
+        horizon=int(horizon),
+        threshold_up=float(threshold_up),
+        threshold_down=float(threshold_down),
+        position_size=int(position_size),
+        artifacts_dir=Path(artifacts_dir),
+        runs_dir=Path(runs_dir),
+        poll_interval_sec=float(poll_interval_sec),
+    )
+    run_strategy_runner(cfg)
+
+
+# ---------------------------------------------------------------------------
 # record
 # ---------------------------------------------------------------------------
 
@@ -2191,13 +2324,13 @@ def account_verify(ctx: click.Context, account_profile: str, timeout_sec: float,
 @click.pass_context
 def record(ctx: click.Context, symbols: tuple[str, ...], data_dir: str) -> None:
     """Run live tick recorder (QuestDB canonical)."""
-    from ghtrader.tq_ingest import run_live_recorder
+    from ghtrader.tq.ingest import run_live_recorder
 
     log = structlog.get_logger()
     _acquire_locks([f"ticks:symbol={s}" for s in symbols])
     log.info("record.start", symbols=symbols)
     lv = "v2"
-    run_live_recorder(symbols=list(symbols), data_dir=Path(data_dir), lake_version=lv)  # type: ignore[arg-type]
+    run_live_recorder(symbols=list(symbols), data_dir=Path(data_dir), dataset_version=lv)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -2210,11 +2343,12 @@ def record(ctx: click.Context, symbols: tuple[str, ...], data_dir: str) -> None:
 @click.option("--horizons", default="10,50,200", help="Comma-separated label horizons (ticks)")
 @click.option("--threshold-k", default=1, type=int, help="Label threshold in price ticks")
 @click.option(
+    "--ticks-kind",
     "--ticks-lake",
     default="raw",
     type=click.Choice(["raw", "main_l5"]),
     show_default=True,
-    help="Which ticks lake to read from (raw ticks vs derived main-with-depth ticks).",
+    help="Which ticks kind to read from (raw ticks vs derived main-with-depth ticks).",
 )
 @click.option(
     "--overwrite/--no-overwrite",
@@ -2224,26 +2358,26 @@ def record(ctx: click.Context, symbols: tuple[str, ...], data_dir: str) -> None:
 )
 @click.pass_context
 def build(ctx: click.Context, symbol: str, data_dir: str, horizons: str,
-          threshold_k: int, ticks_lake: str, overwrite: bool) -> None:
+          threshold_k: int, ticks_kind: str, overwrite: bool) -> None:
     """Build features and labels (QuestDB-first)."""
-    from ghtrader.features import FactorEngine
-    from ghtrader.labels import build_labels_for_symbol
+    from ghtrader.datasets.features import FactorEngine
+    from ghtrader.datasets.labels import build_labels_for_symbol
 
     log = structlog.get_logger()
-    if str(symbol).startswith("KQ.m@") and str(ticks_lake) != "main_l5":
+    if str(symbol).startswith("KQ.m@") and str(ticks_kind) != "main_l5":
         raise click.ClickException(
             "Continuous symbols (KQ.m@...) are L1-only in raw ticks. "
             "Build on the derived L5 dataset instead: run `ghtrader main-l5 --var <var>` "
-            "and then `ghtrader build --ticks-lake main_l5 ...`."
+            "and then `ghtrader build --ticks-kind main_l5 ...`."
         )
-    _acquire_locks([f"build:symbol={symbol},ticks_lake={ticks_lake}"])
+    _acquire_locks([f"build:symbol={symbol},ticks_kind={ticks_kind}"])
     horizon_list = [int(h.strip()) for h in horizons.split(",")]
     log.info(
         "build.start",
         symbol=symbol,
         horizons=horizon_list,
         threshold_k=threshold_k,
-        ticks_lake=ticks_lake,
+        ticks_kind=ticks_kind,
         overwrite=overwrite,
     )
 
@@ -2253,7 +2387,7 @@ def build(ctx: click.Context, symbol: str, data_dir: str, horizons: str,
         data_dir=Path(data_dir),
         horizons=horizon_list,
         threshold_k=threshold_k,
-        ticks_lake=ticks_lake,  # type: ignore[arg-type]
+        ticks_kind=ticks_kind,  # type: ignore[arg-type]
         overwrite=overwrite,
     )
 
@@ -2262,7 +2396,7 @@ def build(ctx: click.Context, symbol: str, data_dir: str, horizons: str,
     engine.build_features_for_symbol(
         symbol=symbol,
         data_dir=Path(data_dir),
-        ticks_lake=ticks_lake,  # type: ignore[arg-type]
+        ticks_kind=ticks_kind,  # type: ignore[arg-type]
         overwrite=overwrite,
     )
 
@@ -2297,7 +2431,7 @@ def train(ctx: click.Context, model: str, symbol: str, data_dir: str,
           artifacts_dir: str, horizon: int, gpus: int,
           epochs: int, batch_size: int, seq_len: int, lr: float, ddp: bool) -> None:
     """Train a model (baseline or deep)."""
-    from ghtrader.models import train_model
+    from ghtrader.research.models import train_model
 
     log = structlog.get_logger()
     _acquire_locks([f"train:symbol={symbol},model={model},h={horizon}"])
@@ -2351,7 +2485,7 @@ def train(ctx: click.Context, model: str, symbol: str, data_dir: str,
 def backtest(ctx: click.Context, model: str, symbol: str, start: datetime,
              end: datetime, data_dir: str, artifacts_dir: str, runs_dir: str) -> None:
     """Run TqSdk backtest harness with trained model."""
-    from ghtrader.eval import run_backtest
+    from ghtrader.tq.eval import run_backtest
 
     log = structlog.get_logger()
     log.info("backtest.start", model=model, symbol=symbol, start=start.date(), end=end.date())
@@ -2380,7 +2514,7 @@ def backtest(ctx: click.Context, model: str, symbol: str, start: datetime,
 def paper(ctx: click.Context, model: str, symbols: tuple[str, ...],
           artifacts_dir: str) -> None:
     """Run paper-trading loop with online calibrator (no real orders)."""
-    from ghtrader.online import run_paper_trading
+    from ghtrader.tq.paper import run_paper_trading
 
     log = structlog.get_logger()
     log.info("paper.start", model=model, symbols=symbols)
@@ -2389,190 +2523,6 @@ def paper(ctx: click.Context, model: str, symbols: tuple[str, ...],
         symbols=list(symbols),
         artifacts_dir=Path(artifacts_dir),
     )
-
-
-# ---------------------------------------------------------------------------
-# trade (paper/sim/live; subprocess-friendly)
-# ---------------------------------------------------------------------------
-
-@main.command()
-@click.option(
-    "--mode",
-    default="paper",
-    show_default=True,
-    type=click.Choice(["paper", "sim", "live"]),
-    help="Trading mode (paper=no orders, sim=simulated orders, live=real account; safety-gated).",
-)
-@click.option(
-    "--sim-account",
-    default="tqsim",
-    show_default=True,
-    type=click.Choice(["tqsim", "tqkq"]),
-    help="Sim account type for paper/sim modes.",
-)
-@click.option(
-    "--executor",
-    default="targetpos",
-    show_default=True,
-    type=click.Choice(["targetpos", "direct"]),
-    help="Execution style: TargetPosTask vs direct insert/cancel.",
-)
-@click.option(
-    "--model",
-    "-m",
-    required=True,
-    type=click.Choice(["logistic", "xgboost", "lightgbm", "deeplob", "transformer", "tcn", "tlob", "ssm"]),
-    help="Model type to use for signals",
-)
-@click.option("--symbols", "-s", required=True, multiple=True, help="Symbols to trade (can specify multiple)")
-@click.option("--data-dir", default="data", help="Data directory root (for schedule resolution)")
-@click.option("--artifacts-dir", default="artifacts", help="Artifacts directory (for model loading)")
-@click.option("--runs-dir", default="runs", help="Runs directory (snapshots/events under runs/trading/)")
-@click.option("--horizon", default=50, type=int, help="Label horizon the model was trained on")
-@click.option("--threshold-up", default=0.6, type=float, help="Probability threshold for long signal")
-@click.option("--threshold-down", default=0.6, type=float, help="Probability threshold for short signal")
-@click.option("--position-size", default=1, type=int, help="Lots per signal (±position_size)")
-@click.option("--max-position", default=1, type=int, help="Max absolute net position per symbol")
-@click.option("--max-order-size", default=1, type=int, help="Max lots per order (direct executor splits)")
-@click.option("--max-ops-per-sec", default=10, type=int, help="Max order ops per second (insert/cancel)")
-@click.option("--max-daily-loss", default=None, type=float, help="Kill-switch: max absolute loss from start balance")
-@click.option(
-    "--enforce-trading-time/--no-enforce-trading-time",
-    default=True,
-    show_default=True,
-    help="Best-effort: avoid orders outside trading session",
-)
-@click.option("--tp-price", default="ACTIVE", show_default=True, type=click.Choice(["ACTIVE", "PASSIVE"]), help="TargetPosTask price mode")
-@click.option("--tp-offset-priority", default="今昨,开", show_default=True, type=str, help="TargetPosTask offset priority (e.g. 今昨,开)")
-@click.option("--direct-price-mode", default="ACTIVE", show_default=True, type=click.Choice(["ACTIVE", "PASSIVE"]), help="Direct executor price mode")
-@click.option(
-    "--direct-advanced",
-    default="",
-    show_default=True,
-    type=click.Choice(["", "FAK", "FOK"]),
-    help='Direct executor advanced order type ("FAK"/"FOK"; empty means none)',
-)
-@click.option(
-    "--monitor-only/--no-monitor-only",
-    default=False,
-    show_default=True,
-    help="Connect and record snapshots/events but never send orders (safe for real-account validation).",
-)
-@click.option(
-    "--account",
-    "account_profile",
-    default="default",
-    show_default=True,
-    type=str,
-    help="Broker account profile (env-based). Use `default` for TQ_BROKER_ID/TQ_ACCOUNT_ID/TQ_ACCOUNT_PASSWORD, or a named profile from GHTRADER_TQ_ACCOUNT_PROFILES.",
-)
-@click.option(
-    "--require-no-alive-orders",
-    default="auto",
-    show_default=True,
-    type=click.Choice(["auto", "true", "false"]),
-    help="Preflight: refuse to start if there are any ALIVE orders (auto=true for live order routing).",
-)
-@click.option(
-    "--require-flat-start",
-    default="auto",
-    show_default=True,
-    type=click.Choice(["auto", "true", "false"]),
-    help="Preflight: require net position == 0 at startup (auto=true for live order routing).",
-)
-@click.option("--confirm-live", default="", type=str, help="Required for live: set to I_UNDERSTAND")
-@click.option(
-    "--snapshot-interval-sec",
-    default=10.0,
-    type=float,
-    show_default=True,
-    help="Account snapshot interval (seconds)",
-)
-@click.pass_context
-def trade(
-    ctx: click.Context,
-    mode: str,
-    sim_account: str,
-    executor: str,
-    model: str,
-    symbols: tuple[str, ...],
-    account_profile: str,
-    data_dir: str,
-    artifacts_dir: str,
-    runs_dir: str,
-    horizon: int,
-    threshold_up: float,
-    threshold_down: float,
-    position_size: int,
-    max_position: int,
-    max_order_size: int,
-    max_ops_per_sec: int,
-    max_daily_loss: float | None,
-    enforce_trading_time: bool,
-    tp_price: str,
-    tp_offset_priority: str,
-    direct_price_mode: str,
-    direct_advanced: str,
-    monitor_only: bool,
-    require_no_alive_orders: str,
-    require_flat_start: str,
-    confirm_live: str,
-    snapshot_interval_sec: float,
-) -> None:
-    """Run a trading job (paper/sim/live) suitable for dashboard subprocess execution."""
-    from ghtrader.execution import RiskLimits
-    from ghtrader.trade import TradeConfig, run_trade
-    from ghtrader.tq_runtime import canonical_account_profile
-
-    prof = canonical_account_profile(account_profile)
-    # Lock by broker account profile so multiple accounts can run in parallel.
-    # (Symbol-level locks are intentionally not used here.)
-    lock_keys = [f"trade:account={prof}"]
-    _acquire_locks(lock_keys)
-
-    limits = RiskLimits(
-        max_abs_position=int(max_position),
-        max_order_size=int(max_order_size),
-        max_ops_per_sec=int(max_ops_per_sec),
-        max_daily_loss=max_daily_loss,
-        enforce_trading_time=bool(enforce_trading_time),
-    )
-
-    def _tri(x: str) -> bool | None:
-        x = str(x or "auto").strip().lower()
-        if x == "auto":
-            return None
-        if x == "true":
-            return True
-        if x == "false":
-            return False
-        return None
-
-    cfg = TradeConfig(
-        mode=mode,  # type: ignore[arg-type]
-        monitor_only=bool(monitor_only),
-        sim_account=sim_account,  # type: ignore[arg-type]
-        executor=executor,  # type: ignore[arg-type]
-        account_profile=prof,
-        model_name=model,
-        symbols=list(symbols),
-        horizon=int(horizon),
-        threshold_up=float(threshold_up),
-        threshold_down=float(threshold_down),
-        position_size=int(position_size),
-        data_dir=Path(data_dir),
-        artifacts_dir=Path(artifacts_dir),
-        runs_dir=Path(runs_dir),
-        require_no_alive_orders=_tri(require_no_alive_orders),
-        require_flat_start=_tri(require_flat_start),
-        limits=limits,
-        targetpos_price=tp_price,
-        targetpos_offset_priority=tp_offset_priority,
-        direct_price_mode=direct_price_mode,  # type: ignore[arg-type]
-        direct_advanced=direct_advanced or None,
-        snapshot_interval_sec=float(snapshot_interval_sec),
-    )
-    run_trade(cfg, confirm_live=confirm_live or None)
 
 
 # ---------------------------------------------------------------------------
@@ -2592,7 +2542,7 @@ def trade(
 def benchmark(ctx: click.Context, model: str, symbol: str, data_dir: str,
               artifacts_dir: str, runs_dir: str, horizon: int) -> None:
     """Run a benchmark for a model on a symbol."""
-    from ghtrader.benchmark import run_benchmark
+    from ghtrader.research.benchmark import run_benchmark
 
     log = structlog.get_logger()
     log.info("benchmark.cli", model=model, symbol=symbol)
@@ -2623,7 +2573,7 @@ def benchmark(ctx: click.Context, model: str, symbol: str, data_dir: str,
 def compare(ctx: click.Context, symbol: str, models: str, data_dir: str,
             artifacts_dir: str, runs_dir: str, horizon: int) -> None:
     """Compare multiple models on the same dataset."""
-    from ghtrader.benchmark import compare_models
+    from ghtrader.research.benchmark import compare_models
 
     log = structlog.get_logger()
     model_list = [m.strip() for m in models.split(",")]
@@ -2663,13 +2613,13 @@ def daily_train(ctx: click.Context, symbols: tuple[str, ...], model: str,
                 data_dir: str, artifacts_dir: str, runs_dir: str,
                 horizon: int, lookback_days: int) -> None:
     """Run daily training pipeline: refresh data, build, train, evaluate, promote."""
-    from ghtrader.pipeline import run_daily_pipeline
+    from ghtrader.research.pipeline import run_daily_pipeline
 
     log = structlog.get_logger()
     lock_keys: list[str] = []
     for s in symbols:
         lock_keys.append(f"ticks:symbol={s}")
-        lock_keys.append(f"build:symbol={s},ticks_lake=raw")
+        lock_keys.append(f"build:symbol={s},ticks_kind=raw")
         lock_keys.append(f"train:symbol={s},model={model},h={horizon}")
     _acquire_locks(lock_keys)
     log.info("daily_train.start", symbols=symbols, model=model)
@@ -2704,7 +2654,7 @@ def sweep(ctx: click.Context, symbol: str, model: str,
           data_dir: str, artifacts_dir: str, runs_dir: str,
           n_trials: int, n_cpus: int, n_gpus: int) -> None:
     """Run Ray-based hyperparameter sweep."""
-    from ghtrader.pipeline import run_hyperparam_sweep
+    from ghtrader.research.pipeline import run_hyperparam_sweep
 
     log = structlog.get_logger()
     _acquire_locks([f"sweep:symbol={symbol},model={model}"])
@@ -2767,7 +2717,7 @@ def main_schedule(
     data_dir: str,
 ) -> None:
     """Build a main-contract roll schedule (date -> underlying contract)."""
-    from ghtrader.main_contract import build_shfe_main_schedule
+    from ghtrader.data.main_schedule import build_shfe_main_schedule
 
     log = structlog.get_logger()
     _acquire_locks([f"main_schedule:var={variety.lower()}"])
@@ -2807,7 +2757,7 @@ def main_l5(
     overwrite: bool,
 ) -> None:
     """Build derived main_l5 ticks for the L5 era only (QuestDB-backed detection)."""
-    from ghtrader.main_l5 import build_main_l5_l5_era_only
+    from ghtrader.data.main_l5 import build_main_l5_l5_era_only
 
     log = structlog.get_logger()
     var_l = variety.lower().strip()
@@ -2822,7 +2772,7 @@ def main_l5(
     log.info(
         "main_l5.done",
         derived_symbol=res.derived_symbol,
-        lake_version=res.lake_version,
+        dataset_version=res.dataset_version,
         l5_start_date=res.l5_start_date.isoformat(),
         schedule_hash=str(res.schedule_hash),
         schedule_rows_used=int(res.schedule_rows_used),
@@ -2864,14 +2814,14 @@ def audit(
     runs_dir: str,
 ) -> None:
     """Audit data integrity and write a JSON report under runs/audit/."""
-    from ghtrader.audit import run_audit
+    from ghtrader.data.audit import run_audit
 
     log = structlog.get_logger()
     out_path, report = run_audit(
         data_dir=Path(data_dir),
         runs_dir=Path(runs_dir),
         scopes=list(scopes),
-        lake_version="v2",
+        dataset_version="v2",
         symbols=[str(s).strip() for s in symbols if str(s).strip()] or None,
         exchange=str(exchange).strip() or None,
         var=str(variety).strip() or None,
@@ -2884,320 +2834,14 @@ def audit(
         raise SystemExit(1)
 
 
-# ---------------------------------------------------------------------------
-# features (feature store utilities)
-# ---------------------------------------------------------------------------
+# Command-heavy groups live in `ghtrader.cli_commands.*` and are registered here.
 
 
-@main.group("features")
-@click.pass_context
-def features_group(ctx: click.Context) -> None:
-    """Feature store utilities (list, info, sync)."""
-    _ = ctx
+from ghtrader.cli_commands.db import register as _register_db
+from ghtrader.cli_commands.features import register as _register_features
 
-
-@features_group.command("list")
-@click.option("--with-metadata/--no-metadata", default=True, show_default=True, help="Include factor metadata")
-def features_list(with_metadata: bool) -> None:
-    """List all registered factors."""
-    import json
-
-    from ghtrader.features import list_factors, list_factors_with_metadata
-
-    log = structlog.get_logger()
-
-    if with_metadata:
-        factors = list_factors_with_metadata()
-        for f in factors:
-            log.info(
-                "factor",
-                name=f["name"],
-                input_columns=f["input_columns"],
-                lookback=f["lookback_ticks"],
-                ttl=f["ttl_seconds"],
-            )
-        print(json.dumps(factors, indent=2))
-    else:
-        factors = list_factors()
-        for name in factors:
-            print(name)
-
-
-@features_group.command("info")
-@click.argument("factor_name")
-def features_info(factor_name: str) -> None:
-    """Show detailed information about a factor."""
-    import json
-
-    from ghtrader.features import get_factor
-
-    try:
-        factor = get_factor(factor_name)
-        meta = factor.get_metadata()
-        print(json.dumps(meta, indent=2))
-    except ValueError as e:
-        print(f"Error: {e}")
-        raise SystemExit(1)
-
-
-@features_group.command("sync")
-@click.option("--host", default="", help="QuestDB host (default: env/config)")
-@click.option("--pg-port", default=0, type=int, help="QuestDB PGWire port (default: env/config)")
-def features_sync(host: str, pg_port: int) -> None:
-    """Sync feature definitions to QuestDB registry table."""
-    from ghtrader.questdb_client import QuestDBQueryConfig, make_questdb_query_config_from_env
-    from ghtrader.feature_store import FeatureRegistry, get_feature_registry
-    from ghtrader.features import list_factors_with_metadata
-
-    log = structlog.get_logger()
-
-    base = make_questdb_query_config_from_env()
-    cfg = QuestDBQueryConfig(
-        host=str(host or base.host),
-        pg_port=int(pg_port or base.pg_port),
-        pg_user=str(base.pg_user),
-        pg_password=str(base.pg_password),
-        pg_dbname=str(base.pg_dbname),
-    )
-
-    # Register all factors into the registry
-    registry = get_feature_registry()
-    factors_meta = list_factors_with_metadata()
-
-    for meta in factors_meta:
-        registry.register(
-            name=meta["name"],
-            input_columns=tuple(meta["input_columns"]),
-            lookback_ticks=meta["lookback_ticks"],
-            ttl_seconds=meta["ttl_seconds"],
-            output_dtype=meta["output_dtype"],
-        )
-
-    # Sync to QuestDB
-    try:
-        count = registry.sync_to_questdb(cfg)
-        log.info("features.synced", count=count)
-        print(f"Synced {count} feature definitions to QuestDB")
-    except Exception as e:
-        log.error("features.sync_failed", error=str(e))
-        print(f"Error syncing to QuestDB: {e}")
-        raise SystemExit(1)
-
-
-@features_group.command("registry")
-@click.option("--active-only/--all", default=True, show_default=True, help="Show only active features")
-def features_registry(active_only: bool) -> None:
-    """Show registered feature definitions."""
-    import json
-
-    from ghtrader.feature_store import get_feature_registry
-
-    registry = get_feature_registry()
-
-    if active_only:
-        features = registry.list_active()
-    else:
-        features = registry.list_all()
-
-    if not features:
-        print("No features registered in this session.")
-        print("Use 'ghtrader features sync' to register factors and sync to QuestDB.")
-        return
-
-    for feat in features:
-        print(json.dumps(feat.to_dict(), indent=2))
-
-
-# ---------------------------------------------------------------------------
-# db (QuestDB utilities)
-# ---------------------------------------------------------------------------
-
-
-@main.group("db")
-@click.pass_context
-def db_group(ctx: click.Context) -> None:
-    """Database/query-layer utilities (QuestDB)."""
-    _ = ctx
-
-
-@db_group.command("questdb-health")
-@click.option("--host", default="", help="QuestDB host (default: env/config)")
-@click.option("--pg-port", default=0, type=int, help="QuestDB PGWire port (default: env/config)")
-@click.option("--pg-user", default="", help="QuestDB PGWire user (default: env/config)")
-@click.option("--pg-password", default="", help="QuestDB PGWire password (default: env/config)")
-@click.option("--pg-dbname", default="", help="QuestDB PGWire dbname (default: env/config)")
-@click.option("--connect-timeout", default=1, type=int, show_default=True, help="Connect timeout seconds")
-def db_questdb_health(
-    host: str,
-    pg_port: int,
-    pg_user: str,
-    pg_password: str,
-    pg_dbname: str,
-    connect_timeout: int,
-) -> None:
-    """Check QuestDB reachability via PGWire (SELECT 1)."""
-    import json
-    import time
-
-    from ghtrader.config import (
-        get_questdb_host,
-        get_questdb_pg_dbname,
-        get_questdb_pg_password,
-        get_questdb_pg_port,
-        get_questdb_pg_user,
-    )
-
-    h = str(host).strip() or str(get_questdb_host())
-    p = int(pg_port) if int(pg_port) > 0 else int(get_questdb_pg_port())
-    u = str(pg_user).strip() or str(get_questdb_pg_user())
-    pw = str(pg_password).strip() or str(get_questdb_pg_password())
-    dbn = str(pg_dbname).strip() or str(get_questdb_pg_dbname())
-
-    t0 = time.time()
-    try:
-        import psycopg  # type: ignore
-
-        with psycopg.connect(user=u, password=pw, host=h, port=int(p), dbname=dbn, connect_timeout=int(connect_timeout)) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                cur.fetchone()
-        dt_ms = int((time.time() - t0) * 1000.0)
-        click.echo(json.dumps({"ok": True, "host": h, "pg_port": int(p), "pg_user": u, "pg_dbname": dbn, "latency_ms": dt_ms}))
-    except Exception as e:
-        dt_ms = int((time.time() - t0) * 1000.0)
-        click.echo(
-            json.dumps(
-                {"ok": False, "host": h, "pg_port": int(p), "pg_user": u, "pg_dbname": dbn, "latency_ms": dt_ms, "error": str(e)}
-            )
-        )
-        raise SystemExit(1)
-
-
-@db_group.command("questdb-init")
-@click.option("--host", default="", help="QuestDB host (default: env/config)")
-@click.option("--ilp-port", default=0, type=int, help="QuestDB ILP port (default: env/config)")
-@click.option("--pg-port", default=0, type=int, help="QuestDB PGWire port (default: env/config)")
-@click.option("--pg-user", default="", help="QuestDB PGWire user (default: env/config)")
-@click.option("--pg-password", default="", help="QuestDB PGWire password (default: env/config)")
-@click.option("--pg-dbname", default="", help="QuestDB PGWire dbname (default: env/config)")
-@click.option("--raw-table", default="ghtrader_ticks_raw_v2", show_default=True, help="Raw ticks table name")
-@click.option("--main-l5-table", default="ghtrader_ticks_main_l5_v2", show_default=True, help="Derived main_l5 ticks table name")
-def db_questdb_init(
-    host: str,
-    ilp_port: int,
-    pg_port: int,
-    pg_user: str,
-    pg_password: str,
-    pg_dbname: str,
-    raw_table: str,
-    main_l5_table: str,
-) -> None:
-    """Ensure required ghTrader tables exist in QuestDB (DDL via PGWire)."""
-    import json
-
-    from ghtrader.config import (
-        get_questdb_host,
-        get_questdb_ilp_port,
-        get_questdb_pg_dbname,
-        get_questdb_pg_password,
-        get_questdb_pg_port,
-        get_questdb_pg_user,
-    )
-    from ghtrader.serving_db import ServingDBConfig, make_serving_backend
-
-    h = str(host).strip() or str(get_questdb_host())
-    ilp = int(ilp_port) if int(ilp_port) > 0 else int(get_questdb_ilp_port())
-    p = int(pg_port) if int(pg_port) > 0 else int(get_questdb_pg_port())
-    u = str(pg_user).strip() or str(get_questdb_pg_user())
-    pw = str(pg_password).strip() or str(get_questdb_pg_password())
-    dbn = str(pg_dbname).strip() or str(get_questdb_pg_dbname())
-
-    cfg = ServingDBConfig(
-        backend="questdb",
-        host=h,
-        questdb_ilp_port=int(ilp),
-        questdb_pg_port=int(p),
-        questdb_pg_user=u,
-        questdb_pg_password=pw,
-        questdb_pg_dbname=dbn,
-    )
-    backend = make_serving_backend(cfg)
-
-    # Ensure both table schemas exist (best-effort idempotent DDL).
-    backend.ensure_table(table=str(raw_table), include_segment_metadata=False)
-    backend.ensure_table(table=str(main_l5_table), include_segment_metadata=True)
-
-    # Validate tables are queryable (so failures are surfaced loudly).
-    try:
-        import psycopg  # type: ignore
-
-        with psycopg.connect(user=u, password=pw, host=h, port=int(p), dbname=dbn, connect_timeout=2) as conn:
-            with conn.cursor() as cur:
-                for tbl in [str(raw_table), str(main_l5_table)]:
-                    cur.execute(f"SELECT 1 FROM {tbl} LIMIT 1")
-                    cur.fetchone()
-    except Exception as e:
-        click.echo(json.dumps({"ok": False, "error": str(e)}))
-        raise SystemExit(1)
-
-    click.echo(
-        json.dumps(
-            {
-                "ok": True,
-                "host": h,
-                "pg_port": int(p),
-                "ilp_port": int(ilp),
-                "pg_user": u,
-                "pg_dbname": dbn,
-                "tables": {"raw": str(raw_table), "main_l5": str(main_l5_table)},
-            }
-        )
-    )
-
-
-@db_group.command("benchmark")
-@click.option("--symbol", required=True, help="Symbol to benchmark (e.g. SHFE.cu2602 or KQ.m@SHFE.cu)")
-@click.option("--start", required=True, type=click.DateTime(formats=["%Y-%m-%d"]), help="Start date (YYYY-MM-DD)")
-@click.option("--end", required=True, type=click.DateTime(formats=["%Y-%m-%d"]), help="End date (YYYY-MM-DD)")
-@click.option("--data-dir", default="data", help="Data directory root")
-@click.option("--runs-dir", default="runs", help="Runs directory root")
-@click.option(
-    "--ticks-lake",
-    default="raw",
-    type=click.Choice(["raw", "main_l5"]),
-    show_default=True,
-    help="Which ticks lake to benchmark (raw vs main_l5).",
-)
-@click.option("--max-rows", default=200000, type=int, show_default=True, help="Max rows to load/ingest for the benchmark")
-@click.option("--host", default="127.0.0.1", show_default=True, help="QuestDB host")
-@click.pass_context
-def db_benchmark(
-    ctx: click.Context,
-    symbol: str,
-    start: datetime,
-    end: datetime,
-    data_dir: str,
-    runs_dir: str,
-    ticks_lake: str,
-    max_rows: int,
-    host: str,
-) -> None:
-    """Benchmark QuestDB ingestion/query on a real tick sample."""
-    from ghtrader.db_bench import run_db_benchmark
-
-    log = structlog.get_logger()
-    out_path, report = run_db_benchmark(
-        data_dir=Path(data_dir),
-        runs_dir=Path(runs_dir),
-        symbol=symbol,
-        start_date=start.date(),
-        end_date=end.date(),
-        ticks_lake=ticks_lake,  # type: ignore[arg-type]
-        lake_version="v2",
-        max_rows=int(max_rows),
-        host=str(host),
-    )
-    log.info("db.benchmark_done", report_path=str(out_path), n_results=len(report.get("results") or []), n_errors=len(report.get("errors") or []))
+_register_features(main)
+_register_db(main)
 
 
 def entrypoint() -> None:
