@@ -166,7 +166,7 @@ def query_symbol_day_bounds(
     table: str,
     symbols: list[str],
     dataset_version: str,
-    ticks_kind: str = "raw",
+    ticks_kind: str = "main_l5",
     l5_only: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """
@@ -218,7 +218,10 @@ def query_symbol_day_bounds(
 
     with _connect(cfg, connect_timeout_s=2) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params)
+            try:
+                cur.execute(sql, params)
+            except Exception as e:
+                raise
             for row in cur.fetchall():
                 try:
                     sym = str(row[0])
@@ -251,13 +254,54 @@ def query_symbol_day_bounds(
     return out
 
 
+def list_trading_days_for_symbol(
+    *,
+    cfg: QuestDBQueryConfig,
+    table: str,
+    symbol: str,
+    start_day: date,
+    end_day: date,
+    dataset_version: str,
+    ticks_kind: str = "main_l5",
+) -> list[date]:
+    """
+    List distinct trading_day values for a symbol from the canonical ticks table.
+    """
+    sym = str(symbol or "").strip()
+    if not sym:
+        return []
+    dv = str(dataset_version).lower().strip()
+    tk = str(ticks_kind).lower().strip()
+    d0 = start_day.isoformat()
+    d1 = end_day.isoformat()
+    tbl = str(table).strip()
+
+    sql = (
+        "SELECT DISTINCT cast(trading_day as string) AS trading_day "
+        f"FROM {tbl} "
+        "WHERE symbol=%s AND ticks_kind=%s AND dataset_version=%s "
+        "AND cast(trading_day as string) >= %s AND cast(trading_day as string) <= %s "
+        "ORDER BY trading_day ASC"
+    )
+    out: list[date] = []
+    with _connect(cfg, connect_timeout_s=2) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, [sym, tk, dv, d0, d1])
+            for (td,) in cur.fetchall():
+                try:
+                    out.append(date.fromisoformat(str(td)))
+                except Exception:
+                    continue
+    return out
+
+
 def query_symbol_latest(
     *,
     cfg: QuestDBQueryConfig,
     table: str,
     symbols: list[str],
     dataset_version: str,
-    ticks_kind: str = "raw",
+    ticks_kind: str = "main_l5",
 ) -> dict[str, dict[str, Any]]:
     """
     Return {symbol: {last_day, last_ns, last_ts}} using QuestDB's optimized LATEST query.
@@ -332,7 +376,7 @@ def fetch_ticks_for_symbol_day(
     symbol: str,
     trading_day: str,
     dataset_version: str,
-    ticks_kind: str = "raw",
+    ticks_kind: str = "main_l5",
     limit: int | None = None,
     order: Literal["asc", "desc"] = "asc",
     include_provenance: bool = False,
@@ -564,12 +608,12 @@ def query_contract_last_coverage(
     table: str,
     symbols: list[str],
     dataset_version: str,
-    ticks_kind: str = "raw",
+    ticks_kind: str = "main_l5",
     recent_days: list[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """
     Fast per-symbol coverage for Contracts UI:
-    - last_tick_day/ts (raw)
+    - last_tick_day/ts (main_l5)
     - last_l5_day/ts (main_l5 when available)
 
     First-day and day-count fields are returned as None (can be merged from a cached full report).
@@ -626,7 +670,7 @@ def query_contract_coverage(
     table: str,
     symbols: list[str],
     dataset_version: str,
-    ticks_kind: str = "raw",
+    ticks_kind: str = "main_l5",
 ) -> dict[str, dict[str, Any]]:
     """
     Return per-symbol coverage:

@@ -66,25 +66,25 @@ def load_tick_sample(
     Load a tick sample from QuestDB for benchmarking.
     """
     from ghtrader.questdb.client import make_questdb_query_config_from_env
-    from ghtrader.questdb.index import list_present_trading_days
-    from ghtrader.questdb.queries import fetch_ticks_for_symbol_day
+    from ghtrader.questdb.queries import fetch_ticks_for_symbol_day, list_trading_days_for_symbol
 
     _ = data_dir  # QuestDB is the canonical source
 
     dv = str(dataset_version).lower().strip() or "v2"
-    tk = str(ticks_kind).lower().strip() or "raw"
-    table = "ghtrader_ticks_main_l5_v2" if tk == "main_l5" else "ghtrader_ticks_raw_v2"
+    tk = str(ticks_kind).lower().strip() or "main_l5"
+    if tk != "main_l5":
+        raise ValueError("raw ticks are deferred (Phase-1/2)")
+    table = "ghtrader_ticks_main_l5_v2"
     cfg = make_questdb_query_config_from_env()
 
-    days = sorted(
-        list_present_trading_days(
-            cfg=cfg,
-            symbol=str(symbol),
-            start_day=start_date,
-            end_day=end_date,
-            dataset_version=dv,
-            ticks_kind=tk,
-        )
+    days = list_trading_days_for_symbol(
+        cfg=cfg,
+        table=table,
+        symbol=str(symbol),
+        start_day=start_date,
+        end_day=end_date,
+        dataset_version=dv,
+        ticks_kind=tk,
     )
 
     frames: list[pd.DataFrame] = []

@@ -155,11 +155,7 @@ def migrate_column_names_v2(
     # Additional best-effort: after rename, ensure expected UPSERT KEYS use the new column names.
     dedup_keys_by_table: dict[str, str] = {
         # ticks
-        "ghtrader_ticks_raw_v2": "ts, symbol, ticks_kind, dataset_version, row_hash",
         "ghtrader_ticks_main_l5_v2": "ts, symbol, ticks_kind, dataset_version, row_hash",
-        # coverage / no-data
-        "ghtrader_symbol_day_index_v2": "ts, symbol, trading_day, ticks_kind, dataset_version",
-        "ghtrader_no_data_days_v2": "ts, symbol, trading_day, ticks_kind, dataset_version",
         # features / labels (wide per-tick tables)
         "ghtrader_features_v2": "ts, symbol, ticks_kind, dataset_version, build_id, row_hash",
         "ghtrader_labels_v2": "ts, symbol, ticks_kind, dataset_version, build_id, row_hash",
@@ -258,15 +254,6 @@ def ensure_schema_v2(
     # Define required columns per table type.
     # Format: {table_name: [(column_name, column_type), ...]}
     required_columns: dict[str, list[tuple[str, str]]] = {
-        "ghtrader_ticks_raw_v2": [
-            ("symbol", "SYMBOL"),
-            ("ts", "TIMESTAMP"),
-            ("datetime_ns", "LONG"),
-            ("trading_day", "SYMBOL"),
-            ("row_hash", "LONG"),
-            ("dataset_version", "SYMBOL"),
-            ("ticks_kind", "SYMBOL"),
-        ] + [(c, "DOUBLE") for c in tick_numeric_cols],
         "ghtrader_ticks_main_l5_v2": [
             ("symbol", "SYMBOL"),
             ("ts", "TIMESTAMP"),
@@ -279,31 +266,6 @@ def ensure_schema_v2(
             ("segment_id", "LONG"),
             ("schedule_hash", "SYMBOL"),
         ] + [(c, "DOUBLE") for c in tick_numeric_cols],
-        "ghtrader_symbol_day_index_v2": [
-            ("ts", "TIMESTAMP"),
-            ("symbol", "SYMBOL"),
-            ("trading_day", "SYMBOL"),
-            ("ticks_kind", "SYMBOL"),
-            ("dataset_version", "SYMBOL"),
-            ("rows_total", "LONG"),
-            ("first_datetime_ns", "LONG"),
-            ("last_datetime_ns", "LONG"),
-            ("l5_present", "BOOLEAN"),
-            ("row_hash_min", "LONG"),
-            ("row_hash_max", "LONG"),
-            ("row_hash_sum", "LONG"),
-            ("row_hash_sum_abs", "LONG"),
-            ("updated_at", "TIMESTAMP"),
-        ],
-        "ghtrader_no_data_days_v2": [
-            ("ts", "TIMESTAMP"),
-            ("symbol", "SYMBOL"),
-            ("trading_day", "SYMBOL"),
-            ("ticks_kind", "SYMBOL"),
-            ("dataset_version", "SYMBOL"),
-            ("reason", "SYMBOL"),
-            ("created_at", "TIMESTAMP"),
-        ],
     }
 
     planned_adds: list[dict[str, str]] = []

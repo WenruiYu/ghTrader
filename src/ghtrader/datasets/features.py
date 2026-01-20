@@ -12,7 +12,9 @@ from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+import os
 from pathlib import Path
+import time
 from typing import Any, Callable
 
 import numpy as np
@@ -492,13 +494,18 @@ class FactorEngine:
             ensure_features_tables,
             insert_feature_build,
         )
-        from ghtrader.questdb.index import INDEX_TABLE_V2, ensure_index_tables, list_present_trading_days, query_symbol_day_index_bounds
         from ghtrader.questdb.client import make_questdb_query_config_from_env
-        from ghtrader.questdb.queries import fetch_ticks_for_symbol_day
+        from ghtrader.questdb.queries import (
+            fetch_ticks_for_symbol_day,
+            list_trading_days_for_symbol,
+            query_symbol_day_bounds,
+        )
         from ghtrader.questdb.serving_db import ServingDBConfig, make_serving_backend
 
         dv = str(dataset_version).lower().strip() or "v2"
-        tk = str(ticks_kind).lower().strip() or "raw"
+        tk = str(ticks_kind).lower().strip() or "main_l5"
+        if tk != "main_l5":
+            raise ValueError("ticks_kind raw is deferred (Phase-1/2)")
 
         # Derived ticks require schedule provenance to prevent roll-boundary leakage.
         underlying_by_date: dict[date, str] = {}
@@ -518,28 +525,33 @@ class FactorEngine:
             )
         )
 
-        ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
-
-        # Determine available tick days from the QuestDB tick index (QuestDB-only).
-        bounds = query_symbol_day_index_bounds(
-            cfg=cfg, symbols=[symbol], dataset_version=dv, ticks_kind=tk, index_table=INDEX_TABLE_V2, connect_timeout_s=2
+        ticks_table = "ghtrader_ticks_main_l5_v2"
+        bounds = query_symbol_day_bounds(
+            cfg=cfg,
+            table=ticks_table,
+            symbols=[symbol],
+            dataset_version=dv,
+            ticks_kind=tk,
+            l5_only=False,
         )
         b = bounds.get(symbol) or {}
         d0s = str(b.get("first_day") or "").strip()
         d1s = str(b.get("last_day") or "").strip()
-        dates: list[date] = []
-        if d0s and d1s:
-            start_d = date.fromisoformat(d0s)
-            end_d = date.fromisoformat(d1s)
-            dates = sorted(
-                list_present_trading_days(
-                    cfg=cfg, symbol=symbol, start_day=start_d, end_day=end_d, dataset_version=dv, ticks_kind=tk, index_table=INDEX_TABLE_V2
-                )
-            )
+        if not d0s or not d1s:
+            raise ValueError(f"No tick data found for {symbol} (ticks_kind={ticks_kind}, dataset_version={dataset_version}) in QuestDB")
+        start_d = date.fromisoformat(d0s)
+        end_d = date.fromisoformat(d1s)
+        dates = list_trading_days_for_symbol(
+            cfg=cfg,
+            table=ticks_table,
+            symbol=str(symbol),
+            start_day=start_d,
+            end_day=end_d,
+            dataset_version=dv,
+            ticks_kind=tk,
+        )
         if not dates:
-            raise ValueError(f"No tick data found for {symbol} (ticks_kind={ticks_kind}, dataset_version={dataset_version}) in QuestDB index")
-
-        ticks_table = "ghtrader_ticks_main_l5_v2" if tk == "main_l5" else "ghtrader_ticks_raw_v2"
+            raise ValueError(f"No tick data found for {symbol} (ticks_kind={ticks_kind}, dataset_version={dataset_version}) in QuestDB")
         if tk == "main_l5" and schedule_hash is None:
             # Best-effort: pull schedule_hash from derived tick rows (preferred over recomputing).
             try:
@@ -595,6 +607,27 @@ class FactorEngine:
         idx_map = {d: i for i, d in enumerate(dates)}
         rows_total = 0
         days_done = 0
+        days_total = int(len(dates))
+        started_at = time.time()
+        last_progress_ts = started_at
+        try:
+            progress_every_s = float(os.environ.get("GHTRADER_BUILD_PROGRESS_EVERY_S", "30") or "30")
+        except Exception:
+            progress_every_s = 30.0
+        progress_every_s = max(5.0, float(progress_every_s))
+        try:
+            progress_every_n = int(os.environ.get("GHTRADER_BUILD_PROGRESS_EVERY_N", "5") or "5")
+        except Exception:
+            progress_every_n = 5
+        progress_every_n = max(1, int(progress_every_n))
+        log.info(
+            "features.build_start",
+            symbol=str(symbol),
+            ticks_kind=str(tk),
+            dataset_version=str(dv),
+            days_total=int(days_total),
+            factors=int(len(self.enabled_factors)),
+        )
 
         for dt in dates:
             # Fetch day ticks (QuestDB-first).
@@ -719,6 +752,32 @@ class FactorEngine:
 
             rows_total += int(len(out))
             days_done += 1
+            if (
+                days_done == 1
+                or days_done == days_total
+                or days_done % progress_every_n == 0
+                or (time.time() - last_progress_ts) >= progress_every_s
+            ):
+                log.info(
+                    "features.build_progress",
+                    symbol=str(symbol),
+                    trading_day=str(dt.isoformat()),
+                    days_done=int(days_done),
+                    days_total=int(days_total),
+                    rows_total=int(rows_total),
+                    last_rows=int(len(out)),
+                    elapsed_s=int(time.time() - started_at),
+                )
+                last_progress_ts = time.time()
+            else:
+                log.debug(
+                    "features.build_day",
+                    symbol=str(symbol),
+                    trading_day=str(dt.isoformat()),
+                    rows=int(len(out)),
+                    days_done=int(days_done),
+                    days_total=int(days_total),
+                )
 
         insert_feature_build(
             cfg=cfg,
@@ -734,6 +793,15 @@ class FactorEngine:
             first_day=(dates[0].isoformat() if dates else ""),
             last_day=(dates[-1].isoformat() if dates else ""),
             connect_timeout_s=2,
+        )
+        log.info(
+            "features.build_done",
+            symbol=str(symbol),
+            ticks_kind=str(tk),
+            dataset_version=str(dv),
+            rows_total=int(rows_total),
+            days=int(days_done),
+            elapsed_s=int(time.time() - started_at),
         )
 
         return {

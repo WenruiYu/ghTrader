@@ -17,7 +17,6 @@
     <form class="form" method="post" action="/jobs/start{{ token_qs }}" id="startJobForm">
       <label>Job type</label>
       <select name="job_type" id="jobType">
-        <option value="download_contract_range">download-contract-range</option>
         <option value="build">build (labels+features)</option>
         <option value="train">train</option>
         <option value="benchmark">benchmark</option>
@@ -36,23 +35,6 @@
         </div>
       </div>
 
-      <details id="groupContractRange">
-        <summary>download-contract-range options</summary>
-        <div class="grid3">
-          <div>
-            <label>Start contract (YYMM)</label>
-            <input name="start_contract" value="1601"/>
-          </div>
-          <div>
-            <label>End contract</label>
-            <input name="end_contract" value="auto"/>
-          </div>
-          <div>
-            <label>Chunk days</label>
-            <input name="chunk_days" value="5"/>
-          </div>
-        </div>
-      </details>
 
       <details id="groupModel">
         <summary>train / benchmark options</summary>
@@ -168,7 +150,6 @@
       const symbolOrVar = document.getElementById("symbolOrVar");
 
       const groups = {
-        contract: document.getElementById("groupContractRange"),
         model: document.getElementById("groupModel"),
         mainSchedule: document.getElementById("groupMainSchedule"),
         mainL5: document.getElementById("groupMainL5"),
@@ -181,19 +162,17 @@
 
       function syncFormByType() {
         const t = (jobType && jobType.value) ? jobType.value : "";
-        setGroupVisible(groups.contract, t === "download_contract_range");
-        setGroupVisible(groups.model, t === "train" || t === "benchmark");
+        setGroupVisible(groups.model, t === "train" || t === "benchmark" || t === "build");
         setGroupVisible(groups.mainSchedule, t === "main_schedule");
         setGroupVisible(groups.mainL5, t === "main_l5");
 
         // Open the relevant section by default to reduce missed-required-fields.
-        if (groups.contract) groups.contract.open = (t === "download_contract_range");
-        if (groups.model) groups.model.open = (t === "train" || t === "benchmark");
+        if (groups.model) groups.model.open = (t === "train" || t === "benchmark" || t === "build");
         if (groups.mainSchedule) groups.mainSchedule.open = (t === "main_schedule");
         if (groups.mainL5) groups.mainL5.open = (t === "main_l5");
 
         if (!symbolOrVar) return;
-        if (t === "download_contract_range" || t === "main_schedule" || t === "main_l5") {
+        if (t === "main_schedule" || t === "main_l5") {
           symbolOrVar.placeholder = "e.g. cu";
         } else {
           symbolOrVar.placeholder = "e.g. SHFE.cu2602";

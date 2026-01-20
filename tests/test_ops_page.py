@@ -27,14 +27,13 @@ def test_ops_page_renders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert "/data" in r.headers.get("location", "")
     assert "#contracts" in r.headers.get("location", "")
 
-    # Following the redirect should render the Data Hub with unified workflow
+    # Following the redirect should render the Data Hub
     r_data = client.get("/data")
     assert r_data.status_code == 200
     html = r_data.text
-    # Check for unified 8-step workflow in Contracts tab
-    assert "Workflow Steps" in html
+    assert "Main schedule" in html
     assert "Build Schedule" in html
-    assert "main_l5" in html
+    assert "Build main_l5" in html
 
     # Legacy Ops pages redirect to consolidated page.
     r2 = client.get("/ops/ingest", follow_redirects=False)

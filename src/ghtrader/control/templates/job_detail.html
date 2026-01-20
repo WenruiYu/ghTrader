@@ -68,14 +68,6 @@
     </div>
   </div>
 
-  <h3>Ingest status</h3>
-  <div class="card" id="ingestCard" style="display:none;">
-    <div><b>Kind:</b> <span class="mono" id="ingestKind"></span></div>
-    <div><b>Current:</b> <span class="mono" id="ingestCurrent"></span></div>
-    <div><b>Progress:</b> <span class="mono" id="ingestProgress"></span></div>
-    <div id="ingestLastErrorRow" style="display:none;"><b>Last error:</b> <span class="mono text-xs" id="ingestLastError"></span></div>
-    <div class="muted">For full details, see <a href="/data{{ token_qs }}#ingest">Ingest</a>.</div>
-  </div>
 
   <h3>Log tail</h3>
   <div class="card">
@@ -104,16 +96,9 @@
   <script>
     (function() {
       const logUrl = "/api/jobs/{{ job.id }}/log{{ token_qs }}";
-      const ingestUrl = "/api/jobs/{{ job.id }}/ingest_status{{ token_qs }}";
       const progressUrl = "/api/jobs/{{ job.id }}/progress{{ token_qs }}";
       const statusUrl = "/api/jobs{{ token_qs }}";
       const box = document.getElementById("logBox");
-      const ingestCard = document.getElementById("ingestCard");
-      const ingestKind = document.getElementById("ingestKind");
-      const ingestCurrent = document.getElementById("ingestCurrent");
-      const ingestProgress = document.getElementById("ingestProgress");
-      const ingestLastErrorRow = document.getElementById("ingestLastErrorRow");
-      const ingestLastError = document.getElementById("ingestLastError");
       const pill = document.getElementById("jobStatusPill");
       const autoScroll = document.getElementById("autoScroll");
       const pausePolling = document.getElementById("pausePolling");
@@ -139,14 +124,7 @@
       let isActive = (("{{ job.status }}" === "running") || ("{{ job.status }}" === "queued"));
       let logTimer = null;
       let statusTimer = null;
-      let ingestTimer = null;
       let progressTimer = null;
-
-      // Ingest speed/ETA (best-effort, computed from ingest_status deltas)
-      let ingestLastAtMs = null;
-      let ingestLastDone = null;
-      let ingestFirstAtMs = null;
-      let ingestFirstDone = null;
 
       function fmtPct(x) {
         if (x === null || x === undefined) return "-";
@@ -163,12 +141,6 @@
         return ss + "s";
       }
 
-      function fmtSpeedDaysPerMin(x) {
-        if (x === null || x === undefined) return "";
-        const v = Number(x);
-        if (!isFinite(v) || v <= 0) return "";
-        return (Math.round(v * 100) / 100).toFixed(2) + " days/min";
-      }
 
       async function copyText(s) {
         const txt = String(s || "");
@@ -193,105 +165,6 @@
           box.textContent = txt;
           if (autoScroll && autoScroll.checked) {
             box.scrollTop = box.scrollHeight;
-          }
-        } catch (e) {}
-      }
-
-      async function tickIngest() {
-        try {
-          const resp = await fetch(ingestUrl);
-          if (!resp.ok) return;
-          const s = await resp.json();
-          if (!s || !s.kind || s.kind === "unknown") {
-            ingestCard.style.display = "none";
-            return;
-          }
-          ingestCard.style.display = "block";
-          ingestKind.textContent = s.kind || "";
-          if (ingestLastErrorRow && ingestLastError) {
-            const le = String(s.last_error_line || "").trim();
-            if (le) {
-              ingestLastErrorRow.style.display = "block";
-              ingestLastError.textContent = le;
-            } else {
-              ingestLastErrorRow.style.display = "none";
-              ingestLastError.textContent = "";
-            }
-          }
-
-          if (s.kind === "download_contract_range") {
-            ingestCurrent.textContent = s.current_symbol || "";
-            const sum = s.summary || {};
-            const done = (sum.days_done_total ?? null);
-            const expected = (sum.days_expected_total ?? null);
-            const nowMs = Date.now();
-            if (ingestFirstAtMs === null && done !== null) { ingestFirstAtMs = nowMs; ingestFirstDone = done; }
-            let speedText = "";
-            let etaText = "";
-            if (done !== null) {
-              if (ingestLastAtMs !== null && ingestLastDone !== null) {
-                const dtSec = (nowMs - ingestLastAtMs) / 1000.0;
-                const dd = Number(done) - Number(ingestLastDone);
-                const sp = (dtSec > 0) ? (dd / dtSec) * 60.0 : 0;
-                const spTxt = fmtSpeedDaysPerMin(sp);
-                if (spTxt) speedText = spTxt;
-                if (expected !== null && sp > 0) {
-                  const rem = Math.max(0, Number(expected) - Number(done));
-                  etaText = "ETA " + fmtDurationSec((rem / sp) * 60.0);
-                }
-              } else if (ingestFirstAtMs !== null && ingestFirstDone !== null) {
-                const dtSec = (nowMs - ingestFirstAtMs) / 1000.0;
-                const dd = Number(done) - Number(ingestFirstDone);
-                const sp = (dtSec > 0) ? (dd / dtSec) * 60.0 : 0;
-                const spTxt = fmtSpeedDaysPerMin(sp);
-                if (spTxt) speedText = spTxt;
-              }
-            }
-            ingestLastAtMs = nowMs; ingestLastDone = done;
-            const extra = [speedText, etaText].filter(Boolean).join(", ");
-            ingestProgress.textContent =
-              fmtPct(sum.pct) +
-              " days " + (sum.days_done_total ?? "") + "/" + (sum.days_expected_total ?? "") +
-              " contracts " + (sum.contracts_done ?? "") + "/" + (sum.contracts_total ?? "") +
-              (extra ? (" (" + extra + ")") : "");
-          } else if (s.kind === "download") {
-            ingestCurrent.textContent = s.symbol || "";
-            const sum = s.summary || {};
-            const done = (sum.days_done ?? null);
-            const expected = (sum.days_expected ?? null);
-            const nowMs = Date.now();
-            if (ingestFirstAtMs === null && done !== null) { ingestFirstAtMs = nowMs; ingestFirstDone = done; }
-            let speedText = "";
-            let etaText = "";
-            if (done !== null) {
-              if (ingestLastAtMs !== null && ingestLastDone !== null) {
-                const dtSec = (nowMs - ingestLastAtMs) / 1000.0;
-                const dd = Number(done) - Number(ingestLastDone);
-                const sp = (dtSec > 0) ? (dd / dtSec) * 60.0 : 0;
-                const spTxt = fmtSpeedDaysPerMin(sp);
-                if (spTxt) speedText = spTxt;
-                if (expected !== null && sp > 0) {
-                  const rem = Math.max(0, Number(expected) - Number(done));
-                  etaText = "ETA " + fmtDurationSec((rem / sp) * 60.0);
-                }
-              } else if (ingestFirstAtMs !== null && ingestFirstDone !== null) {
-                const dtSec = (nowMs - ingestFirstAtMs) / 1000.0;
-                const dd = Number(done) - Number(ingestFirstDone);
-                const sp = (dtSec > 0) ? (dd / dtSec) * 60.0 : 0;
-                const spTxt = fmtSpeedDaysPerMin(sp);
-                if (spTxt) speedText = spTxt;
-              }
-            }
-            ingestLastAtMs = nowMs; ingestLastDone = done;
-            const extra = [speedText, etaText].filter(Boolean).join(", ");
-            ingestProgress.textContent =
-              fmtPct(sum.pct) +
-              " days " + (sum.days_done ?? "") + "/" + (sum.days_expected ?? "") +
-              (s.chunk_idx ? (" chunk_idx=" + s.chunk_idx) : "") +
-              (extra ? (" (" + extra + ")") : "");
-          } else {
-            ingestCurrent.textContent = s.current_symbol || "";
-            ingestProgress.textContent = "-";
           }
         } catch (e) {}
       }
@@ -378,7 +251,6 @@
 
       function stopPolling() {
         if (logTimer) { clearInterval(logTimer); logTimer = null; }
-        if (ingestTimer) { clearInterval(ingestTimer); ingestTimer = null; }
         if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
         if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
       }
@@ -389,11 +261,9 @@
         if (!pausePolling || !pausePolling.checked) {
           logTimer = setInterval(tick, ms);
           statusTimer = setInterval(tickStatus, Math.max(2000, ms));
-          ingestTimer = setInterval(tickIngest, 10000);
           progressTimer = setInterval(tickProgress, 2000);
           tick();
           tickStatus();
-          tickIngest();
           tickProgress();
         }
       }

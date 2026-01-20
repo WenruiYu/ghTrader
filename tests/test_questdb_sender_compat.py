@@ -51,7 +51,7 @@ def test_questdb_backend_ingest_uses_sender_from_conf(monkeypatch) -> None:
             "datetime_ns": [1],
             "trading_day": ["2026-01-01"],
             "row_hash": [1],
-            "ticks_kind": ["raw"],
+            "ticks_kind": ["main_l5"],
             "dataset_version": ["v2"],
         }
     )

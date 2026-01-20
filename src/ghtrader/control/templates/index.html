@@ -61,38 +61,32 @@
       <div class="muted text-sm">Data flow for primary symbol</div>
     </div>
     <div class="pipeline-flow" id="pipelineFlow">
-      <div class="pipeline-step" id="stepIngest">
-        <div class="pipeline-step-icon">1</div>
-        <div class="pipeline-step-label">Ingest</div>
-        <div class="pipeline-step-status">--</div>
-      </div>
-      <div class="pipeline-arrow"></div>
       <div class="pipeline-step" id="stepSync">
-        <div class="pipeline-step-icon">2</div>
+        <div class="pipeline-step-icon">1</div>
         <div class="pipeline-step-label">QuestDB</div>
         <div class="pipeline-step-status">--</div>
       </div>
       <div class="pipeline-arrow"></div>
       <div class="pipeline-step" id="stepSchedule">
-        <div class="pipeline-step-icon">3</div>
+        <div class="pipeline-step-icon">2</div>
         <div class="pipeline-step-label">Schedule</div>
         <div class="pipeline-step-status">--</div>
       </div>
       <div class="pipeline-arrow"></div>
       <div class="pipeline-step" id="stepMainL5">
-        <div class="pipeline-step-icon">4</div>
+        <div class="pipeline-step-icon">3</div>
         <div class="pipeline-step-label">main_l5</div>
         <div class="pipeline-step-status">--</div>
       </div>
       <div class="pipeline-arrow"></div>
       <div class="pipeline-step" id="stepBuild">
-        <div class="pipeline-step-icon">5</div>
+        <div class="pipeline-step-icon">4</div>
         <div class="pipeline-step-label">Features</div>
         <div class="pipeline-step-status">--</div>
       </div>
       <div class="pipeline-arrow"></div>
       <div class="pipeline-step" id="stepTrain">
-        <div class="pipeline-step-icon">6</div>
+        <div class="pipeline-step-icon">5</div>
         <div class="pipeline-step-label">Train</div>
         <div class="pipeline-step-status">--</div>
       </div>
@@ -107,7 +101,6 @@
         <input type="hidden" name="variety" value="cu"/>
         <input type="hidden" name="start_date" value="{{ default_schedule_start }}"/>
         <input type="hidden" name="end_date" value="{{ default_schedule_end }}"/>
-        <input type="hidden" name="threshold" value="1.1"/>
         <input type="hidden" name="data_dir" value="data"/>
         <button type="submit" class="btn btn-secondary" style="width:100%;">Build Schedule (cu)</button>
       </form>
@@ -115,7 +108,6 @@
         <input type="hidden" name="variety" value="cu"/>
         <input type="hidden" name="derived_symbol" value="KQ.m@SHFE.cu"/>
         <input type="hidden" name="data_dir" value="data"/>
-        <input type="hidden" name="overwrite" value="false"/>
         <button type="submit" class="btn btn-secondary" style="width:100%;">Build main_l5 (cu)</button>
       </form>
       <form method="post" action="/data/build/build{{ token_qs }}">
@@ -301,7 +293,6 @@
       }
       
       // Pipeline status
-      updatePipelineStep("stepIngest", data.pipeline?.ingest);
       updatePipelineStep("stepSync", data.pipeline?.sync);
       updatePipelineStep("stepSchedule", data.pipeline?.schedule);
       updatePipelineStep("stepMainL5", data.pipeline?.main_l5);
@@ -367,7 +358,6 @@
 
   function setupPipelineNavigation() {
     const map = {
-      stepIngest: `/data${tokenQs}#ingest`,
       stepSync: `/data${tokenQs}#contracts`,
       stepSchedule: `/data${tokenQs}#build`,
       stepMainL5: `/data${tokenQs}#build`,

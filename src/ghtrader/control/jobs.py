@@ -124,6 +124,9 @@ class JobManager:
         env["GHTRADER_JOB_ID"] = job_id
         env["GHTRADER_JOB_SOURCE"] = "dashboard"
         env["GHTRADER_JOB_LOG_PATH"] = str(log_path)
+        env["GHTRADER_JOB_VERBOSE"] = "1"
+        env["GHTRADER_LOG_LEVEL"] = "debug"
+        env["PYTHONUNBUFFERED"] = "1"
         with open(log_path, "ab", buffering=0) as f:
             proc = subprocess.Popen(
                 argv,
@@ -202,6 +205,9 @@ class JobManager:
         env["GHTRADER_JOB_ID"] = job_id
         env["GHTRADER_JOB_SOURCE"] = str(job.source or "dashboard")
         env["GHTRADER_JOB_LOG_PATH"] = str(log_path)
+        env["GHTRADER_JOB_VERBOSE"] = "1"
+        env["GHTRADER_LOG_LEVEL"] = "debug"
+        env["PYTHONUNBUFFERED"] = "1"
 
         with open(log_path, "ab", buffering=0) as f:
             proc = subprocess.Popen(

@@ -91,7 +91,6 @@ def register(main: click.Group) -> None:
     @click.option("--pg-user", default="", help="QuestDB PGWire user (default: env/config)")
     @click.option("--pg-password", default="", help="QuestDB PGWire password (default: env/config)")
     @click.option("--pg-dbname", default="", help="QuestDB PGWire dbname (default: env/config)")
-    @click.option("--raw-table", default="ghtrader_ticks_raw_v2", show_default=True, help="Raw ticks table name")
     @click.option("--main-l5-table", default="ghtrader_ticks_main_l5_v2", show_default=True, help="Derived main_l5 ticks table name")
     def db_questdb_init(
         host: str,
@@ -100,7 +99,6 @@ def register(main: click.Group) -> None:
         pg_user: str,
         pg_password: str,
         pg_dbname: str,
-        raw_table: str,
         main_l5_table: str,
     ) -> None:
         """Ensure required ghTrader tables exist in QuestDB (DDL via PGWire)."""
@@ -134,8 +132,7 @@ def register(main: click.Group) -> None:
         )
         backend = make_serving_backend(cfg)
 
-        # Ensure both table schemas exist (best-effort idempotent DDL).
-        backend.ensure_table(table=str(raw_table), include_segment_metadata=False)
+        # Ensure main_l5 table schema exists (best-effort idempotent DDL).
         backend.ensure_table(table=str(main_l5_table), include_segment_metadata=True)
 
         # Validate tables are queryable (so failures are surfaced loudly).
@@ -144,7 +141,7 @@ def register(main: click.Group) -> None:
 
             with psycopg.connect(user=u, password=pw, host=h, port=int(p), dbname=dbn, connect_timeout=2) as conn:
                 with conn.cursor() as cur:
-                    for tbl in [str(raw_table), str(main_l5_table)]:
+                    for tbl in [str(main_l5_table)]:
                         cur.execute(f"SELECT 1 FROM {tbl} LIMIT 1")
                         cur.fetchone()
         except Exception as e:
@@ -160,7 +157,7 @@ def register(main: click.Group) -> None:
                     "ilp_port": int(ilp),
                     "pg_user": u,
                     "pg_dbname": dbn,
-                    "tables": {"raw": str(raw_table), "main_l5": str(main_l5_table)},
+                    "tables": {"main_l5": str(main_l5_table)},
                 }
             )
         )
@@ -271,11 +268,10 @@ def register(main: click.Group) -> None:
     @click.option("--runs-dir", default="runs", help="Runs directory root")
     @click.option(
         "--ticks-kind",
-        "--ticks-lake",
-        default="raw",
-        type=click.Choice(["raw", "main_l5"]),
+        default="main_l5",
+        type=click.Choice(["main_l5"]),
         show_default=True,
-        help="Which ticks kind to benchmark (raw vs main_l5).",
+        help="Ticks kind to benchmark (main_l5 only).",
     )
     @click.option("--max-rows", default=200000, type=int, show_default=True, help="Max rows to load/ingest for the benchmark")
     @click.option("--host", default="127.0.0.1", show_default=True, help="QuestDB host")

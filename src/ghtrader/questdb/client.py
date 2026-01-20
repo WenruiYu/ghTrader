@@ -93,7 +93,8 @@ def connect_pg_safe(
             return conn
         except Exception as e:
             last_err = e
-            if attempt >= int(retries) or not is_transient_pg_error(e):
+            is_transient = is_transient_pg_error(e)
+            if attempt >= int(retries) or not is_transient:
                 raise
             try:
                 time.sleep(float(backoff_s) * (2 ** attempt))

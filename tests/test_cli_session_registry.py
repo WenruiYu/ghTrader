@@ -51,13 +51,13 @@ def test_cli_lock_acquire_updates_job_fields(tmp_path: Path, monkeypatch: pytest
     from ghtrader.cli import _acquire_locks
     from ghtrader.control.locks import LockStore
 
-    _acquire_locks(["build:symbol=SHFE.cu2602,ticks_kind=raw"])
+    _acquire_locks(["build:symbol=KQ.m@SHFE.cu,ticks_kind=main_l5"])
 
     j = store.get_job("jid123")
     assert j is not None
     assert j.status == "running"
-    assert j.held_locks and "build:symbol=SHFE.cu2602,ticks_kind=raw" in j.held_locks
+    assert j.held_locks and "build:symbol=KQ.m@SHFE.cu,ticks_kind=main_l5" in j.held_locks
 
     locks = LockStore(db_path).list_locks()
-    assert any(l.key == "build:symbol=SHFE.cu2602,ticks_kind=raw" and l.job_id == "jid123" for l in locks)
+    assert any(l.key == "build:symbol=KQ.m@SHFE.cu,ticks_kind=main_l5" and l.job_id == "jid123" for l in locks)
 

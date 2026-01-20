@@ -25,7 +25,7 @@ from ghtrader.util.json_io import read_json as _read_json, write_json_atomic as 
 
 log = structlog.get_logger()
 
-_TQSDK_HEAVY_SUBCOMMANDS = {"download", "download-contract-range", "record", "probe-l5", "update", "account"}
+_TQSDK_HEAVY_SUBCOMMANDS = {"download", "download-contract-range", "record", "update", "account"}
 _TQSDK_HEAVY_DATA_SUBCOMMANDS = {"repair", "health"}
 
 _UI_STATUS_TTL_S = 5.0
@@ -243,16 +243,7 @@ def _daily_update_targets_from_env() -> list[tuple[str, str]]:
 
 
 def _daily_update_enabled() -> bool:
-    if not _daily_update_targets_from_env():
-        return False
-    if str(os.environ.get("GHTRADER_DISABLE_DAILY_UPDATE", "")).strip().lower() in {"1", "true", "yes"}:
-        return False
-    # Avoid background threads during pytest unless explicitly enabled.
-    if ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")) and str(
-        os.environ.get("GHTRADER_ENABLE_DAILY_UPDATE_IN_TESTS", "")
-    ).strip().lower() not in {"1", "true", "yes"}:
-        return False
-    return True
+    return False
 
 
 def _daily_update_state_path(*, runs_dir: Path) -> Path:
@@ -1178,118 +1169,7 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
-
-        k = str(kind or "ticks").strip().lower()
-        lim = max(1, min(int(limit or 200), 500))
-        q = str(search or "").strip().lower()
-
-        global _data_coverage_at, _data_coverage_cache_key, _data_coverage_payload
-        now = time.time()
-        cache_key = f"{k}|{lim}|{q}"
-        with _data_coverage_lock:
-            if (
-                isinstance(_data_coverage_payload, dict)
-                and _data_coverage_cache_key == cache_key
-                and (now - float(_data_coverage_at)) <= float(_DATA_COVERAGE_TTL_S)
-                and not refresh
-            ):
-                cached = dict(_data_coverage_payload)
-                return cached
-
-        # QuestDB-first: prefer DB-backed coverage when available.
-        # - ticks/main_l5: QuestDB index tables
-        # - features/labels: QuestDB build-metadata tables (latest build per symbol)
-        if k in {"ticks", "main_l5"}:
-            lv = "v2"
-            tl = "raw" if k == "ticks" else "main_l5"
-            try:
-                from ghtrader.questdb.index import INDEX_TABLE_V2, ensure_index_tables, query_index_coverage_rows
-                from ghtrader.questdb.client import make_questdb_query_config_from_env
-
-                cfg = make_questdb_query_config_from_env()
-                ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
-                rows2 = query_index_coverage_rows(
-                    cfg=cfg,
-                    dataset_version=lv,
-                    ticks_kind=tl,
-                    limit=lim,
-                    search=q,
-                    index_table=INDEX_TABLE_V2,
-                )
-                out2 = [{"symbol": r.get("symbol"), "n_dates": r.get("n_days"), "min_date": r.get("min_day"), "max_date": r.get("max_day")} for r in rows2]
-                payload2 = {"ok": True, "kind": k, "count": len(out2), "rows": out2, "source": "questdb_index", "generated_at": _now_iso()}
-                with _data_coverage_lock:
-                    _data_coverage_payload = dict(payload2)
-                    _data_coverage_cache_key = cache_key
-                    _data_coverage_at = time.time()
-                return payload2
-            except Exception as e:
-                log.warning("api_data_coverage.questdb_index_failed", kind=k, error=str(e))
-                payload_err = {"ok": False, "kind": k, "error": str(e), "rows": [], "source": "questdb_index", "generated_at": _now_iso()}
-                with _data_coverage_lock:
-                    _data_coverage_payload = dict(payload_err)
-                    _data_coverage_cache_key = cache_key
-                    _data_coverage_at = time.time()
-                return payload_err
-
-        if k in {"features", "labels"}:
-            try:
-                from datetime import date as _date
-
-                from ghtrader.questdb.features_labels import FEATURE_BUILDS_TABLE_V2, LABEL_BUILDS_TABLE_V2
-                from ghtrader.questdb.client import connect_pg as _connect, make_questdb_query_config_from_env
-
-                cfg = make_questdb_query_config_from_env()
-                bt = FEATURE_BUILDS_TABLE_V2 if k == "features" else LABEL_BUILDS_TABLE_V2
-                sql = f"""
-                SELECT symbol, first_day, last_day
-                FROM {bt}
-                WHERE dataset_version = 'v2'
-                LATEST ON ts PARTITION BY symbol
-                LIMIT {int(lim)}
-                """
-
-                out2: list[dict[str, Any]] = []
-                with _connect(cfg, connect_timeout_s=2) as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(sql)
-                        for sym, first_day, last_day in cur.fetchall():
-                            s = str(sym or "").strip()
-                            if not s:
-                                continue
-                            if q and q not in s.lower():
-                                continue
-                            a = str(first_day or "").strip()
-                            b = str(last_day or "").strip()
-                            n_dates = 0
-                            try:
-                                if a and b:
-                                    d0 = _date.fromisoformat(a[:10])
-                                    d1 = _date.fromisoformat(b[:10])
-                                    if d1 >= d0:
-                                        n_dates = int((d1 - d0).days + 1)
-                            except Exception:
-                                n_dates = 0
-                            out2.append({"symbol": s, "n_dates": n_dates, "min_date": a, "max_date": b})
-                            if len(out2) >= lim:
-                                break
-
-                payload2 = {"ok": True, "kind": k, "count": len(out2), "rows": out2, "source": "questdb_builds", "generated_at": _now_iso()}
-                with _data_coverage_lock:
-                    _data_coverage_payload = dict(payload2)
-                    _data_coverage_cache_key = cache_key
-                    _data_coverage_at = time.time()
-                return payload2
-            except Exception as e:
-                log.warning("api_data_coverage.questdb_builds_failed", kind=k, error=str(e))
-                payload_err = {"ok": False, "kind": k, "error": str(e), "rows": [], "source": "questdb_builds", "generated_at": _now_iso()}
-                with _data_coverage_lock:
-                    _data_coverage_payload = dict(payload_err)
-                    _data_coverage_cache_key = cache_key
-                    _data_coverage_at = time.time()
-                return payload_err
-
-        raise HTTPException(status_code=400, detail="invalid kind")
+        return {"ok": False, "error": "data coverage deferred (Phase-1/2)"}
 
     @app.get("/api/data/coverage/summary", response_class=JSONResponse)
     def api_data_coverage_summary(request: Request, refresh: bool = False) -> dict[str, Any]:
@@ -1298,104 +1178,7 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
-
-        global _data_coverage_summary_at, _data_coverage_summary_payload
-        now = time.time()
-        with _data_coverage_summary_lock:
-            if (
-                isinstance(_data_coverage_summary_payload, dict)
-                and (now - float(_data_coverage_summary_at)) <= float(_DATA_COVERAGE_SUMMARY_TTL_S)
-                and not refresh
-            ):
-                return dict(_data_coverage_summary_payload)
-
-        payload: dict[str, Any] = {"ok": True, "generated_at": _now_iso(), "summary": {}}
-
-        try:
-            from ghtrader.questdb.client import connect_pg as _connect, make_questdb_query_config_from_env
-            from ghtrader.questdb.features_labels import FEATURE_BUILDS_TABLE_V2, LABEL_BUILDS_TABLE_V2
-            from ghtrader.questdb.index import INDEX_TABLE_V2, ensure_index_tables
-
-            cfg = make_questdb_query_config_from_env()
-            ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
-
-            idx = INDEX_TABLE_V2
-            with _connect(cfg, connect_timeout_s=2) as conn:
-                with conn.cursor() as cur:
-                    for kind, ticks_kind in [("ticks", "raw"), ("main_l5", "main_l5")]:
-                        try:
-                            cur.execute(
-                                f"""
-                                SELECT count() AS n_symbols, min(min_day) AS min_day, max(max_day) AS max_day
-                                FROM (
-                                  SELECT symbol,
-                                         min(cast(trading_day as string)) AS min_day,
-                                         max(cast(trading_day as string)) AS max_day
-                                  FROM {idx}
-                                  WHERE ticks_kind = %s AND dataset_version = %s AND rows_total > 0
-                                  GROUP BY symbol
-                                )
-                                """,
-                                [ticks_kind, "v2"],
-                            )
-                            row = cur.fetchone() or (0, None, None)
-                            payload["summary"][kind] = {
-                                "ok": True,
-                                "symbols": int(row[0] or 0),
-                                "min_day": str(row[1] or "") or None,
-                                "max_day": str(row[2] or "") or None,
-                                "source": "questdb_index",
-                            }
-                        except Exception as e:
-                            payload["summary"][kind] = {
-                                "ok": False,
-                                "symbols": None,
-                                "min_day": None,
-                                "max_day": None,
-                                "source": "questdb_index",
-                                "error": str(e),
-                            }
-
-                    for kind, table in [("features", FEATURE_BUILDS_TABLE_V2), ("labels", LABEL_BUILDS_TABLE_V2)]:
-                        try:
-                            cur.execute(
-                                f"""
-                                SELECT count() AS n_symbols, min(first_day) AS min_day, max(last_day) AS max_day
-                                FROM (
-                                  SELECT symbol, first_day, last_day
-                                  FROM {table}
-                                  WHERE dataset_version = %s
-                                  LATEST ON ts PARTITION BY symbol
-                                )
-                                """,
-                                ["v2"],
-                            )
-                            row = cur.fetchone() or (0, None, None)
-                            payload["summary"][kind] = {
-                                "ok": True,
-                                "symbols": int(row[0] or 0),
-                                "min_day": str(row[1] or "") or None,
-                                "max_day": str(row[2] or "") or None,
-                                "source": "questdb_builds",
-                            }
-                        except Exception as e:
-                            payload["summary"][kind] = {
-                                "ok": False,
-                                "symbols": None,
-                                "min_day": None,
-                                "max_day": None,
-                                "source": "questdb_builds",
-                                "error": str(e),
-                            }
-        except Exception as e:
-            payload["ok"] = False
-            payload["error"] = str(e)
-            payload["source"] = "questdb"
-
-        with _data_coverage_summary_lock:
-            _data_coverage_summary_payload = dict(payload)
-            _data_coverage_summary_at = time.time()
-        return payload
+        return {"ok": False, "error": "coverage summary deferred (Phase-1/2)"}
 
     @app.get("/api/data/quality-summary", response_class=JSONResponse)
     def api_data_quality_summary(
@@ -1412,6 +1195,7 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
+        return {"ok": False, "error": "data quality deferred (Phase-1/2)"}
 
         ex = str(exchange).upper().strip() or "SHFE"
         v = str(var).lower().strip() or "cu"
@@ -1507,7 +1291,7 @@ def create_app() -> Any:
                     "bid_price1_null_rate, ask_price1_null_rate, last_price_null_rate, volume_null_rate, open_interest_null_rate, "
                     "l5_fields_null_rate, price_jump_outliers, volume_spike_outliers, spread_anomaly_outliers, updated_at "
                     "FROM ghtrader_field_quality_v2 "
-                    f"WHERE symbol IN ({placeholders}) AND ticks_kind='raw' AND dataset_version='v2' "
+                    f"WHERE symbol IN ({placeholders}) AND ticks_kind='main_l5' AND dataset_version='v2' "
                     "LATEST ON ts PARTITION BY symbol"
                 )
                 gaps_sql = (
@@ -1515,7 +1299,7 @@ def create_app() -> Any:
                     "median_interval_ms, p95_interval_ms, p99_interval_ms, max_interval_ms, "
                     "abnormal_gaps_count, critical_gaps_count, largest_gap_duration_ms, updated_at "
                     "FROM ghtrader_tick_gaps_v2 "
-                    f"WHERE symbol IN ({placeholders}) AND ticks_kind='raw' AND dataset_version='v2' "
+                    f"WHERE symbol IN ({placeholders}) AND ticks_kind='main_l5' AND dataset_version='v2' "
                     "LATEST ON ts PARTITION BY symbol"
                 )
                 with _connect(cfg, connect_timeout_s=2) as conn:
@@ -1707,6 +1491,8 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
+        _ = symbol, limit
+        return {"ok": False, "error": "data quality deferred (Phase-1/2)"}
         sym = str(symbol or "").strip()
         if not sym or len(sym) > 64:
             raise HTTPException(status_code=400, detail="invalid symbol")
@@ -1728,7 +1514,7 @@ def create_app() -> Any:
                             "SELECT trading_day, rows_total, bid_price1_null_rate, ask_price1_null_rate, last_price_null_rate, volume_null_rate, open_interest_null_rate, "
                             "l5_fields_null_rate, price_jump_outliers, volume_spike_outliers, spread_anomaly_outliers, consecutive_gaps_metadata, updated_at "
                             "FROM ghtrader_field_quality_v2 "
-                            "WHERE symbol=%s AND ticks_kind='raw' AND dataset_version='v2' "
+                            "WHERE symbol=%s AND ticks_kind='main_l5' AND dataset_version='v2' "
                             "ORDER BY ts DESC LIMIT %s",
                             [sym, lim],
                         )
@@ -1757,7 +1543,7 @@ def create_app() -> Any:
                             "SELECT trading_day, tick_count_actual, tick_count_expected_min, tick_count_expected_max, median_interval_ms, p95_interval_ms, p99_interval_ms, "
                             "max_interval_ms, abnormal_gaps_count, critical_gaps_count, largest_gap_duration_ms, updated_at "
                             "FROM ghtrader_tick_gaps_v2 "
-                            "WHERE symbol=%s AND ticks_kind='raw' AND dataset_version='v2' "
+                            "WHERE symbol=%s AND ticks_kind='main_l5' AND dataset_version='v2' "
                             "ORDER BY ts DESC LIMIT %s",
                             [sym, lim],
                         )
@@ -1821,6 +1607,8 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
+        _ = request
+        return {"ok": False, "error": "data diagnose deferred (Phase-1/2)"}
         payload = await request.json()
 
         runs_dir = get_runs_dir()
@@ -1892,6 +1680,8 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
+        _ = request
+        return {"ok": False, "error": "data repair deferred (Phase-1/2)"}
         payload = await request.json()
 
         runs_dir = get_runs_dir()
@@ -1968,6 +1758,8 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
+        _ = request
+        return {"ok": False, "error": "data health deferred (Phase-1/2)"}
         payload = await request.json()
 
         runs_dir = get_runs_dir()
@@ -2045,98 +1837,6 @@ def create_app() -> Any:
 
         # Health may be TqSdk-heavy (auto-repair downloads): enqueue to respect scheduler.
         rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
-
-    @app.post("/api/data/enqueue-index-bootstrap", response_class=JSONResponse)
-    async def api_data_enqueue_index_bootstrap(request: Request) -> dict[str, Any]:
-        """
-        Enqueue an index bootstrap job (runs `ghtrader data index-bootstrap ...`).
-
-        This scans the canonical ticks table and populates `ghtrader_symbol_day_index_v2`
-        for the selected exchange/variety. Required when the index is empty or incomplete
-        before Diagnose/Health can compute meaningful completeness.
-
-        Payload:
-        - exchange: SHFE (default)
-        - var: cu|au|ag (default cu)
-        - force: bool (default false) - bypass TTL check for explicit user requests
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        payload = await request.json()
-
-        runs_dir = get_runs_dir()
-        data_dir = get_data_dir()
-
-        ex = str(payload.get("exchange") or "SHFE").upper().strip()
-        v = str(payload.get("var") or "cu").lower().strip()
-        force = bool(payload.get("force", False))
-
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "data",
-            "index-bootstrap",
-            "--exchange",
-            ex,
-            "--var",
-            v,
-            "--data-dir",
-            str(data_dir),
-            "--runs-dir",
-            str(runs_dir),
-        )
-
-        title = f"data-index-bootstrap {ex}.{v}"
-        store = request.app.state.job_store
-        jm = request.app.state.job_manager
-
-        # Dedupe: avoid duplicate queued/active index-bootstrap jobs for the same scope.
-        try:
-            active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=5000)
-            for j in active:
-                if str(j.title or "").startswith(title):
-                    return {"ok": True, "enqueued": [j.id], "count": 1, "deduped": True}
-        except Exception:
-            pass
-
-        # TTL marker to avoid repeated attempts in a tight loop (skip if force=True).
-        if not force:
-            try:
-                ttl_boot = float(os.environ.get("GHTRADER_INDEX_BOOTSTRAP_TTL_S", "86400") or "86400")
-            except Exception:
-                ttl_boot = 86400.0
-            ttl_boot = float(max(60.0, ttl_boot))
-
-            st_path = runs_dir / "control" / "cache" / "index_bootstrap" / f"state_exchange={ex}_var={v}.json"
-            st = _read_json(st_path) if st_path.exists() else None
-            last_unix = 0.0
-            try:
-                last_unix = float((st or {}).get("last_attempt_unix") or 0.0) if isinstance(st, dict) else 0.0
-            except Exception:
-                last_unix = 0.0
-
-            if last_unix > 0 and (time.time() - last_unix) < ttl_boot:
-                return {"ok": False, "error": "bootstrap_ttl", "message": f"Bootstrap was attempted recently. TTL: {int(ttl_boot)}s. Use force=true to override.", "last_attempt_unix": last_unix}
-
-        # Index bootstrap is local work (QuestDB queries), not TqSdk-heavy, so start immediately.
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-
-        # Update TTL marker.
-        try:
-            _write_json_atomic(
-                st_path,
-                {
-                    "exchange": ex,
-                    "var": v,
-                    "last_attempt_at": _now_iso(),
-                    "last_attempt_unix": float(time.time()),
-                    "job_id": str(rec.id),
-                    "reason": "explicit_request",
-                },
-            )
-        except Exception:
-            pass
-
         return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
 
     @app.post("/api/data/enqueue-l5-start", response_class=JSONResponse)
@@ -2318,248 +2018,7 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
-
-        ex = str(exchange).upper().strip() or "SHFE"
-        v = str(var).lower().strip() or "cu"
-        lv = "v2"
-
-        runs_dir = get_runs_dir()
-        data_dir = get_data_dir()
-
-        refresh_req = str(refresh).strip() in {"1", "true", "yes"}
-
-        # PRD: Contracts table is always snapshot-backed (no request-path compute).
-        snap_path = _contracts_snapshot_path(runs_dir=runs_dir, exchange=ex, var=v)
-        snap = _read_json(snap_path) if snap_path.exists() else None
-
-        try:
-            ttl_s = float(os.environ.get("GHTRADER_CONTRACTS_SNAPSHOT_TTL_S", "20") or "20")
-        except Exception:
-            ttl_s = 20.0
-
-        age_s = _contracts_snapshot_age_s(path=snap_path, obj=snap)
-        fresh = bool(snap) and (age_s <= float(max(1.0, ttl_s)))
-        stale = bool(snap) and not fresh
-
-        job_info: dict[str, Any] | None = None
-        if refresh_req or stale or not snap:
-            # Dedupe by checking existing jobs.
-            store = request.app.state.job_store
-            jm = request.app.state.job_manager
-            target_prefix = f"contracts-snapshot-build {ex}.{v}"
-            existing = None
-            try:
-                active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=2000)
-                for j in active:
-                    if str(j.title or "").startswith(target_prefix):
-                        existing = j
-                        break
-            except Exception:
-                existing = None
-
-            if existing is not None:
-                job_info = {"enqueued": False, "job_id": existing.id, "status": existing.status}
-            else:
-                refresh_catalog = bool(refresh_req)
-                questdb_full = False
-                bootstrap_reason = ""
-                bootstrap_skipped = False
-
-                # Auto-bootstrap the QuestDB symbol-day index on explicit Refresh when the index appears
-                # empty OR clearly incomplete for the selected exchange/var. This is a bootstrap path for
-                # deployments that already have ticks in QuestDB but don't yet have the index populated.
-                if refresh_req:
-                    # Use previous snapshot hints first (cheap).
-                    q_prev = snap.get("questdb") if isinstance(snap, dict) else None
-                    hint_empty = False
-                    try:
-                        if isinstance(q_prev, dict) and bool(q_prev.get("index_empty")):
-                            hint_empty = True
-                    except Exception:
-                        hint_empty = False
-
-                    idx_empty = hint_empty
-                    idx_incomplete = False
-                    idx_symbols = 0
-                    expected_symbols = 0
-                    idx_check_err = ""
-                    try:
-                        from ghtrader.questdb.client import make_questdb_query_config_from_env
-                        from ghtrader.questdb.index import INDEX_TABLE_V2, ensure_index_tables, list_symbols_from_index
-
-                        # Best-effort expected symbol count (from previous snapshot), so we can detect
-                        # "partially populated" index tables (not just fully empty).
-                        try:
-                            prev_rows = (snap.get("contracts") if isinstance(snap, dict) else None) or []
-                            if isinstance(prev_rows, list):
-                                expected_symbols = int(
-                                    len(
-                                        [
-                                            rr
-                                            for rr in prev_rows
-                                            if isinstance(rr, dict) and str(rr.get("symbol") or "").strip()
-                                        ]
-                                    )
-                                )
-                        except Exception:
-                            expected_symbols = 0
-
-                        qcfg = make_questdb_query_config_from_env()
-                        ensure_index_tables(cfg=qcfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
-                        got = list_symbols_from_index(
-                            cfg=qcfg,
-                            dataset_version=lv,
-                            ticks_kind="raw",
-                            prefix=f"{ex}.{v}",
-                            index_table=INDEX_TABLE_V2,
-                            limit=10000,
-                            connect_timeout_s=2,
-                        )
-                        idx_symbols = int(len(got or []))
-                        idx_empty = idx_empty or (idx_symbols <= 0)
-
-                        # Detect strongly incomplete index (e.g., only active symbols present).
-                        # Default threshold is conservative and only triggers on large gaps.
-                        try:
-                            min_ratio = float(os.environ.get("GHTRADER_INDEX_BOOTSTRAP_MIN_SYMBOL_RATIO", "0.8") or "0.8")
-                        except Exception:
-                            min_ratio = 0.8
-                        min_ratio = float(max(0.0, min(1.0, min_ratio)))
-                        if expected_symbols >= 10 and idx_symbols > 0:
-                            idx_incomplete = float(idx_symbols) < (float(expected_symbols) * min_ratio)
-                    except Exception as e:
-                        idx_check_err = str(e)
-
-                    if idx_empty or idx_incomplete:
-                        # TTL marker to avoid repeatedly bootstrapping in a tight loop.
-                        try:
-                            ttl_boot = float(os.environ.get("GHTRADER_INDEX_BOOTSTRAP_TTL_S", "86400") or "86400")
-                        except Exception:
-                            ttl_boot = 86400.0
-                        ttl_boot = float(max(60.0, ttl_boot))
-
-                        st_path = runs_dir / "control" / "cache" / "index_bootstrap" / f"state_exchange={ex}_var={v}.json"
-                        st = _read_json(st_path) if st_path.exists() else None
-                        last_unix = 0.0
-                        try:
-                            last_unix = float((st or {}).get("last_attempt_unix") or 0.0) if isinstance(st, dict) else 0.0
-                        except Exception:
-                            last_unix = 0.0
-
-                        if last_unix > 0 and (time.time() - last_unix) < ttl_boot:
-                            bootstrap_skipped = True
-                            bootstrap_reason = "ttl"
-                        else:
-                            questdb_full = True
-                            if idx_empty:
-                                bootstrap_reason = "index_empty" if not hint_empty else "index_empty_hint"
-                            else:
-                                bootstrap_reason = f"index_incomplete idx={idx_symbols} expected={expected_symbols}"
-                            if idx_check_err:
-                                bootstrap_reason = bootstrap_reason + "_check_failed"
-                argv = python_module_argv(
-                    "ghtrader.cli",
-                    "contracts-snapshot-build",
-                    "--exchange",
-                    ex,
-                    "--var",
-                    v,
-                    "--refresh-catalog",
-                    ("1" if refresh_catalog else "0"),
-                    "--questdb-full",
-                    ("1" if questdb_full else "0"),
-                    "--data-dir",
-                    str(data_dir),
-                    "--runs-dir",
-                    str(runs_dir),
-                )
-                suffixes: list[str] = []
-                if refresh_catalog:
-                    suffixes.append("live")
-                if questdb_full:
-                    suffixes.append("index-bootstrap")
-                title = f"contracts-snapshot-build {ex}.{v}" + (f" ({', '.join(suffixes)})" if suffixes else "")
-                rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-                job_info = {
-                    "enqueued": True,
-                    "job_id": rec.id,
-                    "status": rec.status,
-                    "questdb_full": bool(questdb_full),
-                    "bootstrap_reason": str(bootstrap_reason or ""),
-                    "bootstrap_skipped": bool(bootstrap_skipped),
-                }
-
-                if questdb_full:
-                    try:
-                        st_path = runs_dir / "control" / "cache" / "index_bootstrap" / f"state_exchange={ex}_var={v}.json"
-                        _write_json_atomic(
-                            st_path,
-                            {
-                                "exchange": ex,
-                                "var": v,
-                                "last_attempt_at": _now_iso(),
-                                "last_attempt_unix": float(time.time()),
-                                "job_id": str(rec.id),
-                                "reason": str(bootstrap_reason or ""),
-                            },
-                        )
-                    except Exception:
-                        pass
-
-        if snap:
-            out = dict(snap)
-            out["cache_stale"] = bool(stale)
-            out["snapshot_age_s"] = float(age_s)
-            out["snapshot_job"] = job_info
-            return out
-        return {
-            "ok": False,
-            "error": "contracts_snapshot_building",
-            "exchange": ex,
-            "var": v,
-            "dataset_version": lv,
-            "snapshot_job": job_info,
-        }
-
-    @app.post("/api/contracts/enqueue-probe-l5", response_class=JSONResponse)
-    async def api_contracts_enqueue_probe_l5(request: Request) -> dict[str, Any]:
-        """
-        Enqueue per-contract L5 probe jobs (runs `ghtrader probe-l5 --symbol ...`).
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        payload = await request.json()
-
-        runs_dir = get_runs_dir()
-        data_dir = get_data_dir()
-
-        symbols: list[str] = []
-        raw_syms = payload.get("symbols")
-        if isinstance(raw_syms, list):
-            symbols = [str(s).strip() for s in raw_syms if str(s).strip()]
-        scope = str(payload.get("scope") or "").strip().lower()
-        ex = str(payload.get("exchange") or "SHFE").upper().strip()
-        v = str(payload.get("var") or "cu").lower().strip()
-
-        if not symbols and scope == "all":
-            from ghtrader.tq.catalog import get_contract_catalog
-
-            cat = get_contract_catalog(exchange=ex, var=v, runs_dir=runs_dir, refresh=False)
-            if not bool(cat.get("ok", False)):
-                return {"ok": False, "error": str(cat.get("error") or "tqsdk_catalog_failed")}
-            symbols = [str(r.get("symbol") or "").strip() for r in (cat.get("contracts") or []) if str(r.get("symbol") or "").strip()]
-
-        if not symbols:
-            raise HTTPException(status_code=400, detail="No symbols to probe (pass symbols[] or scope=all)")
-
-        enqueued: list[str] = []
-        for sym in symbols:
-            argv = python_module_argv("ghtrader.cli", "probe-l5", "--symbol", sym, "--data-dir", str(data_dir))
-            title = f"probe-l5 {sym}"
-            rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-            enqueued.append(rec.id)
-
-        return {"ok": True, "enqueued": enqueued, "count": int(len(enqueued))}
+        return {"ok": False, "error": "contracts explorer deferred (Phase-1/2)"}
 
     @app.post("/api/contracts/enqueue-fill", response_class=JSONResponse)
     async def api_contracts_enqueue_fill(request: Request) -> dict[str, Any]:
@@ -2574,130 +2033,8 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
-        payload = await request.json()
-
-        runs_dir = get_runs_dir()
-        data_dir = get_data_dir()
-
-        symbols: list[str] = []
-        raw_syms = payload.get("symbols")
-        if isinstance(raw_syms, list):
-            symbols = [str(s).strip() for s in raw_syms if str(s).strip()]
-
-        scope = str(payload.get("scope") or "missing").strip().lower()
-        ex = str(payload.get("exchange") or "SHFE").upper().strip()
-        v = str(payload.get("var") or "cu").lower().strip()
-        lv = "v2"
-
-        if not symbols and scope in {"missing", "all"}:
-            from ghtrader.data.contract_status import compute_contract_statuses
-            from ghtrader.tq.catalog import get_contract_catalog
-
-            cat = get_contract_catalog(exchange=ex, var=v, runs_dir=runs_dir, refresh=False)
-            if not bool(cat.get("ok", False)):
-                return {"ok": False, "error": str(cat.get("error") or "tqsdk_catalog_failed")}
-
-            # PRD: QuestDB-first - fetch coverage from QuestDB index for accurate status computation.
-            scope_syms = [str(c.get("symbol") or "").strip() for c in (cat.get("contracts") or []) if str(c.get("symbol") or "").strip()]
-            scope_cov: dict[str, dict[str, Any]] | None = None
-            try:
-                from ghtrader.questdb.client import make_questdb_query_config_from_env
-                from ghtrader.questdb.index import INDEX_TABLE_V2, ensure_index_tables, query_contract_coverage_from_index
-                cfg = make_questdb_query_config_from_env()
-                ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
-                scope_cov = query_contract_coverage_from_index(
-                    cfg=cfg,
-                    symbols=scope_syms,
-                    dataset_version=lv,
-                    ticks_kind="raw",
-                    index_table=INDEX_TABLE_V2,
-                )
-            except Exception:
-                scope_cov = None
-
-            status = compute_contract_statuses(
-                exchange=ex,
-                var=v,
-                data_dir=data_dir,
-                contracts=list(cat.get("contracts") or []),
-                questdb_cov_by_symbol=scope_cov,
-            )
-            rows = list(status.get("contracts") or [])
-            if scope == "missing":
-                # PRD status taxonomy: include unindexed, not-downloaded, incomplete, stale
-                rows = [r for r in rows if str(r.get("status") or "") in {"unindexed", "not-downloaded", "incomplete", "stale"}]
-            symbols = [str(r.get("symbol") or "").strip() for r in rows if str(r.get("symbol") or "").strip()]
-
-        if not symbols:
-            raise HTTPException(status_code=400, detail="No symbols to fill (pass symbols[] or scope=missing/all)")
-
-        manual_start = str(payload.get("start") or "").strip() or None
-        manual_end = str(payload.get("end") or "").strip() or None
-
-        # Build a lookup of expected ranges using local active-ranges cache (no network).
-        from ghtrader.data.contract_status import compute_contract_statuses
-        from ghtrader.tq.catalog import get_contract_catalog
-
-        cat2 = get_contract_catalog(exchange=ex, var=v, runs_dir=runs_dir, refresh=False)
-        by_catalog_sym = {str(r.get("symbol") or "").strip(): r for r in (cat2.get("contracts") or []) if str(r.get("symbol") or "").strip()}
-        contracts_for_ranges = [by_catalog_sym.get(s) or {"symbol": s, "expired": None, "expire_datetime": None} for s in symbols]
-
-        # Best-effort: prefer QuestDB canonical bounds when available for better Fill ranges.
-        cov: dict[str, dict[str, Any]] = {}
-        questdb_ok = False
-        try:
-            from ghtrader.questdb.client import make_questdb_query_config_from_env
-            from ghtrader.questdb.index import INDEX_TABLE_V2, ensure_index_tables, query_contract_coverage_from_index
-
-            cfg = make_questdb_query_config_from_env()
-            ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
-            cov = query_contract_coverage_from_index(
-                cfg=cfg,
-                symbols=[str(r.get("symbol") or "").strip() for r in contracts_for_ranges if str(r.get("symbol") or "").strip()],
-                dataset_version=lv,
-                ticks_kind="raw",
-                index_table=INDEX_TABLE_V2,
-            )
-            questdb_ok = True
-        except Exception:
-            cov = {}
-            questdb_ok = False
-
-        ranges = compute_contract_statuses(
-            exchange=ex,
-            var=v,
-            data_dir=data_dir,
-            contracts=contracts_for_ranges,
-            questdb_cov_by_symbol=cov if questdb_ok else None,
-        )
-        by_sym = {str(r.get("symbol") or ""): r for r in (ranges.get("contracts") or [])}
-
-        enqueued: list[str] = []
-        skipped: list[dict[str, Any]] = []
-        for sym in symbols:
-            r = by_sym.get(sym) or {}
-            start = str(r.get("expected_first") or "").strip() or manual_start
-            end = str(r.get("expected_last") or "").strip() or manual_end
-            if not start or not end:
-                skipped.append({"symbol": sym, "reason": "missing_expected_range", "hint": "run download-contract-range once or provide start/end"})
-                continue
-            argv = python_module_argv(
-                "ghtrader.cli",
-                "download",
-                "--symbol",
-                sym,
-                "--start",
-                start,
-                "--end",
-                end,
-                "--data-dir",
-                str(data_dir),
-            )
-            title = f"download {sym}"
-            rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-            enqueued.append(rec.id)
-
-        return {"ok": True, "enqueued": enqueued, "skipped": skipped, "count": int(len(enqueued))}
+        _ = request
+        return {"ok": False, "error": "contracts fill deferred (Phase-1/2)"}
 
     @app.post("/api/contracts/enqueue-update", response_class=JSONResponse)
     async def api_contracts_enqueue_update(request: Request) -> dict[str, Any]:
@@ -2712,6 +2049,8 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
+        _ = request
+        return {"ok": False, "error": "update deferred (Phase-1/2)"}
         payload = await request.json()
 
         runs_dir = get_runs_dir()
@@ -2760,6 +2099,8 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
+        _ = request
+        return {"ok": False, "error": "audit deferred (Phase-1/2)"}
         payload = await request.json()
 
         data_dir = get_data_dir()
@@ -2845,11 +2186,27 @@ def create_app() -> Any:
         else:
             raise HTTPException(status_code=400, detail="statuses must be list[str]")
 
-        # Default: cancel ingest downloads (safe conservative default).
+        # Default: cancel Phase-0 data pipeline jobs.
         if not kinds:
-            kinds = {"download", "download_contract_range"}
+            kinds = {"main_schedule", "main_l5"}
 
-        from ghtrader.control.ingest_status import parse_ingest_command
+        def _job_kind_from_command(cmd: list[str] | None) -> str:
+            parts = [str(p) for p in (cmd or [])]
+            if not parts:
+                return "unknown"
+            if "ghtrader" in parts:
+                i = parts.index("ghtrader")
+                if i + 1 < len(parts):
+                    return parts[i + 1].replace("-", "_")
+            if "ghtrader.cli" in parts:
+                i = parts.index("ghtrader.cli")
+                if i + 1 < len(parts):
+                    return parts[i + 1].replace("-", "_")
+            if "-m" in parts:
+                i = parts.index("-m")
+                if i + 2 < len(parts) and parts[i + 1].endswith("ghtrader.cli"):
+                    return parts[i + 2].replace("-", "_")
+            return "unknown"
 
         matched: list[str] = []
         cancelled: list[str] = []
@@ -2863,8 +2220,7 @@ def create_app() -> Any:
                 continue
 
             # Determine kind from argv; if unknown, skip.
-            desc = parse_ingest_command(list(job.command or []))
-            kind = str(desc.get("kind") or "unknown")
+            kind = _job_kind_from_command(list(job.command or []))
             if kind not in kinds:
                 continue
 
@@ -2921,36 +2277,6 @@ def create_app() -> Any:
 
         return FileResponse(path=str(p), filename=p.name, media_type="text/plain")
 
-    @app.get("/api/jobs/{job_id}/ingest_status", response_class=JSONResponse)
-    def api_job_ingest_status(request: Request, job_id: str) -> dict[str, Any]:
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        job = store.get_job(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="Job not found")
-        from ghtrader.control.ingest_status import ingest_status_for_job
-
-        try:
-            status = ingest_status_for_job(
-                job_id=job.id,
-                command=job.command,
-                log_path=job.log_path,
-                default_data_dir=get_data_dir(),
-            )
-        except Exception as e:
-            # Never wedge the dashboard UI on ingest-status computation failures.
-            status = {"kind": "unknown", "job_id": job.id, "error": str(e)}
-        # Attach minimal job metadata for UI convenience.
-        status.update(
-            {
-                "job_status": job.status,
-                "title": job.title,
-                "source": job.source,
-                "created_at": job.created_at,
-                "started_at": job.started_at,
-            }
-        )
-        return status
 
     @app.get("/api/jobs/{job_id}/progress", response_class=JSONResponse)
     def api_job_progress(request: Request, job_id: str) -> dict[str, Any]:
@@ -2978,40 +2304,6 @@ def create_app() -> Any:
         progress["available"] = True
         return progress
 
-    @app.get("/api/ingest/status", response_class=JSONResponse)
-    def api_ingest_status(request: Request, limit: int = 200) -> dict[str, Any]:
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        from ghtrader.control.ingest_status import ingest_status_for_job, parse_ingest_command
-
-        jobs = store.list_jobs(limit=int(limit))
-        out: list[dict[str, Any]] = []
-        for job in jobs:
-            if job.status not in {"queued", "running"}:
-                continue
-            kind = parse_ingest_command(job.command).get("kind")
-            if kind not in {"download", "download_contract_range", "record"}:
-                continue
-            try:
-                status = ingest_status_for_job(
-                    job_id=job.id,
-                    command=job.command,
-                    log_path=job.log_path,
-                    default_data_dir=get_data_dir(),
-                )
-            except Exception as e:
-                status = {"kind": "unknown", "job_id": job.id, "error": str(e)}
-            status.update(
-                {
-                    "job_status": job.status,
-                    "title": job.title,
-                    "source": job.source,
-                    "created_at": job.created_at,
-                    "started_at": job.started_at,
-                }
-            )
-            out.append(status)
-        return {"jobs": out}
 
     @app.post("/api/questdb/query", response_class=JSONResponse)
     async def api_questdb_query(request: Request) -> dict[str, Any]:
@@ -3082,30 +2374,9 @@ def create_app() -> Any:
         except Exception:
             questdb_ok = False
 
-        # Data symbols counts (QuestDB index; v2-only)
+        # Data symbols counts (Phase-1/2 deferred)
         data_symbols = 0
-        data_status = "unknown"
-        try:
-            if questdb_ok:
-                from ghtrader.questdb.client import make_questdb_query_config_from_env
-                from ghtrader.questdb.index import INDEX_TABLE_V2, list_symbols_from_index
-
-                cfg = make_questdb_query_config_from_env()
-                syms = list_symbols_from_index(
-                    cfg=cfg,
-                    dataset_version="v2",
-                    ticks_kind="raw",
-                    index_table=INDEX_TABLE_V2,
-                    limit=200000,
-                    connect_timeout_s=1,
-                )
-                data_symbols = int(len(syms))
-                data_status = "questdb" if data_symbols > 0 else "empty"
-            else:
-                data_status = "questdb_offline"
-        except Exception:
-            data_symbols = 0
-            data_status = "error"
+        data_status = "deferred"
 
         # Model count (count actual model files, not arbitrary artifacts/ subdirs)
         model_files: list[dict[str, Any]] = []
@@ -3169,25 +2440,8 @@ def create_app() -> Any:
         except Exception:
             pass
 
-        # Check main_l5 exists (QuestDB index)
-        try:
-            if questdb_ok:
-                from ghtrader.questdb.client import connect_pg, make_questdb_query_config_from_env
-                from ghtrader.questdb.index import INDEX_TABLE_V2
-
-                cfg = make_questdb_query_config_from_env()
-                with connect_pg(cfg, connect_timeout_s=1) as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            f"SELECT count(DISTINCT symbol) FROM {INDEX_TABLE_V2} "
-                            "WHERE ticks_kind=%s AND dataset_version=%s AND rows_total > 0",
-                            ["main_l5", "v2"],
-                        )
-                        n = int((cur.fetchone() or [0])[0] or 0)
-                if n > 0:
-                    pipeline["main_l5"] = {"state": "ok", "text": f"{n} derived"}
-        except Exception:
-            pass
+        # main_l5 status (Phase-1/2 deferred)
+        pipeline["main_l5"] = {"state": "deferred", "text": "deferred"}
 
         # Check features/labels builds exist (QuestDB build tables)
         try:

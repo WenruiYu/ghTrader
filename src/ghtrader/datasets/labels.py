@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+import os
 from pathlib import Path
+import time
 from typing import Any, Literal
 
 import numpy as np
@@ -170,13 +172,18 @@ def build_labels_for_symbol(
         get_questdb_pg_user,
     )
     from ghtrader.questdb.features_labels import LABELS_TABLE_V2, ensure_labels_tables, insert_label_build
-    from ghtrader.questdb.index import INDEX_TABLE_V2, ensure_index_tables, list_present_trading_days, query_symbol_day_index_bounds
     from ghtrader.questdb.client import make_questdb_query_config_from_env
-    from ghtrader.questdb.queries import fetch_ticks_for_symbol_day
+    from ghtrader.questdb.queries import (
+        fetch_ticks_for_symbol_day,
+        list_trading_days_for_symbol,
+        query_symbol_day_bounds,
+    )
     from ghtrader.questdb.serving_db import ServingDBConfig, make_serving_backend
 
     dv = str(dataset_version).lower().strip() or "v2"
-    tk = str(ticks_kind).lower().strip() or "raw"
+    tk = str(ticks_kind).lower().strip() or "main_l5"
+    if tk != "main_l5":
+        raise ValueError("ticks_kind raw is deferred (Phase-1/2)")
     hs = [int(h) for h in horizons if int(h) > 0]
     if not hs:
         raise ValueError("horizons must be non-empty")
@@ -197,29 +204,36 @@ def build_labels_for_symbol(
         )
     )
 
-    ensure_index_tables(cfg=cfg, index_table=INDEX_TABLE_V2, connect_timeout_s=2)
-
-    bounds = query_symbol_day_index_bounds(
-        cfg=cfg, symbols=[symbol], dataset_version=dv, ticks_kind=tk, index_table=INDEX_TABLE_V2, connect_timeout_s=2
+    ticks_table = "ghtrader_ticks_main_l5_v2"
+    bounds = query_symbol_day_bounds(
+        cfg=cfg,
+        table=ticks_table,
+        symbols=[symbol],
+        dataset_version=dv,
+        ticks_kind=tk,
+        l5_only=False,
     )
     b = bounds.get(symbol) or {}
     d0s = str(b.get("first_day") or "").strip()
     d1s = str(b.get("last_day") or "").strip()
-    dates: list[date] = []
-    if d0s and d1s:
-        start_d = date.fromisoformat(d0s)
-        end_d = date.fromisoformat(d1s)
-        dates = sorted(
-            list_present_trading_days(
-                cfg=cfg, symbol=symbol, start_day=start_d, end_day=end_d, dataset_version=dv, ticks_kind=tk, index_table=INDEX_TABLE_V2
-            )
-        )
+    if not d0s or not d1s:
+        raise ValueError(f"No tick data found for {symbol} (ticks_kind={ticks_kind}, dataset_version={dataset_version}) in QuestDB")
+    start_d = date.fromisoformat(d0s)
+    end_d = date.fromisoformat(d1s)
+    dates = list_trading_days_for_symbol(
+        cfg=cfg,
+        table=ticks_table,
+        symbol=str(symbol),
+        start_day=start_d,
+        end_day=end_d,
+        dataset_version=dv,
+        ticks_kind=tk,
+    )
     if not dates:
-        raise ValueError(f"No tick data found for {symbol} (ticks_kind={ticks_kind}, dataset_version={dataset_version}) in QuestDB index")
+        raise ValueError(f"No tick data found for {symbol} (ticks_kind={ticks_kind}, dataset_version={dataset_version}) in QuestDB")
 
     price_tick = float(_get_price_tick(symbol))
     horizons_str = ",".join([str(h) for h in sorted(hs)])
-    ticks_table = "ghtrader_ticks_main_l5_v2" if tk == "main_l5" else "ghtrader_ticks_raw_v2"
     if tk == "main_l5" and schedule_hash is None:
         # Best-effort: pull schedule_hash from derived tick rows.
         try:
@@ -269,6 +283,28 @@ def build_labels_for_symbol(
     max_h = max(hs) if hs else 0
     rows_total = 0
     days_done = 0
+    days_total = int(len(dates))
+    started_at = time.time()
+    last_progress_ts = started_at
+    try:
+        progress_every_s = float(os.environ.get("GHTRADER_BUILD_PROGRESS_EVERY_S", "30") or "30")
+    except Exception:
+        progress_every_s = 30.0
+    progress_every_s = max(5.0, float(progress_every_s))
+    try:
+        progress_every_n = int(os.environ.get("GHTRADER_BUILD_PROGRESS_EVERY_N", "5") or "5")
+    except Exception:
+        progress_every_n = 5
+    progress_every_n = max(1, int(progress_every_n))
+    log.info(
+        "labels.build_start",
+        symbol=str(symbol),
+        ticks_kind=str(tk),
+        dataset_version=str(dv),
+        days_total=int(days_total),
+        horizons=hs,
+        threshold_k=int(threshold_k),
+    )
 
     for dt in dates:
         df_day = fetch_ticks_for_symbol_day(
@@ -407,6 +443,32 @@ def build_labels_for_symbol(
 
         rows_total += int(len(out))
         days_done += 1
+        if (
+            days_done == 1
+            or days_done == days_total
+            or days_done % progress_every_n == 0
+            or (time.time() - last_progress_ts) >= progress_every_s
+        ):
+            log.info(
+                "labels.build_progress",
+                symbol=str(symbol),
+                trading_day=str(dt.isoformat()),
+                days_done=int(days_done),
+                days_total=int(days_total),
+                rows_total=int(rows_total),
+                last_rows=int(len(out)),
+                elapsed_s=int(time.time() - started_at),
+            )
+            last_progress_ts = time.time()
+        else:
+            log.debug(
+                "labels.build_day",
+                symbol=str(symbol),
+                trading_day=str(dt.isoformat()),
+                rows=int(len(out)),
+                days_done=int(days_done),
+                days_total=int(days_total),
+            )
 
     insert_label_build(
         cfg=cfg,
@@ -422,6 +484,15 @@ def build_labels_for_symbol(
         first_day=(dates[0].isoformat() if dates else ""),
         last_day=(dates[-1].isoformat() if dates else ""),
         connect_timeout_s=2,
+    )
+    log.info(
+        "labels.build_done",
+        symbol=str(symbol),
+        ticks_kind=str(tk),
+        dataset_version=str(dv),
+        rows_total=int(rows_total),
+        days=int(days_done),
+        elapsed_s=int(time.time() - started_at),
     )
 
     return {

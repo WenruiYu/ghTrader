@@ -557,25 +557,25 @@ class OfflineMicroSim:
         import pandas as pd
 
         from ghtrader.questdb.client import make_questdb_query_config_from_env
-        from ghtrader.questdb.index import list_present_trading_days
-        from ghtrader.questdb.queries import fetch_ticks_for_symbol_day
+        from ghtrader.questdb.queries import fetch_ticks_for_symbol_day, list_trading_days_for_symbol
 
         _ = data_dir  # QuestDB is the canonical source
 
         lv = "v2"
-        tl = "main_l5" if str(symbol).startswith("KQ.m@") else "raw"
-        table = "ghtrader_ticks_main_l5_v2" if tl == "main_l5" else "ghtrader_ticks_raw_v2"
+        if not str(symbol).startswith("KQ.m@"):
+            raise ValueError("raw ticks are deferred (Phase-1/2)")
+        tl = "main_l5"
+        table = "ghtrader_ticks_main_l5_v2"
         cfg = make_questdb_query_config_from_env()
 
-        days = sorted(
-            list_present_trading_days(
-                cfg=cfg,
-                symbol=str(symbol),
-                start_day=start_date,
-                end_day=end_date,
-                dataset_version=lv,
-                ticks_kind=tl,
-            )
+        days = list_trading_days_for_symbol(
+            cfg=cfg,
+            table=table,
+            symbol=str(symbol),
+            start_day=start_date,
+            end_day=end_date,
+            dataset_version=lv,
+            ticks_kind=tl,
         )
 
         frames: list[pd.DataFrame] = []

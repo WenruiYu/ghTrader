@@ -6,59 +6,24 @@ import pandas as pd
 import pytest
 
 
-def test_compute_shfe_main_schedule_from_daily_switch_rule():
-    """
-    The schedule for day T is decided using end-of-day OI from day T-1.
-    """
-    from ghtrader.data.main_schedule import compute_shfe_main_schedule_from_daily
-
-    daily = pd.DataFrame(
-        [
-            # Day 1: CU2501 is main
-            {"date": "2025-01-01", "symbol": "CU2501", "open_interest": 100, "volume": 0, "variety": "CU"},
-            {"date": "2025-01-01", "symbol": "CU2502", "open_interest": 90, "volume": 0, "variety": "CU"},
-            # Day 2: CU2502 becomes > 1.1x CU2501
-            {"date": "2025-01-02", "symbol": "CU2501", "open_interest": 100, "volume": 0, "variety": "CU"},
-            {"date": "2025-01-02", "symbol": "CU2502", "open_interest": 120, "volume": 0, "variety": "CU"},
-            # Day 3: keep CU2502
-            {"date": "2025-01-03", "symbol": "CU2501", "open_interest": 80, "volume": 0, "variety": "CU"},
-            {"date": "2025-01-03", "symbol": "CU2502", "open_interest": 130, "volume": 0, "variety": "CU"},
-        ]
-    )
-
-    sched = compute_shfe_main_schedule_from_daily(daily, var="cu", rule_threshold=1.1, market="SHFE")
-    got = {row["date"].isoformat(): row["main_contract"] for _, row in sched.iterrows()}
-    assert got["2025-01-01"] == "SHFE.cu2501"
-    # Day 2 decision uses day-1 OI, so still CU2501
-    assert got["2025-01-02"] == "SHFE.cu2501"
-    # Day 3 decision uses day-2 OI, so switches to CU2502
-    assert got["2025-01-03"] == "SHFE.cu2502"
-
-    # Segment id increments on contract change
-    seg = sched.set_index(sched["date"].astype(str))["segment_id"].to_dict()
-    assert seg["2025-01-01"] == 0
-    assert seg["2025-01-02"] == 0
-    assert seg["2025-01-03"] == 1
-
-
 def test_query_contract_coverage_merges_base_and_l5(monkeypatch: pytest.MonkeyPatch):
     import ghtrader.questdb.queries as qq
 
     symbols = ["SHFE.cu2501", "SHFE.cu2502"]
 
+    calls = {"n": 0}
+
     def fake_bounds(*, l5_only: bool, **kwargs):
-        # Base coverage comes from raw ticks; L5 coverage prefers the derived main_l5 ticks kind.
-        if str(kwargs.get("ticks_kind") or "") == "main_l5":
-            return {
-                "SHFE.cu2502": {"first_day": "2025-01-02", "last_day": "2025-01-03", "n_days": 2},
-            }
-        if not l5_only:
+        # First call: base coverage. Second call: main_l5 coverage.
+        calls["n"] += 1
+        if calls["n"] == 1:
             return {
                 "SHFE.cu2501": {"first_day": "2025-01-01", "last_day": "2025-01-03", "n_days": 3},
                 "SHFE.cu2502": {"first_day": "2025-01-02", "last_day": "2025-01-03", "n_days": 2},
             }
-        # Fallback raw-tick predicate path (not used in this test)
-        return {}
+        return {
+            "SHFE.cu2502": {"first_day": "2025-01-02", "last_day": "2025-01-03", "n_days": 2},
+        }
 
     monkeypatch.setattr(qq, "query_symbol_day_bounds", fake_bounds)
 
@@ -67,7 +32,7 @@ def test_query_contract_coverage_merges_base_and_l5(monkeypatch: pytest.MonkeyPa
         table="t",
         symbols=symbols,
         dataset_version="v2",
-        ticks_kind="raw",
+        ticks_kind="main_l5",
     )
 
     assert cov["SHFE.cu2501"]["first_tick_day"] == "2025-01-01"

@@ -40,6 +40,7 @@
       <div class="kpiLabel">Metrics status</div>
       <div class="kpiValue" id="qdbStatus">…</div>
       <div class="muted text-sm mono" id="qdbEndpoint">…</div>
+      <div class="muted text-xs mono" id="qdbServiceStatus">…</div>
     </div>
     <div class="card">
       <div class="kpiLabel">PGWire connections</div>
@@ -51,6 +52,10 @@
       <div class="kpiValue mono" id="qdbUpdatedAt">…</div>
       <div class="muted text-sm" id="qdbError"></div>
     </div>
+  </div>
+  <div class="muted text-sm" style="margin-top:6px;">
+    PG limit env/config:
+    <span class="pill mono" id="qdbPgLimitPill">…</span>
   </div>
   <div class="muted text-sm" style="margin-top:6px;">
     Source: QuestDB Prometheus endpoint (/metrics).
@@ -155,6 +160,25 @@
         );
         setText("qdbUpdatedAt", qdb.updated_at || "n/a");
         setText("qdbError", qdbOk ? "" : (qdb.error || "metrics unavailable"));
+
+        const qdbSvc = snap.questdb_service || {};
+        const svcTxt = qdbSvc.service
+          ? `service ${qdbSvc.service} (${qdbSvc.scope || "system"}): ${qdbSvc.active_state || "n/a"}${qdbSvc.sub_state ? "/" + qdbSvc.sub_state : ""}`
+          : "service n/a";
+        setText("qdbServiceStatus", qdbSvc.error ? `${svcTxt} [${qdbSvc.error}]` : svcTxt);
+
+        const qdbCfg = snap.questdb_config || {};
+        const envLim = qdbCfg.pg_net_connection_limit_env;
+        const confLim = qdbCfg.pg_net_connection_limit_conf;
+        const confPath = qdbCfg.conf_path || "n/a";
+        const confErr = qdbCfg.conf_error ? ` (${qdbCfg.conf_error})` : "";
+        const limTxt = `env=${envLim ?? "n/a"} conf=${confLim ?? "n/a"} path=${confPath}${confErr}`;
+        const limPill = document.getElementById("qdbPgLimitPill");
+        if (limPill) {
+          const mismatch = Number.isFinite(Number(envLim)) && Number.isFinite(Number(confLim)) && Number(envLim) !== Number(confLim);
+          limPill.textContent = limTxt;
+          limPill.className = "pill mono" + (mismatch ? " pill-warning" : "");
+        }
 
         // Dir sizes status
         const ds = snap.dir_sizes || {};

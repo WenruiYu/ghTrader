@@ -16,7 +16,7 @@ The canonical product/spec/plan for this repo is [`PRD.md`](PRD.md). All future 
 
 ### Data integrity and lineage
 
-- Raw market data is **append-only** in **QuestDB** (canonical); never mutate historical tick rows
+- Canonical tick data (**main_l5**) is **append-only** in **QuestDB**; never mutate historical tick rows
 - Ingest writes a lightweight manifest under `data/manifests/` (run id, symbols, date range, schema hash, code hash)
 - Timestamps are stored in **epoch-nanoseconds** (`datetime_ns`, as provided by TqSdk)
 
@@ -34,7 +34,7 @@ The canonical product/spec/plan for this repo is [`PRD.md`](PRD.md). All future 
 
 ### Performance and scale
 
-- Use QuestDB partitioning + the symbol-day index (`ghtrader_symbol_day_index_v2`) for coverage/completeness (avoid full scans on interactive paths)
+- Use QuestDB partitioning + cached manifests/summaries for coverage/completeness (avoid full scans on interactive paths)
 - Use subprocess jobs (dashboard/CLI) for long-running operations
 - Parallelize CPU-heavy stages (ingest/build/backtests) across symbols/partitions
 
@@ -158,21 +158,18 @@ ghTrader/
   .gitignore             # Ignore data/, runs/, artifacts/, secrets
   src/ghtrader/
     __init__.py
-    cli.py               # CLI entrypoint (download, record, build, train, backtest, paper)
-    tq_ingest.py         # TqSdk integration: historical download + live recorder
-    questdb_client.py    # QuestDB config + PGWire connector helpers
-    questdb_index.py     # QuestDB index + no-data tables (coverage ledger)
-    questdb_main_schedule.py  # Schedule storage + resolution (QuestDB)
-    main_schedule_db.py  # Schedule computation from QuestDB OI
-    main_l5.py           # Build derived main-with-depth ticks (L5-era only)
-    main_depth.py        # Derived tick materialization helpers (QuestDB-first)
-    serving_db.py        # QuestDB ILP ingestion backend (table DDL + ingest)
-    features.py          # FactorEngine + registry
-    labels.py            # Event-time labels, horizons
-    models.py            # DeepLOB, Transformer, tabular wrappers
-    trade.py             # Paper/sim/live runners (risk-gated)
-    online.py            # OnlineCalibrator + paper online loop
-    eval.py              # Backtest harness + metrics + promotion gates
+    cli.py               # CLI entrypoint (thin; delegates to cli_commands)
+    cli_commands/        # CLI subcommands by domain
+    control/             # FastAPI UI + APIs + job runner
+    tq/                  # TqSdk-only provider implementation
+    questdb/             # QuestDB schema/query/ingest helpers
+    data/                # Data lifecycle (calendar, schedule, main_l5 builders)
+    datasets/            # Derived datasets (features/labels)
+    trading/             # Trading runtime modules
+    research/            # Training/eval/benchmark utilities
+    util/                # Shared helpers
+    config.py            # Env/config + TqAuth
+    data_provider.py     # Provider interfaces
   data/                  # Local caches + ingest manifests (gitignored)
   runs/                  # Reports + control-plane DB/logs (gitignored)
   artifacts/             # Model artifacts (gitignored)
@@ -185,19 +182,15 @@ ghTrader/
 Key tables (see `PRD.md` for the authoritative architecture):
 
 - **Ticks (canonical)**:
-  - `ghtrader_ticks_raw_v2` (`ticks_lake='raw'`)
-  - `ghtrader_ticks_main_l5_v2` (`ticks_lake='main_l5'`, derived main-with-depth)
-- **Coverage / completeness**:
-  - `ghtrader_symbol_day_index_v2` (per-symbol/day coverage + row_hash aggregates)
-  - `ghtrader_no_data_days_v2` (explicit no-data markers to prevent infinite retries)
+  - `ghtrader_ticks_main_l5_v2` (`ticks_kind='main_l5'`, derived main-with-depth)
 - **Roll schedule**:
   - `ghtrader_main_schedule_v2` (canonical schedule for continuous alias resolution)
-- **Derived datasets**:
+- **Derived datasets** (optional):
   - `ghtrader_features_v2`, `ghtrader_labels_v2` + build-metadata tables
 
 Core tick columns:
 
-- `symbol`, `ts`, `datetime_ns`, `trading_day`, `lake_version='v2'`, `ticks_lake`, `row_hash`
+- `symbol`, `ts`, `datetime_ns`, `trading_day`, `dataset_version='v2'`, `ticks_kind`, `row_hash`
 - L5 numeric columns: `bid/ask_price1..5`, `bid/ask_volume1..5`, plus `last_price`, `average`, `highest`, `lowest`, `volume`, `amount`, `open_interest`
 - Derived `main_l5` rows also include: `underlying_contract`, `segment_id`, `schedule_hash`
 
@@ -205,7 +198,7 @@ Core tick columns:
 
 ## QuestDB (required)
 
-ghTrader is **QuestDB-first/only** for ticks, schedules, features, labels, coverage, and audits.
+ghTrader is **QuestDB-first/only** for ticks, schedules, features, and labels.
 
 Install the QuestDB extras:
 
@@ -235,21 +228,14 @@ Configure connection (see `env.example`):
 Common flows:
 
 ```bash
-# Download historical ticks (writes to QuestDB and updates the symbol/day index)
-ghtrader download --symbol SHFE.cu2602 --start 2025-01-01 --end 2025-01-31
-
-# Build the SHFE-style OI roll schedule from QuestDB (required before main_l5)
+# Build main schedule from TqSdk KQ.m@ mapping
 ghtrader main-schedule --var cu --start 2015-01-01 --end 2026-01-01
 
-# Build derived main_l5 ticks for the L5 era only (writes to QuestDB)
-ghtrader main-l5 --var cu
+# Build derived main_l5 ticks for the continuous alias (writes to QuestDB)
+ghtrader main-l5 --var cu --symbol KQ.m@SHFE.cu
 
-# Build features + labels (ticks_lake=raw for specific contracts; main_l5 for continuous aliases)
-ghtrader build --symbol SHFE.cu2602 --ticks-lake raw
-ghtrader build --symbol KQ.m@SHFE.cu --ticks-lake main_l5
-
-# Audit integrity (writes report under runs/audit/)
-ghtrader audit --scope all
+# (Optional) Build features + labels from main_l5
+ghtrader build --symbol KQ.m@SHFE.cu --ticks-kind main_l5
 ```
 
 ## Data maintenance (Update)

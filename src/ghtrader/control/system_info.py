@@ -55,6 +55,55 @@ def _human_bytes(n: int | None) -> str:
     return f"{x:.2f} PiB"
 
 
+def _read_questdb_server_conf_limit(conf_path: str | None) -> dict[str, Any]:
+    path = str(conf_path or "").strip() or "/home/ops/questdb/conf/server.conf"
+    out: dict[str, Any] = {"path": path, "pg_net_connection_limit": None, "error": None}
+    try:
+        p = Path(path)
+        if not p.exists():
+            out["error"] = "missing"
+            return out
+        for line in p.read_text().splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("pg.net.connection.limit"):
+                parts = s.split("=", 1)
+                if len(parts) == 2:
+                    try:
+                        out["pg_net_connection_limit"] = int(parts[1].strip())
+                    except Exception:
+                        out["error"] = "parse_error"
+                break
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+def _systemd_service_status(*, service: str, scope: str) -> dict[str, Any]:
+    svc = str(service or "").strip() or "questdb"
+    sc = str(scope or "").strip().lower() or "system"
+    if sc not in {"system", "user"}:
+        sc = "system"
+    cmd = ["systemctl", "--system" if sc == "system" else "--user", "show", svc, "--no-page", "--property", "ActiveState,SubState"]
+    out: dict[str, Any] = {"service": svc, "scope": sc, "active_state": None, "sub_state": None, "ok": False, "error": None}
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+        if res.returncode != 0:
+            out["error"] = (res.stderr or res.stdout or "").strip() or f"exit_{res.returncode}"
+            return out
+        for line in (res.stdout or "").splitlines():
+            if line.startswith("ActiveState="):
+                out["active_state"] = line.split("=", 1)[1].strip()
+            elif line.startswith("SubState="):
+                out["sub_state"] = line.split("=", 1)[1].strip()
+        out["ok"] = out.get("active_state") == "active"
+        return out
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+
+
 def cpu_mem_info() -> dict[str, Any]:
     try:
         import psutil
@@ -425,6 +474,19 @@ def system_snapshot(
             force=True,
         )
 
+    qdb_conf = _read_questdb_server_conf_limit(os.environ.get("GHTRADER_QUESTDB_SERVER_CONF_PATH"))
+    qdb_env_limit = os.environ.get("GHTRADER_QDB_PG_NET_CONNECTION_LIMIT")
+    qdb_env_limit_val = None
+    try:
+        if qdb_env_limit is not None:
+            qdb_env_limit_val = int(qdb_env_limit)
+    except Exception:
+        qdb_env_limit_val = None
+
+    svc_name = os.environ.get("GHTRADER_QUESTDB_SYSTEMD_SERVICE", "questdb")
+    svc_scope = os.environ.get("GHTRADER_QUESTDB_SYSTEMD_SCOPE", "system")
+    svc_status = _systemd_service_status(service=str(svc_name), scope=str(svc_scope))
+
     # Build response from caches
     with _CACHE_LOCK:
         fast = dict(_fast_payload or {})
@@ -455,6 +517,13 @@ def system_snapshot(
             "status": "running" if gpu_running else ("ready" if gpu_payload.get("info") else "idle"),
         },
         "questdb": qdb_payload,
+        "questdb_config": {
+            "pg_net_connection_limit_env": qdb_env_limit_val,
+            "pg_net_connection_limit_conf": qdb_conf.get("pg_net_connection_limit"),
+            "conf_path": qdb_conf.get("path"),
+            "conf_error": qdb_conf.get("error"),
+        },
+        "questdb_service": svc_status,
         "dir_sizes": {
             "updated_at": dir_payload.get("updated_at", ""),
             "status": "running"

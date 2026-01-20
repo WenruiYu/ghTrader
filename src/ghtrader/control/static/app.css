@@ -203,6 +203,7 @@ h4 { margin: 14px 0 8px; font-size: 14px; }
 .pill-failed { background: var(--bad-bg); border-color: var(--bad-border); }
 .pill-cancelled { background: rgba(148, 163, 184, 0.14); border-color: rgba(148, 163, 184, 0.30); }
 .pill-queued { background: var(--info-bg); border-color: var(--info-border); }
+.pill-warning { background: var(--warn-bg); border-color: var(--warn-border); }
 
 .form label { display: block; font-weight: 700; margin-top: 10px; }
 .form input, .form select, .form textarea {

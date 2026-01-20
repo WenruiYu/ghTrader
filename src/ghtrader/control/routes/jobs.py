@@ -104,15 +104,3 @@ def api_job_log_download(request: Request, job_id: str):
     return FileResponse(path=str(log_path), media_type="text/plain", filename=filename)
 
 
-@router.get("/{job_id}/ingest_status", response_class=JSONResponse)
-def api_job_ingest_status(request: Request, job_id: str) -> dict[str, Any]:
-    """Return parsed ingest status from job log (if available)."""
-    if not auth.is_authorized(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    from ghtrader.control.ingest_status import parse_ingest_status
-
-    jm = request.app.state.job_manager
-    log = jm.read_log(job_id)
-    parsed = parse_ingest_status(log)
-    return {"ok": True, "job_id": job_id, "ingest_status": parsed}

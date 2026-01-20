@@ -187,6 +187,7 @@ def build_router() -> Any:
     @router.post("/data/ingest/download")
     async def data_ingest_download(request: Request):
         _require_auth(request)
+        raise HTTPException(status_code=400, detail="download deferred (Phase-1/2)")
         form = await request.form()
         symbol = str(form.get("symbol") or "").strip()
         start_date = str(form.get("start_date") or "").strip()
@@ -217,6 +218,7 @@ def build_router() -> Any:
     @router.post("/data/ingest/download_contract_range")
     async def data_ingest_download_contract_range(request: Request):
         _require_auth(request)
+        raise HTTPException(status_code=400, detail="download-contract-range deferred (Phase-1/2)")
         form = await request.form()
         exchange = str(form.get("exchange") or "SHFE").strip()
         var = str(form.get("variety") or "").strip()
@@ -256,6 +258,7 @@ def build_router() -> Any:
     @router.post("/data/ingest/record")
     async def data_ingest_record(request: Request):
         _require_auth(request)
+        raise HTTPException(status_code=400, detail="record deferred (Phase-1/2)")
         form = await request.form()
         symbols = str(form.get("symbols") or "").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
@@ -292,7 +295,6 @@ def build_router() -> Any:
         var = str(form.get("variety") or "cu").strip()
         start_date = str(form.get("start_date") or "").strip()
         end_date = str(form.get("end_date") or "").strip()
-        threshold = str(form.get("threshold") or "1.1").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
         if not start_date or not end_date:
             raise HTTPException(status_code=400, detail="start_date/end_date required")
@@ -305,8 +307,6 @@ def build_router() -> Any:
             start_date,
             "--end",
             end_date,
-            "--threshold",
-            threshold,
             "--data-dir",
             data_dir,
         )
@@ -321,7 +321,7 @@ def build_router() -> Any:
         form = await request.form()
         var = str(form.get("variety") or "cu").strip()
         derived_symbol = str(form.get("derived_symbol") or f"KQ.m@SHFE.{var}").strip()
-        overwrite = str(form.get("overwrite") or "false").strip().lower() == "true"
+        data_dir = str(form.get("data_dir") or "data").strip()
         if not var or not derived_symbol:
             raise HTTPException(status_code=400, detail="variety/derived_symbol required")
         argv = python_module_argv(
@@ -331,7 +331,8 @@ def build_router() -> Any:
             var,
             "--symbol",
             derived_symbol,
-            "--overwrite" if overwrite else "--no-overwrite",
+            "--data-dir",
+            data_dir,
         )
         title = f"main-l5 {var} {derived_symbol}"
         jm = request.app.state.job_manager
@@ -345,7 +346,7 @@ def build_router() -> Any:
         symbol = str(form.get("symbol") or "").strip()
         horizons = str(form.get("horizons") or "10,50,200").strip()
         threshold_k = str(form.get("threshold_k") or "1").strip()
-        ticks_kind = str(form.get("ticks_kind") or "raw").strip()
+        ticks_kind = str(form.get("ticks_kind") or "main_l5").strip()
         overwrite = str(form.get("overwrite") or "false").strip().lower() == "true"
         data_dir = str(form.get("data_dir") or "data").strip()
         if not symbol:
@@ -373,6 +374,7 @@ def build_router() -> Any:
     @router.post("/data/integrity/audit")
     async def data_integrity_audit(request: Request):
         _require_auth(request)
+        raise HTTPException(status_code=400, detail="audit deferred (Phase-1/2)")
         form = await request.form()
         scopes = form.getlist("scopes")
         data_dir = str(form.get("data_dir") or "data").strip()
@@ -419,6 +421,7 @@ def build_router() -> Any:
     @router.post("/ops/ingest/update_variety")
     async def ops_ingest_update_variety(request: Request):
         _require_auth(request)
+        raise HTTPException(status_code=400, detail="update deferred (Phase-1/2)")
         form = await request.form()
         exchange = str(form.get("exchange") or "SHFE").strip()
         var = str(form.get("variety") or "").strip()
@@ -885,35 +888,6 @@ def build_router() -> Any:
         data_dir = get_data_dir()
         lv = "v2"
 
-        # Ingest statuses (from ops page)
-        ingest_statuses: list[dict[str, Any]] = []
-        try:
-            from ghtrader.control.ingest_status import ingest_status_for_job, parse_ingest_command
-
-            for job in jobs:
-                if job.status not in {"queued", "running"}:
-                    continue
-                kind = parse_ingest_command(job.command).get("kind")
-                if kind not in {"download", "download_contract_range", "record"}:
-                    continue
-                s = ingest_status_for_job(
-                    job_id=job.id,
-                    command=job.command,
-                    log_path=job.log_path,
-                    default_data_dir=data_dir,
-                )
-                s.update(
-                    {
-                        "job_status": job.status,
-                        "title": job.title,
-                        "source": job.source,
-                        "created_at": job.created_at,
-                        "started_at": job.started_at,
-                    }
-                )
-                ingest_statuses.append(s)
-        except Exception:
-            ingest_statuses = []
 
         # Locks
         locks = []
@@ -980,7 +954,6 @@ def build_router() -> Any:
                 "features": [],
                 "labels": [],
                 "questdb": questdb,
-                "ingest_statuses": ingest_statuses,
                 "locks": locks,
                 "reports": reports,
                 "default_schedule_start": default_schedule_start,
@@ -996,7 +969,7 @@ def build_router() -> Any:
         jobs = store.list_jobs(limit=50)
         running = [j for j in jobs if j.status == "running"]
 
-        q = "SELECT count() AS n_ticks FROM ghtrader_ticks_raw_v2"
+        q = "SELECT count() AS n_ticks FROM ghtrader_ticks_main_l5_v2"
         return templates.TemplateResponse(
             request,
             "explorer.html",

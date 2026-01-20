@@ -1,0 +1,18 @@
+[Unit]
+Description=QuestDB (native, system service)
+After=network.target
+
+[Service]
+Type=simple
+User=ops
+Group=ops
+WorkingDirectory=/home/ops/questdb
+EnvironmentFile=/home/ops/ghTrader/infra/questdb/native/questdb.env
+ExecStart=/home/ops/questdb/bin/questdb.sh start -c -d /home/ops/questdb
+Restart=always
+RestartSec=3
+LimitNOFILE=2097152
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

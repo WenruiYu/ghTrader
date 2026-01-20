@@ -24,10 +24,10 @@
           <label>Sample queries</label>
           <select id="sampleQuery">
             <option value="" selected>(select)</option>
-            <option value="SELECT count() AS n_ticks FROM ghtrader_ticks_raw_v2">Count raw ticks rows</option>
-            <option value="SELECT symbol, count() AS n_rows FROM ghtrader_ticks_raw_v2 GROUP BY symbol ORDER BY n_rows DESC LIMIT 20">Top symbols by rows (raw)</option>
-            <option value="SELECT symbol, min(cast(trading_day as string)) AS first_day, max(cast(trading_day as string)) AS last_day, count(DISTINCT cast(trading_day as string)) AS n_days FROM ghtrader_ticks_raw_v2 WHERE dataset_version='v2' AND ticks_kind='raw' GROUP BY symbol ORDER BY n_days DESC LIMIT 20">Coverage bounds by symbol (raw)</option>
-            <option value="SELECT ts, symbol, last_price FROM ghtrader_ticks_raw_v2 WHERE symbol='SHFE.cu2602' ORDER BY ts DESC LIMIT 50">Latest ticks for SHFE.cu2602</option>
+            <option value="SELECT count() AS n_ticks FROM ghtrader_ticks_main_l5_v2">Count main_l5 rows</option>
+            <option value="SELECT symbol, count() AS n_rows FROM ghtrader_ticks_main_l5_v2 GROUP BY symbol ORDER BY n_rows DESC LIMIT 20">Top symbols by rows (main_l5)</option>
+            <option value="SELECT symbol, min(cast(trading_day as string)) AS first_day, max(cast(trading_day as string)) AS last_day, count(DISTINCT cast(trading_day as string)) AS n_days FROM ghtrader_ticks_main_l5_v2 GROUP BY symbol ORDER BY n_days DESC LIMIT 20">Coverage bounds by symbol (main_l5)</option>
+            <option value="SELECT ts, symbol, last_price FROM ghtrader_ticks_main_l5_v2 WHERE symbol='KQ.m@SHFE.cu' ORDER BY ts DESC LIMIT 50">Latest ticks for KQ.m@SHFE.cu</option>
           </select>
         </div>
         <div class="muted" style="display:flex; align-items:flex-end;">
@@ -53,10 +53,9 @@
   <div class="card">
     <h3>Available tables</h3>
     <ul>
-      <li><span class="mono">ghtrader_ticks_raw_v2</span></li>
       <li><span class="mono">ghtrader_ticks_main_l5_v2</span></li>
     </ul>
-    <p class="muted">Tip: most tick tables include <span class="mono">dataset_version</span>, <span class="mono">ticks_kind</span>, and <span class="mono">trading_day</span>.</p>
+    <p class="muted">Tip: tick tables include <span class="mono">dataset_version</span>, <span class="mono">ticks_kind</span>, and <span class="mono">trading_day</span>.</p>
   </div>
 
   {% if columns and rows %}
