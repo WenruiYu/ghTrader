@@ -29,13 +29,52 @@
     {% endif %}
   </div>
 
+  <h3>Job Progress</h3>
+  <div class="card" id="progressCard" style="display:none;">
+    <div style="margin-bottom:8px;">
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+        <b>Phase:</b>
+        <span class="mono" id="progressPhase">-</span>
+        <span class="muted text-xs" id="progressPhaseIdx"></span>
+      </div>
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+        <b>Step:</b>
+        <span class="mono" id="progressStep">-</span>
+        <span class="muted text-xs" id="progressStepIdx"></span>
+      </div>
+      <div id="progressItemRow" style="display:none; margin-bottom:4px;">
+        <b>Current:</b>
+        <span class="mono" id="progressItem">-</span>
+        <span class="muted text-xs" id="progressItemIdx"></span>
+      </div>
+      <div style="margin-bottom:4px;">
+        <b>Message:</b>
+        <span id="progressMessage">-</span>
+      </div>
+    </div>
+    <div style="margin-bottom:8px;">
+      <div style="display:flex; align-items:center; gap:12px;">
+        <div style="flex:1;">
+          <div class="progressBar" style="height:12px;">
+            <div id="progressBarFill" style="width:0%; transition:width 0.3s;"></div>
+          </div>
+        </div>
+        <span class="mono" id="progressPct" style="min-width:50px; text-align:right;">0%</span>
+        <span class="muted mono" id="progressEta" style="min-width:80px;">-</span>
+      </div>
+    </div>
+    <div id="progressErrorRow" style="display:none; color:var(--danger);">
+      <b>Error:</b> <span class="mono text-xs" id="progressError"></span>
+    </div>
+  </div>
+
   <h3>Ingest status</h3>
   <div class="card" id="ingestCard" style="display:none;">
     <div><b>Kind:</b> <span class="mono" id="ingestKind"></span></div>
     <div><b>Current:</b> <span class="mono" id="ingestCurrent"></span></div>
     <div><b>Progress:</b> <span class="mono" id="ingestProgress"></span></div>
     <div id="ingestLastErrorRow" style="display:none;"><b>Last error:</b> <span class="mono text-xs" id="ingestLastError"></span></div>
-    <div class="muted">For full details, see <a href="/ops/ingest{{ token_qs }}">Ingest</a>.</div>
+    <div class="muted">For full details, see <a href="/data{{ token_qs }}#ingest">Ingest</a>.</div>
   </div>
 
   <h3>Log tail</h3>
@@ -66,6 +105,7 @@
     (function() {
       const logUrl = "/api/jobs/{{ job.id }}/log{{ token_qs }}";
       const ingestUrl = "/api/jobs/{{ job.id }}/ingest_status{{ token_qs }}";
+      const progressUrl = "/api/jobs/{{ job.id }}/progress{{ token_qs }}";
       const statusUrl = "/api/jobs{{ token_qs }}";
       const box = document.getElementById("logBox");
       const ingestCard = document.getElementById("ingestCard");
@@ -79,11 +119,28 @@
       const pausePolling = document.getElementById("pausePolling");
       const pollMs = document.getElementById("pollMs");
 
+      // Progress card elements
+      const progressCard = document.getElementById("progressCard");
+      const progressPhase = document.getElementById("progressPhase");
+      const progressPhaseIdx = document.getElementById("progressPhaseIdx");
+      const progressStep = document.getElementById("progressStep");
+      const progressStepIdx = document.getElementById("progressStepIdx");
+      const progressItemRow = document.getElementById("progressItemRow");
+      const progressItem = document.getElementById("progressItem");
+      const progressItemIdx = document.getElementById("progressItemIdx");
+      const progressMessage = document.getElementById("progressMessage");
+      const progressBarFill = document.getElementById("progressBarFill");
+      const progressPct = document.getElementById("progressPct");
+      const progressEta = document.getElementById("progressEta");
+      const progressErrorRow = document.getElementById("progressErrorRow");
+      const progressError = document.getElementById("progressError");
+
       const jobId = "{{ job.id }}";
       let isActive = (("{{ job.status }}" === "running") || ("{{ job.status }}" === "queued"));
       let logTimer = null;
       let statusTimer = null;
       let ingestTimer = null;
+      let progressTimer = null;
 
       // Ingest speed/ETA (best-effort, computed from ingest_status deltas)
       let ingestLastAtMs = null;
@@ -239,6 +296,67 @@
         } catch (e) {}
       }
 
+      async function tickProgress() {
+        try {
+          const resp = await fetch(progressUrl);
+          if (!resp.ok) return;
+          const p = await resp.json();
+          if (!p || !p.available) {
+            progressCard.style.display = "none";
+            return;
+          }
+          progressCard.style.display = "block";
+
+          // Phase
+          progressPhase.textContent = p.phase || "-";
+          if (p.total_phases > 1) {
+            progressPhaseIdx.textContent = "(" + (p.phase_idx + 1) + "/" + p.total_phases + ")";
+          } else {
+            progressPhaseIdx.textContent = "";
+          }
+
+          // Step
+          progressStep.textContent = p.step || "-";
+          if (p.total_steps > 1) {
+            progressStepIdx.textContent = "(" + (p.step_idx + 1) + "/" + p.total_steps + ")";
+          } else {
+            progressStepIdx.textContent = "";
+          }
+
+          // Item (optional)
+          if (p.total_items > 0 && p.item) {
+            progressItemRow.style.display = "block";
+            progressItem.textContent = p.item;
+            progressItemIdx.textContent = "(" + p.item_idx + "/" + p.total_items + ")";
+          } else {
+            progressItemRow.style.display = "none";
+          }
+
+          // Message
+          progressMessage.textContent = p.message || "-";
+
+          // Progress bar
+          const pctVal = Math.min(100, Math.max(0, (p.pct || 0) * 100));
+          progressBarFill.style.width = pctVal.toFixed(1) + "%";
+          progressPct.textContent = pctVal.toFixed(1) + "%";
+
+          // ETA
+          if (p.eta_seconds !== null && p.eta_seconds !== undefined) {
+            progressEta.textContent = "ETA " + fmtDurationSec(p.eta_seconds);
+          } else {
+            progressEta.textContent = "-";
+          }
+
+          // Error
+          if (p.error) {
+            progressErrorRow.style.display = "block";
+            progressError.textContent = p.error;
+          } else {
+            progressErrorRow.style.display = "none";
+          }
+        } catch (e) {}
+      }
+
       async function tickStatus() {
         try {
           const resp = await fetch(statusUrl);
@@ -262,6 +380,7 @@
         if (logTimer) { clearInterval(logTimer); logTimer = null; }
         if (ingestTimer) { clearInterval(ingestTimer); ingestTimer = null; }
         if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+        if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
       }
 
       function startPolling() {
@@ -271,9 +390,11 @@
           logTimer = setInterval(tick, ms);
           statusTimer = setInterval(tickStatus, Math.max(2000, ms));
           ingestTimer = setInterval(tickIngest, 10000);
+          progressTimer = setInterval(tickProgress, 2000);
           tick();
           tickStatus();
           tickIngest();
+          tickProgress();
         }
       }
 
@@ -311,6 +432,7 @@
       } else {
         tick();
         tickIngest();
+        tickProgress();
       }
     })();
   </script>

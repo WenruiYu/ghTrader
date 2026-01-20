@@ -71,7 +71,8 @@ def _list_columns(*, cfg: QuestDBQueryConfig, table: str, connect_timeout_s: int
     t = _ident(table)
     with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT column FROM table_columns('{t}')")
+            # "column" is a SQL keyword in QuestDB and must be double-quoted.
+            cur.execute(f'SELECT "column" FROM table_columns(\'{t}\')')
             rows = cur.fetchall()
     out: list[str] = []
     for (name,) in rows:
@@ -229,5 +230,149 @@ def best_effort_rename_provenance_columns_v2(*, cur: Any, table: str) -> None:
             pass
 
 
-__all__ = ["migrate_column_names_v2", "best_effort_rename_provenance_columns_v2"]
+def ensure_schema_v2(
+    *,
+    cfg: QuestDBQueryConfig,
+    apply: bool = False,
+    connect_timeout_s: int = 2,
+) -> dict[str, Any]:
+    """
+    Ensure all required columns exist on ghTrader QuestDB tables.
+
+    This function adds missing columns (dataset_version, ticks_kind, etc.) to
+    existing tables that were created before the schema was updated.
+
+    If `apply=False` (default): returns a plan (dry-run).
+    If `apply=True`: executes the ALTER TABLE statements.
+
+    Returns a dict with:
+    - ok: bool
+    - mode: "dry_run" or "apply"
+    - planned_adds: list of {table, column, type} dicts
+    - results: list of {ok, sql, error} dicts (if apply=True)
+    """
+    from ghtrader.data.ticks_schema import TICK_COLUMN_NAMES
+
+    tick_numeric_cols = [c for c in TICK_COLUMN_NAMES if c not in {"symbol", "datetime"}]
+
+    # Define required columns per table type.
+    # Format: {table_name: [(column_name, column_type), ...]}
+    required_columns: dict[str, list[tuple[str, str]]] = {
+        "ghtrader_ticks_raw_v2": [
+            ("symbol", "SYMBOL"),
+            ("ts", "TIMESTAMP"),
+            ("datetime_ns", "LONG"),
+            ("trading_day", "SYMBOL"),
+            ("row_hash", "LONG"),
+            ("dataset_version", "SYMBOL"),
+            ("ticks_kind", "SYMBOL"),
+        ] + [(c, "DOUBLE") for c in tick_numeric_cols],
+        "ghtrader_ticks_main_l5_v2": [
+            ("symbol", "SYMBOL"),
+            ("ts", "TIMESTAMP"),
+            ("datetime_ns", "LONG"),
+            ("trading_day", "SYMBOL"),
+            ("row_hash", "LONG"),
+            ("dataset_version", "SYMBOL"),
+            ("ticks_kind", "SYMBOL"),
+            ("underlying_contract", "SYMBOL"),
+            ("segment_id", "LONG"),
+            ("schedule_hash", "SYMBOL"),
+        ] + [(c, "DOUBLE") for c in tick_numeric_cols],
+        "ghtrader_symbol_day_index_v2": [
+            ("ts", "TIMESTAMP"),
+            ("symbol", "SYMBOL"),
+            ("trading_day", "SYMBOL"),
+            ("ticks_kind", "SYMBOL"),
+            ("dataset_version", "SYMBOL"),
+            ("rows_total", "LONG"),
+            ("first_datetime_ns", "LONG"),
+            ("last_datetime_ns", "LONG"),
+            ("l5_present", "BOOLEAN"),
+            ("row_hash_min", "LONG"),
+            ("row_hash_max", "LONG"),
+            ("row_hash_sum", "LONG"),
+            ("row_hash_sum_abs", "LONG"),
+            ("updated_at", "TIMESTAMP"),
+        ],
+        "ghtrader_no_data_days_v2": [
+            ("ts", "TIMESTAMP"),
+            ("symbol", "SYMBOL"),
+            ("trading_day", "SYMBOL"),
+            ("ticks_kind", "SYMBOL"),
+            ("dataset_version", "SYMBOL"),
+            ("reason", "SYMBOL"),
+            ("created_at", "TIMESTAMP"),
+        ],
+    }
+
+    planned_adds: list[dict[str, str]] = []
+    warnings: list[str] = []
+
+    try:
+        tables = _list_tables(cfg=cfg, connect_timeout_s=connect_timeout_s)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "generated_at": _now_iso()}
+
+    existing_tables = set(tables)
+
+    for table, cols in required_columns.items():
+        if table not in existing_tables:
+            warnings.append(f"table={table} does not exist; skipping")
+            continue
+
+        try:
+            existing_cols = set(_list_columns(cfg=cfg, table=table, connect_timeout_s=connect_timeout_s))
+        except Exception as e:
+            warnings.append(f"table={table}: failed to list columns: {e}")
+            continue
+
+        for col_name, col_type in cols:
+            if col_name not in existing_cols:
+                planned_adds.append({"table": table, "column": col_name, "type": col_type})
+
+    plan_sql: list[str] = [
+        f"ALTER TABLE {_ident(a['table'])} ADD COLUMN {_ident(a['column'])} {a['type']}"
+        for a in planned_adds
+    ]
+
+    if not apply:
+        return {
+            "ok": True,
+            "mode": "dry_run",
+            "tables_checked": len([t for t in required_columns if t in existing_tables]),
+            "planned_adds": planned_adds,
+            "planned_sql": plan_sql,
+            "warnings": warnings,
+            "generated_at": _now_iso(),
+        }
+
+    # Apply: execute ALTER TABLE ADD COLUMN statements.
+    results: list[dict[str, Any]] = []
+    ok = True
+    try:
+        res = _apply_sql(cfg=cfg, statements=plan_sql, connect_timeout_s=connect_timeout_s)
+        for r in res:
+            # Treat "column already exists" as success (idempotent).
+            if not r.ok and "already exists" in str(r.error or "").lower():
+                results.append(asdict(r) | {"ok": True, "note": "column_already_exists"})
+            else:
+                ok = ok and bool(r.ok)
+                results.append(asdict(r))
+    except Exception as e:
+        ok = False
+        results.append(asdict(OpResult(ok=False, table="", action="exec", sql="(add columns batch)", error=str(e))))
+
+    return {
+        "ok": bool(ok),
+        "mode": "apply",
+        "tables_checked": len([t for t in required_columns if t in existing_tables]),
+        "planned_adds": planned_adds,
+        "warnings": warnings,
+        "results": results,
+        "generated_at": _now_iso(),
+    }
+
+
+__all__ = ["migrate_column_names_v2", "best_effort_rename_provenance_columns_v2", "ensure_schema_v2"]
 

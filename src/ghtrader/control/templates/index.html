@@ -103,7 +103,7 @@
   <div class="card">
     <h3 class="mb-3">Quick Actions</h3>
     <div class="grid4">
-      <form method="post" action="/ops/build/main_schedule{{ token_qs }}">
+      <form method="post" action="/data/build/main_schedule{{ token_qs }}">
         <input type="hidden" name="variety" value="cu"/>
         <input type="hidden" name="start_date" value="{{ default_schedule_start }}"/>
         <input type="hidden" name="end_date" value="{{ default_schedule_end }}"/>
@@ -111,14 +111,14 @@
         <input type="hidden" name="data_dir" value="data"/>
         <button type="submit" class="btn btn-secondary" style="width:100%;">Build Schedule (cu)</button>
       </form>
-      <form method="post" action="/ops/build/main_l5{{ token_qs }}">
+      <form method="post" action="/data/build/main_l5{{ token_qs }}">
         <input type="hidden" name="variety" value="cu"/>
         <input type="hidden" name="derived_symbol" value="KQ.m@SHFE.cu"/>
         <input type="hidden" name="data_dir" value="data"/>
         <input type="hidden" name="overwrite" value="false"/>
         <button type="submit" class="btn btn-secondary" style="width:100%;">Build main_l5 (cu)</button>
       </form>
-      <form method="post" action="/ops/build/build{{ token_qs }}">
+      <form method="post" action="/data/build/build{{ token_qs }}">
         <input type="hidden" name="symbol" value="KQ.m@SHFE.cu"/>
         <input type="hidden" name="horizons" value="10,50,200"/>
         <input type="hidden" name="threshold_k" value="1"/>
@@ -354,24 +354,24 @@
       alerts.push(_bannerHtml("error", "QuestDB is offline", hint, `/data${tokenQs}#sync`, "Open DB Sync"));
     }
     if (pipe.schedule && pipe.schedule.state !== "ok") {
-      alerts.push(_bannerHtml("warn", "Main schedule is missing", "Build the main-contract schedule before running main_l5 / features.", `/ops${tokenQs}#build`, "Build Schedule"));
+      alerts.push(_bannerHtml("warn", "Main schedule is missing", "Build the main-contract schedule before running main_l5 / features.", `/data${tokenQs}#build`, "Build Schedule"));
     }
     if (pipe.main_l5 && pipe.main_l5.state !== "ok") {
-      alerts.push(_bannerHtml("warn", "main_l5 ticks are missing", "Build the derived main_l5 ticks before feature engineering.", `/ops${tokenQs}#build`, "Build main_l5"));
+      alerts.push(_bannerHtml("warn", "main_l5 ticks are missing", "Build the derived main_l5 ticks before feature engineering.", `/data${tokenQs}#build`, "Build main_l5"));
     }
     if (pipe.build && pipe.build.state !== "ok") {
-      alerts.push(_bannerHtml("warn", "Features / labels are missing", "Build features/labels before training models.", `/ops${tokenQs}#build`, "Build Features"));
+      alerts.push(_bannerHtml("warn", "Features / labels are missing", "Build features/labels before training models.", `/data${tokenQs}#build`, "Build Features"));
     }
     el.innerHTML = alerts.join("");
   }
 
   function setupPipelineNavigation() {
     const map = {
-      stepIngest: `/ops${tokenQs}#ingest`,
-      stepSync: `/data${tokenQs}#sync`,
-      stepSchedule: `/ops${tokenQs}#build`,
-      stepMainL5: `/ops${tokenQs}#build`,
-      stepBuild: `/ops${tokenQs}#build`,
+      stepIngest: `/data${tokenQs}#ingest`,
+      stepSync: `/data${tokenQs}#contracts`,
+      stepSchedule: `/data${tokenQs}#build`,
+      stepMainL5: `/data${tokenQs}#build`,
+      stepBuild: `/data${tokenQs}#build`,
       stepTrain: `/models${tokenQs}#train`
     };
     Object.entries(map).forEach(([id, href]) => {

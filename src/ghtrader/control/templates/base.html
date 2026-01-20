@@ -30,10 +30,9 @@
             <span class="nav-badge">{{ running_count }}</span>
           {% endif %}
         </a>
-        <a href="/data{{ token_qs }}" class="{% if path.startswith('/data') %}active{% endif %}">Data</a>
+        <a href="/data{{ token_qs }}" class="{% if path.startswith('/data') or path.startswith('/ops') %}active{% endif %}">Data</a>
         <a href="/models{{ token_qs }}" class="{% if path.startswith('/models') %}active{% endif %}">Models</a>
         <a href="/trading{{ token_qs }}" class="{% if path.startswith('/trading') %}active{% endif %}">Trading</a>
-        <a href="/ops{{ token_qs }}" class="{% if path.startswith('/ops') %}active{% endif %}">Ops</a>
         <a href="/explorer{{ token_qs }}" class="{% if path.startswith('/explorer') %}active{% endif %}">SQL</a>
         <a href="/system{{ token_qs }}" class="{% if path.startswith('/system') %}active{% endif %}">System</a>
       </nav>
