@@ -136,6 +136,23 @@ def _infer_market_from_symbol(symbol: str) -> str | None:
     return None
 
 
+# Used by download_historical_ticks and unit tests.
+def _compute_missing_dates(
+    *,
+    all_dates: list[date],
+    existing_dates: set[date],
+    no_data_dates: set[date],
+    force_dates: set[date] | None = None,
+) -> list[date]:
+    ed = set(existing_dates)
+    nd = set(no_data_dates)
+    fd = set(force_dates or set())
+    if fd:
+        ed -= fd
+        nd -= fd
+    return [d for d in all_dates if d not in ed and d not in nd]
+
+
 # All no-data tracking is handled via QuestDB ghtrader_no_data_days_v2 table.
 
 
@@ -148,6 +165,7 @@ def download_historical_ticks(
     *,
     dataset_version: DatasetVersion = "v2",
     auto_bootstrap_index: bool = True,
+    force: bool = False,
 ) -> None:
     """
     Download historical L5 ticks for a symbol and ingest to QuestDB (canonical).
@@ -173,6 +191,7 @@ def download_historical_ticks(
         start=str(start_date),
         end=str(end_date),
         dataset_version=str(dataset_version),
+        force=bool(force),
     )
 
     # QuestDB-first: canonical tick storage + index/no-data tracking.
@@ -248,6 +267,17 @@ def download_historical_ticks(
     except Exception:
         pass
 
+    existing_dates_orig = set(existing_dates)
+    no_data_dates_orig = set(no_data_dates)
+
+    if force:
+        # Allow a re-download even if the index or no-data table already has the day.
+        try:
+            existing_dates -= set(all_dates)
+            no_data_dates -= set(all_dates)
+        except Exception:
+            pass
+
     # If index is empty but ticks exist, bootstrap the index once for resume correctness.
     if auto_bootstrap_index and not existing_dates:
         try:
@@ -277,7 +307,12 @@ def download_historical_ticks(
         except Exception:
             pass
 
-    missing_dates = [d for d in all_dates if d not in existing_dates and d not in no_data_dates]
+    missing_dates = _compute_missing_dates(
+        all_dates=all_dates,
+        existing_dates=existing_dates,
+        no_data_dates=no_data_dates,
+        force_dates=(set(all_dates) if force else None),
+    )
 
     if not missing_dates:
         log.info("tq_ingest.already_complete", symbol=symbol)
@@ -334,6 +369,8 @@ def download_historical_ticks(
             if df.empty:
                 log.warning("tq_ingest.empty_chunk", symbol=symbol, chunk_start=str(chunk_start))
                 missing_in_chunk = set(chunk) - existing_dates - no_data_dates
+                if force:
+                    missing_in_chunk = {d for d in missing_in_chunk if d not in existing_dates_orig}
                 # Do not mark today's trading day as no-data (keep it retriable).
                 try:
                     if today_trading is not None:
@@ -455,6 +492,8 @@ def download_historical_ticks(
 
             # Mark any requested trading dates in this chunk that produced no ticks (QuestDB only).
             missing_in_chunk = set(chunk) - written_dates - existing_dates - no_data_dates
+            if force:
+                missing_in_chunk = {d for d in missing_in_chunk if d not in existing_dates_orig}
             # Do not mark today's trading day as no-data (keep it retriable).
             try:
                 if today_trading is not None:

@@ -118,170 +118,64 @@ def build_router() -> Any:
         )
 
     # ---------------------------------------------------------------------
-    # Ops pages (full-form parity with CLI)
+    # Ops -> Data redirect (backward compatibility)
     # ---------------------------------------------------------------------
 
     @router.get("/ops")
-    def ops(request: Request):
+    def ops_redirect(request: Request):
+        """Redirect /ops to /data for backward compatibility (unified workflow in Contracts tab)."""
         _require_auth(request)
-        store = request.app.state.job_store
-        runs_dir = get_runs_dir()
-
-        jobs = store.list_jobs(limit=200)
-        running_count = len([j for j in jobs if j.status == "running"])
-        queued_count = len([j for j in jobs if j.status == "queued"])
-        recent_count = len(jobs)
-
-        # Ingest statuses
-        ingest_statuses: list[dict[str, Any]] = []
-        try:
-            from ghtrader.control.ingest_status import ingest_status_for_job, parse_ingest_command
-
-            for job in jobs:
-                if job.status not in {"queued", "running"}:
-                    continue
-                kind = parse_ingest_command(job.command).get("kind")
-                if kind not in {"download", "download_contract_range", "record"}:
-                    continue
-                s = ingest_status_for_job(
-                    job_id=job.id,
-                    command=job.command,
-                    log_path=job.log_path,
-                    default_data_dir=get_data_dir(),
-                )
-                s.update(
-                    {
-                        "job_status": job.status,
-                        "title": job.title,
-                        "source": job.source,
-                        "created_at": job.created_at,
-                        "started_at": job.started_at,
-                    }
-                )
-                ingest_statuses.append(s)
-        except Exception:
-            ingest_statuses = []
-
-        # Locks
-        locks = []
-        try:
-            from ghtrader.control.locks import LockStore
-
-            locks = LockStore(runs_dir / "control" / "jobs.db").list_locks()
-        except Exception:
-            locks = []
-
-        # Audit reports
-        reports = []
-        try:
-            reports_dir = runs_dir / "audit"
-            if reports_dir.exists():
-                reports = sorted([p.name for p in reports_dir.glob("*.json")], reverse=True)[:50]
-        except Exception:
-            reports = []
-
-        # QuestDB reachability (best-effort).
-        questdb: dict[str, Any] = {"ok": False}
-        try:
-            from ghtrader.config import (
-                get_questdb_host,
-                get_questdb_ilp_port,
-                get_questdb_pg_dbname,
-                get_questdb_pg_password,
-                get_questdb_pg_port,
-                get_questdb_pg_user,
-            )
-
-            host = get_questdb_host()
-            pg_port = int(get_questdb_pg_port())
-            ilp_port = int(get_questdb_ilp_port())
-            questdb.update({"host": host, "pg_port": pg_port, "ilp_port": ilp_port})
-            try:
-                import psycopg  # type: ignore
-
-                with psycopg.connect(
-                    user=str(get_questdb_pg_user()),
-                    password=str(get_questdb_pg_password()),
-                    host=str(host),
-                    port=int(pg_port),
-                    dbname=str(get_questdb_pg_dbname()),
-                    connect_timeout=1,
-                ) as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT 1")
-                        cur.fetchone()
-                questdb["ok"] = True
-            except Exception as e:
-                questdb["ok"] = False
-                questdb["error"] = str(e)
-        except Exception as e:
-            questdb["ok"] = False
-            questdb["error"] = str(e)
-
-        # Defaults for schedule builder quick actions
-        default_schedule_start = "2015-01-01"
-        default_schedule_end = datetime.now().date().isoformat()
-
-        # TqSdk scheduler settings (max parallel heavy jobs)
-        tqsdk_scheduler = get_tqsdk_scheduler_state(runs_dir=runs_dir)
-
-        return templates.TemplateResponse(
-            request,
-            "ops.html",
-            {
-                "request": request,
-                "title": "Operations",
-                "token_qs": _token_qs(request),
-                "running_count": running_count,
-                "queued_count": queued_count,
-                "recent_count": recent_count,
-                "ingest_statuses": ingest_statuses,
-                "locks": locks,
-                "reports": reports,
-                "questdb": questdb,
-                "default_schedule_start": default_schedule_start,
-                "default_schedule_end": default_schedule_end,
-                "tqsdk_scheduler": tqsdk_scheduler,
-            },
-        )
+        token_qs = _token_qs(request)
+        # Redirect to the unified Data Hub (Contracts tab has the 8-step workflow)
+        return RedirectResponse(url=f"/data{token_qs}#contracts", status_code=303)
 
     @router.get("/ops/ingest")
-    def ops_ingest(request: Request):
+    def ops_ingest_redirect(request: Request):
         _require_auth(request)
-        return RedirectResponse(url=f"/ops{_token_qs(request)}#ingest", status_code=303)
+        return RedirectResponse(url=f"/data{_token_qs(request)}#ingest", status_code=303)
 
     @router.get("/ops/build")
-    def ops_build(request: Request):
+    def ops_build_redirect(request: Request):
         _require_auth(request)
-        return RedirectResponse(url=f"/ops{_token_qs(request)}#build", status_code=303)
+        return RedirectResponse(url=f"/data{_token_qs(request)}#build", status_code=303)
 
     @router.get("/ops/model")
-    def ops_model(request: Request):
+    def ops_model_redirect(request: Request):
         _require_auth(request)
         return RedirectResponse(url=f"/models{_token_qs(request)}", status_code=303)
 
     @router.get("/ops/eval")
-    def ops_eval(request: Request):
+    def ops_eval_redirect(request: Request):
         _require_auth(request)
         return RedirectResponse(url=f"/models{_token_qs(request)}", status_code=303)
 
     @router.get("/ops/trading")
-    def ops_trading(request: Request):
+    def ops_trading_redirect(request: Request):
         _require_auth(request)
         return RedirectResponse(url=f"/trading{_token_qs(request)}", status_code=303)
 
     @router.get("/ops/locks")
-    def ops_locks(request: Request):
+    def ops_locks_redirect(request: Request):
         _require_auth(request)
-        return RedirectResponse(url=f"/ops{_token_qs(request)}#locks", status_code=303)
+        return RedirectResponse(url=f"/data{_token_qs(request)}#locks", status_code=303)
 
     @router.get("/ops/integrity")
-    def ops_integrity(request: Request):
+    def ops_integrity_redirect(request: Request):
         _require_auth(request)
-        return RedirectResponse(url=f"/ops{_token_qs(request)}#integrity", status_code=303)
+        return RedirectResponse(url=f"/data{_token_qs(request)}#integrity", status_code=303)
 
     @router.get("/ops/integrity/report/{name}")
-    def ops_integrity_report(request: Request, name: str):
+    def ops_integrity_report_redirect(request: Request, name: str):
+        """Redirect to /data/integrity/report for backward compatibility."""
+        _require_auth(request)
+        return RedirectResponse(url=f"/data/integrity/report/{name}{_token_qs(request)}", status_code=303)
+
+    # ---------------------------------------------------------------------
+    # Data Hub routes (consolidated from Ops)
+    # ---------------------------------------------------------------------
+
+    @router.get("/data/integrity/report/{name}")
+    def data_integrity_report(request: Request, name: str):
         _require_auth(request)
         if "/" in name or "\\" in name or not name.endswith(".json"):
             raise HTTPException(status_code=400, detail="invalid report name")
@@ -290,8 +184,8 @@ def build_router() -> Any:
             raise HTTPException(status_code=404, detail="report not found")
         return PlainTextResponse(p.read_text(), media_type="application/json")
 
-    @router.post("/ops/ingest/download")
-    async def ops_ingest_download(request: Request):
+    @router.post("/data/ingest/download")
+    async def data_ingest_download(request: Request):
         _require_auth(request)
         form = await request.form()
         symbol = str(form.get("symbol") or "").strip()
@@ -317,12 +211,11 @@ def build_router() -> Any:
         )
         title = f"download {symbol} {start_date}->{end_date}"
         jm = request.app.state.job_manager
-        # Download is TqSdk-heavy; enqueue to respect max-parallel scheduler.
         rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
-    @router.post("/ops/ingest/download_contract_range")
-    async def ops_ingest_download_contract_range(request: Request):
+    @router.post("/data/ingest/download_contract_range")
+    async def data_ingest_download_contract_range(request: Request):
         _require_auth(request)
         form = await request.form()
         exchange = str(form.get("exchange") or "SHFE").strip()
@@ -357,43 +250,11 @@ def build_router() -> Any:
             argv += ["--end-date", end_date]
         title = f"download-contract-range {var} {start_contract}->{end_contract}"
         jm = request.app.state.job_manager
-        # Contract-range backfill is TqSdk-heavy; enqueue to respect max-parallel scheduler.
         rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
-    @router.post("/ops/ingest/update_variety")
-    async def ops_ingest_update_variety(request: Request):
-        _require_auth(request)
-        form = await request.form()
-        exchange = str(form.get("exchange") or "SHFE").strip()
-        var = str(form.get("variety") or "").strip()
-        recent_days = str(form.get("recent_expired_days") or "10").strip()
-        data_dir = str(form.get("data_dir") or "data").strip()
-        runs_dir = str(form.get("runs_dir") or "runs").strip()
-        if not var:
-            raise HTTPException(status_code=400, detail="variety required")
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "update",
-            "--exchange",
-            exchange,
-            "--var",
-            var,
-            "--recent-expired-days",
-            recent_days,
-            "--data-dir",
-            data_dir,
-            "--runs-dir",
-            runs_dir,
-        )
-        title = f"update {exchange}.{var}"
-        jm = request.app.state.job_manager
-        # Update is TqSdk-heavy; enqueue to respect max-parallel scheduler.
-        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
-
-    @router.post("/ops/ingest/record")
-    async def ops_ingest_record(request: Request):
+    @router.post("/data/ingest/record")
+    async def data_ingest_record(request: Request):
         _require_auth(request)
         form = await request.form()
         symbols = str(form.get("symbols") or "").strip()
@@ -409,12 +270,8 @@ def build_router() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
-    # ---------------------------------------------------------------------
-    # Dashboard settings
-    # ---------------------------------------------------------------------
-
-    @router.post("/ops/settings/tqsdk_scheduler")
-    async def ops_settings_tqsdk_scheduler(request: Request):
+    @router.post("/data/settings/tqsdk_scheduler")
+    async def data_settings_tqsdk_scheduler(request: Request):
         _require_auth(request)
         form = await request.form()
         max_parallel = form.get("max_parallel")
@@ -426,10 +283,63 @@ def build_router() -> Any:
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        return RedirectResponse(url=f"/ops{_token_qs(request)}#ingest", status_code=303)
+        return RedirectResponse(url=f"/data{_token_qs(request)}#ingest", status_code=303)
 
-    @router.post("/ops/build/build")
-    async def ops_build_build(request: Request):
+    @router.post("/data/build/main_schedule")
+    async def data_build_main_schedule(request: Request):
+        _require_auth(request)
+        form = await request.form()
+        var = str(form.get("variety") or "cu").strip()
+        start_date = str(form.get("start_date") or "").strip()
+        end_date = str(form.get("end_date") or "").strip()
+        threshold = str(form.get("threshold") or "1.1").strip()
+        data_dir = str(form.get("data_dir") or "data").strip()
+        if not start_date or not end_date:
+            raise HTTPException(status_code=400, detail="start_date/end_date required")
+        argv = python_module_argv(
+            "ghtrader.cli",
+            "main-schedule",
+            "--var",
+            var,
+            "--start",
+            start_date,
+            "--end",
+            end_date,
+            "--threshold",
+            threshold,
+            "--data-dir",
+            data_dir,
+        )
+        title = f"main-schedule {var} {start_date}->{end_date}"
+        jm = request.app.state.job_manager
+        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+
+    @router.post("/data/build/main_l5")
+    async def data_build_main_l5(request: Request):
+        _require_auth(request)
+        form = await request.form()
+        var = str(form.get("variety") or "cu").strip()
+        derived_symbol = str(form.get("derived_symbol") or f"KQ.m@SHFE.{var}").strip()
+        overwrite = str(form.get("overwrite") or "false").strip().lower() == "true"
+        if not var or not derived_symbol:
+            raise HTTPException(status_code=400, detail="variety/derived_symbol required")
+        argv = python_module_argv(
+            "ghtrader.cli",
+            "main-l5",
+            "--var",
+            var,
+            "--symbol",
+            derived_symbol,
+            "--overwrite" if overwrite else "--no-overwrite",
+        )
+        title = f"main-l5 {var} {derived_symbol}"
+        jm = request.app.state.job_manager
+        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+
+    @router.post("/data/build/build")
+    async def data_build_build(request: Request):
         _require_auth(request)
         form = await request.form()
         symbol = str(form.get("symbol") or "").strip()
@@ -460,59 +370,105 @@ def build_router() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
-    @router.post("/ops/build/main_schedule")
-    async def ops_build_main_schedule(request: Request):
+    @router.post("/data/integrity/audit")
+    async def data_integrity_audit(request: Request):
         _require_auth(request)
         form = await request.form()
-        var = str(form.get("variety") or "cu").strip()
-        start_date = str(form.get("start_date") or "").strip()
-        end_date = str(form.get("end_date") or "").strip()
-        threshold = str(form.get("threshold") or "1.1").strip()
+        scopes = form.getlist("scopes")
         data_dir = str(form.get("data_dir") or "data").strip()
-        if not start_date or not end_date:
-            raise HTTPException(status_code=400, detail="start_date/end_date required")
+        runs_dir = str(form.get("runs_dir") or "runs").strip()
+        exchange = str(form.get("exchange") or "").strip()
+        variety = str(form.get("variety") or "").strip()
+        refresh_catalog = str(form.get("refresh_catalog") or "").strip().lower() in {"true", "1", "yes", "on"}
+        scopes = [s for s in scopes if s]
+        if not scopes:
+            scopes = ["all"]
         argv = python_module_argv(
             "ghtrader.cli",
-            "main-schedule",
-            "--var",
-            var,
-            "--start",
-            start_date,
-            "--end",
-            end_date,
-            "--threshold",
-            threshold,
+            "audit",
+            *sum([["--scope", s] for s in scopes], []),
             "--data-dir",
             data_dir,
+            "--runs-dir",
+            runs_dir,
         )
-        title = f"main-schedule {var} {start_date}->{end_date}"
+        if exchange:
+            argv += ["--exchange", exchange]
+        if variety:
+            argv += ["--var", variety]
+        if refresh_catalog:
+            argv += ["--refresh-catalog"]
+        title = f"audit {','.join(scopes)}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+
+    # ---------------------------------------------------------------------
+    # Legacy /ops/* POST routes (redirect to /data/*)
+    # ---------------------------------------------------------------------
+
+    # Legacy /ops/* POST routes - forward to new /data/* handlers
+    @router.post("/ops/ingest/download")
+    async def ops_ingest_download(request: Request):
+        return await data_ingest_download(request)
+
+    @router.post("/ops/ingest/download_contract_range")
+    async def ops_ingest_download_contract_range(request: Request):
+        return await data_ingest_download_contract_range(request)
+
+    @router.post("/ops/ingest/update_variety")
+    async def ops_ingest_update_variety(request: Request):
+        _require_auth(request)
+        form = await request.form()
+        exchange = str(form.get("exchange") or "SHFE").strip()
+        var = str(form.get("variety") or "").strip()
+        recent_days = str(form.get("recent_expired_days") or "10").strip()
+        data_dir = str(form.get("data_dir") or "data").strip()
+        runs_dir_str = str(form.get("runs_dir") or "runs").strip()
+        if not var:
+            raise HTTPException(status_code=400, detail="variety required")
+        argv = python_module_argv(
+            "ghtrader.cli",
+            "update",
+            "--exchange",
+            exchange,
+            "--var",
+            var,
+            "--recent-expired-days",
+            recent_days,
+            "--data-dir",
+            data_dir,
+            "--runs-dir",
+            runs_dir_str,
+        )
+        title = f"update {exchange}.{var}"
+        jm = request.app.state.job_manager
+        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+
+    @router.post("/ops/ingest/record")
+    async def ops_ingest_record(request: Request):
+        return await data_ingest_record(request)
+
+    @router.post("/ops/settings/tqsdk_scheduler")
+    async def ops_settings_tqsdk_scheduler(request: Request):
+        return await data_settings_tqsdk_scheduler(request)
+
+    @router.post("/ops/build/build")
+    async def ops_build_build(request: Request):
+        return await data_build_build(request)
+
+    @router.post("/ops/build/main_schedule")
+    async def ops_build_main_schedule(request: Request):
+        return await data_build_main_schedule(request)
 
     @router.post("/ops/build/main_l5")
     async def ops_build_main_l5(request: Request):
-        _require_auth(request)
-        form = await request.form()
-        var = str(form.get("variety") or "cu").strip()
-        derived_symbol = str(form.get("derived_symbol") or f"KQ.m@SHFE.{var}").strip()
-        overwrite = str(form.get("overwrite") or "false").strip().lower() == "true"
-        if not var or not derived_symbol:
-            raise HTTPException(status_code=400, detail="variety/derived_symbol required")
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "main-l5",
-            "--var",
-            var,
-            "--symbol",
-            derived_symbol,
-            "--overwrite" if overwrite else "--no-overwrite",
-        )
-        title = f"main-l5 {var} {derived_symbol}"
-        jm = request.app.state.job_manager
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        return await data_build_main_l5(request)
 
+    # Note: /ops/model/* and /ops/eval/* routes are kept as-is since they
+    # redirect to /models page which is separate from the Data Hub consolidation.
+    # These routes submit jobs and redirect to job detail, so they work independently.
     @router.post("/ops/model/train")
     async def ops_model_train(request: Request):
         _require_auth(request)
@@ -568,7 +524,7 @@ def build_router() -> Any:
         model = str(form.get("model") or "deeplob").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
         artifacts_dir = str(form.get("artifacts_dir") or "artifacts").strip()
-        runs_dir = str(form.get("runs_dir") or "runs").strip()
+        runs_dir_str = str(form.get("runs_dir") or "runs").strip()
         n_trials = str(form.get("n_trials") or "20").strip()
         n_cpus = str(form.get("n_cpus") or "8").strip()
         n_gpus = str(form.get("n_gpus") or "1").strip()
@@ -586,7 +542,7 @@ def build_router() -> Any:
             "--artifacts-dir",
             artifacts_dir,
             "--runs-dir",
-            runs_dir,
+            runs_dir_str,
             "--n-trials",
             n_trials,
             "--n-cpus",
@@ -607,7 +563,7 @@ def build_router() -> Any:
         symbol = str(form.get("symbol") or "").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
         artifacts_dir = str(form.get("artifacts_dir") or "artifacts").strip()
-        runs_dir = str(form.get("runs_dir") or "runs").strip()
+        runs_dir_str = str(form.get("runs_dir") or "runs").strip()
         horizon = str(form.get("horizon") or "50").strip()
         if not model or not symbol:
             raise HTTPException(status_code=400, detail="model/symbol required")
@@ -623,7 +579,7 @@ def build_router() -> Any:
             "--artifacts-dir",
             artifacts_dir,
             "--runs-dir",
-            runs_dir,
+            runs_dir_str,
             "--horizon",
             horizon,
         )
@@ -640,7 +596,7 @@ def build_router() -> Any:
         models = str(form.get("models") or "").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
         artifacts_dir = str(form.get("artifacts_dir") or "artifacts").strip()
-        runs_dir = str(form.get("runs_dir") or "runs").strip()
+        runs_dir_str = str(form.get("runs_dir") or "runs").strip()
         horizon = str(form.get("horizon") or "50").strip()
         if not symbol:
             raise HTTPException(status_code=400, detail="symbol required")
@@ -656,7 +612,7 @@ def build_router() -> Any:
             "--artifacts-dir",
             artifacts_dir,
             "--runs-dir",
-            runs_dir,
+            runs_dir_str,
             "--horizon",
             horizon,
         )
@@ -675,7 +631,7 @@ def build_router() -> Any:
         end_date = str(form.get("end_date") or "").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
         artifacts_dir = str(form.get("artifacts_dir") or "artifacts").strip()
-        runs_dir = str(form.get("runs_dir") or "runs").strip()
+        runs_dir_str = str(form.get("runs_dir") or "runs").strip()
         if not model or not symbol or not start_date or not end_date:
             raise HTTPException(status_code=400, detail="model/symbol/start_date/end_date required")
         argv = python_module_argv(
@@ -694,7 +650,7 @@ def build_router() -> Any:
             "--artifacts-dir",
             artifacts_dir,
             "--runs-dir",
-            runs_dir,
+            runs_dir_str,
         )
         title = f"backtest {model} {symbol}"
         jm = request.app.state.job_manager
@@ -729,7 +685,7 @@ def build_router() -> Any:
         lookback_days = str(form.get("lookback_days") or "30").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
         artifacts_dir = str(form.get("artifacts_dir") or "artifacts").strip()
-        runs_dir = str(form.get("runs_dir") or "runs").strip()
+        runs_dir_str = str(form.get("runs_dir") or "runs").strip()
         if not symbols:
             raise HTTPException(status_code=400, detail="symbols required")
         argv = python_module_argv("ghtrader.cli", "daily-train")
@@ -743,7 +699,7 @@ def build_router() -> Any:
             "--artifacts-dir",
             artifacts_dir,
             "--runs-dir",
-            runs_dir,
+            runs_dir_str,
             "--horizon",
             horizon,
             "--lookback-days",
@@ -756,36 +712,7 @@ def build_router() -> Any:
 
     @router.post("/ops/integrity/audit")
     async def ops_integrity_audit(request: Request):
-        _require_auth(request)
-        form = await request.form()
-        scopes = form.getlist("scopes")
-        data_dir = str(form.get("data_dir") or "data").strip()
-        runs_dir = str(form.get("runs_dir") or "runs").strip()
-        exchange = str(form.get("exchange") or "").strip()
-        variety = str(form.get("variety") or "").strip()
-        refresh_catalog = str(form.get("refresh_catalog") or "").strip().lower() in {"true", "1", "yes", "on"}
-        scopes = [s for s in scopes if s]
-        if not scopes:
-            scopes = ["all"]
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "audit",
-            *sum([["--scope", s] for s in scopes], []),
-            "--data-dir",
-            data_dir,
-            "--runs-dir",
-            runs_dir,
-        )
-        if exchange:
-            argv += ["--exchange", exchange]
-        if variety:
-            argv += ["--var", variety]
-        if refresh_catalog:
-            argv += ["--refresh-catalog"]
-        title = f"audit {','.join(scopes)}"
-        jm = request.app.state.job_manager
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        return await data_integrity_audit(request)
 
     @router.post("/jobs/start")
     async def jobs_start(request: Request):
@@ -949,11 +876,62 @@ def build_router() -> Any:
     def data_page(request: Request):
         _require_auth(request)
         store = request.app.state.job_store
-        jobs = store.list_jobs(limit=50)
+        runs_dir = get_runs_dir()
+
+        jobs = store.list_jobs(limit=200)
         running = [j for j in jobs if j.status == "running"]
+        queued = [j for j in jobs if j.status == "queued"]
 
         data_dir = get_data_dir()
         lv = "v2"
+
+        # Ingest statuses (from ops page)
+        ingest_statuses: list[dict[str, Any]] = []
+        try:
+            from ghtrader.control.ingest_status import ingest_status_for_job, parse_ingest_command
+
+            for job in jobs:
+                if job.status not in {"queued", "running"}:
+                    continue
+                kind = parse_ingest_command(job.command).get("kind")
+                if kind not in {"download", "download_contract_range", "record"}:
+                    continue
+                s = ingest_status_for_job(
+                    job_id=job.id,
+                    command=job.command,
+                    log_path=job.log_path,
+                    default_data_dir=data_dir,
+                )
+                s.update(
+                    {
+                        "job_status": job.status,
+                        "title": job.title,
+                        "source": job.source,
+                        "created_at": job.created_at,
+                        "started_at": job.started_at,
+                    }
+                )
+                ingest_statuses.append(s)
+        except Exception:
+            ingest_statuses = []
+
+        # Locks
+        locks = []
+        try:
+            from ghtrader.control.locks import LockStore
+
+            locks = LockStore(runs_dir / "control" / "jobs.db").list_locks()
+        except Exception:
+            locks = []
+
+        # Audit reports
+        reports = []
+        try:
+            reports_dir = runs_dir / "audit"
+            if reports_dir.exists():
+                reports = sorted([p.name for p in reports_dir.glob("*.json")], reverse=True)[:50]
+        except Exception:
+            reports = []
 
         # QuestDB reachability (best-effort) for sync tab
         questdb: dict[str, Any] = {"ok": False}
@@ -961,36 +939,29 @@ def build_router() -> Any:
             from ghtrader.config import (
                 get_questdb_host,
                 get_questdb_ilp_port,
-                get_questdb_pg_dbname,
-                get_questdb_pg_password,
                 get_questdb_pg_port,
-                get_questdb_pg_user,
             )
+            from ghtrader.questdb.client import questdb_reachable_pg
 
             host = get_questdb_host()
             pg_port = int(get_questdb_pg_port())
             ilp_port = int(get_questdb_ilp_port())
             questdb.update({"host": host, "pg_port": pg_port, "ilp_port": ilp_port})
-            try:
-                import psycopg  # type: ignore
 
-                with psycopg.connect(
-                    user=str(get_questdb_pg_user()),
-                    password=str(get_questdb_pg_password()),
-                    host=str(host),
-                    port=int(pg_port),
-                    dbname=str(get_questdb_pg_dbname()),
-                ) as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT 1")
-                        cur.fetchone()
-                questdb["ok"] = True
-            except Exception as e:
-                questdb["ok"] = False
-                questdb["error"] = str(e)
+            q = questdb_reachable_pg(connect_timeout_s=2, retries=1, backoff_s=0.2)
+            questdb["ok"] = bool(q.get("ok"))
+            if not questdb["ok"] and q.get("error"):
+                questdb["error"] = str(q.get("error"))
         except Exception as e:
             questdb["ok"] = False
             questdb["error"] = str(e)
+
+        # Defaults for schedule builder quick actions
+        default_schedule_start = "2015-01-01"
+        default_schedule_end = datetime.now().date().isoformat()
+
+        # TqSdk scheduler settings (max parallel heavy jobs)
+        tqsdk_scheduler = get_tqsdk_scheduler_state(runs_dir=runs_dir)
 
         # Coverage lists can get very large; keep /data page load fast by default.
         # The Contracts tab will lazy-load any detailed coverage via API.
@@ -1002,12 +973,19 @@ def build_router() -> Any:
                 "title": "Data Hub",
                 "token_qs": _token_qs(request),
                 "running_count": len(running),
+                "queued_count": len(queued),
                 "dataset_version": lv,
                 "ticks_v2": [],
                 "main_l5_v2": [],
                 "features": [],
                 "labels": [],
                 "questdb": questdb,
+                "ingest_statuses": ingest_statuses,
+                "locks": locks,
+                "reports": reports,
+                "default_schedule_start": default_schedule_start,
+                "default_schedule_end": default_schedule_end,
+                "tqsdk_scheduler": tqsdk_scheduler,
             },
         )
 

@@ -46,6 +46,7 @@ def register(main: click.Group) -> None:
             get_questdb_pg_port,
             get_questdb_pg_user,
         )
+        from ghtrader.questdb.client import QuestDBQueryConfig, connect_pg_safe
 
         h = str(host).strip() or str(get_questdb_host())
         p = int(pg_port) if int(pg_port) > 0 else int(get_questdb_pg_port())
@@ -55,16 +56,8 @@ def register(main: click.Group) -> None:
 
         t0 = time.time()
         try:
-            import psycopg  # type: ignore
-
-            with psycopg.connect(
-                user=u,
-                password=pw,
-                host=h,
-                port=int(p),
-                dbname=dbn,
-                connect_timeout=int(connect_timeout),
-            ) as conn:
+            cfg = QuestDBQueryConfig(host=h, pg_port=int(p), pg_user=u, pg_password=pw, pg_dbname=dbn)
+            with connect_pg_safe(cfg, connect_timeout_s=int(connect_timeout), retries=1, backoff_s=0.2, autocommit=True) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
                     cur.fetchone()
@@ -217,6 +210,56 @@ def register(main: click.Group) -> None:
             cfg=cfg, table_prefix=str(table_prefix), apply=bool(apply), connect_timeout_s=int(connect_timeout)
         )
         click.echo(json.dumps(out, ensure_ascii=False))
+        if not bool(out.get("ok", False)):
+            raise SystemExit(1)
+
+    @db_group.command("ensure-schema")
+    @click.option("--apply/--dry-run", default=False, show_default=True, help="Apply schema changes (default: dry-run)")
+    @click.option("--host", default="", help="QuestDB host (default: env/config)")
+    @click.option("--pg-port", default=0, type=int, help="QuestDB PGWire port (default: env/config)")
+    @click.option("--pg-user", default="", help="QuestDB PGWire user (default: env/config)")
+    @click.option("--pg-password", default="", help="QuestDB PGWire password (default: env/config)")
+    @click.option("--pg-dbname", default="", help="QuestDB PGWire dbname (default: env/config)")
+    @click.option("--connect-timeout", default=2, type=int, show_default=True, help="Connect timeout seconds")
+    def db_ensure_schema(
+        apply: bool,
+        host: str,
+        pg_port: int,
+        pg_user: str,
+        pg_password: str,
+        pg_dbname: str,
+        connect_timeout: int,
+    ) -> None:
+        """
+        Ensure all required columns exist on ghTrader QuestDB tables.
+
+        This command adds missing columns (dataset_version, ticks_kind, etc.) to
+        existing tables that were created before the schema was updated.
+
+        Use --dry-run (default) to see what would be changed.
+        Use --apply to execute the schema changes.
+        """
+        import json
+
+        from ghtrader.config import (
+            get_questdb_host,
+            get_questdb_pg_dbname,
+            get_questdb_pg_password,
+            get_questdb_pg_port,
+            get_questdb_pg_user,
+        )
+        from ghtrader.questdb.client import QuestDBQueryConfig
+        from ghtrader.questdb.migrate import ensure_schema_v2
+
+        h = str(host).strip() or str(get_questdb_host())
+        p = int(pg_port) if int(pg_port) > 0 else int(get_questdb_pg_port())
+        u = str(pg_user).strip() or str(get_questdb_pg_user())
+        pw = str(pg_password).strip() or str(get_questdb_pg_password())
+        dbn = str(pg_dbname).strip() or str(get_questdb_pg_dbname())
+
+        cfg = QuestDBQueryConfig(host=h, pg_port=int(p), pg_user=u, pg_password=pw, pg_dbname=dbn)
+        out = ensure_schema_v2(cfg=cfg, apply=bool(apply), connect_timeout_s=int(connect_timeout))
+        click.echo(json.dumps(out, ensure_ascii=False, indent=2))
         if not bool(out.get("ok", False)):
             raise SystemExit(1)
 

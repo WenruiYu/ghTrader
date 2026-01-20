@@ -12,6 +12,8 @@ services:
     ports:
       # Web console + REST API
       - "9000:9000"
+      # Prometheus metrics
+      - "9003:9003"
       # Influx Line Protocol (ILP) ingestion
       - "9009:9009"
       # Postgres wire protocol (SQL)
@@ -23,6 +25,8 @@ services:
     environment:
       # Disable telemetry
       - QDB_TELEMETRY_ENABLED=false
+      # Prometheus metrics (read-only)
+      - QDB_METRICS_ENABLED=true
 
       # WAL (Write-Ahead Log) configuration
       - QDB_CAIRO_WAL_ENABLED=true
@@ -31,23 +35,28 @@ services:
       # Page cache for column files (main memory consumer)
       - QDB_CAIRO_SQL_JIT_PAGE_SIZE=4194304
       - QDB_CAIRO_SQL_COPY_BUFFER_SIZE=4194304
+      # Avoid mmap failures when mapped file size exceeds RAM
+      - QDB_RAM_USAGE_LIMIT_PERCENT=0
+      - QDB_RAM_USAGE_LIMIT_BYTES=0
 
       # Worker thread configuration (utilize high core count)
       # Shared workers for general SQL execution
-      - QDB_SHARED_WORKER_COUNT=128
+      - QDB_SHARED_WORKER_COUNT=256
 
       # ILP (Line Protocol) ingestion workers
-      - QDB_LINE_TCP_WRITER_WORKER_COUNT=32
-      - QDB_LINE_TCP_IO_WORKER_COUNT=32
+      - QDB_LINE_TCP_WRITER_WORKER_COUNT=96
+      - QDB_LINE_TCP_IO_WORKER_COUNT=96
 
       # PostgreSQL wire protocol workers
-      - QDB_PG_WORKER_COUNT=32
+      - QDB_PG_WORKER_COUNT=128
+      # PGWire connection limit (default 64); raise for heavy parallel scans
+      - QDB_PG_NET_CONNECTION_LIMIT=512
 
       # WAL apply workers (for DEDUP UPSERT operations)
-      - QDB_WAL_APPLY_WORKER_COUNT=64
+      - QDB_WAL_APPLY_WORKER_COUNT=128
 
       # Cairo writer file operations
-      - QDB_CAIRO_WRITER_FO_COUNT=64
+      - QDB_CAIRO_WRITER_FO_COUNT=256
 
       # O3 (Out-of-order) commit lag for time-series optimization
       # Allow 5 minutes of out-of-order data before commit
@@ -60,7 +69,7 @@ services:
       - QDB_CAIRO_SQL_CACHE_SIZE=1024
 
       # HTTP connection pool for REST API
-      - QDB_HTTP_CONNECTION_POOL_SIZE=128
+      - QDB_HTTP_CONNECTION_POOL_SIZE=256
 
       # Enable parallel GROUP BY for large aggregations
       - QDB_CAIRO_SQL_PARALLEL_GROUPBY_ENABLED=true
@@ -73,6 +82,14 @@ services:
         reservations:
           # Reserve 400GB minimum
           memory: 400G
+
+    ulimits:
+      nofile:
+        soft: 2097152
+        hard: 2097152
+      memlock:
+        soft: -1
+        hard: -1
 
     # Health check for container orchestration
     healthcheck:

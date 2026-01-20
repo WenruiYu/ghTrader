@@ -18,6 +18,59 @@
 
   let liveEnabled = null;
 
+  // Quick Order panel state (must be at top for hoisting - used by loadConsoleStatus/loadGatewayStatus)
+  let lastGatewaySymbols = [];
+  let lastPositions = {};  // symbol -> net position
+  let lastGatewayMode = "idle";
+
+  function updateQuickOrderPanel() {
+    const symSelect = document.getElementById("manualOrderSymbol");
+    const posEl = document.getElementById("manualCurrentPos");
+    const modeEl = document.getElementById("manualGatewayMode");
+    const statusEl = document.getElementById("manualOrderStatus");
+
+    // Update symbol dropdown
+    if (symSelect) {
+      const currentVal = symSelect.value;
+      const options = ['<option value="">-- select --</option>'];
+      for (const s of lastGatewaySymbols) {
+        options.push('<option value="' + esc(s) + '"' + (s === currentVal ? ' selected' : '') + '>' + esc(s) + '</option>');
+      }
+      symSelect.innerHTML = options.join("");
+      // Try to restore selection
+      if (currentVal && lastGatewaySymbols.includes(currentVal)) {
+        symSelect.value = currentVal;
+      }
+    }
+
+    // Update current position
+    if (posEl && symSelect) {
+      const sym = symSelect.value;
+      const pos = (sym && lastPositions[sym] !== undefined) ? lastPositions[sym] : 0;
+      posEl.textContent = String(pos);
+      posEl.style.color = pos > 0 ? "#28a745" : (pos < 0 ? "#dc3545" : "inherit");
+    }
+
+    // Update gateway mode
+    if (modeEl) {
+      modeEl.textContent = lastGatewayMode || "idle";
+      const ordersEnabled = (lastGatewayMode === "sim" || lastGatewayMode === "live_trade");
+      modeEl.style.color = ordersEnabled ? "#28a745" : "#6c757d";
+    }
+
+    // Update status
+    if (statusEl) {
+      const ordersEnabled = (lastGatewayMode === "sim" || lastGatewayMode === "live_trade");
+      if (!ordersEnabled) {
+        statusEl.textContent = "Orders disabled (mode: " + lastGatewayMode + ")";
+      } else if (lastGatewaySymbols.length === 0) {
+        statusEl.textContent = "No symbols configured";
+      } else {
+        statusEl.textContent = "Ready";
+      }
+    }
+  }
+
   // Selectors
   const accountProfileSelect = document.getElementById("accountProfileSelect");
 
@@ -266,7 +319,7 @@
       if (action === "select-account") {
         setSelectedAccountProfile(prof);
         updateAccountProfileStatus();
-        tabs.activate("status");
+        tabs.activate("monitor");
         await refreshAll();
         return;
       }
@@ -347,6 +400,12 @@
       if (!resp.ok) return;
       const data = await resp.json();
       if (!data || data.ok === false) return;
+
+      // Raw API response - update FIRST before any other processing
+      const rawEl = document.getElementById("monitorRawResponse");
+      if (rawEl) {
+        rawEl.textContent = JSON.stringify(data, null, 2);
+      }
 
       // Live enabled
       liveEnabled = (data.live_enabled === true);
@@ -481,6 +540,127 @@
         if (el4) el4.textContent = (maxLoss !== undefined && maxLoss !== null) ? String(maxLoss) : "--";
       }
 
+      // Monitor tab: Gateway health summary
+      const monitorGatewayStatus = document.getElementById("monitorGatewayStatus");
+      const monitorGatewayMode = document.getElementById("monitorGatewayMode");
+      const monitorGatewaySymbols = document.getElementById("monitorGatewaySymbols");
+      if (monitorGatewayStatus) monitorGatewayStatus.textContent = String(gw.component_status || gw.status || "--");
+      if (monitorGatewayMode) monitorGatewayMode.textContent = String(mode || "idle");
+      if (monitorGatewaySymbols) {
+        const effectiveSymbols = (gwState && gwState.effective && gwState.effective.symbols) ? gwState.effective.symbols : [];
+        monitorGatewaySymbols.textContent = Array.isArray(effectiveSymbols) && effectiveSymbols.length ? effectiveSymbols.join(", ") : "--";
+      }
+
+      // Update Quick Order panel state from console status (for cross-tab freshness)
+      const gwEffective = (gwState && gwState.effective) ? gwState.effective : {};
+      lastGatewayMode = String(gwEffective.mode || mode || "idle");
+      lastGatewaySymbols = Array.isArray(gwEffective.symbols) ? gwEffective.symbols : [];
+
+      // Extract positions from gateway snapshot
+      if (pos && typeof pos === "object") {
+        lastPositions = {};
+        for (const sym of Object.keys(pos)) {
+          const p = pos[sym] || {};
+          const vlong = Number(p.volume_long || 0);
+          const vshort = Number(p.volume_short || 0);
+          lastPositions[sym] = vlong - vshort;
+        }
+      }
+      updateQuickOrderPanel();
+
+      // Quick Start panel updates
+      const qsGatewayStatus = document.getElementById("qsGatewayStatus");
+      const qsStrategyStatus = document.getElementById("qsStrategyStatus");
+      const qsGatewayMode = document.getElementById("qsGatewayMode");
+      const qsStrategyMode = document.getElementById("qsStrategyMode");
+      const qsLastUpdate = document.getElementById("qsLastUpdate");
+      const qsLiveEnabled = document.getElementById("qsLiveEnabled");
+      const qsStaleWarning = document.getElementById("qsStaleWarning");
+
+      // Gateway status
+      const gwComponentStatus = String(gw.component_status || gw.status || "unknown");
+      const gwStale = gw.stale === true;
+      if (qsGatewayStatus) {
+        let statusText = gwComponentStatus;
+        let statusColor = "#6c757d";
+        if (gwComponentStatus === "running") { statusText = "Running"; statusColor = "#28a745"; }
+        else if (gwComponentStatus === "degraded") { statusText = "Degraded"; statusColor = "#ffc107"; }
+        else if (gwComponentStatus === "starting") { statusText = "Starting"; statusColor = "#17a2b8"; }
+        else if (gwComponentStatus === "desired_idle") { statusText = "Stopped"; statusColor = "#6c757d"; }
+        else if (gwComponentStatus === "not_initialized") { statusText = "Not initialized"; statusColor = "#6c757d"; }
+        if (gwStale) { statusText += " (stale)"; statusColor = "#ffc107"; }
+        qsGatewayStatus.textContent = statusText;
+        qsGatewayStatus.style.color = statusColor;
+      }
+      if (qsGatewayMode) {
+        qsGatewayMode.textContent = "Mode: " + lastGatewayMode;
+      }
+
+      // Strategy status
+      const st = data.strategy || {};
+      const stStatus = String(st.status || "unknown");
+      const stStale = st.stale === true;
+      const stDesiredWrap = (st.desired && typeof st.desired === "object") ? st.desired : {};
+      const stDesired = (stDesiredWrap.desired && typeof stDesiredWrap.desired === "object") ? stDesiredWrap.desired : stDesiredWrap;
+      const stDesiredMode = String((stDesired || {}).mode || "idle");
+      if (qsStrategyStatus) {
+        let statusText = stStatus;
+        let statusColor = "#6c757d";
+        if (stStatus === "running") { statusText = "Running"; statusColor = "#28a745"; }
+        else if (stStatus === "degraded") { statusText = "Degraded"; statusColor = "#ffc107"; }
+        else if (stStatus === "starting") { statusText = "Starting"; statusColor = "#17a2b8"; }
+        else if (stStatus === "desired_idle") { statusText = "Stopped"; statusColor = "#6c757d"; }
+        else if (stStatus === "not_initialized") { statusText = "Not initialized"; statusColor = "#6c757d"; }
+        if (stStale) { statusText += " (stale)"; statusColor = "#ffc107"; }
+        qsStrategyStatus.textContent = statusText;
+        qsStrategyStatus.style.color = statusColor;
+      }
+      if (qsStrategyMode) {
+        qsStrategyMode.textContent = "Mode: " + stDesiredMode;
+      }
+
+      // Last update + live enabled
+      if (qsLastUpdate) qsLastUpdate.textContent = new Date().toLocaleTimeString();
+      if (qsLiveEnabled) {
+        qsLiveEnabled.textContent = liveEnabled ? "Yes" : "No";
+        qsLiveEnabled.style.color = liveEnabled ? "#28a745" : "#6c757d";
+      }
+
+      // Stale warning
+      if (qsStaleWarning) {
+        qsStaleWarning.style.display = (gwStale || stStale) ? "block" : "none";
+      }
+
+      // Sync Quick Start symbols from gateway
+      const qsSymbolsEl = document.getElementById("qsSymbols");
+      if (qsSymbolsEl && !qsSymbolsEl.value && lastGatewaySymbols.length > 0) {
+        qsSymbolsEl.value = lastGatewaySymbols.join(",");
+      }
+
+      // Show/hide confirm_live field based on mode
+      const qsModeEl = document.getElementById("qsMode");
+      const qsConfirmLiveWrap = document.getElementById("qsConfirmLiveWrap");
+      if (qsModeEl && qsConfirmLiveWrap) {
+        qsConfirmLiveWrap.style.display = (qsModeEl.value === "live_trade") ? "block" : "none";
+      }
+
+      // Monitor tab: Strategy health summary (reuse st from Quick Start section above)
+      const stState2 = (st.state && typeof st.state === "object") ? st.state : {};
+      const stEffective = (stState2.effective && typeof stState2.effective === "object") ? stState2.effective : {};
+      const monitorStrategyStatus = document.getElementById("monitorStrategyStatus");
+      const monitorStrategyModel = document.getElementById("monitorStrategyModel");
+      const monitorStrategyTarget = document.getElementById("monitorStrategyTarget");
+      if (monitorStrategyStatus) monitorStrategyStatus.textContent = String(st.status || "--");
+      if (monitorStrategyModel) monitorStrategyModel.textContent = String(stEffective.model_name || "--") + " h" + String(stEffective.horizon || "--");
+      if (monitorStrategyTarget) {
+        const lastTgts = stState2.last_targets;
+        if (lastTgts && typeof lastTgts === "object" && Object.keys(lastTgts).length > 0) {
+          monitorStrategyTarget.textContent = Object.entries(lastTgts).map(([k, v]) => k + ":" + v).join(", ");
+        } else {
+          monitorStrategyTarget.textContent = "--";
+        }
+      }
+
       // Signals: prefer strategy recent events
       const sigTbody = document.getElementById("signalsTbody");
       if (sigTbody) {
@@ -585,6 +765,24 @@
       if (gatewayEnforceTradingTimeEl) gatewayEnforceTradingTimeEl.value = (desired.enforce_trading_time === false) ? "false" : "true";
 
       if (gatewayRawEl) gatewayRawEl.textContent = JSON.stringify(data, null, 2);
+
+      // Update Quick Order panel state
+      const eff = (st.effective && typeof st.effective === "object") ? st.effective : {};
+      lastGatewayMode = String(eff.mode || desired.mode || "idle");
+      lastGatewaySymbols = Array.isArray(eff.symbols) ? eff.symbols : (Array.isArray(desired.symbols) ? desired.symbols : []);
+
+      // Extract positions from last_snapshot
+      const snap = (st.last_snapshot && typeof st.last_snapshot === "object") ? st.last_snapshot : {};
+      const posObj = (snap.positions && typeof snap.positions === "object") ? snap.positions : {};
+      lastPositions = {};
+      for (const sym of Object.keys(posObj)) {
+        const p = posObj[sym] || {};
+        const vlong = Number(p.volume_long || 0);
+        const vshort = Number(p.volume_short || 0);
+        lastPositions[sym] = vlong - vshort;
+      }
+
+      updateQuickOrderPanel();
     } catch (e) {
       setText(gatewayHealthEl, "error");
       if (gatewayRawEl) gatewayRawEl.textContent = String(e && e.message ? e.message : e);
@@ -796,6 +994,245 @@
 
   if (gatewayRefreshBtn) gatewayRefreshBtn.addEventListener("click", () => loadGatewayStatus());
 
+  // Quick Order button handlers
+  const manualOpenLongBtn = document.getElementById("manualOpenLong");
+  const manualOpenShortBtn = document.getElementById("manualOpenShort");
+  const manualCloseAllBtn = document.getElementById("manualCloseAll");
+  const manualOrderSymbolEl = document.getElementById("manualOrderSymbol");
+  const manualOrderSizeEl = document.getElementById("manualOrderSize");
+  const manualOrderStatusEl = document.getElementById("manualOrderStatus");
+
+  function getCurrentPosition(sym) {
+    return (sym && lastPositions[sym] !== undefined) ? Number(lastPositions[sym]) : 0;
+  }
+
+  if (manualOpenLongBtn) {
+    manualOpenLongBtn.addEventListener("click", async () => {
+      const sym = manualOrderSymbolEl ? manualOrderSymbolEl.value : "";
+      if (!sym) { window.ghTrader.toast("Select a symbol first", "error"); return; }
+      const size = manualOrderSizeEl ? Number(manualOrderSizeEl.value || 1) : 1;
+      const current = getCurrentPosition(sym);
+      const target = current + size;
+      if (manualOrderStatusEl) manualOrderStatusEl.textContent = "Sending Open Long...";
+      await sendGatewayCommand("set_target", { symbol: sym, target: target });
+      if (manualOrderStatusEl) manualOrderStatusEl.textContent = "Open Long sent (target: " + target + ")";
+    });
+  }
+
+  if (manualOpenShortBtn) {
+    manualOpenShortBtn.addEventListener("click", async () => {
+      const sym = manualOrderSymbolEl ? manualOrderSymbolEl.value : "";
+      if (!sym) { window.ghTrader.toast("Select a symbol first", "error"); return; }
+      const size = manualOrderSizeEl ? Number(manualOrderSizeEl.value || 1) : 1;
+      const current = getCurrentPosition(sym);
+      const target = current - size;
+      if (manualOrderStatusEl) manualOrderStatusEl.textContent = "Sending Open Short...";
+      await sendGatewayCommand("set_target", { symbol: sym, target: target });
+      if (manualOrderStatusEl) manualOrderStatusEl.textContent = "Open Short sent (target: " + target + ")";
+    });
+  }
+
+  if (manualCloseAllBtn) {
+    manualCloseAllBtn.addEventListener("click", async () => {
+      const sym = manualOrderSymbolEl ? manualOrderSymbolEl.value : "";
+      if (!sym) { window.ghTrader.toast("Select a symbol first", "error"); return; }
+      if (manualOrderStatusEl) manualOrderStatusEl.textContent = "Sending Close Position...";
+      await sendGatewayCommand("set_target", { symbol: sym, target: 0 });
+      if (manualOrderStatusEl) manualOrderStatusEl.textContent = "Close Position sent (target: 0)";
+    });
+  }
+
+  // Update Quick Order panel when symbol changes
+  if (manualOrderSymbolEl) {
+    manualOrderSymbolEl.addEventListener("change", () => updateQuickOrderPanel());
+  }
+
+  // Quick Start panel handlers
+  const qsStartGatewayBtn = document.getElementById("qsStartGateway");
+  const qsStopGatewayBtn = document.getElementById("qsStopGateway");
+  const qsStartStrategyBtn = document.getElementById("qsStartStrategy");
+  const qsStopStrategyBtn = document.getElementById("qsStopStrategy");
+  const qsModeEl = document.getElementById("qsMode");
+  const qsSymbolsEl = document.getElementById("qsSymbols");
+  const qsConfirmLiveEl = document.getElementById("qsConfirmLive");
+  const qsActionStatusEl = document.getElementById("qsActionStatus");
+  const qsConfirmLiveWrap = document.getElementById("qsConfirmLiveWrap");
+  const qsPrereqHint = document.getElementById("qsPrereqHint");
+  const qsPrereqText = document.getElementById("qsPrereqText");
+
+  // Show/hide confirm_live field when mode changes
+  if (qsModeEl) {
+    qsModeEl.addEventListener("change", () => {
+      if (qsConfirmLiveWrap) {
+        qsConfirmLiveWrap.style.display = (qsModeEl.value === "live_trade") ? "block" : "none";
+      }
+      updateQsPrerequisites();
+    });
+  }
+
+  function updateQsPrerequisites() {
+    if (!qsPrereqHint || !qsPrereqText) return;
+    const mode = qsModeEl ? qsModeEl.value : "sim";
+    const symbols = parseCsvSymbols(qsSymbolsEl ? qsSymbolsEl.value : "");
+    const confirmLive = qsConfirmLiveEl ? qsConfirmLiveEl.value.trim() : "";
+
+    const issues = [];
+    if (symbols.length === 0) {
+      issues.push("Symbols required");
+    }
+    if (mode === "live_trade") {
+      if (!liveEnabled) {
+        issues.push("GHTRADER_LIVE_ENABLED=true required");
+      }
+      if (confirmLive !== "I_UNDERSTAND") {
+        issues.push("confirm_live must be I_UNDERSTAND");
+      }
+    }
+
+    if (issues.length > 0) {
+      qsPrereqHint.style.display = "block";
+      qsPrereqText.textContent = issues.join("; ");
+    } else {
+      qsPrereqHint.style.display = "none";
+    }
+  }
+
+  // Update prerequisites on input changes
+  if (qsSymbolsEl) qsSymbolsEl.addEventListener("input", updateQsPrerequisites);
+  if (qsConfirmLiveEl) qsConfirmLiveEl.addEventListener("input", updateQsPrerequisites);
+
+  // Start Gateway
+  if (qsStartGatewayBtn) {
+    qsStartGatewayBtn.addEventListener("click", async () => {
+      const mode = qsModeEl ? qsModeEl.value : "sim";
+      const symbols = parseCsvSymbols(qsSymbolsEl ? qsSymbolsEl.value : "");
+      const confirmLive = qsConfirmLiveEl ? qsConfirmLiveEl.value.trim() : "";
+
+      if (symbols.length === 0) {
+        window.ghTrader.toast("Symbols required", "error");
+        return;
+      }
+      if (mode === "live_trade" && !liveEnabled) {
+        window.ghTrader.toast("Live trading not enabled (GHTRADER_LIVE_ENABLED)", "error");
+        return;
+      }
+      if (mode === "live_trade" && confirmLive !== "I_UNDERSTAND") {
+        window.ghTrader.toast("confirm_live must be I_UNDERSTAND for live_trade", "error");
+        return;
+      }
+
+      if (qsActionStatusEl) qsActionStatusEl.textContent = "Starting gateway...";
+      try {
+        const out = await window.ghTrader.postJson("/api/gateway/start", {
+          account_profile: selectedAccountProfile,
+          desired: {
+            mode: mode,
+            symbols: symbols,
+            confirm_live: confirmLive,
+            max_abs_position: 1,
+            max_order_size: 1,
+            max_ops_per_sec: 10,
+          },
+        });
+        if (out.ok) {
+          window.ghTrader.toast("Gateway started (job: " + (out.job_id || "") + ")", "success");
+          if (qsActionStatusEl) qsActionStatusEl.textContent = "Gateway started";
+        } else {
+          window.ghTrader.toast(out.message || out.error || "Failed to start gateway", "error");
+          if (qsActionStatusEl) qsActionStatusEl.textContent = out.message || out.error || "Failed";
+        }
+        await refreshAll();
+      } catch (e) {
+        window.ghTrader.toast("Failed: " + (e.message || e), "error");
+        if (qsActionStatusEl) qsActionStatusEl.textContent = "Error";
+      }
+    });
+  }
+
+  // Stop Gateway
+  if (qsStopGatewayBtn) {
+    qsStopGatewayBtn.addEventListener("click", async () => {
+      if (qsActionStatusEl) qsActionStatusEl.textContent = "Stopping gateway...";
+      try {
+        const out = await window.ghTrader.postJson("/api/gateway/stop", {
+          account_profile: selectedAccountProfile,
+        });
+        if (out.ok) {
+          window.ghTrader.toast("Gateway stop signal sent", "success");
+          if (qsActionStatusEl) qsActionStatusEl.textContent = "Gateway stopped";
+        } else {
+          window.ghTrader.toast(out.message || out.error || "Failed to stop gateway", "error");
+          if (qsActionStatusEl) qsActionStatusEl.textContent = out.message || out.error || "Failed";
+        }
+        await refreshAll();
+      } catch (e) {
+        window.ghTrader.toast("Failed: " + (e.message || e), "error");
+        if (qsActionStatusEl) qsActionStatusEl.textContent = "Error";
+      }
+    });
+  }
+
+  // Start Strategy
+  if (qsStartStrategyBtn) {
+    qsStartStrategyBtn.addEventListener("click", async () => {
+      const symbols = parseCsvSymbols(qsSymbolsEl ? qsSymbolsEl.value : "");
+      if (symbols.length === 0) {
+        window.ghTrader.toast("Symbols required", "error");
+        return;
+      }
+
+      if (qsActionStatusEl) qsActionStatusEl.textContent = "Starting strategy...";
+      try {
+        const out = await window.ghTrader.postJson("/api/strategy/start", {
+          account_profile: selectedAccountProfile,
+          desired: {
+            mode: "run",
+            symbols: symbols,
+            model_name: "xgboost",
+            horizon: 50,
+            threshold_up: 0.6,
+            threshold_down: 0.6,
+            position_size: 1,
+          },
+        });
+        if (out.ok) {
+          window.ghTrader.toast("Strategy started (job: " + (out.job_id || "") + ")", "success");
+          if (qsActionStatusEl) qsActionStatusEl.textContent = "Strategy started";
+        } else {
+          window.ghTrader.toast(out.message || out.error || "Failed to start strategy", "error");
+          if (qsActionStatusEl) qsActionStatusEl.textContent = out.message || out.error || "Failed";
+        }
+        await refreshAll();
+      } catch (e) {
+        window.ghTrader.toast("Failed: " + (e.message || e), "error");
+        if (qsActionStatusEl) qsActionStatusEl.textContent = "Error";
+      }
+    });
+  }
+
+  // Stop Strategy
+  if (qsStopStrategyBtn) {
+    qsStopStrategyBtn.addEventListener("click", async () => {
+      if (qsActionStatusEl) qsActionStatusEl.textContent = "Stopping strategy...";
+      try {
+        const out = await window.ghTrader.postJson("/api/strategy/stop", {
+          account_profile: selectedAccountProfile,
+        });
+        if (out.ok) {
+          window.ghTrader.toast("Strategy stop signal sent", "success");
+          if (qsActionStatusEl) qsActionStatusEl.textContent = "Strategy stopped";
+        } else {
+          window.ghTrader.toast(out.message || out.error || "Failed to stop strategy", "error");
+          if (qsActionStatusEl) qsActionStatusEl.textContent = out.message || out.error || "Failed";
+        }
+        await refreshAll();
+      } catch (e) {
+        window.ghTrader.toast("Failed: " + (e.message || e), "error");
+        if (qsActionStatusEl) qsActionStatusEl.textContent = "Error";
+      }
+    });
+  }
+
   // Strategy desired submit
   if (strategyDesiredForm) {
     strategyDesiredForm.addEventListener("submit", async (ev) => {
@@ -856,10 +1293,80 @@
   loadAccounts();
   refreshAll();
 
-  // Auto-refresh (lightweight)
-  setInterval(loadConsoleStatus, 10000);
-  setInterval(loadGatewayStatus, 10000);
-  setInterval(loadStrategyStatus, 10000);
+  // Tab-aware polling: 1s for active monitoring tabs, slower for background
+  let consoleStatusPending = false;
+  let gatewayStatusPending = false;
+  let strategyStatusPending = false;
+
+  function getActiveTab() {
+    const active = tabs.navItems.find((t) => t.classList.contains("active"));
+    return active ? String(active.dataset.tab || "") : "";
+  }
+
+  async function pollConsoleStatus() {
+    if (consoleStatusPending) return;
+    consoleStatusPending = true;
+    try {
+      await loadConsoleStatus();
+    } finally {
+      consoleStatusPending = false;
+    }
+  }
+
+  async function pollGatewayStatus() {
+    if (gatewayStatusPending) return;
+    gatewayStatusPending = true;
+    try {
+      await loadGatewayStatus();
+    } finally {
+      gatewayStatusPending = false;
+    }
+  }
+
+  async function pollStrategyStatus() {
+    if (strategyStatusPending) return;
+    strategyStatusPending = true;
+    try {
+      await loadStrategyStatus();
+    } finally {
+      strategyStatusPending = false;
+    }
+  }
+
+  // Fast polling (1s) for Auto Monitor tab
+  setInterval(() => {
+    const tab = getActiveTab();
+    if (tab === "monitor") {
+      pollConsoleStatus();
+    }
+  }, 1000);
+
+  // Fast polling (1s) for Manual Test tab
+  setInterval(() => {
+    const tab = getActiveTab();
+    if (tab === "test") {
+      pollGatewayStatus();
+      pollStrategyStatus();
+    }
+  }, 1000);
+
+  // Background polling (30s) for inactive tabs
+  setInterval(() => {
+    const tab = getActiveTab();
+    if (tab !== "monitor") {
+      pollConsoleStatus();
+    }
+  }, 30000);
+
+  setInterval(() => {
+    const tab = getActiveTab();
+    if (tab !== "test") {
+      pollGatewayStatus();
+      pollStrategyStatus();
+    }
+  }, 30000);
+
+  // Other background tasks
   setInterval(loadTradingJobs, 15000);
   setInterval(loadStrategyRunHistory, 30000);
   setInterval(loadAccounts, 30000);

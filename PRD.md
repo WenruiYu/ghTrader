@@ -98,7 +98,15 @@ A model family is considered “better” when, on walk-forward evaluation:
 
 ### 4.2 Core workflows
 
-- **Data workflow (QuestDB-first)**: `download`/`record` → `data health` (diagnose + auto-repair) → (optional manual `data repair`) → `main-schedule` → `main-l5` → `build` (features/labels) → `train` → `backtest`/`benchmark`
+- **Data workflow (QuestDB-first)**: The canonical 8-step pipeline executed via the Data Hub:
+  - **Step 0**: Refresh Snapshot (catalog + QuestDB index)
+  - **Step 1**: Health Check (diagnose + auto-repair)
+  - **Step 2**: Update All (forward-fill active + recently expired contracts)
+  - **Step 3**: Build Schedule (OI-based roll schedule for main contract)
+  - **Step 4**: Build main_l5 (continuous L5 depth ticks from underlying contracts)
+  - **Step 5**: Build Features/Labels (causal features + multi-horizon labels)
+  - **Step 6**: Train Model (link to Models page)
+  - **Step 7**: Backtest/Trade (link to Trading page)
 - **Continual workflow**: `daily-train` (scheduled) → gated promotion → rollback on regression
 - **Model research workflow**: `compare` and benchmarking reports across model families
 
@@ -187,6 +195,12 @@ Implementation:
 - `src/ghtrader/tq/execution.py` (TqSdk execution primitives)
 - `src/ghtrader/tq/runtime.py` (TqSdk runtime helpers: auth/account creation, snapshot shaping, symbol/profile normalization)
 
+#### 5.1.4 Best-in-class ingest governance (alignment)
+
+- Define ingest **SLIs/SLOs** (freshness, completeness, error budget) and surface in dashboard health.
+- Persist **lineage metadata** per ingest batch (source version, config hash, row_hash summary).
+- Formalize **backfill policy** (allowed windows + change log) so historical corrections are auditable.
+
 ### 5.2 Data ingest (live recorder)
 
 - Must subscribe to ticks and append to QuestDB (ILP).
@@ -262,6 +276,11 @@ Unified validation + repair workflow (operator-facing):
     - refresh catalog cache
   - Repairs must be **idempotent** and must not silently “fix” suspicious value outliers without an explicit operator decision.
 - `ghtrader data health` is a convenience wrapper (diagnose → auto-repair → summarize manual-review items).
+  - **QuestDB PGWire resilience**: diagnose/health must tolerate transient PGWire disconnects (e.g., “server closed the connection unexpectedly”) by retrying queries and reusing connections when safe. Read-only queries should avoid rollback noise (autocommit) and failures should be logged as warnings without aborting the full run.
+  - **Connection budgeting**: diagnose/health must cap concurrent partition workers to avoid exhausting PGWire connection limits. Default cap is controlled by `GHTRADER_DIAGNOSE_MAX_WORKERS` (recommended default: 32). If the cap is increased, QuestDB `pg.net.connection.limit` must be raised accordingly and monitored for saturation.
+  - **Incremental scan default**: diagnose/health should skip partitions whose content has not changed since the last validation, using `ghtrader_symbol_day_index_v2` row-hash values and the quality ledgers (`ghtrader_field_quality_v2`, `ghtrader_tick_gaps_v2`) as the cache of validated partitions. Provide `--force-full-scan` to revalidate every partition when needed.
+  - **SQL pushdown**: field-quality and gap metrics should be computed in QuestDB SQL (full-partition scans inside the database) to reduce client data transfer and Python-side CPU/memory cost. Any detailed per-partition metadata (e.g., consecutive-missing segments JSON) may be computed on-demand only for partitions that breach thresholds.
+    - Window-function results must be computed in their own CTE/SELECT before applying other functions (QuestDB does not allow nested window functions like `abs(lag(...))`).
 
 Audit command (deep integrity validation):
 - Must provide `ghtrader audit` which validates QuestDB-backed datasets and produces:
@@ -273,6 +292,8 @@ Audit command (deep integrity validation):
   - basic sanity rules for ticks (non-negative volume/OI; non-negative prices; `ask_price1 >= bid_price1` when present)
   - index consistency: `ghtrader_symbol_day_index_v2` matches the underlying tick tables for sampled partitions
   - derived-vs-raw equivalence for `main_l5` (tick value columns must match raw underlying; `symbol` differs by design; metadata columns must match schedule provenance) when `ghtrader_ticks_main_l5_v2` is enabled
+  - Sampling checks must be explicit about the source ticks table and `ticks_kind` (e.g., raw ticks use `ghtrader_ticks_raw_v2` with `ticks_kind='raw'`).
+  - When `data diagnose` is run with an explicit `--symbol` list, audit sampling must be limited to that symbol set (avoid cross-variety `unfixable` findings).
 
 #### 5.3.0.3 Database / query layer (QuestDB-only)
 
@@ -299,6 +320,12 @@ Canonical ticks, features, labels, and schedules are stored in QuestDB.
 
 QuestDB is the chosen canonical tick store for this phase.
 
+#### 5.3.0.4 Best-in-class data governance (alignment)
+
+- **Lineage manifests**: each derived dataset build must emit a QuestDB‑stored manifest (config hash, source tables, schedule hash, row_hash summary).
+- **Backfill governance**: define allowed backfill windows, approval rules, and change‑log records for any historical corrections.
+- **Data SLIs/SLOs**: set explicit freshness/completeness targets and track error budgets in the control plane.
+
 #### 5.3.0.5 Field-level Quality Validation (QuestDB-first)
 
 Day-level completeness is necessary but not sufficient for tick data. ghTrader must validate field-level completeness and quality within each `(symbol, trading_day, ticks_kind, dataset_version)` partition.
@@ -319,6 +346,7 @@ Outlier pre-detection (flagging only; do not auto-correct):
 - Price jumps: \(|price[t] - price[t-1]| > k * rolling_std\) (k=5 default)
 - Volume spikes: \(volume[t] > k * rolling_median\) (k=10 default)
 - Spread anomalies: \((ask - bid) > k * historical_spread_p95\) (k=3 default)
+- Session-aware filtering: ignore cross-session deltas and optionally ignore warmup/cooldown windows at session open/close.
 
 Storage (QuestDB):
 - Table: `ghtrader_field_quality_v2` (symbol/day-level quality ledger)
@@ -341,6 +369,7 @@ Inter-tick interval analysis:
 Expected tick count modeling:
 - For liquid contracts, define a minimum expected tick count (heuristic or historical baseline) and flag abnormally low days.
 - Default baseline is adaptive: compare to recent historical distribution (p10/p50/p90) when available.
+- Diagnostics should include lookback size, sample count, and p10/p90 values in the diagnose report.
 
 Gap categorization:
 - Normal: known non-trading windows (exchange closure / lunch break) when calendar/session metadata is available.
@@ -515,6 +544,12 @@ ghTrader must implement feature store principles to ensure consistency between t
   - `lookback_ticks`, `ttl_seconds`
   - `created_at`, `deprecated_at`
 
+#### 5.4.0.5 Best-in-class feature store hardening (alignment)
+
+- **Parity tests**: enforce offline/online feature parity with golden replays.
+- **Staleness SLAs**: per‑feature TTL SLOs; alert when breached.
+- **Schema governance**: breaking‑change protocol with automatic version bump and migration notes.
+
 #### 5.4.1 Automatic Feature Engineering
 
 ghTrader should support automated feature generation and selection:
@@ -634,6 +669,12 @@ Implementation:
 - `src/ghtrader/datasets/labels.py` (direction labels)
 - `src/ghtrader/fill_labels.py` (fill probability labels, new module)
 - `src/ghtrader/execution_labels.py` (execution cost labels, new module)
+
+#### 5.5.5 Best-in-class label governance (alignment)
+
+- **Leakage guardrails**: enforce purged/embargoed splits for label generation and evaluation.
+- **Label schema versioning**: breaking changes require new label version with explicit migration notes.
+- **Label SLIs**: track label coverage, horizon consistency, and missing‑label rates.
 
 ### 5.6 Modeling (offline)
 
@@ -764,6 +805,12 @@ ghTrader must support model ensembles to improve prediction robustness and reduc
 Implementation:
 - `src/ghtrader/ensemble.py` (new module)
 
+#### 5.6.2 Best-in-class model risk controls (alignment)
+
+- **Risk tiering**: classify models by latency/complexity and apply stricter gates to higher‑risk tiers.
+- **Robustness tests**: require regime‑split validation and stress scenarios before promotion.
+- **Significance gates**: require statistical confidence (bootstrap CIs) on PnL metrics before promotion.
+
 ### 5.7 Online calibrator (stacked learning)
 
 - Must support intraday adaptation by fitting on delayed event-time labels.
@@ -778,6 +825,12 @@ Implementation:
 - `src/ghtrader/research/online.py` (`OnlineCalibrator`, `DelayedLabelBuffer`)
 - `src/ghtrader/tq/paper.py` (`run_paper_trading`)  # TqSdk-specific loop (see §5.1.3)
 - Drift detection via `src/ghtrader/anomaly.py` (see Section 5.14)
+
+#### 5.7.1 Best-in-class drift SLAs (alignment)
+
+- Define **drift SLAs** (warning/critical thresholds) per model family.
+- Tie **rollback** rules to drift + execution anomaly thresholds.
+- Require **fallback policy** (simple baseline model) for critical drift events.
 
 ### 5.8 Evaluation and Simulation
 
@@ -842,6 +895,12 @@ Implementation:
 - `src/ghtrader/research/pipeline.py` (`OfflineMicroSim` for Tier2)
 - `src/ghtrader/simulator.py` (new module for LOB simulation, market generation, multi-agent)
 
+#### 5.8.7 Best-in-class evaluation rigor (alignment)
+
+- **Statistical significance**: require bootstrap CIs for core PnL metrics and Sharpe.
+- **Stress protocols**: run scenario tests (volatility spikes, liquidity droughts, spread widening).
+- **Leakage audits**: ensure event‑time correctness and embargoed splits for all benchmarks.
+
 ### 5.9 Continual training + promotion
 
 Daily job must:
@@ -855,6 +914,12 @@ Daily job must:
 
 Implementation:
 - `src/ghtrader/research/pipeline.py` (`run_daily_pipeline`, `PromotionGate` in `eval.py`)
+
+#### 5.9.1 Best-in-class continual training governance (alignment)
+
+- **Pipeline SLOs**: daily run must complete within defined window; alert on breach.
+- **Reproducibility bundle**: store code hash + data manifest + config snapshot per run.
+- **Automatic rollback**: require explicit rollback trigger policy and audit trail.
 
 ### 5.10 Benchmarking and comparisons
 
@@ -985,16 +1050,20 @@ Requirements:
           - When the index is missing/incomplete, `data health` should bootstrap/rebuild the index first, then re-run diagnose so missing-day backfills can be computed correctly.
         - New-variety seed (operator-confirmed):
           - When there are effectively **no ticks yet** for a scope, the UI may offer an explicit **Seed (Download)** action that enqueues per-symbol `download` jobs over inferred per-contract windows (clamped by optional Start/End overrides).
-      - Must include an integrated **Workflow stepper card** above the contracts table (replaces previous toolbar + options panel):
+      - Must include an integrated **Workflow stepper card** above the contracts table implementing the canonical 8-step data pipeline:
         - **Step 0 (Refresh)**: Refresh snapshot (shows snapshot time/source)
         - **Step 1 (Health)**: Health check (runs diagnose + auto-repair; shows last diagnose/repair summaries)
         - **Step 2 (Update All)**: Update All (explicit description; confirm dialog) — daily forward-fill active + recently expired
-        - **Step 3 (Compute L5 start)**: Compute L5 start (PRD-required; shows last L5-start summary)
-        - Advanced options (collapsible): date overrides + refresh catalog toggle
+        - **Step 3 (Build Schedule)**: Compute OI-based main contract roll schedule
+        - **Step 4 (Build main_l5)**: Materialize continuous L5 ticks from underlying contracts
+        - **Step 5 (Build Features/Labels)**: Compute causal features + multi-horizon labels
+        - **Step 6 (Train)**: Link to Models page for training
+        - **Step 7 (Trade)**: Link to Trading page for backtesting/live trading
+        - Advanced options (collapsible): date overrides + refresh catalog toggle + Compute L5 Start (metadata)
         - Inline help: "What each step does" description (not just tooltips)
       - Action semantics (avoid duplicates/confusion):
         - **Refresh**: rebuild the cached Contracts snapshot (cache-first read paths; no heavy work on request path)
-        - **Health**: run `data health` (diagnose → auto-repair → summarize manual-review items). Auto-repair includes index bootstrap and missing-days backfill when possible.
+        - **Health**: run `data health` (diagnose → auto-repair → summarize manual-review items). Auto-repair includes index bootstrap and missing-days backfill when possible. Must retry transient QuestDB PGWire disconnects without reducing scan scope.
         - **Bootstrap Index** (optional): scan ticks table and populate index for selected exchange/var (enqueued job)
         - **Seed (Download)** (optional; explicit/confirmed): enqueue per-symbol `download` jobs over inferred per-contract windows for brand-new varieties
         - **Update All**: daily forward-fill active + recently expired (TqSdk-heavy; throttled)
@@ -1003,16 +1072,68 @@ Requirements:
     - Tab 2: Training (train form + sweep form + active training jobs)
     - Tab 3: Benchmarks (benchmark/compare/backtest forms, results table)
   - **Trading** (`/trading`):
-    - Tab 1: Live status (Gateway-first; KPIs, positions, signals/targets, risk metrics, orders)
-    - Tab 2: Start / Control (Gateway + Strategy desired-state; supervisors start/stop processes)
-    - Tab 3: Run history (strategy runs)
-  - **Ops** (`/ops`):
-    - Tab 1: Pipeline (happy path buttons, running ingest jobs)
-    - Tab 2: Ingest (download, download-contract-range, record forms)
-    - Tab 3: Schedule & Build (schedule, main_l5, features/labels forms)
-    - Tab 4: Integrity (audit forms, recent reports)
-    - Tab 5: Locks (active locks table with key reference)
-  - `/ops` is the canonical entrypoint. Any older `/ops/*` routes must redirect to `/ops` (optionally with a tab anchor) and must not introduce a second “source of truth” UI.
+    - Tab 1: **Auto Monitor** — real-time consolidated monitoring dashboard:
+      - Gateway/strategy health indicators + mode badges
+      - Account KPIs (balance, equity, unrealized PnL)
+      - Positions table + recent orders (alive)
+      - Recent signals/targets from StrategyRunner
+      - Strategy run history (last N runs)
+      - **Real-time auto-refresh polling (1s cadence when tab active; 30s background)**
+      - **Collapsible raw API response panel** (for debugging/transparency)
+    - Tab 2: **Manual Test** — control plane for research/testing:
+      - **Quick Start panel** (prominent, at top of tab) — guided workflow to reduce clicks:
+        - **Process Status strip**: shows gateway/strategy process state (Stopped / Running / Stale), desired mode, and last update timestamp
+        - **Stale warning**: if `state_age_sec > 30` and desired mode is not idle, display warning with restart prompt
+        - Compact fields: Mode selector, Symbols input, Confirm live input (only shown for live_trade)
+        - **Start Gateway** button: calls `POST /api/gateway/start` to launch gateway job
+        - **Stop Gateway** button: calls `POST /api/gateway/stop` to cancel running gateway job
+        - **Start Strategy** / **Stop Strategy** buttons (same pattern)
+        - Prerequisites enforcement:
+          - Symbols required for start (disabled if empty)
+          - `live_trade` requires `GHTRADER_LIVE_ENABLED=true` env AND `confirm_live=I_UNDERSTAND`
+          - UI must disable Start and show hint when prerequisites unmet
+      - **Quick Order panel** (below Quick Start):
+        - Symbol selector (populated from gateway effective symbols)
+        - Size input (lots, default 1)
+        - Current position display (live updated)
+        - Gateway mode indicator (shows if orders are enabled)
+        - **Open Long** button: sends `set_target` command with target = current + size
+        - **Open Short** button: sends `set_target` command with target = current - size
+        - **Close Position** button: sends `set_target` command with target = 0
+        - Status display (Ready / Sending... / Sent)
+      - **Advanced settings** (collapsible `<details>` disclosure, collapsed by default):
+        - Gateway desired-state form (mode, symbols, executor, sim account, risk limits, confirm_live)
+        - StrategyRunner desired-state form (mode, model, horizon, thresholds, position size)
+      - Safety commands (cancel all, flatten, disarm live) — logged and auditable
+      - Active gateway/strategy jobs with stop button
+      - Raw state inspector (transparent JSON view)
+      - **Gateway command: `set_target`** — manual position targeting for one-lot testing:
+        - Appends to `commands.jsonl` with `{type: "set_target", symbol, target, command_id}`
+        - Gateway clamps target to `max_abs_position` risk limit
+        - Uses configured executor (targetpos or direct)
+        - All manual targets are logged to `events.jsonl`
+    - **Trading API endpoints**:
+      - `POST /api/gateway/start`: start gateway job for selected profile (writes desired.json if needed, then starts job)
+      - `POST /api/gateway/stop`: cancel running gateway job for selected profile
+      - `POST /api/strategy/start`: start strategy job for selected profile (requires symbols + model in desired)
+      - `POST /api/strategy/stop`: cancel running strategy job for selected profile
+      - `GET /api/trading/console/status`: enriched with `gateway_job`, `strategy_job` (active job info), and `stale` flags
+    - Tab 3: **Account Config** — broker account management:
+      - Profiles table (profile, broker, masked account, configured status, gateway/strategy status, last verify)
+      - Add/edit account form (profile, broker ID, account ID, password)
+      - Verify action (enqueues `ghtrader account verify` job)
+      - Remove action (with confirmation)
+      - Broker ID datalist (from Shinny cache or fallback)
+  - **Ops** (`/ops`) — **CONSOLIDATED INTO DATA HUB**:
+    - The `/ops` page has been merged into `/data` (Data Hub) to provide a unified workflow.
+    - All `/ops/*` routes redirect to `/data` with appropriate tab anchors for backward compatibility.
+    - Former Ops tabs are now available in Data Hub:
+      - Pipeline → Data Hub unified 8-step workflow (Steps 0-7)
+      - Ingest → Data Hub Ingest tab
+      - Schedule & Build → Data Hub Build tab
+      - Integrity → Data Hub Integrity tab
+      - Locks → Data Hub Locks tab
+  - `/data` is the canonical entrypoint for data operations. All `/ops/*` routes redirect to `/data` with appropriate tab anchors. Data Hub provides a single “source of truth” UI.
 - **Job execution model**:
   - Long-running operations must run as **subprocess jobs** (not in-process), so they are cancellable and resilient to UI restarts.
   - Job history must **persist across dashboard restarts**.
@@ -1053,6 +1174,14 @@ Requirements:
     - Controlled by environment variables:
       - `GHTRADER_DAILY_UPDATE_TARGETS` (comma-separated, e.g. `SHFE:cu,SHFE:au`)
       - `GHTRADER_DAILY_UPDATE_RECENT_EXPIRED_DAYS` (default `10`)
+      - `GHTRADER_DAILY_UPDATE_CATALOG_TTL_SECONDS` (default `3600`)
+      - `GHTRADER_DAILY_UPDATE_POLL_SECONDS` (default `60`)
+      - `GHTRADER_DAILY_UPDATE_MAX_CATCHUP_DAYS` (default `0`, disabled)
+      - `GHTRADER_DAILY_UPDATE_RETRY_BACKOFF_SECONDS` (default `300`)
+    - Scheduler behavior:
+      - Uses catalog cache if fresh; refreshes only when TTL is exceeded or a prior attempt failed.
+      - Retries failed trading days with backoff instead of marking the day complete on enqueue.
+      - Optional catch‑up: if the scheduler was down, enqueue missed trading days up to `MAX_CATCHUP_DAYS`.
     - Manual triggers must remain available (Data hub “Update” button, CLI `ghtrader update`).
 - **Observability**:
   - Must display data coverage (QuestDB index by symbol/trading_day, derived dataset coverage).
@@ -1114,6 +1243,10 @@ Requirements:
       - Filesystem totals for key roots (total/used/free + % used).
       - Optional per-directory sizes for `data/`, `runs/`, `artifacts/` (must be lazy/cached and must not block page load).
     - GPU: best-effort `nvidia-smi` summary or a helpful diagnostic string (must be cached/non-blocking for the HTML page).
+    - QuestDB metrics (read-only, cached):
+      - API: `GET /api/questdb/metrics` (auth required; local-only via SSH forwarding).
+      - Response fields: `ok`, `endpoint`, `latency_ms`, `metrics` (subset of Prometheus gauges/counters).
+      - Expected keys include `metrics.pg_wire_connections` for PGWire saturation tracking.
   - Must surface integrity status: latest audit report(s) and how to run an audit.
   - Must surface multi-session state:
     - show job source (`terminal` vs `dashboard`)
@@ -1141,6 +1274,66 @@ Implementation:
 - `src/ghtrader/control/` (FastAPI app + job runner + SQLite store)
 - CLI command: `ghtrader dashboard`
 
+#### 5.11.2 Job Progress Observability
+
+Long-running jobs (Health Check, Build Schedule, main_l5, Features/Labels) must provide **real-time progress visibility** so operators can monitor execution status without parsing raw logs.
+
+Requirements:
+- **Progress API**: `/api/jobs/{id}/progress` returns structured progress data including:
+  - Current phase and step (e.g., "diagnose" → "field_quality")
+  - Step index and total steps for progress bar
+  - Current item being processed (e.g., symbol, trading day)
+  - Item index and total items for granular progress
+  - Percentage complete (0.0 to 1.0)
+  - Estimated time remaining (ETA in seconds)
+  - Error message if job failed
+- **SQL pushdown observability**: when `data diagnose/health` uses SQL pushdown, job logs must include start/done/failure events and failures must surface the exception type/message in progress state. The diagnose summary must record pushdown counts (attempts, successes, failures, fallback partitions) for post-run verification.
+- **Job logs (dashboard)**: every line in `runs/control/logs/job-*.log` must include a timestamp prefix, avoid ANSI/color noise, and include event details (key=value) when available.
+- **Progress File**: Jobs write progress to `runs/control/progress/job-{id}.progress.json` atomically
+- **Job Detail UI**: Job detail page displays:
+  - Phase/step with progress indices
+  - Current item (if applicable)
+  - Progress bar with percentage
+  - ETA countdown
+  - Error state (if applicable)
+- **Polling**: Dashboard polls progress API every 2 seconds for active jobs
+
+Performance / defaults:
+- `ghtrader data health` and `ghtrader data diagnose` default `--thoroughness comprehensive` (full partition checks).
+- Concurrency knobs:
+  - `--check-workers N` controls parallelism for per-partition checks (field quality + gap detection). `0=auto` scales with CPU.
+  - `--download-workers N` controls parallelism for repair downloads (fill-missing-days). `0=auto` scales with CPU and is bounded for safety.
+  - **Unified worker policy**: all data/repair/index worker counts must be resolved by a shared policy using CPU count and QuestDB PG connection limits.
+    - Inputs: `GHTRADER_QDB_PG_NET_CONNECTION_LIMIT`, `GHTRADER_QDB_CONN_RESERVE`, `GHTRADER_WORKERS_GLOBAL_MAX`, and per-kind caps (e.g., `GHTRADER_DIAGNOSE_MAX_WORKERS`, `GHTRADER_DOWNLOAD_MAX_WORKERS`, `GHTRADER_INDEX_BOOTSTRAP_WORKERS`).
+    - Rule: explicit CLI values override auto but are still clamped to caps for safety.
+
+Progress data structure:
+```json
+{
+  "job_id": "abc123",
+  "phase": "diagnose",
+  "phase_idx": 0,
+  "total_phases": 2,
+  "step": "field_quality",
+  "step_idx": 3,
+  "total_steps": 5,
+  "item": "SHFE.cu2602",
+  "item_idx": 5,
+  "total_items": 20,
+  "message": "Checking field quality for SHFE.cu2602 (5/20)",
+  "pct": 0.25,
+  "eta_seconds": 180,
+  "started_at": "2026-01-18T00:00:00Z",
+  "updated_at": "2026-01-18T00:01:30Z",
+  "error": null
+}
+```
+
+Implementation:
+- `src/ghtrader/control/progress.py` (JobProgress class)
+- `src/ghtrader/control/templates/job_detail.html` (UI progress card)
+- Instrumented modules: `diagnose.py`, `repair.py` (via `progress` parameter)
+
 #### 5.11.3 Data Quality Monitoring Dashboard
 
 ghTrader must expose clear, low-latency visibility into data quality (QuestDB-first) so operators can detect gaps early and avoid training/backtesting on corrupted data.
@@ -1165,6 +1358,12 @@ Actions:
 Implementation:
 - `src/ghtrader/control/templates/data.html` (new Quality tab)
 - APIs: `GET /api/data/quality-summary`, `GET /api/data/quality-detail/{symbol}`, and enqueue endpoints for diagnose/repair.
+
+#### 5.11.4 Best-in-class ops + SLOs (alignment)
+
+- Define **SLO dashboards** (data freshness, job latency, QuestDB saturation, drift alerts).
+- Add **incident runbooks** for data corruption, QuestDB outages, and model regressions.
+- Enforce **audit retention** for job logs, trading commands, and safety actions.
 
 ### 5.12 Account + trading (TqSdk; phased, safety-gated)
 
@@ -1218,16 +1417,26 @@ Dashboard responsibility:
 - Provide UI/API to view and modify `desired.json`, append `commands.jsonl`, and display `state.json` + recent `events.jsonl`.
 - Provide a **GatewaySupervisor** that ensures a gateway process is running for profiles whose `desired.mode != idle`.
 
-#### 5.12.1 Trading modes
+#### 5.12.1 Trading modes and account types
 
-Trading mode defines whether orders may be sent:
+**Account classification**:
 
-- **paper**: no orders are sent; compute signals + write logs/snapshots only.
-- **sim**: orders are allowed using simulated accounts:
-  - `TqSim()` (local sim) or `TqKq()` (快期模拟).
-- **live**: orders are allowed using `TqAccount(...)` (real broker account). This is **disabled by default**.
-- **live (monitor-only)**: connect to the real broker account and record snapshots/events, but **never send orders**.
-  This is the required first step before any live order routing.
+- **Simulated accounts** (no credentials required beyond Shinny auth):
+  - `TqSim()`: local-only order book simulation; no network trading.
+  - `TqKq()`: 快期模拟 (Kuaiqi simulated); realistic matching but no real capital.
+  - Configured via `desired.sim_account` field (`tqsim` or `tqkq`).
+- **Live accounts** (broker credentials required in `runs/control/accounts.env` or `.env`):
+  - `TqAccount(broker_id, account_id, password)`: real broker connectivity.
+  - Each profile (e.g., `default`, `tg_1`) maps to a set of `TQ_BROKER_ID[_P]`, `TQ_ACCOUNT_ID[_P]`, `TQ_ACCOUNT_PASSWORD[_P]` env vars.
+  - Live accounts require explicit enablement (`GHTRADER_LIVE_ENABLED=true`) and confirmation (`confirm_live=I_UNDERSTAND`).
+
+**Trading modes** (gateway desired state):
+
+- **idle**: no TqApi; gateway is stopped.
+- **paper**: data-only TqApi (no account); compute signals + write logs/snapshots only. Useful for strategy testing without execution.
+- **sim**: orders are allowed using a simulated account (`TqSim` or `TqKq`). Safe for research validation.
+- **live_monitor**: connect to the real broker account and record snapshots/events, but **never send orders**. This is the required first step before any live order routing.
+- **live_trade**: orders are allowed using `TqAccount(...)`. Requires both `GHTRADER_LIVE_ENABLED=true` and `confirm_live=I_UNDERSTAND`; if either is missing, the gateway automatically downgrades to `live_monitor`.
 
 #### 5.12.2 Account configuration (.env + dashboard-managed accounts.env)
 
@@ -1403,6 +1612,12 @@ Dashboard read-only APIs (local-only via SSH forwarding):
 - `GET /api/strategy/status?account_profile=...`: strategy stable state (reads `runs/strategy/account=<PROFILE>/state.json`)
 - `POST /api/strategy/desired`: upsert strategy desired state (writes `runs/strategy/account=<PROFILE>/desired.json`)
 - `GET /api/strategy/runs?limit=...`: list strategy run history (`runs/strategy/<run_id>/...`)
+
+#### 5.12.7 Best-in-class execution risk controls (alignment)
+
+- **Pre‑trade checks**: max order size, max position, max loss, and cooldown windows.
+- **Kill switch policy**: auto‑flatten on breach + audit log, with manual override requiring explicit confirm.
+- **Execution SLIs**: fill rate, slippage, latency, reject rates with alerts.
 
 ### 5.13 Market Regime Detection
 
@@ -1625,6 +1840,12 @@ Storage: `ghtrader_model_registry_v2` table with:
 Implementation:
 - `src/ghtrader/model_registry.py` (new module)
 
+#### 5.16.6 Best-in-class governance + auditability (alignment)
+
+- **Repro bundles**: require code+config+data‑manifest hashes per model artifact.
+- **Promotion checklist**: explicit automated + manual gates with recorded approvals.
+- **Audit trail**: immutable log of promotions, rollbacks, and deployment modes.
+
 ### 5.17 Experiment Tracking
 
 ghTrader must support systematic experiment tracking for research and development:
@@ -1826,6 +2047,31 @@ Implementation (future):
   - Full rebuild of features/labels must require explicit `--overwrite`.
   - Incremental builds must refuse to mix configurations if the stored build metadata/config hash does not match (require `--overwrite`).
 
+**QuestDB performance tuning (high-core systems)**:
+- Set QuestDB worker pools explicitly for large servers to avoid under-utilization:
+  - `shared.worker.count` (general SQL execution) sized for high-core boxes.
+  - `pg.worker.count` sized for expected PGWire query concurrency.
+  - `wal.apply.worker.count` sized for DEDUP UPSERT load.
+- Size PGWire connection limit for peak health/diagnose concurrency:
+  - `pg.net.connection.limit` must exceed the largest expected concurrent PGWire clients (health/diagnose workers + dashboard + background jobs).
+  - The app-side cap `GHTRADER_DIAGNOSE_MAX_WORKERS` exists to keep within this limit.
+- Monitor PGWire saturation using QuestDB Prometheus metrics (recommended):
+  - Enable `metrics.enabled=true` (env `QDB_METRICS_ENABLED=true`) and expose the metrics port.
+  - Track `questdb_pg_wire_connections` and alert when near the configured connection limit.
+- Prevent mmap failures on large datasets:
+  - Host `vm.max_map_count` should be high (>= 1,048,576; consider 2,097,152 for multi-TB datasets).
+  - Container `ulimit` should set `nofile` >= 1,048,576 and `memlock` unlimited.
+  - Set QuestDB RAM usage limits to allow large file-backed mappings (e.g., `ram.usage.limit.percent=0` or `ram.usage.limit.bytes=0`).
+  - On large datasets, QuestDB's `memory_mem_used` reflects mapped file bytes (may exceed on-disk size); monitor RSS for actual RAM footprint.
+
+Current system profile (as tuned baseline):
+- CPU: 2x AMD EPYC 9V94, 512 threads total
+- RAM: ~528 GB (MemTotal)
+- Storage: NVMe root (`/dev/nvme0n1p2`), ~28 TB; QuestDB DB size ~282 GB
+- Kernel: `vm.max_map_count=2097152`
+- Container ulimits: `nofile=1048576`, `memlock=unlimited`
+- vm dirty settings: `vm.dirty_ratio=10`, `vm.dirty_background_ratio=5`, `vm.swappiness=10`
+
 Implementation:
 - `src/ghtrader/research/pipeline.py` (`LatencyTracker`, `LatencyContext`)
 
@@ -1868,6 +2114,13 @@ CI requirements:
   - `runs/control/accounts.env` (dashboard-managed broker account profiles; contains secrets)
 - `env.example` must be provided.
 - Never commit secrets.
+
+### 6.6 Operational resilience (best‑in‑class alignment)
+
+- **Backup/restore**: define cadence and validation for QuestDB + model artifacts.
+- **Change management**: document schema changes and migration approvals.
+- **Dependency security**: periodic vulnerability scans and pinned critical dependencies.
+- **Incident response**: documented playbooks and post‑mortem templates for outages.
 
 ---
 
@@ -1959,6 +2212,12 @@ flowchart TD
   gates --> prod[ProductionArtifacts]
 ```
 
+### 8.3 Best-in-class architecture deltas (alignment)
+
+- **Service boundaries**: explicitly separate data build, training, and trading runtimes for failure isolation.
+- **Artifact contracts**: standardize manifest schemas for data/features/labels/models to enable reproducibility.
+- **Optional event bus**: reserve a boundary for future streaming (QuestDB‑first remains default).
+
 ---
 
 ## 9) Model research program (what to explore and why)
@@ -2025,6 +2284,14 @@ Core commands:
 - `ghtrader benchmark`
 - `ghtrader compare`
 - `ghtrader audit`
+
+Database administration commands:
+
+- `ghtrader db questdb-health` - Check QuestDB connectivity
+- `ghtrader db questdb-init` - Initialize QuestDB tables with correct schema
+- `ghtrader db ensure-schema` - Add missing columns to existing QuestDB tables (schema evolution)
+- `ghtrader db migrate-columns-v2` - Rename legacy column names to v2 naming convention
+- `ghtrader db benchmark` - Benchmark QuestDB ingestion/query performance
 
 ---
 
@@ -2136,3 +2403,130 @@ Core commands:
 - Build automated regression testing for model performance
 - Add latency regression tests for inference pipeline
 
+### 11.5 Best-in-Class Alignment Roadmap (Phased)
+
+**Phase 0: Data governance + reliability (prereq for all)**:
+- Define data SLIs/SLOs (freshness, completeness, error budget) and dashboard surfacing (§6.6, §5.11)
+- Add dataset lineage/provenance manifests (source, config hash, build id) to QuestDB tables (§5.3, §5.4, §5.5)
+- Formalize backfill policy and change log for any historical corrections (§5.3)
+- Enforce data contract checks in CI (schema + null‑rate + row_hash integrity) (§6.4)
+
+**Phase 1: Feature/label parity + evaluation rigor**:
+- Implement training‑serving parity tests and feature TTL/staleness SLAs (§5.4)
+- Add label leakage guardrails and split discipline (purged/embargoed CV) (§5.5, §5.8)
+- Standardize robustness/stress tests and statistical significance gates (§5.8, §5.10)
+
+**Phase 2: MLOps + lifecycle hardening**:
+- Expand model registry with lineage, promotion gates, and rollback runbooks (§5.16)
+- Integrate experiment tracking + reproducibility bundles (§5.17, §6.2)
+- Add champion‑challenger + shadow/canary governance (§5.16)
+
+**Phase 3: Execution + risk feedback loop**:
+- Implement pre‑trade risk checks, kill‑switch policy, and execution audit trails (§5.12, §6.1)
+- Build TCA feedback into execution tuning and model selection (§5.15)
+- Add simulation stress harness for execution robustness (§5.8)
+
+**Phase 4: Real‑time streaming (optional, later)**:
+- Evaluate event streaming for sub‑10ms inference and online feature serving (§5.20)
+- Introduce low‑latency inference service boundary (research → paper → live) (§6.3)
+
+## 12) Best-in-Class Capability Rubric + Optimization Proposals
+
+This section provides a systematic, best‑in‑class alignment rubric mapped to the PRD sections. Each area lists **current PRD coverage**, **gaps**, and **optimization proposals** that are consistent with ghTrader’s QuestDB‑first, research‑first constraints.
+
+### 12.1 Data ingest + storage (PRD §§5.1–5.3, §6.3.1)
+
+**Current coverage**: Strong on QuestDB‑first, idempotent ingest, and integrity checks.  
+**Gaps vs best‑in‑class**:
+- Explicit data SLIs/SLOs and error budgets are not defined.
+- Dataset lineage/provenance is not formalized as a manifest with immutable hashes.
+- Backfill governance (what is allowed to change, when, and how it is logged) is implicit.
+
+**Optimization proposals**:
+- Define **data SLIs/SLOs** (freshness, completeness, integrity) and surface in `/system` (§6.6, §5.11).
+- Persist **dataset lineage manifests** (source, build id, config hash, row_hash summary) in QuestDB metadata tables.
+- Establish **backfill policy**: allowed windows, approval gates, and mandatory change logs.
+
+### 12.2 Feature store + labels (PRD §§5.4–5.5)
+
+**Current coverage**: Clear feature/label taxonomy, causal requirements, and QuestDB storage.  
+**Gaps vs best‑in‑class**:
+- No enforced training‑serving parity tests or TTL SLAs.
+- Feature/label schema evolution lacks explicit breaking‑change process.
+- Label leakage guardrails need formal split rules.
+
+**Optimization proposals**:
+- Add **parity tests** (offline vs online feature computation) and **TTL/staleness SLAs**.
+- Introduce **feature/label schema versioning** with explicit breaking‑change policy.
+- Enforce **purged/embargoed time‑series splits** for label leakage prevention.
+
+### 12.3 Modeling + evaluation (PRD §§5.6–5.10)
+
+**Current coverage**: Strong model zoo and rich evaluation metrics.  
+**Gaps vs best‑in‑class**:
+- Statistical significance tests and robustness/stress protocols are not required.
+- Model risk classification (low/medium/high) and deployment constraints are not formalized.
+
+**Optimization proposals**:
+- Add **bootstrap confidence intervals** and **combinatorial CV** gates for promotion.
+- Require **stress tests** across regimes, liquidity shocks, and spread widening.
+- Add **model risk tiers** with stricter gates for higher‑risk models.
+
+### 12.4 Online calibration + drift (PRD §§5.7, 5.14)
+
+**Current coverage**: Drift detection methods are specified.  
+**Gaps vs best‑in‑class**:
+- Drift response actions are not tied to explicit operational SLAs.
+- Automated rollback criteria are not linked to execution safety.
+
+**Optimization proposals**:
+- Define **drift SLAs** (warning/critical thresholds) and automatic response playbooks.
+- Tie **rollback** to drift + PnL degradation + execution anomalies.
+
+### 12.5 Control plane + observability (PRD §5.11)
+
+**Current coverage**: Strong job model, observability, and dashboard UX.  
+**Gaps vs best‑in‑class**:
+- No incident response runbooks or SLO dashboards.
+- Limited governance around audit trails and access policy.
+
+**Optimization proposals**:
+- Add **SLO dashboards** (data freshness, job latency, QuestDB health, drift alerts).
+- Formalize **incident response runbooks** (data corruption, QuestDB outage, model regression).
+- Add **audit trail retention policy** for jobs and trading commands.
+
+### 12.6 Trading + risk (PRD §5.12, §6.1)
+
+**Current coverage**: Safety gating and phased trading are defined.  
+**Gaps vs best‑in‑class**:
+- Pre‑trade risk checks and kill‑switch rules need explicit thresholds.
+- Execution monitoring lacks formal SLA constraints.
+
+**Optimization proposals**:
+- Define **pre‑trade risk checks** (max order size, max position, max loss, cooldown).
+- Implement **kill‑switch policy** (auto‑flatten on breach; audit log).
+- Add **execution SLIs** (fill rate, slippage, latency) and alerts.
+
+### 12.7 MLOps + lifecycle (PRD §§5.16–5.19)
+
+**Current coverage**: Model registry and experiment tracking are specified.  
+**Gaps vs best‑in‑class**:
+- Artifact lineage and reproducibility bundles are not required.
+- Promotion gates are not tied to a repeatable operational checklist.
+
+**Optimization proposals**:
+- Require **reproducibility bundles** (code+config+data manifest hashes).
+- Add **promotion checklists** with automated + manual sign‑off.
+- Enable **shadow/canary** deployments in research/paper mode for comparability.
+
+### 12.8 Non‑functional excellence (PRD §6, §8)
+
+**Current coverage**: Core NFRs exist, but operational excellence is implicit.  
+**Gaps vs best‑in‑class**:
+- Backup/restore and disaster recovery not documented.
+- Security posture and secret rotation not operationalized.
+
+**Optimization proposals**:
+- Define **backup/restore policy** for QuestDB and artifacts.
+- Add **secrets rotation** policy and dependency vulnerability checks.
+- Establish **change management** for schema and model versions.

@@ -34,6 +34,28 @@
     </div>
   </div>
 
+  <h3>QuestDB</h3>
+  <div class="grid3">
+    <div class="card">
+      <div class="kpiLabel">Metrics status</div>
+      <div class="kpiValue" id="qdbStatus">…</div>
+      <div class="muted text-sm mono" id="qdbEndpoint">…</div>
+    </div>
+    <div class="card">
+      <div class="kpiLabel">PGWire connections</div>
+      <div class="kpiValue" id="qdbPgConns">…</div>
+      <div class="muted text-sm" id="qdbLatency">…</div>
+    </div>
+    <div class="card">
+      <div class="kpiLabel">Metrics updated</div>
+      <div class="kpiValue mono" id="qdbUpdatedAt">…</div>
+      <div class="muted text-sm" id="qdbError"></div>
+    </div>
+  </div>
+  <div class="muted text-sm" style="margin-top:6px;">
+    Source: QuestDB Prometheus endpoint (/metrics).
+  </div>
+
   <h3>Disk</h3>
   <div class="tableWrap">
     <table class="table" id="diskTable">
@@ -118,6 +140,21 @@
         const gpu = snap.gpu || {};
         setText("gpuInfo", gpu.info || "n/a");
         setText("gpuStatusPill", "GPU: " + (gpu.status || "n/a"));
+
+        // QuestDB
+        const qdb = snap.questdb || {};
+        const qdbOk = qdb.ok === true;
+        setText("qdbStatus", qdbOk ? "OK" : "Unavailable");
+        setText("qdbEndpoint", qdb.endpoint || "n/a");
+        const qdbMetrics = qdb.metrics || {};
+        const pgConns = qdbMetrics.pg_wire_connections;
+        setText("qdbPgConns", Number.isFinite(Number(pgConns)) ? String(Math.round(Number(pgConns))) : "n/a");
+        setText(
+          "qdbLatency",
+          Number.isFinite(Number(qdb.latency_ms)) ? ("latency " + Number(qdb.latency_ms).toFixed(0) + " ms") : "latency n/a"
+        );
+        setText("qdbUpdatedAt", qdb.updated_at || "n/a");
+        setText("qdbError", qdbOk ? "" : (qdb.error || "metrics unavailable"));
 
         // Dir sizes status
         const ds = snap.dir_sizes || {};

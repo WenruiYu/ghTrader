@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import sys
 import time
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,8 +33,97 @@ from ghtrader.util.json_io import read_json as _read_json_shared, write_json_ato
 # Logging setup
 # ---------------------------------------------------------------------------
 
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?")
+
+
+def _strip_ansi(line: str) -> str:
+    return _ANSI_RE.sub("", line)
+
+
+def _has_timestamp(line: str) -> bool:
+    return bool(_TS_RE.match(_strip_ansi(line).lstrip()))
+
+
+def _now_ts() -> str:
+    ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    return ts.replace("+00:00", "Z")
+
+
+class TimestampedWriter:
+    def __init__(self, stream: Any, *, strip_ansi: bool = False) -> None:
+        self._stream = stream
+        self._strip_ansi = strip_ansi
+        self._buffer = ""
+        self._closed = False
+
+    def write(self, data: Any) -> int:
+        if self._closed:
+            return 0
+        if data is None:
+            return 0
+        if isinstance(data, bytes):
+            text = data.decode("utf-8", errors="replace")
+        else:
+            text = str(data)
+        if not text:
+            return 0
+        self._buffer += text
+        out: list[str] = []
+        while "\n" in self._buffer:
+            line, rest = self._buffer.split("\n", 1)
+            self._buffer = rest
+            out.append(self._format_line(line, newline=True))
+        if out:
+            self._stream.write("".join(out))
+            self._stream.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        if self._closed:
+            return
+        if self._buffer:
+            self._stream.write(self._format_line(self._buffer, newline=False))
+            self._buffer = ""
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        self.flush()
+        self._closed = True
+
+    def isatty(self) -> bool:
+        return False
+
+    def _format_line(self, line: str, *, newline: bool) -> str:
+        out_line = _strip_ansi(line) if self._strip_ansi else line
+        if not _has_timestamp(out_line):
+            out_line = f"{_now_ts()} {out_line}" if out_line else f"{_now_ts()}"
+        if newline:
+            out_line += "\n"
+        return out_line
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def _wrap_dashboard_stdio() -> None:
+    if getattr(sys.stdout, "_ghtrader_timestamped", False):
+        return
+    stdout_wrapped = TimestampedWriter(sys.stdout, strip_ansi=True)
+    stderr_wrapped = TimestampedWriter(sys.stderr, strip_ansi=True)
+    setattr(stdout_wrapped, "_ghtrader_timestamped", True)
+    setattr(stderr_wrapped, "_ghtrader_timestamped", True)
+    sys.stdout = stdout_wrapped  # type: ignore[assignment]
+    sys.stderr = stderr_wrapped  # type: ignore[assignment]
+
+
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
+    is_dashboard = os.environ.get("GHTRADER_JOB_SOURCE", "").strip() == "dashboard"
     structlog.configure(
         processors=[
             structlog.stdlib.add_log_level,
@@ -41,7 +131,7 @@ def _setup_logging(verbose: bool) -> None:
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
-            structlog.dev.ConsoleRenderer(),
+            structlog.dev.ConsoleRenderer(colors=(not is_dashboard)),
         ],
         wrapper_class=structlog.stdlib.BoundLogger,
         context_class=dict,
@@ -125,15 +215,16 @@ def main(ctx: click.Context, verbose: bool) -> None:
               help="End date (YYYY-MM-DD)")
 @click.option("--data-dir", default="data", help="Data directory root")
 @click.option("--chunk-days", default=5, type=int, show_default=True, help="Days per download chunk")
+@click.option("--force/--no-force", default=False, show_default=True, help="Force re-download for the date range")
 @click.pass_context
 def download(ctx: click.Context, symbol: str, start: datetime, end: datetime,
-             data_dir: str, chunk_days: int) -> None:
+             data_dir: str, chunk_days: int, force: bool) -> None:
     """Download historical L5 ticks for a symbol into QuestDB (canonical)."""
     from ghtrader.tq.ingest import download_historical_ticks
 
     log = structlog.get_logger()
     _acquire_locks([f"ticks:symbol={symbol}"])
-    log.info("download.start", symbol=symbol, start=start.date(), end=end.date())
+    log.info("download.start", symbol=symbol, start=start.date(), end=end.date(), force=bool(force))
     lv = "v2"
     download_historical_ticks(
         symbol=symbol,
@@ -142,6 +233,7 @@ def download(ctx: click.Context, symbol: str, start: datetime, end: datetime,
         data_dir=Path(data_dir),
         chunk_days=int(chunk_days),
         dataset_version=lv,  # type: ignore[arg-type]
+        force=bool(force),
     )
     log.info("download.done", symbol=symbol)
 
@@ -223,6 +315,13 @@ def download_contract_range(
     show_default=True,
     help="Refresh TqSdk contract catalog (network)",
 )
+@click.option(
+    "--catalog-ttl-seconds",
+    default=3600,
+    type=int,
+    show_default=True,
+    help="Catalog cache TTL in seconds (used when refresh is false or gated)",
+)
 @click.option("--data-dir", default="data", help="Data directory root")
 @click.option("--runs-dir", default="runs", help="Runs directory root")
 @click.option("--chunk-days", default=5, type=int, show_default=True, help="Days per download chunk")
@@ -234,6 +333,7 @@ def update(
     symbols: tuple[str, ...],
     recent_expired_days: int,
     refresh_catalog: bool,
+    catalog_ttl_seconds: int,
     data_dir: str,
     runs_dir: str,
     chunk_days: int,
@@ -256,6 +356,7 @@ def update(
         symbols=list(symbols) if symbols else None,
         recent_expired_trading_days=int(recent_expired_days),
         refresh_catalog=bool(refresh_catalog),
+        catalog_ttl_seconds=int(catalog_ttl_seconds),
         chunk_days=int(chunk_days),
     )
     click.echo(json.dumps({"ok": bool(report.get("ok", False)), "report_path": str(out_path), "run_id": str(report.get("run_id") or "")}))
@@ -1658,7 +1759,26 @@ def _verify_completeness_payload(
 @click.option("--exchange", default="SHFE", show_default=True, help="Exchange (e.g. SHFE)")
 @click.option("--var", "variety", default="cu", show_default=True, help="Variety code (e.g. cu)")
 @click.option("--symbol", "-s", "symbols", multiple=True, help="Optional symbol(s) (default: all in catalog)")
-@click.option("--thoroughness", default="standard", show_default=True, type=click.Choice(["quick", "standard", "comprehensive"]), help="Validation thoroughness")
+@click.option(
+    "--thoroughness",
+    default="comprehensive",
+    show_default=True,
+    type=click.Choice(["quick", "standard", "comprehensive"]),
+    help="Validation thoroughness",
+)
+@click.option(
+    "--check-workers",
+    default=0,
+    type=int,
+    show_default=True,
+    help="Workers for per-partition checks (field-quality/gaps). 0=auto",
+)
+@click.option(
+    "--force-full-scan/--no-force-full-scan",
+    default=False,
+    show_default=True,
+    help="Revalidate all partitions (ignore incremental cache)",
+)
 @click.option("--start", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional expected start override (YYYY-MM-DD)")
 @click.option("--end", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional expected end override (YYYY-MM-DD)")
 @click.option("--refresh-catalog", default=0, type=int, show_default=True, help="Refresh catalog cache (network) (0/1)")
@@ -1672,6 +1792,8 @@ def data_diagnose(
     variety: str,
     symbols: tuple[str, ...],
     thoroughness: str,
+    check_workers: int,
+    force_full_scan: bool,
     start: datetime | None,
     end: datetime | None,
     refresh_catalog: int,
@@ -1703,6 +1825,8 @@ def data_diagnose(
         var=v,
         symbols=syms if syms else None,
         thoroughness=str(thoroughness),
+        check_workers=int(check_workers),
+        force_full_scan=bool(force_full_scan),
         start=s0,
         end=s1,
         refresh_catalog=bool(refresh_cat),
@@ -1727,6 +1851,13 @@ def data_diagnose(
 @click.option("--dry-run/--no-dry-run", default=False, show_default=True, help="Plan only (no changes)")
 @click.option("--refresh-catalog", default=0, type=int, show_default=True, help="Refresh catalog cache (network) before repairs (0/1)")
 @click.option("--chunk-days", default=5, type=int, show_default=True, help="Days per download chunk")
+@click.option(
+    "--download-workers",
+    default=0,
+    type=int,
+    show_default=True,
+    help="Workers for repair downloads (fill-missing-days). 0=auto",
+)
 @click.option("--data-dir", default="data", show_default=True, help="Data directory root")
 @click.option("--runs-dir", default="runs", show_default=True, help="Runs directory root")
 @click.pass_context
@@ -1737,6 +1868,7 @@ def data_repair(
     dry_run: bool,
     refresh_catalog: int,
     chunk_days: int,
+    download_workers: int,
     data_dir: str,
     runs_dir: str,
 ) -> None:
@@ -1756,7 +1888,14 @@ def data_repair(
 
     rep = load_diagnose_report(rp)
     plan = generate_repair_plan(report=rep, include_refresh_catalog=bool(int(refresh_catalog or 0)), chunk_days=int(chunk_days))
-    res = execute_repair_plan(plan=plan, dry_run=bool(dry_run), auto_only=bool(auto_only), data_dir=dd, runs_dir=rd)
+    res = execute_repair_plan(
+        plan=plan,
+        dry_run=bool(dry_run),
+        auto_only=bool(auto_only),
+        data_dir=dd,
+        runs_dir=rd,
+        download_workers=int(download_workers),
+    )
     out = {"ok": bool(res.ok), "run_id": str(res.run_id), "actions": res.actions}
     click.echo(json.dumps(out, ensure_ascii=False, indent=2, default=str, sort_keys=True))
     if not bool(res.ok):
@@ -1766,13 +1905,39 @@ def data_repair(
 @data_group.command("health")
 @click.option("--exchange", default="SHFE", show_default=True, help="Exchange (e.g. SHFE)")
 @click.option("--var", "variety", default="cu", show_default=True, help="Variety code (e.g. cu)")
-@click.option("--thoroughness", default="standard", show_default=True, type=click.Choice(["quick", "standard", "comprehensive"]), help="Validation thoroughness")
+@click.option(
+    "--thoroughness",
+    default="comprehensive",
+    show_default=True,
+    type=click.Choice(["quick", "standard", "comprehensive"]),
+    help="Validation thoroughness",
+)
+@click.option(
+    "--check-workers",
+    default=0,
+    type=int,
+    show_default=True,
+    help="Workers for per-partition checks (field-quality/gaps). 0=auto",
+)
+@click.option(
+    "--force-full-scan/--no-force-full-scan",
+    default=False,
+    show_default=True,
+    help="Revalidate all partitions (ignore incremental cache)",
+)
 @click.option("--start", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional expected start override (YYYY-MM-DD)")
 @click.option("--end", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional expected end override (YYYY-MM-DD)")
 @click.option("--auto-repair/--no-auto-repair", default=False, show_default=True, help="If enabled, run auto-repair after diagnose")
 @click.option("--dry-run/--no-dry-run", default=False, show_default=True, help="If auto-repair, plan only (no changes)")
 @click.option("--refresh-catalog", default=0, type=int, show_default=True, help="Refresh catalog cache (network) (0/1)")
 @click.option("--chunk-days", default=5, type=int, show_default=True, help="Days per download chunk")
+@click.option(
+    "--download-workers",
+    default=0,
+    type=int,
+    show_default=True,
+    help="Workers for repair downloads (fill-missing-days). 0=auto",
+)
 @click.option("--data-dir", default="data", show_default=True, help="Data directory root")
 @click.option("--runs-dir", default="runs", show_default=True, help="Runs directory root")
 @click.pass_context
@@ -1781,12 +1946,15 @@ def data_health(
     exchange: str,
     variety: str,
     thoroughness: str,
+    check_workers: int,
+    force_full_scan: bool,
     start: datetime | None,
     end: datetime | None,
     auto_repair: bool,
     dry_run: bool,
     refresh_catalog: int,
     chunk_days: int,
+    download_workers: int,
     data_dir: str,
     runs_dir: str,
 ) -> None:
@@ -1804,21 +1972,40 @@ def data_health(
     s0 = start.date() if start else None
     s1 = end.date() if end else None
 
+    # Create progress tracker if we have a job ID
+    job_id = _current_job_id()
+    progress = None
+    if job_id:
+        from ghtrader.control.progress import JobProgress
+
+        progress = JobProgress(job_id=job_id, runs_dir=rd)
+        total_phases = 2 if bool(auto_repair) else 1
+        progress.start(total_phases=total_phases, message=f"Starting health check for {ex}.{v}...")
+
     from ghtrader.data.diagnose import run_diagnose, write_diagnose_report
     from ghtrader.data.repair import execute_repair_plan, generate_repair_plan
 
-    rep = run_diagnose(
-        exchange=ex,
-        var=v,
-        symbols=None,
-        thoroughness=str(thoroughness),
-        start=s0,
-        end=s1,
-        refresh_catalog=bool(refresh_cat),
-        allow_download_calendar=True,
-        data_dir=dd,
-        runs_dir=rd,
-    )
+    try:
+        rep = run_diagnose(
+            exchange=ex,
+            var=v,
+            symbols=None,
+            thoroughness=str(thoroughness),
+            check_workers=int(check_workers),
+            force_full_scan=bool(force_full_scan),
+            start=s0,
+            end=s1,
+            refresh_catalog=bool(refresh_cat),
+            allow_download_calendar=True,
+            data_dir=dd,
+            runs_dir=rd,
+            progress=progress,
+        )
+    except Exception as e:
+        if progress:
+            progress.set_error(str(e))
+        raise
+
     diag_path = write_diagnose_report(report=rep, runs_dir=rd)
 
     out: dict[str, Any] = {
@@ -1841,8 +2028,28 @@ def data_health(
             out["error"] = "unfixable_findings"
             out["hint"] = "Resolve unfixable findings before auto-repair"
         else:
+            # Update progress for repair phase
+            if progress:
+                progress.update(
+                    phase="repair",
+                    phase_idx=1,
+                    total_phases=2,
+                    step="generating_plan",
+                    step_idx=0,
+                    total_steps=1,
+                    message="Generating repair plan...",
+                )
+
             plan = generate_repair_plan(report=rep, include_refresh_catalog=bool(refresh_cat), chunk_days=int(chunk_days))
-            res = execute_repair_plan(plan=plan, dry_run=bool(dry_run), auto_only=True, data_dir=dd, runs_dir=rd)
+            res = execute_repair_plan(
+                plan=plan,
+                dry_run=bool(dry_run),
+                auto_only=True,
+                data_dir=dd,
+                runs_dir=rd,
+                progress=progress,
+                download_workers=int(download_workers),
+            )
             out["repair_run_id"] = str(plan.run_id)
             out["repair_ok"] = bool(res.ok)
             out["repair_actions"] = res.actions
@@ -1853,6 +2060,13 @@ def data_health(
                 # so missing-days backfills can be computed after the index becomes available.
                 did_bootstrap = any(a.kind == "bootstrap_index" for a in (plan.actions or []))
                 if did_bootstrap and not bool(dry_run):
+                    if progress:
+                        progress.update(
+                            phase="repair",
+                            step="post_bootstrap_diagnose",
+                            message="Re-running diagnose after index bootstrap...",
+                        )
+
                     rep2 = run_diagnose(
                         exchange=ex,
                         var=v,
@@ -1864,18 +2078,34 @@ def data_health(
                         allow_download_calendar=True,
                         data_dir=dd,
                         runs_dir=rd,
+                        progress=None,  # Don't report detailed progress for quick re-diagnose
                     )
                     diag_path2 = write_diagnose_report(report=rep2, runs_dir=rd)
                     out["diagnose_report_path_after_bootstrap"] = str(diag_path2)
                     if not rep2.unfixable:
                         plan2 = generate_repair_plan(report=rep2, include_refresh_catalog=False, chunk_days=int(chunk_days))
                         if any(a.kind != "bootstrap_index" for a in (plan2.actions or [])):
-                            res2 = execute_repair_plan(plan=plan2, dry_run=False, auto_only=True, data_dir=dd, runs_dir=rd)
+                            res2 = execute_repair_plan(
+                                plan=plan2,
+                                dry_run=False,
+                                auto_only=True,
+                                data_dir=dd,
+                                runs_dir=rd,
+                                progress=progress,
+                                download_workers=int(download_workers),
+                            )
                             out["repair_run_id_2"] = str(plan2.run_id)
                             out["repair_ok_2"] = bool(res2.ok)
                             out["repair_actions_2"] = res2.actions
                             if not bool(res2.ok):
                                 out["ok"] = False
+
+    # Mark progress complete
+    if progress:
+        if out.get("ok", False):
+            progress.finish(message=f"Health check complete for {ex}.{v}")
+        else:
+            progress.set_error(out.get("error") or "Health check failed")
 
     click.echo(json.dumps(out, ensure_ascii=False, indent=2, default=str, sort_keys=True))
     if not bool(out.get("ok", False)):
@@ -2852,6 +3082,13 @@ def entrypoint() -> None:
     - terminal users running `ghtrader ...`
     - the dashboard spawning subprocess jobs (via env GHTRADER_JOB_ID)
     """
+    job_id = os.environ.get("GHTRADER_JOB_ID", "").strip() or uuid.uuid4().hex[:12]
+    os.environ["GHTRADER_JOB_ID"] = job_id
+    source = os.environ.get("GHTRADER_JOB_SOURCE", "").strip() or "terminal"
+    os.environ["GHTRADER_JOB_SOURCE"] = source
+    if source == "dashboard":
+        _wrap_dashboard_stdio()
+
     # Ensure .env is loaded for runs_dir etc.
     load_config()
 
@@ -2859,11 +3096,6 @@ def entrypoint() -> None:
     db_path = _jobs_db_path(runs_dir)
     logs_dir = _logs_dir(runs_dir)
     logs_dir.mkdir(parents=True, exist_ok=True)
-
-    job_id = os.environ.get("GHTRADER_JOB_ID", "").strip() or uuid.uuid4().hex[:12]
-    os.environ["GHTRADER_JOB_ID"] = job_id
-    source = os.environ.get("GHTRADER_JOB_SOURCE", "").strip() or "terminal"
-    os.environ["GHTRADER_JOB_SOURCE"] = source
 
     # Log path: dashboard jobs already redirect stdout/stderr to a file; terminal jobs need a file handler.
     default_log_path = logs_dir / f"job-{job_id}.log"

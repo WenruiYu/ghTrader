@@ -148,20 +148,22 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
     - reads gateway market ticks from state.json
     - computes features + model inference
     - writes targets.json for the gateway to consume
+    - handles symbol roll detection (resets FactorEngine state on underlying change)
     """
     prof = _canonical_profile(cfg.account_profile)
-    symbols = [str(s).strip() for s in (cfg.symbols or []) if str(s).strip()]
-    if not symbols:
+    requested_symbols = [str(s).strip() for s in (cfg.symbols or []) if str(s).strip()]
+    if not requested_symbols:
         raise ValueError("symbols is required")
 
     from ghtrader.datasets.features import FactorEngine
+    from ghtrader.trading.symbol_resolver import is_continuous_alias
 
     writer = StrategyWriter(runs_dir=cfg.runs_dir, account_profile=prof)
     statew = StrategyStateWriter(runs_dir=cfg.runs_dir, profile=prof)
     writer.write_config(
         {
             "account_profile": prof,
-            "symbols": list(symbols),
+            "symbols": list(requested_symbols),
             "model_name": cfg.model_name,
             "horizon": int(cfg.horizon),
             "threshold_up": float(cfg.threshold_up),
@@ -176,7 +178,7 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
         run_id=writer.run_id,
         run_root=str(writer.root),
         account_profile=prof,
-        symbols=list(symbols),
+        symbols=list(requested_symbols),
         model_name=str(cfg.model_name),
         horizon=int(cfg.horizon),
         threshold_up=float(cfg.threshold_up),
@@ -187,12 +189,13 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
     )
     statew.append_event({"type": "strategy_start", "run_id": writer.run_id})
 
-    # Models + factor specs
+    # Models + factor specs (keyed by requested symbol for artifact lookup)
     models: dict[str, Any] = {}
     enabled_factors: dict[str, list[str]] = {}
     engines: dict[str, Any] = {}
 
-    for sym in symbols:
+    def _init_engines_for_symbol(sym: str) -> None:
+        """Initialize or reinitialize model and engine for a requested symbol."""
         mdir = cfg.artifacts_dir / sym / cfg.model_name
         mp = _find_model_path(model_dir=mdir, horizon=cfg.horizon)
         models[sym] = load_model(cfg.model_name, mp)  # type: ignore[arg-type]
@@ -201,8 +204,14 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
         writer.event({"type": "model_loaded", "symbol": sym, "path": str(mp), "n_factors": len(enabled_factors[sym])})
         statew.append_event({"type": "model_loaded", "symbol": sym, "path": str(mp), "n_factors": len(enabled_factors[sym])})
 
-    last_tick_dt: dict[str, str] = {s: "" for s in symbols}
+    for sym in requested_symbols:
+        _init_engines_for_symbol(sym)
+
+    last_tick_dt: dict[str, str] = {s: "" for s in requested_symbols}
     last_targets: dict[str, int] = {}
+
+    # Track execution symbols from gateway for roll detection
+    last_symbol_mapping: dict[str, str] = {}  # requested_symbol -> execution_symbol
 
     while True:
         statew.set_health(ok=True, running=True, error="", last_loop_at=_now_iso())
@@ -211,43 +220,76 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
             st = read_json(st_path) or {}
             market = st.get("market") if isinstance(st.get("market"), dict) else {}
             ticks = market.get("ticks") if isinstance(market.get("ticks"), dict) else {}
+            effective = st.get("effective") if isinstance(st.get("effective"), dict) else {}
+            symbol_mapping = effective.get("symbol_mapping") if isinstance(effective.get("symbol_mapping"), dict) else {}
         except Exception as e:
             ticks = {}
+            symbol_mapping = {}
             statew.set_health(ok=False, running=True, error=str(e), last_loop_at=_now_iso())
             statew.append_event({"type": "gateway_state_read_failed", "error": str(e)})
+
+        # Detect roll: if execution symbol changed for any requested symbol, reset engines
+        for req_sym in requested_symbols:
+            prev_exec = last_symbol_mapping.get(req_sym, "")
+            curr_exec = symbol_mapping.get(req_sym, "")
+            if prev_exec and curr_exec and prev_exec != curr_exec:
+                # Roll detected: reset FactorEngine state for this symbol
+                writer.event({
+                    "type": "symbol_roll_reset",
+                    "requested_symbol": req_sym,
+                    "old_execution": prev_exec,
+                    "new_execution": curr_exec,
+                })
+                statew.append_event({
+                    "type": "symbol_roll_reset",
+                    "requested_symbol": req_sym,
+                    "old_execution": prev_exec,
+                    "new_execution": curr_exec,
+                })
+                try:
+                    _init_engines_for_symbol(req_sym)
+                    last_tick_dt[req_sym] = ""  # Force re-process
+                except Exception as e:
+                    writer.event({"type": "roll_reset_failed", "symbol": req_sym, "error": str(e)})
+                    statew.append_event({"type": "roll_reset_failed", "symbol": req_sym, "error": str(e)})
+        last_symbol_mapping = dict(symbol_mapping) if symbol_mapping else {}
 
         desired_targets: dict[str, int] = {}
         probs_meta: dict[str, Any] = {}
 
-        for sym in symbols:
-            tick = ticks.get(sym)
+        for req_sym in requested_symbols:
+            # Get ticks using execution symbol from mapping (gateway writes ticks by execution symbol)
+            exec_sym = symbol_mapping.get(req_sym, req_sym)
+            tick = ticks.get(exec_sym)
             if not isinstance(tick, dict):
                 continue
             dt = str(tick.get("datetime") or tick.get("datetime_ns") or "")
-            if dt and dt == last_tick_dt.get(sym):
+            if dt and dt == last_tick_dt.get(req_sym):
                 continue
-            last_tick_dt[sym] = dt
+            last_tick_dt[req_sym] = dt
 
             try:
-                feats = engines[sym].compute_incremental(tick)
+                # Use req_sym for model/engine lookup (artifacts stored by requested symbol)
+                feats = engines[req_sym].compute_incremental(tick)
                 # Stable order: enabled_factors list
-                xs = [float(feats.get(k) or 0.0) for k in enabled_factors[sym]]
+                xs = [float(feats.get(k) or 0.0) for k in enabled_factors[req_sym]]
                 X = np.asarray(xs, dtype=float).reshape(1, -1)
                 X = np.nan_to_num(X, nan=0.0)
-                probs = models[sym].predict_proba(X)
+                probs = models[req_sym].predict_proba(X)
                 p = probs[-1] if hasattr(probs, "__len__") else probs
                 p = np.asarray(p, dtype=float).reshape(-1)
-                probs_meta[sym] = [float(x) for x in p[:3].tolist()] if p.size >= 3 else []
-                desired_targets[sym] = compute_target(
+                probs_meta[exec_sym] = [float(x) for x in p[:3].tolist()] if p.size >= 3 else []
+                # Targets keyed by execution symbol (gateway executes on these)
+                desired_targets[exec_sym] = compute_target(
                     p,
                     threshold_up=float(cfg.threshold_up),
                     threshold_down=float(cfg.threshold_down),
                     position_size=int(cfg.position_size),
                 )
             except Exception as e:
-                writer.event({"type": "predict_failed", "symbol": sym, "error": str(e)})
-                statew.append_event({"type": "predict_failed", "symbol": sym, "error": str(e)})
-                desired_targets[sym] = 0
+                writer.event({"type": "predict_failed", "symbol": req_sym, "exec_symbol": exec_sym, "error": str(e)})
+                statew.append_event({"type": "predict_failed", "symbol": req_sym, "exec_symbol": exec_sym, "error": str(e)})
+                desired_targets[exec_sym] = 0
 
         if desired_targets and desired_targets != last_targets:
             last_targets = dict(desired_targets)

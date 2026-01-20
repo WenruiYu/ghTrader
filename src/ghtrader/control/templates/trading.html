@@ -30,17 +30,14 @@
 
   <!-- Tab Navigation -->
   <div class="tab-nav">
-    <button class="tab-nav-item active" data-tab="status">Live Status</button>
-    <button class="tab-nav-item" data-tab="start">Start / Control</button>
-    <button class="tab-nav-item" data-tab="history">
-      Run History
-      <span class="badge" id="runCountBadge">--</span>
-    </button>
-    <button class="tab-nav-item" data-tab="accounts">Accounts</button>
+    <button class="tab-nav-item active" data-tab="monitor">Auto Monitor</button>
+    <button class="tab-nav-item" data-tab="test">Manual Test</button>
+    <button class="tab-nav-item" data-tab="config">Account Config</button>
   </div>
 
-  <!-- Tab: Live Status -->
-  <div class="tab-content active" id="tab-status">
+  <!-- Tab: Auto Monitor -->
+  <div class="tab-content active" id="tab-monitor">
+    <!-- KPI Grid -->
     <div class="kpi-grid mb-3">
       <div class="kpi-card">
         <div class="kpiLabel">Trading Mode</div>
@@ -64,18 +61,59 @@
       </div>
     </div>
 
-    <div class="split-pane">
-      <div>
-        <div class="card">
-          <h3 class="mb-2">Active Control Plane</h3>
-          <div id="activeRunInfo">
-            <div class="empty-state" style="padding:30px;">
-              <div class="empty-state-title">No Active Process</div>
-              <div class="empty-state-text">Use the “Start / Control” tab to set Gateway/Strategy desired state.</div>
+    <!-- Gateway/Strategy Health -->
+    <div class="grid2 mb-3">
+      <div class="card card-compact">
+        <h4 class="mb-1">Gateway Health</h4>
+        <div class="grid3">
+          <div class="metric-card">
+            <div class="metric-content">
+              <div class="metric-label">Status</div>
+              <div class="metric-value" id="monitorGatewayStatus">--</div>
+            </div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-content">
+              <div class="metric-label">Mode</div>
+              <div class="metric-value mono" id="monitorGatewayMode">--</div>
+            </div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-content">
+              <div class="metric-label">Symbols</div>
+              <div class="metric-value mono text-sm" id="monitorGatewaySymbols">--</div>
             </div>
           </div>
         </div>
+      </div>
+      <div class="card card-compact">
+        <h4 class="mb-1">Strategy Health</h4>
+        <div class="grid3">
+          <div class="metric-card">
+            <div class="metric-content">
+              <div class="metric-label">Status</div>
+              <div class="metric-value" id="monitorStrategyStatus">--</div>
+            </div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-content">
+              <div class="metric-label">Model</div>
+              <div class="metric-value mono" id="monitorStrategyModel">--</div>
+            </div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-content">
+              <div class="metric-label">Last target</div>
+              <div class="metric-value mono text-sm" id="monitorStrategyTarget">--</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
 
+    <div class="split-pane">
+      <div>
+        <!-- Positions -->
         <div class="card">
           <h3 class="mb-2">Positions</h3>
           <div class="tableWrap">
@@ -96,9 +134,31 @@
             </table>
           </div>
         </div>
+
+        <!-- Recent Orders -->
+        <div class="card">
+          <h3 class="mb-2">Recent Orders (alive)</h3>
+          <div class="tableWrap" style="max-height:180px; overflow:auto;">
+            <table class="table table-compact">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Symbol</th>
+                  <th>Side</th>
+                  <th>Volume</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="ordersTbody">
+                <tr><td colspan="5" class="muted">No orders</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
 
       <div>
+        <!-- Recent Signals -->
         <div class="card">
           <h3 class="mb-2">Recent Signals / Targets</h3>
           <div class="tableWrap" style="max-height:220px; overflow:auto;">
@@ -118,6 +178,7 @@
           </div>
         </div>
 
+        <!-- Risk Metrics -->
         <div class="card">
           <h3 class="mb-2">Risk Metrics</h3>
           <div class="grid2">
@@ -147,49 +208,171 @@
             </div>
           </div>
         </div>
-
-        <div class="card">
-          <h3 class="mb-2">Recent Orders (alive)</h3>
-          <div class="tableWrap" style="max-height:180px; overflow:auto;">
-            <table class="table table-compact">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Symbol</th>
-                  <th>Side</th>
-                  <th>Volume</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody id="ordersTbody">
-                <tr><td colspan="5" class="muted">No orders</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
       </div>
     </div>
+
+    <!-- Strategy Run History (moved from separate tab) -->
+    <div class="card">
+      <h3 class="mb-2">
+        Strategy Run History
+        <span class="badge" id="runCountBadge">--</span>
+      </h3>
+      <div class="tableWrap" style="max-height:280px; overflow:auto;">
+        <table class="table table-compact">
+          <thead>
+            <tr>
+              <th>Run ID</th>
+              <th>Account</th>
+              <th>Model</th>
+              <th>Horizon</th>
+              <th>Created</th>
+              <th>Last event</th>
+            </tr>
+          </thead>
+          <tbody id="strategyRunHistoryTbody">
+            <tr><td colspan="6" class="muted">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Raw API Response (collapsible) -->
+    <details class="card" style="margin-top:12px;">
+      <summary style="cursor:pointer; font-weight:600; user-select:none;">
+        Raw API Response
+        <span class="muted text-sm" style="margin-left:8px;">(click to expand)</span>
+      </summary>
+      <pre class="mono text-xs" id="monitorRawResponse" style="white-space:pre-wrap; max-height:400px; overflow:auto; margin-top:8px; padding:8px; background:var(--bg-secondary); border-radius:4px;">--</pre>
+    </details>
   </div>
 
-  <!-- Tab: Start / Control -->
-  <div class="tab-content" id="tab-start">
-    <div class="split-pane-2-1">
-      <div>
-        <div class="card">
-          <h3 class="mb-2">Gateway-first control plane</h3>
-          <div class="muted text-sm">
-            Preferred path: set desired state for <strong>AccountGateway</strong> and <strong>StrategyRunner</strong>.
-            The dashboard supervisors will start/stop processes automatically.
+  <!-- Tab: Manual Test -->
+  <div class="tab-content" id="tab-test">
+    <!-- Quick Start Panel -->
+    <div class="card" style="border: 2px solid var(--accent); margin-bottom:16px;">
+      <h3 class="mb-2">Quick Start</h3>
+      <div class="muted text-sm mb-2">
+        Start/stop trading processes with minimal configuration. For advanced settings, expand the sections below.
+      </div>
+
+      <!-- Process Status Strip -->
+      <div class="grid4 mb-3" style="gap:12px;">
+        <div class="metric-card">
+          <div class="metric-content">
+            <div class="metric-label">Gateway Status</div>
+            <div class="metric-value" id="qsGatewayStatus">--</div>
+            <div class="metric-sub text-xs muted" id="qsGatewayMode">Mode: --</div>
+          </div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-content">
+            <div class="metric-label">Strategy Status</div>
+            <div class="metric-value" id="qsStrategyStatus">--</div>
+            <div class="metric-sub text-xs muted" id="qsStrategyMode">Mode: --</div>
+          </div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-content">
+            <div class="metric-label">Last Update</div>
+            <div class="metric-value text-sm mono" id="qsLastUpdate">--</div>
+          </div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-content">
+            <div class="metric-label">Live Enabled</div>
+            <div class="metric-value" id="qsLiveEnabled">--</div>
           </div>
         </div>
       </div>
 
-      <div>
-        <div class="card">
-          <h3 class="mb-2">AccountGateway (OMS/EMS)</h3>
+      <!-- Stale Warning -->
+      <div id="qsStaleWarning" class="muted text-sm mb-2" style="display:none; padding:8px; background:var(--warn-bg); border-radius:4px; color:var(--warn-text);">
+        <strong>Warning:</strong> Gateway state is stale (>30s). The process may have stopped. Consider restarting.
+      </div>
+
+      <!-- Quick Config -->
+      <div class="grid3 mb-3">
+        <div>
+          <label>Mode</label>
+          <select id="qsMode" style="width:100%;">
+            <option value="sim" selected>sim (simulated)</option>
+            <option value="live_monitor">live_monitor (read-only)</option>
+            <option value="live_trade">live_trade (real orders)</option>
+          </select>
+        </div>
+        <div>
+          <label>Symbols (comma-separated)</label>
+          <input id="qsSymbols" placeholder="SHFE.cu2602" style="width:100%;"/>
+        </div>
+        <div id="qsConfirmLiveWrap" style="display:none;">
+          <label>Confirm live (required)</label>
+          <input id="qsConfirmLive" placeholder="I_UNDERSTAND" style="width:100%;"/>
+        </div>
+      </div>
+
+      <!-- Start/Stop Buttons -->
+      <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+        <button type="button" class="btn" style="background:#28a745; color:#fff;" id="qsStartGateway">Start Gateway</button>
+        <button type="button" class="btn btn-secondary" id="qsStopGateway">Stop Gateway</button>
+        <span style="border-left:1px solid var(--border); height:24px;"></span>
+        <button type="button" class="btn" style="background:#17a2b8; color:#fff;" id="qsStartStrategy">Start Strategy</button>
+        <button type="button" class="btn btn-secondary" id="qsStopStrategy">Stop Strategy</button>
+        <span class="muted text-sm" id="qsActionStatus" style="margin-left:auto;">Ready</span>
+      </div>
+
+      <!-- Prerequisites Hint -->
+      <div id="qsPrereqHint" class="muted text-xs" style="margin-top:8px; display:none;">
+        <span style="color:var(--warn-text);">Note:</span> <span id="qsPrereqText"></span>
+      </div>
+    </div>
+
+    <!-- Quick Order Panel -->
+    <div class="card" style="border: 2px solid var(--accent); margin-bottom:16px;">
+      <h3 class="mb-2">Quick Order (Manual Test)</h3>
+      <div class="muted text-sm mb-2">
+        Execute one-lot orders manually for testing. Requires gateway in <strong>sim</strong> or <strong>live_trade</strong> mode with symbols configured.
+      </div>
+      <div class="grid4 mb-2">
+        <div>
+          <label>Symbol</label>
+          <select id="manualOrderSymbol" style="width:100%;">
+            <option value="">-- select --</option>
+          </select>
+        </div>
+        <div>
+          <label>Size (lots)</label>
+          <input id="manualOrderSize" type="number" min="1" max="10" value="1" style="width:100%;"/>
+        </div>
+        <div>
+          <label>Current Position</label>
+          <div class="metric-value mono" id="manualCurrentPos" style="font-size:1.2rem; padding:4px 0;">0</div>
+        </div>
+        <div>
+          <label>Gateway Mode</label>
+          <div class="metric-value mono" id="manualGatewayMode" style="font-size:1rem; padding:4px 0;">--</div>
+        </div>
+      </div>
+      <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+        <button type="button" class="btn" style="background:#28a745; color:#fff;" id="manualOpenLong">Open Long (+1)</button>
+        <button type="button" class="btn" style="background:#dc3545; color:#fff;" id="manualOpenShort">Open Short (-1)</button>
+        <button type="button" class="btn btn-secondary" id="manualCloseAll">Close Position (0)</button>
+        <span class="muted text-sm" id="manualOrderStatus" style="margin-left:auto;">Ready</span>
+      </div>
+    </div>
+
+    <!-- Advanced Settings (collapsible) -->
+    <details class="card" style="margin-bottom:16px;">
+      <summary style="cursor:pointer; font-weight:600; user-select:none;">
+        Advanced Settings
+        <span class="muted text-sm" style="margin-left:8px;">(Gateway + Strategy configuration)</span>
+      </summary>
+
+      <div style="margin-top:16px;">
+        <!-- AccountGateway -->
+        <div class="card" style="margin-bottom:12px;">
+          <h4 class="mb-2">AccountGateway (OMS/EMS)</h4>
           <div class="muted text-sm mb-2">
             Gateway state is persisted under <span class="mono">runs/gateway/account=&lt;profile&gt;/</span>.
-            This control plane edits <span class="mono">desired.json</span> and appends <span class="mono">commands.jsonl</span>.
           </div>
 
           <div class="grid3 mb-2">
@@ -218,7 +401,7 @@
           </div>
 
           <form class="form" id="gatewayDesiredForm">
-            <h4 class="mb-2">Desired state</h4>
+            <h5 class="mb-2">Desired state</h5>
             <div class="grid3">
               <div>
                 <label>Mode</label>
@@ -274,30 +457,31 @@
               </div>
             </div>
           </form>
+        </div>
 
-          <div class="card" style="margin-top:12px; background: var(--warn-bg); border-color: var(--warn-border);">
-            <h4 class="mb-2">Manual interventions (logged)</h4>
-            <div class="muted text-sm mb-2">
-              These append commands to <span class="mono">commands.jsonl</span>. Use only when necessary.
-            </div>
-            <div style="display:flex; gap:8px; flex-wrap:wrap;">
-              <button type="button" class="btn btn-secondary btn-sm" id="gatewayCmdCancelAll">Cancel all orders</button>
-              <button type="button" class="btn btn-secondary btn-sm" id="gatewayCmdFlatten">Flatten positions</button>
-              <button type="button" class="btn btn-danger btn-sm" id="gatewayCmdDisarm">Disarm live (switch to live_monitor)</button>
-            </div>
+        <!-- Manual Interventions -->
+        <div class="card" style="margin-bottom:12px; background: var(--warn-bg); border-color: var(--warn-border);">
+          <h4 class="mb-2">Manual interventions (logged)</h4>
+          <div class="muted text-sm mb-2">
+            These append commands to <span class="mono">commands.jsonl</span>. Use only when necessary.
           </div>
-
-          <div class="card" style="margin-top:12px;">
-            <h4 class="mb-2">Raw status (transparent)</h4>
-            <pre class="mono text-xs" id="gatewayRaw" style="white-space:pre-wrap;">--</pre>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button type="button" class="btn btn-secondary btn-sm" id="gatewayCmdCancelAll">Cancel all orders</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="gatewayCmdFlatten">Flatten positions</button>
+            <button type="button" class="btn btn-danger btn-sm" id="gatewayCmdDisarm">Disarm live (switch to live_monitor)</button>
           </div>
         </div>
 
-        <div class="card">
-          <h3 class="mb-2">StrategyRunner (AI)</h3>
+        <div class="card" style="margin-bottom:12px;">
+          <h5 class="mb-2">Gateway Raw Status</h5>
+          <pre class="mono text-xs" id="gatewayRaw" style="white-space:pre-wrap; max-height:150px; overflow:auto;">--</pre>
+        </div>
+
+        <!-- StrategyRunner -->
+        <div class="card" style="margin-bottom:12px;">
+          <h4 class="mb-2">StrategyRunner (AI)</h4>
           <div class="muted text-sm mb-2">
             Strategy state is persisted under <span class="mono">runs/strategy/account=&lt;profile&gt;/</span>.
-            This control plane edits <span class="mono">desired.json</span>.
           </div>
 
           <div class="grid3 mb-2">
@@ -326,7 +510,7 @@
           </div>
 
           <form class="form" id="strategyDesiredForm">
-            <h4 class="mb-2">Desired state</h4>
+            <h5 class="mb-2">Desired state</h5>
             <div class="grid2">
               <div>
                 <label>Mode</label>
@@ -356,51 +540,31 @@
             <button type="submit" class="btn btn-primary">Apply desired</button>
           </form>
 
-          <div class="card" style="margin-top:12px;">
-            <h4 class="mb-2">Raw status (transparent)</h4>
-            <pre class="mono text-xs" id="strategyRaw" style="white-space:pre-wrap;">--</pre>
+          <div style="margin-top:12px;">
+            <h5 class="mb-2">Strategy Raw Status</h5>
+            <pre class="mono text-xs" id="strategyRaw" style="white-space:pre-wrap; max-height:150px; overflow:auto;">--</pre>
           </div>
         </div>
 
+        <!-- Active Jobs -->
         <div class="card">
-          <h3 class="mb-2">Active Jobs (gateway/strategy)</h3>
+          <h4 class="mb-2">Active Jobs (gateway/strategy)</h4>
           <div id="tradingJobsList">
             <div class="muted">Loading...</div>
           </div>
         </div>
       </div>
-    </div>
+    </details>
   </div>
 
-  <!-- Tab: Run History -->
-  <div class="tab-content" id="tab-history">
-    <div class="card">
-      <h3 class="mb-2">Strategy runs (<span class="mono">runs/strategy/&lt;run_id&gt;/</span>)</h3>
-      <div class="tableWrap">
-        <table class="table table-compact">
-          <thead>
-            <tr>
-              <th>Run ID</th>
-              <th>Account</th>
-              <th>Model</th>
-              <th>Horizon</th>
-              <th>Created</th>
-              <th>Last event</th>
-            </tr>
-          </thead>
-          <tbody id="strategyRunHistoryTbody">
-            <tr><td colspan="6" class="muted">Loading...</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <!-- Tab: Accounts -->
-  <div class="tab-content" id="tab-accounts">
+  <!-- Tab: Account Config -->
+  <div class="tab-content" id="tab-config">
     <div class="card">
       <h3 class="mb-2">Broker Accounts (profiles)</h3>
-      <div class="muted text-sm mb-2">Credentials are stored in <span class="mono">runs/control/accounts.env</span> (gitignored). Add/edit accounts here; the table only displays non-secret info.</div>
+      <div class="muted text-sm mb-2">
+        Credentials are stored in <span class="mono">runs/control/accounts.env</span> (gitignored). 
+        Add/edit accounts here; the table only displays non-secret info.
+      </div>
 
       <form class="form" id="accountUpsertForm" style="margin-bottom:12px;">
         <h4 class="mb-2">Add / Edit Account</h4>
@@ -458,4 +622,3 @@
 {% block scripts %}
 <script src="/static/trading.js"></script>
 {% endblock %}
-

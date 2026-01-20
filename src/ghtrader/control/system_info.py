@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -137,6 +138,7 @@ _FAST_TTL_SEC = 3.0
 _GPU_TTL_SEC = 30.0
 _DIR_TTL_SEC = 300.0
 _DU_TIMEOUT_SEC = 8.0
+_QDB_TTL_SEC = 5.0
 
 _fast_key: tuple[str, str, str] | None = None
 _fast_at: float = 0.0
@@ -150,6 +152,15 @@ _dir_key: tuple[str, str, str] | None = None
 _dir_at: float = 0.0
 _dir_payload: dict[str, Any] | None = None
 _dir_thread_running: bool = False
+
+_qdb_at: float = 0.0
+_qdb_payload: dict[str, Any] | None = None
+
+_QDB_METRIC_MAP = {
+    "questdb_pg_wire_connections": "pg_wire_connections",
+    "questdb_pg_wire_queries_total": "pg_wire_queries_total",
+    "questdb_pg_wire_queries_completed_total": "pg_wire_queries_completed_total",
+}
 
 
 def _fs_item(label: str, p: Path) -> dict[str, Any]:
@@ -213,6 +224,79 @@ def _compute_dir_sizes(data_dir: Path, runs_dir: Path, artifacts_dir: Path) -> d
             "error": err or "",
         }
     return out
+
+
+def _parse_prometheus_metrics(payload: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for raw in (payload or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[0].strip()
+        if name not in _QDB_METRIC_MAP:
+            continue
+        try:
+            out[_QDB_METRIC_MAP[name]] = float(parts[1])
+        except Exception:
+            continue
+    return out
+
+
+def _questdb_metrics_snapshot(*, host: str, port: int, timeout_s: float = 1.0) -> dict[str, Any]:
+    t0 = time.time()
+    endpoint = f"http://{host}:{int(port)}/metrics"
+    try:
+        req = urllib.request.Request(endpoint, headers={"User-Agent": "ghtrader"})
+        with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        metrics = _parse_prometheus_metrics(text)
+        latency_ms = int((time.time() - t0) * 1000.0)
+        return {
+            "ok": True,
+            "endpoint": endpoint,
+            "latency_ms": latency_ms,
+            "metrics": metrics,
+            "updated_at": _now_utc_iso(),
+        }
+    except Exception as e:
+        latency_ms = int((time.time() - t0) * 1000.0)
+        return {
+            "ok": False,
+            "endpoint": endpoint,
+            "latency_ms": latency_ms,
+            "metrics": {},
+            "error": str(e),
+            "updated_at": _now_utc_iso(),
+        }
+
+
+def questdb_metrics_snapshot(*, refresh: bool = False) -> dict[str, Any]:
+    """
+    Cached QuestDB Prometheus metrics snapshot.
+    """
+    global _qdb_at, _qdb_payload
+    now = time.time()
+    with _CACHE_LOCK:
+        if not refresh and _qdb_payload is not None and (now - _qdb_at) <= _QDB_TTL_SEC:
+            return dict(_qdb_payload)
+
+    try:
+        from ghtrader.config import get_questdb_host, get_questdb_metrics_port
+
+        qdb_host = get_questdb_host()
+        qdb_port = get_questdb_metrics_port()
+    except Exception:
+        qdb_host = "127.0.0.1"
+        qdb_port = 9003
+
+    payload = _questdb_metrics_snapshot(host=str(qdb_host), port=int(qdb_port))
+    with _CACHE_LOCK:
+        _qdb_payload = payload
+        _qdb_at = time.time()
+    return dict(payload)
 
 
 def _maybe_start_gpu_refresh(*, force: bool) -> None:
@@ -324,6 +408,10 @@ def system_snapshot(
             _fast_key = key
             _fast_at = time.time()
 
+    # QuestDB metrics cache (Prometheus endpoint)
+    if _qdb_payload is None or refresh in {"fast", "dir"} or (now - _qdb_at) > _QDB_TTL_SEC:
+        questdb_metrics_snapshot(refresh=True)
+
     # GPU refresh: always background; force on refresh=fast
     _maybe_start_gpu_refresh(force=(refresh == "fast"))
 
@@ -345,6 +433,7 @@ def system_snapshot(
         dir_payload = dict(_dir_payload or {})
         dir_running = bool(_dir_thread_running)
         dir_key = _dir_key
+        qdb_payload = dict(_qdb_payload or {})
 
     disks_out = list(fast.get("disks") or [])
     if include_dir_sizes and dir_payload and dir_key == key:
@@ -365,6 +454,7 @@ def system_snapshot(
             "updated_at": gpu_payload.get("updated_at", ""),
             "status": "running" if gpu_running else ("ready" if gpu_payload.get("info") else "idle"),
         },
+        "questdb": qdb_payload,
         "dir_sizes": {
             "updated_at": dir_payload.get("updated_at", ""),
             "status": "running"

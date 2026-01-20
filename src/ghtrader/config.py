@@ -196,3 +196,11 @@ def get_questdb_pg_password() -> str:
 def get_questdb_pg_dbname() -> str:
     load_config()
     return str(get_env("GHTRADER_QUESTDB_PG_DBNAME", "qdb") or "qdb")
+
+
+def get_questdb_metrics_port() -> int:
+    load_config()
+    try:
+        return int(get_env("GHTRADER_QUESTDB_METRICS_PORT", "9003") or 9003)
+    except Exception:
+        return 9003

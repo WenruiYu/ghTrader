@@ -7,7 +7,8 @@ from typing import Any, Iterable
 
 import structlog
 
-from .client import QuestDBQueryConfig, connect_pg as _connect
+from .client import QuestDBQueryConfig, connect_pg_safe as _connect
+from ghtrader.util.worker_policy import resolve_worker_count
 
 log = structlog.get_logger()
 
@@ -298,6 +299,60 @@ def query_present_trading_days(
                         continue
     except Exception as e:
         log.warning("query_present_trading_days.error", error=str(e))
+    return out
+
+
+def query_symbol_day_index_hashes(
+    *,
+    cfg: QuestDBQueryConfig,
+    symbols: list[str],
+    dataset_version: str,
+    ticks_kind: str,
+    index_table: str = INDEX_TABLE_V2,
+    connect_timeout_s: int = 2,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """
+    Return {(symbol, trading_day): {rows_total, row_hash_min/max/sum/sum_abs}} from the index table.
+    """
+    syms = [str(s).strip() for s in (symbols or []) if str(s).strip()]
+    if not syms:
+        return {}
+    dv = str(dataset_version).lower().strip()
+    tk = str(ticks_kind).lower().strip()
+    idx = str(index_table).strip() or INDEX_TABLE_V2
+
+    placeholders = ", ".join(["%s"] * len(syms))
+    where = [f"symbol IN ({placeholders})", "ticks_kind = %s", "dataset_version = %s", "rows_total > 0"]
+    params: list[Any] = list(syms) + [tk, dv]
+
+    sql = (
+        "SELECT symbol, cast(trading_day as string) AS trading_day, rows_total, "
+        "row_hash_min, row_hash_max, row_hash_sum, row_hash_sum_abs "
+        f"FROM {idx} WHERE {' AND '.join(where)}"
+    )
+
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    try:
+        with _connect(cfg, connect_timeout_s=connect_timeout_s) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                for row in cur.fetchall():
+                    try:
+                        sym = str(row[0]).strip()
+                        day = str(row[1]).strip()
+                        if not sym or not day:
+                            continue
+                        out[(sym, day)] = {
+                            "rows_total": int(row[2]) if row[2] is not None else None,
+                            "row_hash_min": int(row[3]) if row[3] is not None else None,
+                            "row_hash_max": int(row[4]) if row[4] is not None else None,
+                            "row_hash_sum": int(row[5]) if row[5] is not None else None,
+                            "row_hash_sum_abs": int(row[6]) if row[6] is not None else None,
+                        }
+                    except Exception:
+                        continue
+    except Exception as e:
+        log.warning("query_symbol_day_index_hashes.error", error=str(e))
     return out
 
 
@@ -1049,6 +1104,7 @@ def bootstrap_symbol_day_index_parallel(
         dict with ok, ticks_table, index_table, rows, seconds, workers_used
     """
     import multiprocessing
+    import os
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     tbl = str(ticks_table).strip()
@@ -1064,13 +1120,16 @@ def bootstrap_symbol_day_index_parallel(
 
     # Determine worker count
     cpu_count = multiprocessing.cpu_count()
-    if n_workers is None:
-        # Use 1/4 of available cores for QuestDB queries to avoid overwhelming the DB
-        n_workers = max(1, min(32, cpu_count // 4))
-    n_workers = max(1, min(n_workers, cpu_count))
+    n_workers = resolve_worker_count(kind="index_bootstrap", requested=n_workers, cpu_count=cpu_count)
 
     # Prepare batches
     batches: list[list[str]] = []
+    env_batch = os.getenv("GHTRADER_INDEX_BOOTSTRAP_BATCH_SYMBOLS")
+    if env_batch:
+        try:
+            batch_symbols = int(env_batch)
+        except Exception:
+            pass
     nn = max(1, int(batch_symbols))
     for i in range(0, len(syms), nn):
         batches.append(syms[i : i + nn])

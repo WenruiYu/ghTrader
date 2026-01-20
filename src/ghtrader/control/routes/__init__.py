@@ -10,14 +10,14 @@ from fastapi import APIRouter
 
 from .health import router as health_router
 from .jobs import router as jobs_router
-from .accounts import router as accounts_router
+
+# Note: accounts API is implemented directly in app.py (PRD-aligned TQ_* env vars).
 
 
 def build_api_router() -> APIRouter:
     """Build combined API router from all sub-routers."""
     api = APIRouter(prefix="/api")
     api.include_router(jobs_router)
-    api.include_router(accounts_router)
     return api
 
 

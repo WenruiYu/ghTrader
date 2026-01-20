@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import os
+import threading
 import time
 from typing import Any, Literal
 
@@ -10,8 +11,45 @@ import structlog
 
 log = structlog.get_logger()
 
+_thread_local = threading.local()
 
-from .client import QuestDBQueryConfig, connect_pg as _connect
+
+def _clear_thread_conn() -> None:
+    try:
+        conn = getattr(_thread_local, "questdb_conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        _thread_local.questdb_conn = None
+        _thread_local.questdb_conn_cfg = None
+    except Exception:
+        pass
+
+
+def _get_thread_conn(*, cfg: QuestDBQueryConfig, connect_timeout_s: int) -> Any:
+    try:
+        conn = getattr(_thread_local, "questdb_conn", None)
+        conn_cfg = getattr(_thread_local, "questdb_conn_cfg", None)
+        if conn is not None and conn_cfg == cfg:
+            try:
+                if getattr(conn, "closed", False):
+                    _clear_thread_conn()
+                else:
+                    return conn
+            except Exception:
+                _clear_thread_conn()
+        conn = _connect_safe(cfg, connect_timeout_s=connect_timeout_s, retries=2, backoff_s=0.2, autocommit=True)
+        _thread_local.questdb_conn = conn
+        _thread_local.questdb_conn_cfg = cfg
+        return conn
+    except Exception:
+        _clear_thread_conn()
+        raise
+
+
+from .client import QuestDBQueryConfig, connect_pg as _connect, connect_pg_safe as _connect_safe, is_transient_pg_error
 
 
 _READ_ONLY_START_RE = re.compile(r"^\s*(with|select)\b", flags=re.IGNORECASE)
@@ -299,6 +337,9 @@ def fetch_ticks_for_symbol_day(
     order: Literal["asc", "desc"] = "asc",
     include_provenance: bool = False,
     connect_timeout_s: int = 2,
+    retries: int = 2,
+    backoff_s: float = 0.2,
+    reuse_conn: bool = True,
 ) -> "pd.DataFrame":
     """
     Fetch ticks for a single symbol+trading_day from QuestDB into a pandas DataFrame.
@@ -353,11 +394,38 @@ def fetch_ticks_for_symbol_day(
         if lim is not None:
             q_sql = base_sql + " LIMIT %s"
             q_params.append(int(lim))
+        rows: list[Any] = []
 
-        with _connect(cfg, connect_timeout_s=connect_timeout_s) as conn:
-            with conn.cursor() as cur:
-                cur.execute(q_sql, q_params)
-                rows = cur.fetchall()
+        def _fetch_rows() -> list[Any]:
+            if reuse_conn:
+                conn = _get_thread_conn(cfg=cfg, connect_timeout_s=connect_timeout_s)
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(q_sql, q_params)
+                        return cur.fetchall()
+                except Exception:
+                    _clear_thread_conn()
+                    raise
+            with _connect_safe(cfg, connect_timeout_s=connect_timeout_s, retries=retries, backoff_s=backoff_s, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(q_sql, q_params)
+                    return cur.fetchall()
+
+        last_err: Exception | None = None
+        for attempt in range(int(retries) + 1):
+            try:
+                rows = _fetch_rows()
+                break
+            except Exception as e:
+                last_err = e
+                if attempt >= int(retries) or not is_transient_pg_error(e):
+                    raise
+                try:
+                    time.sleep(float(backoff_s) * (2 ** attempt))
+                except Exception:
+                    pass
+        if rows is None and last_err:
+            raise last_err
         if not rows:
             cols = list(TICK_COLUMN_NAMES) + ["row_hash"] + (prov_cols if include_prov else [])
             return pd.DataFrame(columns=cols)

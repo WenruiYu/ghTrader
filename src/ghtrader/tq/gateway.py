@@ -30,9 +30,53 @@ import structlog
 from ghtrader.config import get_tqsdk_auth, is_live_enabled, load_config
 from ghtrader.util.json_io import read_json, write_json_atomic
 
-from .runtime import canonical_account_profile, create_tq_account, snapshot_account_state
+from .runtime import canonical_account_profile, create_tq_account, snapshot_account_state, trading_day_from_ts_ns
 
 log = structlog.get_logger()
+
+
+def _resolve_symbols_for_execution(
+    *,
+    requested_symbols: list[str],
+    data_dir: Path,
+    previous_mapping: dict[str, str],
+) -> tuple[dict[str, str], list[str], bool]:
+    """
+    Resolve requested symbols (which may include continuous aliases like KQ.m@SHFE.cu) to
+    execution symbols (specific contracts like SHFE.cu2602).
+
+    Returns:
+        (mapping, execution_symbols, rolled) where:
+        - mapping: {requested_symbol: execution_symbol}
+        - execution_symbols: list of resolved symbols (for subscriptions)
+        - rolled: True if any execution symbol changed vs previous_mapping
+    """
+    from ghtrader.trading.symbol_resolver import is_continuous_alias, resolve_trading_symbol
+
+    mapping: dict[str, str] = {}
+    execution_symbols: list[str] = []
+    rolled = False
+
+    for req_sym in requested_symbols:
+        try:
+            if is_continuous_alias(req_sym):
+                exec_sym = resolve_trading_symbol(symbol=req_sym, data_dir=data_dir)
+            else:
+                exec_sym = req_sym
+        except Exception as e:
+            log.warning("symbol_resolution_failed", symbol=req_sym, error=str(e))
+            # Fallback: use the requested symbol as-is (gateway may still work for specific contracts)
+            exec_sym = req_sym
+
+        mapping[req_sym] = exec_sym
+        if exec_sym not in execution_symbols:
+            execution_symbols.append(exec_sym)
+
+        # Check for roll
+        if previous_mapping.get(req_sym) and previous_mapping[req_sym] != exec_sym:
+            rolled = True
+
+    return mapping, execution_symbols, rolled
 
 GatewayMode = Literal["idle", "paper", "sim", "live_monitor", "live_trade"]
 ExecutorType = Literal["targetpos", "direct"]
@@ -359,6 +403,15 @@ def run_gateway(
     last_snapshot_at = 0.0
     last_wait_ok_at = 0.0
 
+    # Symbol resolution: track mapping from requested (possibly continuous) to execution symbols
+    symbol_mapping: dict[str, str] = {}  # requested_symbol -> execution_symbol
+    last_resolution_at = 0.0
+    resolution_interval_sec = 60.0  # Re-resolve periodically to catch trading day changes
+
+    # Get data_dir for symbol resolution
+    from ghtrader.config import get_data_dir
+    data_dir = get_data_dir()
+
     writer.set_health(ok=False, connected=False, last_wait_update_at="", error="")
     writer.set_effective(mode="idle", symbols=[], executor="targetpos")
     writer.append_event({"type": "gateway_start"})
@@ -451,13 +504,54 @@ def run_gateway(
 
         # Manage subscriptions (best-effort; only if api is connected and mode is not idle).
         if api is not None:
-            if desired_symbols != current_symbols:
+            # Resolve continuous aliases to execution symbols (with roll detection)
+            now_t = time.time()
+            need_resolution = (
+                desired_symbols != list(symbol_mapping.keys())
+                or (now_t - last_resolution_at) > resolution_interval_sec
+            )
+
+            execution_symbols = current_symbols
+            rolled = False
+            if need_resolution and desired_symbols:
+                try:
+                    new_mapping, execution_symbols, rolled = _resolve_symbols_for_execution(
+                        requested_symbols=desired_symbols,
+                        data_dir=data_dir,
+                        previous_mapping=symbol_mapping,
+                    )
+                    symbol_mapping = new_mapping
+                    last_resolution_at = now_t
+
+                    if rolled:
+                        writer.append_event({
+                            "type": "symbol_roll",
+                            "mapping": dict(symbol_mapping),
+                            "reason": "trading_day_change",
+                        })
+                        # On roll: cancel all and flatten positions before switching
+                        try:
+                            if exec_direct is not None:
+                                exec_direct.cancel_all_alive()
+                            if exec_targetpos is not None:
+                                for s in list(current_symbols):
+                                    exec_targetpos.set_target(s, 0)
+                        except Exception as e:
+                            writer.append_event({"type": "roll_flatten_failed", "error": str(e)})
+                except Exception as e:
+                    log.warning("symbol_resolution_error", error=str(e))
+                    # Fallback: use requested symbols directly
+                    execution_symbols = list(desired_symbols)
+                    symbol_mapping = {s: s for s in desired_symbols}
+
+            symbols_changed = execution_symbols != current_symbols or rolled
+            if symbols_changed:
                 quotes = {}
                 tick_serials = {}
                 positions = {}
                 local_time_record = {}
                 market = {"ticks": {}, "quotes": {}}
-                current_symbols = list(desired_symbols)
+                current_symbols = list(execution_symbols)
                 for s in current_symbols:
                     try:
                         quotes[s] = api.get_quote(s)
@@ -467,7 +561,12 @@ def run_gateway(
                         local_time_record[s] = time.time() - 0.005
                     except Exception:
                         continue
-                writer.set_effective(mode=current_mode, symbols=current_symbols, executor=desired.executor)
+                writer.set_effective(
+                    mode=current_mode,
+                    symbols=current_symbols,
+                    executor=desired.executor,
+                    symbol_mapping=dict(symbol_mapping),
+                )
 
                 # (Re)create executors (best-effort). Even in monitor-only, operators may use manual commands.
                 try:
@@ -615,6 +714,32 @@ def run_gateway(
                                 writer.append_event({"type": "gateway_disarmed"})
                             except Exception as e:
                                 writer.append_event({"type": "gateway_disarm_failed", "error": str(e)})
+
+                        if ctype == "set_target":
+                            # Manual target setting (for one-lot testing)
+                            try:
+                                params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
+                                sym = str((obj.get("symbol") if "symbol" in obj else params.get("symbol")) or "").strip()
+                                tgt_raw = obj.get("target") if "target" in obj else params.get("target")
+                                try:
+                                    tgt = int(tgt_raw) if tgt_raw is not None else 0
+                                except Exception:
+                                    tgt = 0
+                                if sym and sym in current_symbols:
+                                    # Clamp to risk limits
+                                    tgt = int(clamp_target_position(tgt, max_abs_position=int(desired.max_abs_position)))
+                                    if desired.executor == "direct" and exec_direct is not None and sym in positions and sym in quotes:
+                                        exec_direct.set_target(symbol=sym, target_net=tgt, position=positions[sym], quote=quotes[sym])
+                                        writer.append_event({"type": "manual_target_set", "symbol": sym, "target": tgt, "executor": "direct"})
+                                    elif exec_targetpos is not None:
+                                        exec_targetpos.set_target(sym, tgt)
+                                        writer.append_event({"type": "manual_target_set", "symbol": sym, "target": tgt, "executor": "targetpos"})
+                                    else:
+                                        writer.append_event({"type": "manual_target_failed", "symbol": sym, "error": "no_executor"})
+                                else:
+                                    writer.append_event({"type": "manual_target_failed", "symbol": sym, "error": "symbol_not_in_current_symbols"})
+                            except Exception as e:
+                                writer.append_event({"type": "manual_target_failed", "error": str(e)})
 
                     cmd_offset = int(new_off)
                     _write_commands_cursor(runs_dir=runs_dir, profile=prof, offset=int(cmd_offset))
