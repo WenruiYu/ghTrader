@@ -29,3 +29,7 @@ artifacts/
 akshare/
 tqsdk-python/
 
+.claude/
+.cursor/
+.*/
+
