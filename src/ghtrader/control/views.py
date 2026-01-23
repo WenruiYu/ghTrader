@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+import structlog
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse, RedirectResponse
@@ -14,6 +19,36 @@ from ghtrader.control import auth
 from ghtrader.control.jobs import JobSpec, python_module_argv
 from ghtrader.control.settings import get_tqsdk_scheduler_state, set_tqsdk_scheduler_max_parallel
 from ghtrader.control.system_info import cpu_mem_info, disk_usage, gpu_info
+
+log = structlog.get_logger()
+
+_DATA_PAGE_CACHE_TTL_S = 5.0
+_DATA_PAGE_CACHE: dict[str, tuple[float, Any]] = {}
+_DATA_PAGE_CACHE_LOCK = threading.Lock()
+
+
+def _data_page_cache_get(key: str, *, ttl_s: float | None = None) -> Any | None:
+    ttl = float(_DATA_PAGE_CACHE_TTL_S if ttl_s is None else ttl_s)
+    now = time.time()
+    with _DATA_PAGE_CACHE_LOCK:
+        item = _DATA_PAGE_CACHE.get(key)
+        if not item:
+            return None
+        ts, payload = item
+        if (now - float(ts)) > ttl:
+            _DATA_PAGE_CACHE.pop(key, None)
+            return None
+        return payload
+
+
+def _data_page_cache_set(key: str, payload: Any) -> None:
+    with _DATA_PAGE_CACHE_LOCK:
+        _DATA_PAGE_CACHE[key] = (time.time(), payload)
+
+
+def _data_page_cache_clear() -> None:
+    with _DATA_PAGE_CACHE_LOCK:
+        _DATA_PAGE_CACHE.clear()
 
 
 def build_router() -> Any:
@@ -36,9 +71,23 @@ def build_router() -> Any:
         running = [j for j in jobs if j.status == "running"]
         queued = [j for j in jobs if j.status == "queued"]
 
-        # Defaults for schedule builder quick actions
-        default_schedule_start = "2015-01-01"
-        default_schedule_end = datetime.now().date().isoformat()
+        data_dir = get_data_dir()
+        l5_start_date = ""
+        l5_start_error = ""
+        latest_trading_day = ""
+        latest_trading_error = ""
+        try:
+            from ghtrader.config import get_l5_start_date
+
+            l5_start_date = get_l5_start_date().isoformat()
+        except Exception as e:
+            l5_start_error = str(e)
+        try:
+            from ghtrader.data.trading_calendar import latest_trading_day as _latest_trading_day
+
+            latest_trading_day = _latest_trading_day(data_dir=data_dir, refresh=False, allow_download=True).isoformat()
+        except Exception as e:
+            latest_trading_error = str(e)
 
         return templates.TemplateResponse(
             request,
@@ -51,8 +100,10 @@ def build_router() -> Any:
                 "running_count": len(running),
                 "queued_count": len(queued),
                 "recent_count": len(jobs),
-                "default_schedule_start": default_schedule_start,
-                "default_schedule_end": default_schedule_end,
+                "l5_start_date": l5_start_date,
+                "l5_start_error": l5_start_error,
+                "latest_trading_day": latest_trading_day,
+                "latest_trading_error": latest_trading_error,
             },
         )
 
@@ -62,6 +113,23 @@ def build_router() -> Any:
         store = request.app.state.job_store
         jobs = store.list_jobs(limit=200)
         running = [j for j in jobs if j.status == "running"]
+        data_dir = get_data_dir()
+        l5_start_date = ""
+        l5_start_error = ""
+        latest_trading_day = ""
+        latest_trading_error = ""
+        try:
+            from ghtrader.config import get_l5_start_date
+
+            l5_start_date = get_l5_start_date().isoformat()
+        except Exception as e:
+            l5_start_error = str(e)
+        try:
+            from ghtrader.data.trading_calendar import latest_trading_day as _latest_trading_day
+
+            latest_trading_day = _latest_trading_day(data_dir=data_dir, refresh=False, allow_download=True).isoformat()
+        except Exception as e:
+            latest_trading_error = str(e)
         return templates.TemplateResponse(
             request,
             "jobs.html",
@@ -71,6 +139,10 @@ def build_router() -> Any:
                 "token_qs": _token_qs(request),
                 "jobs": jobs,
                 "running_count": len(running),
+                "l5_start_date": l5_start_date,
+                "l5_start_error": l5_start_error,
+                "latest_trading_day": latest_trading_day,
+                "latest_trading_error": latest_trading_error,
             },
         )
 
@@ -184,6 +256,16 @@ def build_router() -> Any:
             raise HTTPException(status_code=404, detail="report not found")
         return PlainTextResponse(p.read_text(), media_type="application/json")
 
+    @router.get("/data/main-l5-validate/report/{name}")
+    def data_main_l5_validate_report(request: Request, name: str):
+        _require_auth(request)
+        if "/" in name or "\\" in name or not name.endswith(".json"):
+            raise HTTPException(status_code=400, detail="invalid report name")
+        p = get_runs_dir() / "control" / "reports" / "main_l5_validate" / name
+        if not p.exists():
+            raise HTTPException(status_code=404, detail="report not found")
+        return PlainTextResponse(p.read_text(), media_type="application/json")
+
     @router.post("/data/ingest/download")
     async def data_ingest_download(request: Request):
         _require_auth(request)
@@ -293,24 +375,16 @@ def build_router() -> Any:
         _require_auth(request)
         form = await request.form()
         var = str(form.get("variety") or "cu").strip()
-        start_date = str(form.get("start_date") or "").strip()
-        end_date = str(form.get("end_date") or "").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
-        if not start_date or not end_date:
-            raise HTTPException(status_code=400, detail="start_date/end_date required")
         argv = python_module_argv(
             "ghtrader.cli",
             "main-schedule",
             "--var",
             var,
-            "--start",
-            start_date,
-            "--end",
-            end_date,
             "--data-dir",
             data_dir,
         )
-        title = f"main-schedule {var} {start_date}->{end_date}"
+        title = f"main-schedule {var} env->latest"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -322,6 +396,7 @@ def build_router() -> Any:
         var = str(form.get("variety") or "cu").strip()
         derived_symbol = str(form.get("derived_symbol") or f"KQ.m@SHFE.{var}").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
+        update_mode = str(form.get("update_mode") or "0").strip().lower() in {"1", "true", "yes", "on"}
         if not var or not derived_symbol:
             raise HTTPException(status_code=400, detail="variety/derived_symbol required")
         argv = python_module_argv(
@@ -334,6 +409,8 @@ def build_router() -> Any:
             "--data-dir",
             data_dir,
         )
+        if update_mode:
+            argv += ["--update"]
         title = f"main-l5 {var} {derived_symbol}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
@@ -811,33 +888,25 @@ def build_router() -> Any:
             title = f"benchmark {model} {symbol}"
         elif job_type == "main_schedule":
             var = symbol_or_var or "cu"
-            start_date = str(form.get("start_date") or "").strip()
-            end_date = str(form.get("end_date") or "").strip()
-            threshold = str(form.get("threshold") or "1.1").strip()
-            if not start_date or not end_date:
-                raise HTTPException(status_code=400, detail="start_date and end_date are required for main_schedule")
             argv = python_module_argv(
                 "ghtrader.cli",
                 "main-schedule",
                 "--var",
                 var,
-                "--start",
-                start_date,
-                "--end",
-                end_date,
-                "--threshold",
-                threshold,
                 "--data-dir",
                 str(data_dir),
             )
-            title = f"main-schedule {var} {start_date}->{end_date}"
+            title = f"main-schedule {var} env->latest"
         elif job_type == "main_l5":
             var = symbol_or_var or "cu"
             derived_symbol = str(form.get("derived_symbol") or "").strip()
             overwrite = str(form.get("overwrite") or "0").strip().lower() in {"1", "true", "yes", "on"}
+            update_mode = str(form.get("update_mode") or "0").strip().lower() in {"1", "true", "yes", "on"}
             argv = python_module_argv("ghtrader.cli", "main-l5", "--var", var)
             if derived_symbol:
                 argv += ["--symbol", derived_symbol]
+            if update_mode:
+                argv += ["--update"]
             argv += ["--overwrite" if overwrite else "--no-overwrite"]
             title = f"main-l5 {var}"
         else:
@@ -898,41 +967,233 @@ def build_router() -> Any:
         except Exception:
             locks = []
 
-        # Audit reports
-        reports = []
+        # Audit reports / QuestDB / coverage / validation can be cached + parallelized.
+        t0 = time.time()
+        reports = _data_page_cache_get("data_page:audit_reports")
+        questdb = _data_page_cache_get("data_page:questdb_status")
+
+        l5_start_date = ""
+        l5_start_error = ""
+        latest_trading_day = ""
+        latest_trading_error = ""
         try:
-            reports_dir = runs_dir / "audit"
-            if reports_dir.exists():
-                reports = sorted([p.name for p in reports_dir.glob("*.json")], reverse=True)[:50]
-        except Exception:
-            reports = []
+            from ghtrader.config import get_l5_start_date
 
-        # QuestDB reachability (best-effort) for sync tab
-        questdb: dict[str, Any] = {"ok": False}
-        try:
-            from ghtrader.config import (
-                get_questdb_host,
-                get_questdb_ilp_port,
-                get_questdb_pg_port,
-            )
-            from ghtrader.questdb.client import questdb_reachable_pg
-
-            host = get_questdb_host()
-            pg_port = int(get_questdb_pg_port())
-            ilp_port = int(get_questdb_ilp_port())
-            questdb.update({"host": host, "pg_port": pg_port, "ilp_port": ilp_port})
-
-            q = questdb_reachable_pg(connect_timeout_s=2, retries=1, backoff_s=0.2)
-            questdb["ok"] = bool(q.get("ok"))
-            if not questdb["ok"] and q.get("error"):
-                questdb["error"] = str(q.get("error"))
+            l5_start_date = get_l5_start_date().isoformat()
         except Exception as e:
-            questdb["ok"] = False
-            questdb["error"] = str(e)
+            l5_start_error = str(e)
+        try:
+            from ghtrader.data.trading_calendar import latest_trading_day as _latest_trading_day
 
-        # Defaults for schedule builder quick actions
-        default_schedule_start = "2015-01-01"
-        default_schedule_end = datetime.now().date().isoformat()
+            latest_trading_day = _latest_trading_day(data_dir=data_dir, refresh=False, allow_download=True).isoformat()
+        except Exception as e:
+            latest_trading_error = str(e)
+
+        # Coverage watermarks (best-effort, default CU)
+        main_l5_coverage: dict[str, Any] = {}
+        main_schedule_coverage: dict[str, Any] = {}
+        coverage_error = ""
+        main_l5_validation: dict[str, Any] = {}
+        validation_error = ""
+        coverage_var = "cu"
+        coverage_symbol = f"KQ.m@SHFE.{coverage_var}"
+
+        coverage_payload = _data_page_cache_get(f"data_page:coverage:{coverage_symbol}")
+        validation_payload = _data_page_cache_get(f"data_page:validation:{coverage_symbol}")
+
+        tasks: dict[str, Any] = {}
+
+        def _load_reports() -> list[str]:
+            out: list[str] = []
+            try:
+                reports_dir = runs_dir / "audit"
+                if reports_dir.exists():
+                    out = sorted([p.name for p in reports_dir.glob("*.json")], reverse=True)[:50]
+            except Exception:
+                out = []
+            return out
+
+        def _load_questdb_status() -> dict[str, Any]:
+            out: dict[str, Any] = {"ok": False}
+            try:
+                from ghtrader.config import (
+                    get_questdb_host,
+                    get_questdb_ilp_port,
+                    get_questdb_pg_port,
+                )
+                from ghtrader.questdb.client import questdb_reachable_pg
+
+                host = get_questdb_host()
+                pg_port = int(get_questdb_pg_port())
+                ilp_port = int(get_questdb_ilp_port())
+                out.update({"host": host, "pg_port": pg_port, "ilp_port": ilp_port})
+
+                q = questdb_reachable_pg(connect_timeout_s=2, retries=1, backoff_s=0.2)
+                out["ok"] = bool(q.get("ok"))
+                if not out["ok"] and q.get("error"):
+                    out["error"] = str(q.get("error"))
+            except Exception as e:
+                out["ok"] = False
+                out["error"] = str(e)
+            return out
+
+        cfg = None
+        if coverage_payload is None or validation_payload is None:
+            try:
+                from ghtrader.questdb.client import make_questdb_query_config_from_env
+
+                cfg = make_questdb_query_config_from_env()
+            except Exception:
+                cfg = None
+
+        def _load_coverage() -> dict[str, Any]:
+            out = {"main_schedule_coverage": {}, "main_l5_coverage": {}, "coverage_error": ""}
+            if cfg is None:
+                out["coverage_error"] = "questdb config unavailable"
+                return out
+            try:
+                from ghtrader.questdb.main_schedule import fetch_main_schedule_state
+                from ghtrader.questdb.queries import query_symbol_day_bounds
+
+                sched = fetch_main_schedule_state(
+                    cfg=cfg,
+                    exchange="SHFE",
+                    variety=coverage_var,
+                )
+                hashes = sched.get("schedule_hashes") or set()
+                sched["schedule_hashes"] = sorted([str(h) for h in hashes if str(h).strip()])
+                cov = query_symbol_day_bounds(
+                    cfg=cfg,
+                    table="ghtrader_ticks_main_l5_v2",
+                    symbols=[coverage_symbol],
+                    dataset_version="v2",
+                    ticks_kind="main_l5",
+                    l5_only=True,
+                )
+                out["main_schedule_coverage"] = sched
+                out["main_l5_coverage"] = dict(cov.get(coverage_symbol) or {})
+            except Exception as e:
+                out["coverage_error"] = str(e)
+            return out
+
+        def _load_validation() -> dict[str, Any]:
+            out = {"main_l5_validation": {}, "validation_error": ""}
+            if cfg is None:
+                out["validation_error"] = "questdb config unavailable"
+                return out
+            try:
+                from ghtrader.questdb.main_l5_validate import (
+                    fetch_latest_main_l5_validate_summary,
+                    fetch_main_l5_validate_overview,
+                )
+                from ghtrader.data.main_l5_validation import read_latest_validation_report
+
+                overview = fetch_main_l5_validate_overview(cfg=cfg, symbol=coverage_symbol)
+                latest_rows = fetch_latest_main_l5_validate_summary(cfg=cfg, symbol=coverage_symbol, limit=1)
+                latest = latest_rows[0] if latest_rows else {}
+                if overview.get("days_total"):
+                    out["main_l5_validation"] = {
+                        "status": "ok"
+                        if (
+                            overview.get("missing_days", 0) == 0
+                            and overview.get("missing_segments", 0) == 0
+                            and overview.get("missing_half_seconds", 0) == 0
+                        )
+                        else "warn",
+                        "last_day": overview.get("last_day"),
+                        "checked_days": overview.get("days_total"),
+                        "missing_days": overview.get("missing_days"),
+                        "missing_segments_total": overview.get("missing_segments"),
+                        "missing_half_seconds_total": overview.get("missing_half_seconds"),
+                        "expected_seconds_strict_total": overview.get("expected_seconds_strict_total"),
+                        "total_segments": overview.get("total_segments"),
+                        "max_gap_s": overview.get("max_gap_s"),
+                        "gap_threshold_s": overview.get("gap_threshold_s"),
+                        "cadence_mode": latest.get("cadence_mode"),
+                        "two_plus_ratio": latest.get("two_plus_ratio"),
+                        "last_run": latest.get("updated_at"),
+                    }
+                rep = read_latest_validation_report(
+                    runs_dir=runs_dir,
+                    exchange="SHFE",
+                    variety=coverage_var,
+                    derived_symbol=coverage_symbol,
+                )
+                if rep and rep.get("_path"):
+                    out["main_l5_validation"]["report_name"] = Path(str(rep.get("_path"))).name
+                if rep.get("created_at") and not out["main_l5_validation"].get("last_run"):
+                    out["main_l5_validation"]["last_run"] = rep.get("created_at")
+                    for key in ("max_gap_s", "gap_threshold_s", "seconds_with_one_tick_total"):
+                        if key in rep and key not in out["main_l5_validation"]:
+                            out["main_l5_validation"][key] = rep.get(key)
+            except Exception as e:
+                out["validation_error"] = str(e)
+            return out
+
+
+        if reports is None:
+            tasks["reports"] = _load_reports
+        if questdb is None:
+            tasks["questdb"] = _load_questdb_status
+        if coverage_payload is None:
+            tasks["coverage"] = _load_coverage
+        if validation_payload is None:
+            tasks["validation"] = _load_validation
+
+        if tasks:
+            with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as executor:
+                future_map = {executor.submit(fn): name for name, fn in tasks.items()}
+                for fut in as_completed(future_map):
+                    name = future_map[fut]
+                    try:
+                        result = fut.result()
+                    except Exception as e:
+                        result = {"error": str(e)}
+                    if name == "reports":
+                        reports = result if isinstance(result, list) else []
+                        _data_page_cache_set("data_page:audit_reports", reports)
+                    elif name == "questdb":
+                        questdb = result if isinstance(result, dict) else {"ok": False, "error": "invalid"}
+                        _data_page_cache_set("data_page:questdb_status", questdb)
+                    elif name == "coverage":
+                        coverage_payload = result if isinstance(result, dict) else {}
+                        _data_page_cache_set(f"data_page:coverage:{coverage_symbol}", coverage_payload)
+                    elif name == "validation":
+                        validation_payload = result if isinstance(result, dict) else {}
+                        _data_page_cache_set(f"data_page:validation:{coverage_symbol}", validation_payload)
+
+        if reports is None:
+            reports = []
+        if questdb is None:
+            questdb = {"ok": False, "error": "questdb unavailable"}
+        if coverage_payload is not None:
+            main_schedule_coverage = dict((coverage_payload or {}).get("main_schedule_coverage") or {})
+            main_l5_coverage = dict((coverage_payload or {}).get("main_l5_coverage") or {})
+            coverage_error = str((coverage_payload or {}).get("coverage_error") or "")
+        if validation_payload is not None:
+            main_l5_validation = dict((validation_payload or {}).get("main_l5_validation") or {})
+            validation_error = str((validation_payload or {}).get("validation_error") or "")
+
+        try:
+            log.debug(
+                "data_page.timing",
+                coverage_symbol=coverage_symbol,
+                cache_hits=int(
+                    sum(
+                        1
+                        for k in (
+                            reports is not None,
+                            questdb is not None,
+                            coverage_payload is not None,
+                            validation_payload is not None,
+                        )
+                        if k
+                    )
+                ),
+                ms=int((time.time() - t0) * 1000),
+            )
+        except Exception:
+            pass
 
         # TqSdk scheduler settings (max parallel heavy jobs)
         tqsdk_scheduler = get_tqsdk_scheduler_state(runs_dir=runs_dir)
@@ -956,9 +1217,18 @@ def build_router() -> Any:
                 "questdb": questdb,
                 "locks": locks,
                 "reports": reports,
-                "default_schedule_start": default_schedule_start,
-                "default_schedule_end": default_schedule_end,
+                "l5_start_date": l5_start_date,
+                "l5_start_error": l5_start_error,
+                "latest_trading_day": latest_trading_day,
+                "latest_trading_error": latest_trading_error,
                 "tqsdk_scheduler": tqsdk_scheduler,
+                "coverage_var": coverage_var,
+                "coverage_symbol": coverage_symbol,
+                "main_schedule_coverage": main_schedule_coverage,
+                "main_l5_coverage": main_l5_coverage,
+                "coverage_error": coverage_error,
+                "main_l5_validation": main_l5_validation,
+                "validation_error": validation_error,
             },
         )
 

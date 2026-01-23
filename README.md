@@ -228,8 +228,13 @@ Configure connection (see `env.example`):
 Common flows:
 
 ```bash
-# Build main schedule from TqSdk KQ.m@ mapping
-ghtrader main-schedule --var cu --start 2015-01-01 --end 2026-01-01
+# Probe L5 start (manual) and copy the env line
+ghtrader data l5-start --exchange SHFE --var cu
+# Then set in .env:
+#   GHTRADER_L5_START_DATE=YYYY-MM-DD
+
+# Build main schedule from TqSdk KQ.m@ mapping (uses env start → latest trading day)
+ghtrader main-schedule --var cu
 
 # Build derived main_l5 ticks for the continuous alias (writes to QuestDB)
 ghtrader main-l5 --var cu --symbol KQ.m@SHFE.cu

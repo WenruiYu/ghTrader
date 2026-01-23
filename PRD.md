@@ -237,6 +237,28 @@ dashboards are deferred until Phase-1/2.
 Phase-0 focuses on **main_l5 correctness only**:
 - Each `main_l5` row includes `underlying_contract`, `segment_id`, and `schedule_hash`.
 - Ingest writes a manifest under `data/manifests/` for reproducibility.
+- **Main_l5 validation (Phase-0)**:
+  - Validate coverage against **actual trading sessions** (night sessions + holidays) using cached `trading_time` from TqSdk.
+  - Respect **exchange-level session overrides**:
+    - Skip night sessions during known suspension windows (e.g., SHFE night trading suspended from 2020-02-03 through 2020-05-06) in addition to holiday-gap skips.
+    - Handle **one-off delayed night opens** (e.g., SHFE 2019-12-25 delay to 22:30, applied to the 2019-12-26 trading day) by shifting the expected night-session start.
+  - **Hybrid cadence detection** (per trading day):\n    - If `seconds_with_two_plus / seconds_with_ticks >= strict_ratio`, treat day as **fixed 0.5s cadence** and enforce per-second frequency (2 ticks/sec, boundary seconds tolerant).\n    - Otherwise treat as **event-driven** and only flag gaps above a threshold.
+  - **Gap threshold**: gaps shorter than `gap_threshold_s` are ignored to avoid false positives from natural sparsity.
+  - **Detect + report only** (no auto-repair): missing segments (>= threshold), missing half-seconds (strict days), and summary counts.
+  - **Best-effort source attribution**: mark gaps as TqSdk-source when provider returns no data; otherwise `unknown`.
+  - Persist to QuestDB:\n    - Summary table: `ghtrader_main_l5_validate_summary_v2` (symbol + trading_day + cadence stats + gap counts)\n    - Gap detail table: `ghtrader_main_l5_validate_gaps_v2` (per-gap rows; capped per day)\n  - Write a validation report under `runs/control/reports/main_l5_validate/` and surface a summary in `/data`.
+#### 5.3.0.2a Update semantics (Phase-0, safe + idempotent)
+
+- **main_schedule**:
+  - If the computed schedule hash and latest trading day match what is already stored for `(exchange, variety)`, the build is a **no-op**.
+  - Otherwise, rebuild by clearing the existing schedule for that `(exchange, variety)` and writing the new schedule.
+- **main_l5**:
+  - Default behavior is **full rebuild** (clear then re-ingest).
+  - Optional **incremental update** mode may backfill only missing trading days **only if** the schedule hash matches the stored rows.
+  - If the stored schedule hash differs or multiple hashes exist for the same derived symbol, a full rebuild is required.
+- **Idempotence**:
+  - QuestDB tables use DEDUP UPSERT KEYS with `row_hash` so re-ingest does not create duplicates.
+  - Update runs should emit a lightweight report under `runs/control/reports/` with expected days vs present days, plus a coverage watermark (last trading day + last tick timestamp).
 
 All index/no‑data tables, diagnose/repair/health, and audit are **Phase‑1/2 deferred**.
 
@@ -337,6 +359,7 @@ Definition:
 - The derived symbol is named like the continuous series (e.g. `KQ.m@SHFE.cu`), but it is **materialized** from L5 ticks of the underlying contract selected by the roll schedule (§5.3.2).
 - Output is written to QuestDB table `ghtrader_ticks_main_l5_v2` (`ticks_kind='main_l5'`, `dataset_version='v2'`).
 - Provenance must be recorded (schedule hash, underlying contracts used, row counts per day).
+- **L5-only guarantee**: `main_l5` must contain **only true L5 rows** (levels 2–5 present). Any L1-only rows are filtered out, and any trading day with zero L5 rows is skipped.
 
 Segment metadata contract (required for correctness):
 
@@ -378,6 +401,14 @@ Primary rule (TqSdk main mapping):
 Coverage constraints:
 - For the “main-with-depth” dataset, the effective schedule range must start at the earliest date where the main contract has **true L5** available (levels 2–5 non-null/non-NaN), to avoid mixing L1-only eras into depth-model training.
 - Days outside the L5-available era are excluded from `main_l5`.
+- **Manual L5 start (Phase‑0)**:
+  - Operator runs `ghtrader data l5-start --exchange SHFE --var cu` to probe TqSdk L5 availability and write a report under `runs/control/reports/l5_start/`.
+  - Operator **sets `GHTRADER_L5_START_DATE=YYYY-MM-DD` in `.env`** (global) based on the report.
+  - `ghtrader main-schedule` **always reads `GHTRADER_L5_START_DATE`** as its start date and **builds through the latest trading day** (no CLI/UI date inputs).
+  - When the env value changes, schedule and `main_l5` must be rebuilt to reflect the new range.
+- **Schedule alignment (Phase-0)**:
+  - After `main_l5` builds, align `main_schedule` start to the **actual first L5 trading day** derived from the earliest tick timestamp (night-session aware).
+  - Drop earlier schedule rows while keeping the original `schedule_hash` stable for the remaining rows.
 
 Implementation:
 - `src/ghtrader/tq/main_schedule.py` (TqSdk backtest + `underlying_symbol` events)
@@ -2057,6 +2088,7 @@ Core commands (Phase‑0 data pipeline):
 
 - `ghtrader main-schedule`
 - `ghtrader main-l5`
+- `ghtrader data l5-start` (manual probe to set `GHTRADER_L5_START_DATE`)
 
 Optional (Phase‑1/2):
 - `ghtrader build`, `ghtrader train`, `ghtrader backtest`, `ghtrader paper`

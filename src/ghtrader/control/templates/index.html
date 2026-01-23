@@ -99,10 +99,10 @@
     <div class="grid4">
       <form method="post" action="/data/build/main_schedule{{ token_qs }}">
         <input type="hidden" name="variety" value="cu"/>
-        <input type="hidden" name="start_date" value="{{ default_schedule_start }}"/>
-        <input type="hidden" name="end_date" value="{{ default_schedule_end }}"/>
         <input type="hidden" name="data_dir" value="data"/>
-        <button type="submit" class="btn btn-secondary" style="width:100%;">Build Schedule (cu)</button>
+        <input type="hidden" name="start_date" value="{{ l5_start_date or '' }}"/>
+        <input type="hidden" name="end_date" value="{{ latest_trading_day or '' }}"/>
+        <button type="submit" class="btn btn-secondary" style="width:100%;">Build Schedule (env)</button>
       </form>
       <form method="post" action="/data/build/main_l5{{ token_qs }}">
         <input type="hidden" name="variety" value="cu"/>

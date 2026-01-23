@@ -106,6 +106,45 @@ def download_main_l5_for_days(
     auth = get_tqsdk_auth()
     api = TqApi(auth=auth)
 
+    def _is_maintenance_error(text: str) -> bool:
+        if not text:
+            return False
+        lowered = text.lower()
+        return "maintenance" in lowered or "运维" in text or "维护" in text
+
+    def _new_api() -> TqApi:
+        return TqApi(auth=auth)
+
+    def _reset_api(reason: str, err: str) -> None:
+        nonlocal api
+        try:
+            api.close()
+        except Exception:
+            pass
+        api = _new_api()
+        log.info("tq_main_l5.api_reset", reason=reason, error=str(err))
+
+    try:
+        retry_max = int(os.environ.get("GHTRADER_TQ_RETRY_MAX", "3") or "3")
+    except Exception:
+        retry_max = 3
+    retry_max = max(0, int(retry_max))
+    try:
+        retry_base_s = float(os.environ.get("GHTRADER_TQ_RETRY_BASE_S", "10") or "10")
+    except Exception:
+        retry_base_s = 10.0
+    retry_base_s = max(0.0, float(retry_base_s))
+    try:
+        retry_max_s = float(os.environ.get("GHTRADER_TQ_RETRY_MAX_S", "300") or "300")
+    except Exception:
+        retry_max_s = 300.0
+    retry_max_s = max(retry_base_s, float(retry_max_s))
+    try:
+        maintenance_wait_s = float(os.environ.get("GHTRADER_TQ_MAINTENANCE_WAIT_S", "2100") or "2100")
+    except Exception:
+        maintenance_wait_s = 2100.0
+    maintenance_wait_s = max(0.0, float(maintenance_wait_s))
+
     row_counts: dict[str, int] = {}
     unique_days = sorted(set(trading_days))
     days_total = int(len(unique_days))
@@ -139,11 +178,50 @@ def download_main_l5_for_days(
                 day_index=int(idx),
                 days_total=int(days_total),
             )
-            df = api.get_tick_data_series(
-                symbol=underlying_symbol,
-                start_dt=day,
-                end_dt=day + timedelta(days=1),
-            )
+            attempts = 0
+            while True:
+                try:
+                    df = api.get_tick_data_series(
+                        symbol=underlying_symbol,
+                        start_dt=day,
+                        end_dt=day + timedelta(days=1),
+                    )
+                    break
+                except Exception as e:
+                    err = str(e)
+                    if maintenance_wait_s > 0 and _is_maintenance_error(err):
+                        log.warning(
+                            "tq_main_l5.maintenance_wait",
+                            symbol=underlying_symbol,
+                            day=day.isoformat(),
+                            wait_s=float(maintenance_wait_s),
+                            error=err,
+                        )
+                        _reset_api("maintenance", err)
+                        time.sleep(float(maintenance_wait_s))
+                        continue
+                    attempts += 1
+                    if attempts > retry_max:
+                        log.error(
+                            "tq_main_l5.download_day_failed",
+                            symbol=underlying_symbol,
+                            day=day.isoformat(),
+                            attempts=int(attempts),
+                            error=err,
+                        )
+                        raise
+                    wait_s = min(retry_max_s, retry_base_s * (2 ** (attempts - 1)))
+                    log.warning(
+                        "tq_main_l5.download_day_retry",
+                        symbol=underlying_symbol,
+                        day=day.isoformat(),
+                        attempt=int(attempts),
+                        wait_s=float(wait_s),
+                        error=err,
+                    )
+                    _reset_api("retry", err)
+                    if wait_s > 0:
+                        time.sleep(float(wait_s))
             if df.empty:
                 row_counts[day.isoformat()] = 0
                 log.info(
@@ -161,6 +239,36 @@ def download_main_l5_for_days(
             for col in TICK_COLUMN_NAMES:
                 if col not in df.columns:
                     df[col] = float("nan")
+
+            rows_before = int(len(df))
+            try:
+                from ghtrader.util.l5_detection import l5_mask_df
+
+                mask = l5_mask_df(df)
+            except Exception:
+                mask = None
+
+            if mask is not None:
+                l5_rows = int(mask.sum())
+                if l5_rows <= 0:
+                    row_counts[day.isoformat()] = 0
+                    log.info(
+                        "tq_main_l5.download_day_skipped_l1",
+                        symbol=underlying_symbol,
+                        day=day.isoformat(),
+                        day_index=int(idx),
+                        days_total=int(days_total),
+                        rows_total=int(total_rows),
+                    )
+                    continue
+                df = df.loc[mask].copy()
+                log.debug(
+                    "tq_main_l5.download_day_filtered",
+                    symbol=underlying_symbol,
+                    day=day.isoformat(),
+                    l5_rows=int(l5_rows),
+                    rows_before=int(rows_before),
+                )
 
             out = _questdb_df_for_main_l5(
                 df=df,

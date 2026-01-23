@@ -1,41 +1,359 @@
 {% extends "base.html" %}
 
 {% block content %}
-<div class="page">
-  <div class="section-header mb-2">
-    <h2 class="mb-0">Data Hub</h2>
-    <div class="muted text-sm">Main schedule → main_l5 only</div>
+<div class="page page--ops page--data">
+  <div class="page-head">
+    <div>
+      <div class="page-subtitle">Data Pipeline</div>
+      <h2 class="page-title">Data Hub</h2>
+      <div class="muted text-sm">Main schedule → main_l5 only</div>
+    </div>
+    <div class="page-meta">
+      {% if questdb.ok %}
+        <span class="status-indicator status-indicator-ok">
+          <span class="status-dot status-dot-ok"></span>QuestDB OK
+        </span>
+      {% else %}
+        <span class="status-indicator status-indicator-error" title="{{ questdb.error or '' }}">
+          <span class="status-dot status-dot-error"></span>QuestDB error
+        </span>
+      {% endif %}
+      <span class="pill pill-running">running {{ running_count }}</span>
+      <span class="pill pill-queued">queued {{ queued_count }}</span>
+      <a class="btn btn-secondary btn-sm" href="/jobs{{ token_qs }}">Jobs</a>
+    </div>
   </div>
 
-  <div class="card mb-3">
-    <h3 class="mb-2">Build Schedule</h3>
-    <p class="muted text-sm mb-2">Use TqSdk KQ.m@ mapping to generate the daily main contract schedule.</p>
-    <form class="form" method="post" action="/data/build/main_schedule{{ token_qs }}">
-      <div class="grid3">
-        <div><label>Variety</label><input name="variety" value="cu"/></div>
-        <div><label>Start date</label><input name="start_date" value="{{ default_schedule_start }}"/></div>
-        <div><label>End date</label><input name="end_date" value="{{ default_schedule_end }}"/></div>
+  <div class="kpi-grid">
+    <div class="kpi-card">
+      <div class="kpiLabel">Running jobs</div>
+      <div class="kpiValue">{{ running_count }}</div>
+      <div class="kpiSubtext">Active data tasks</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpiLabel">Queued jobs</div>
+      <div class="kpiValue">{{ queued_count }}</div>
+      <div class="kpiSubtext">Waiting for locks</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpiLabel">Active locks</div>
+      <div class="kpiValue">{{ locks | length }}</div>
+      <div class="kpiSubtext">Concurrency guards</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpiLabel">TqSdk parallelism</div>
+      <div class="kpiValue">{{ tqsdk_scheduler.max_parallel }}</div>
+      <div class="kpiSubtext">Source: {{ tqsdk_scheduler.source }}</div>
+    </div>
+  </div>
+
+  <div class="card card--accent">
+    <div class="card-title">
+      <span>Pipeline flow</span>
+      <small>Schedule → L5 → main_l5</small>
+    </div>
+    <div class="pipeline-flow">
+      <div class="pipeline-step pipeline-step-ok">
+        <div class="pipeline-step-icon">①</div>
+        <div class="pipeline-step-label">Schedule</div>
+        <div class="pipeline-step-status">KQ.m@ mapping</div>
       </div>
-      <div class="grid2">
-        <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+      <div class="pipeline-arrow"></div>
+      <div class="pipeline-step pipeline-step-warn">
+        <div class="pipeline-step-icon">②</div>
+        <div class="pipeline-step-label">Download L5</div>
+        <div class="pipeline-step-status">per trading day</div>
       </div>
-      <button type="submit">Build Schedule</button>
-    </form>
+      <div class="pipeline-arrow"></div>
+      <div class="pipeline-step pipeline-step-ok">
+        <div class="pipeline-step-icon">③</div>
+        <div class="pipeline-step-label">main_l5</div>
+        <div class="pipeline-step-status">QuestDB</div>
+      </div>
+      <div class="pipeline-arrow"></div>
+      <div class="pipeline-step">
+        <div class="pipeline-step-icon">④</div>
+        <div class="pipeline-step-label">Use</div>
+        <div class="pipeline-step-status">features/labels</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="split-pane">
+    <div class="card">
+      <div class="card-title">
+        <span>Build Schedule</span>
+        <small>KQ.m@ → underlying</small>
+      </div>
+      <p class="muted text-sm mb-2">Uses <span class="mono">GHTRADER_L5_START_DATE</span> → latest trading day.</p>
+      <form class="form" method="post" action="/data/build/main_schedule{{ token_qs }}">
+        <input type="hidden" name="start_date" value="{{ l5_start_date or '' }}"/>
+        <input type="hidden" name="end_date" value="{{ latest_trading_day or '' }}"/>
+        <div class="grid3">
+          <div><label>Variety</label><input name="variety" value="cu"/></div>
+          <div><label>L5 start (env)</label><input value="{{ l5_start_date or '' }}" readonly/></div>
+          <div><label>End (latest trading day)</label><input value="{{ latest_trading_day or '' }}" readonly/></div>
+        </div>
+        {% if l5_start_error %}
+          <div class="hint">{{ l5_start_error }}</div>
+        {% endif %}
+        {% if latest_trading_error %}
+          <div class="hint">{{ latest_trading_error }}</div>
+        {% endif %}
+        <div class="grid2">
+          <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+        </div>
+        <button type="submit">Build Schedule</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span>Build main_l5</span>
+        <small>Schedule-driven backfill</small>
+      </div>
+      <p class="muted text-sm mb-2">Download per-day L5 from the schedule and write main_l5 in QuestDB.</p>
+      <form class="form" method="post" action="/data/build/main_l5{{ token_qs }}">
+        <div class="grid2">
+          <div><label>Variety</label><input name="variety" value="cu"/></div>
+          <div><label>Derived symbol</label><input name="derived_symbol" value="KQ.m@SHFE.cu"/></div>
+        </div>
+        <div class="grid2">
+          <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+          <div>
+            <label><input type="checkbox" name="update_mode" value="1"/> Update only missing days</label>
+            <div class="hint">Skips days already present when schedule hash matches.</div>
+          </div>
+        </div>
+        <button type="submit">Build main_l5</button>
+      </form>
+      <div class="card-title" style="margin-top:16px;">
+        <span>Coverage watermark</span>
+        <small>QuestDB</small>
+      </div>
+      <div class="kv-list">
+        <div class="kv-k">main_l5 symbol</div><div class="kv-v">{{ coverage_symbol }}</div>
+        <div class="kv-k">main_l5 last day</div><div class="kv-v">{{ main_l5_coverage.last_day or "--" }}</div>
+        <div class="kv-k">main_l5 last ts</div><div class="kv-v">{{ main_l5_coverage.last_ts or "--" }}</div>
+        <div class="kv-k">main_l5 days</div><div class="kv-v">{{ main_l5_coverage.n_days or "--" }}</div>
+        <div class="kv-k">schedule last day</div><div class="kv-v">{{ main_schedule_coverage.last_day or "--" }}</div>
+        <div class="kv-k">schedule days</div><div class="kv-v">{{ main_schedule_coverage.n_days or "--" }}</div>
+        <div class="kv-k">schedule hash</div>
+        <div class="kv-v">
+          {% if main_schedule_coverage.schedule_hashes %}
+            {{ main_schedule_coverage.schedule_hashes | join(", ") }}
+          {% else %}
+            --
+          {% endif %}
+        </div>
+      </div>
+      {% if coverage_error %}
+        <div class="hint">{{ coverage_error }}</div>
+      {% endif %}
+    </div>
   </div>
 
   <div class="card">
-    <h3 class="mb-2">Build main_l5</h3>
-    <p class="muted text-sm mb-2">Download per-day L5 from the schedule and write `main_l5` in QuestDB.</p>
-    <form class="form" method="post" action="/data/build/main_l5{{ token_qs }}">
-      <div class="grid2">
+    <div class="card-title">
+      <span>Validate main_l5</span>
+      <small>Session coverage + per-second checks</small>
+    </div>
+    <p class="muted text-sm mb-2">Writes a report under <span class="mono">runs/control/reports/main_l5_validate/</span>.</p>
+    <form class="form" id="mainL5ValidateForm">
+      <div class="grid3">
+        <div><label>Exchange</label><input name="exchange" value="SHFE"/></div>
         <div><label>Variety</label><input name="variety" value="cu"/></div>
         <div><label>Derived symbol</label><input name="derived_symbol" value="KQ.m@SHFE.cu"/></div>
       </div>
+      <div class="grid3">
+        <div><label>Start (optional)</label><input name="start" placeholder="YYYY-MM-DD"/></div>
+        <div><label>End (optional)</label><input name="end" placeholder="YYYY-MM-DD"/></div>
+        <div>
+          <label><input type="checkbox" name="tqsdk_check" value="1" checked/> Check TqSdk source</label>
+          <div class="hint">Limited to a small number of gaps.</div>
+        </div>
+      </div>
       <div class="grid2">
         <div><label>Data dir</label><input name="data_dir" value="data"/></div>
+        <div><label>Runs dir</label><input name="runs_dir" value="runs"/></div>
       </div>
-      <button type="submit">Build main_l5</button>
+      <button type="submit">Validate main_l5</button>
+    </form>
+    <div class="card-title" style="margin-top:16px;">
+      <span>Validation summary</span>
+      <small>Latest report</small>
+    </div>
+    <div class="kv-list">
+      <div class="kv-k">Status</div><div class="kv-v">{{ main_l5_validation.status or "--" }}</div>
+      <div class="kv-k">Last validate</div><div class="kv-v">{{ main_l5_validation.last_run or "--" }}</div>
+      <div class="kv-k">Last day</div><div class="kv-v">{{ main_l5_validation.last_day or "--" }}</div>
+      <div class="kv-k">Checked days</div><div class="kv-v">{{ main_l5_validation.checked_days or "--" }}</div>
+      <div class="kv-k">Cadence mode</div><div class="kv-v">{{ main_l5_validation.cadence_mode or "--" }}</div>
+      <div class="kv-k">Two+ ticks ratio</div><div class="kv-v">{{ ("%.3f" | format(main_l5_validation.get("two_plus_ratio"))) if main_l5_validation.get("two_plus_ratio") is not none else "--" }}</div>
+      <div class="kv-k">Missing days</div>
+      <div class="kv-v">
+        {% if main_l5_validation.checked_days %}
+          {{ main_l5_validation.missing_days or 0 }} / {{ main_l5_validation.checked_days }}
+        {% else %}
+          --
+        {% endif %}
+      </div>
+      <div class="kv-k">Missing segments</div>
+      <div class="kv-v">
+        {% if main_l5_validation.total_segments %}
+          {{ main_l5_validation.missing_segments_total or 0 }} / {{ main_l5_validation.total_segments }}
+        {% else %}
+          {{ main_l5_validation.missing_segments_total or "--" }}
+        {% endif %}
+      </div>
+      {% if main_l5_validation.get("cadence_mode") == "event" %}
+        <div class="kv-k">Seconds with 1 tick</div><div class="kv-v">{{ main_l5_validation.seconds_with_one_tick_total or "--" }}</div>
+      {% else %}
+        <div class="kv-k">Missing half-seconds</div>
+        <div class="kv-v">
+          {% if main_l5_validation.expected_seconds_strict_total %}
+            {{ main_l5_validation.missing_half_seconds_total or 0 }} / {{ main_l5_validation.expected_seconds_strict_total }}
+          {% else %}
+            {{ main_l5_validation.missing_half_seconds_total or "--" }}
+          {% endif %}
+        </div>
+      {% endif %}
+      <div class="kv-k">Max gap (s)</div><div class="kv-v">{{ main_l5_validation.max_gap_s or "--" }}</div>
+      <div class="kv-k">Gap threshold (s)</div><div class="kv-v">{{ main_l5_validation.gap_threshold_s or "--" }}</div>
+      <div class="kv-k">TqSdk missing segs</div>
+      <div class="kv-v">{{ (main_l5_validation.get("tqsdk_check") or {}).get("provider_missing_segments") or "--" }}</div>
+    </div>
+    {% if main_l5_validation.report_name %}
+      <a class="btn btn-secondary btn-sm" href="/data/main-l5-validate/report/{{ main_l5_validation.report_name }}{{ token_qs }}">View report</a>
+    {% endif %}
+    <a class="btn btn-secondary btn-sm" href="/api/data/main-l5-validate-gaps?exchange=SHFE&var={{ coverage_var }}&symbol={{ coverage_symbol }}{{ token_qs | replace('?', '&') }}">View gaps</a>
+    {% if validation_error %}
+      <div class="hint">{{ validation_error }}</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-title">
+      <span>Manual L5 start probe</span>
+      <small>Write report + copy env line</small>
+    </div>
+    <p class="muted text-sm mb-2">Runs a probe job and writes a report under <span class="mono">runs/control/reports/l5_start/</span>.</p>
+    <form class="form" id="l5StartForm">
+      <div class="grid3">
+        <div><label>Exchange</label><input name="exchange" value="SHFE"/></div>
+        <div><label>Variety</label><input name="variety" value="cu"/></div>
+        <div>
+          <label><input type="checkbox" name="refresh_catalog" value="1"/> Refresh catalog</label>
+          <div class="hint">Force TqSdk catalog refresh (network)</div>
+        </div>
+      </div>
+      <button type="submit">Probe L5 start</button>
     </form>
   </div>
+
+  <div class="split-pane split-pane-2-1">
+    <div class="card">
+      <div class="card-title">
+        <span>QuestDB</span>
+        <small>PGWire + ILP</small>
+      </div>
+      <div class="kv-list">
+        <div class="kv-k">Host</div><div class="kv-v">{{ questdb.host or "--" }}</div>
+        <div class="kv-k">PG port</div><div class="kv-v">{{ questdb.pg_port or "--" }}</div>
+        <div class="kv-k">ILP port</div><div class="kv-v">{{ questdb.ilp_port or "--" }}</div>
+        <div class="kv-k">Dataset</div><div class="kv-v">main_l5 ({{ dataset_version }})</div>
+      </div>
+      {% if questdb.error %}
+        <div class="muted text-sm" style="margin-top:8px;">{{ questdb.error }}</div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span>Active locks</span>
+        <small>{{ locks | length }}</small>
+      </div>
+      {% if locks %}
+        <ul class="list-compact">
+          {% for lk in locks %}
+            <li>
+              <span class="mono">{{ lk.key }}</span>
+              <span class="muted text-xs">job {{ lk.job_id }} · pid {{ lk.pid }}</span>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <div class="empty-state">
+          <div class="empty-state-title">No active locks</div>
+          <div class="empty-state-text">Nothing is blocking schedule or main_l5 jobs right now.</div>
+        </div>
+      {% endif %}
+    </div>
+  </div>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function() {
+    const form = document.getElementById("l5StartForm");
+    if (!form) return;
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const exchange = String(form.querySelector('input[name="exchange"]')?.value || "SHFE").trim();
+      const variety = String(form.querySelector('input[name="variety"]')?.value || "cu").trim();
+      const refresh = form.querySelector('input[name="refresh_catalog"]')?.checked || false;
+      try {
+        const res = await window.ghTrader.postJson("/api/data/enqueue-l5-start", {
+          exchange,
+          var: variety,
+          refresh_catalog: refresh,
+        });
+        const id = (res.enqueued && res.enqueued.length > 0) ? res.enqueued[0] : "";
+        if (id) {
+          window.location.href = window.ghTrader.withToken(`/jobs/${id}`);
+        } else {
+          window.ghTrader.toast("L5-start probe queued", "success");
+        }
+      } catch (e) {
+        window.ghTrader.toast(e && e.message ? e.message : "Failed to enqueue L5-start probe", "error");
+      }
+    });
+  })();
+  (function() {
+    const form = document.getElementById("mainL5ValidateForm");
+    if (!form) return;
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const exchange = String(form.querySelector('input[name="exchange"]')?.value || "SHFE").trim();
+      const variety = String(form.querySelector('input[name="variety"]')?.value || "cu").trim();
+      const derivedSymbol = String(form.querySelector('input[name="derived_symbol"]')?.value || "").trim();
+      const start = String(form.querySelector('input[name="start"]')?.value || "").trim();
+      const end = String(form.querySelector('input[name="end"]')?.value || "").trim();
+      const dataDir = String(form.querySelector('input[name="data_dir"]')?.value || "data").trim();
+      const runsDir = String(form.querySelector('input[name="runs_dir"]')?.value || "runs").trim();
+      const tqsdkCheck = form.querySelector('input[name="tqsdk_check"]')?.checked || false;
+      try {
+        const res = await window.ghTrader.postJson("/api/data/enqueue-main-l5-validate", {
+          exchange,
+          var: variety,
+          derived_symbol: derivedSymbol,
+          start: start || undefined,
+          end: end || undefined,
+          data_dir: dataDir,
+          runs_dir: runsDir,
+          tqsdk_check: tqsdkCheck,
+        });
+        const id = (res.enqueued && res.enqueued.length > 0) ? res.enqueued[0] : "";
+        if (id) {
+          window.location.href = window.ghTrader.withToken(`/jobs/${id}`);
+        } else {
+          window.ghTrader.toast("main_l5 validation queued", "success");
+        }
+      } catch (e) {
+        window.ghTrader.toast(e && e.message ? e.message : "Failed to enqueue main_l5 validation", "error");
+      }
+    });
+  })();
+</script>
 {% endblock %}

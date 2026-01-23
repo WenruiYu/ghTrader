@@ -2,6 +2,8 @@
    ghTrader Control UI (dependency-free)
    ------------------------------------------------------------------------- */
 
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap");
+
 * { box-sizing: border-box; }
 
 :root {
@@ -98,6 +100,104 @@ body {
   line-height: 1.35;
 }
 
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.page--ops {
+  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+}
+.page--ops .mono {
+  font-family: "IBM Plex Mono", var(--mono);
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.page-title {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 0.2px;
+}
+.page-subtitle {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--muted);
+}
+.page-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.card-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.card-title small {
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.card--accent {
+  border-left: 3px solid var(--link);
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.kv-list {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 6px 12px;
+  font-size: 12px;
+}
+.kv-k {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+}
+.kv-v { font-family: var(--mono); }
+
+.list-compact {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.list-compact li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed var(--border2);
+}
+.list-compact li:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
 a { color: var(--link); text-decoration: none; }
 a:hover { color: var(--link-hover); text-decoration: underline; }
 
@@ -167,6 +267,27 @@ h4 { margin: 14px 0 8px; font-size: 14px; }
   overflow: auto;
   background: var(--card);
 }
+.tableScrollTop {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-x: auto;
+  overflow-y: hidden;
+  background: var(--card);
+  height: 14px;
+  margin-bottom: 6px;
+}
+.tableScrollTopInner { height: 1px; }
+.table-wide {
+  min-width: 1200px;
+  width: max-content;
+}
+.table-wide th,
+.table-wide td {
+  white-space: nowrap;
+}
+.table-wide .cell-wrap {
+  white-space: normal;
+}
 .table {
   width: 100%;
   border-collapse: collapse;
@@ -186,6 +307,10 @@ h4 { margin: 14px 0 8px; font-size: 14px; }
 }
 .table tbody tr:nth-child(even) td { background: var(--row-alt); }
 .table tbody tr:hover td { background: var(--row-hover); }
+.table tbody tr[data-status="running"] td { background: var(--warn-bg); }
+.table tbody tr[data-status="queued"] td { background: var(--info-bg); }
+.table tbody tr[data-status="failed"] td { background: var(--bad-bg); }
+.table tbody tr[data-status="cancelled"] td { background: rgba(148, 163, 184, 0.12); }
 
 .rowCurrent td { background: var(--warn-bg) !important; }
 
@@ -216,6 +341,11 @@ h4 { margin: 14px 0 8px; font-size: 14px; }
 }
 .form input::placeholder, .form textarea::placeholder { color: var(--input-placeholder); }
 .form select[multiple] { padding: 8px; }
+.form .hint {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
 
 .btn, .form button {
   margin-top: 12px;

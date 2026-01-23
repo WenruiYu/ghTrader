@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import os
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +103,20 @@ def get_env(key: str, default: str | None = None, required: bool = False) -> str
             f"Please set it in your .env file or environment."
         )
     return value
+
+
+def get_l5_start_date() -> date:
+    """
+    Return the required global L5 start date from the environment.
+    """
+    load_config()
+    raw = str(get_env("GHTRADER_L5_START_DATE", "") or "").strip()
+    if not raw:
+        raise RuntimeError("Required environment variable GHTRADER_L5_START_DATE is not set.")
+    try:
+        return date.fromisoformat(raw[:10])
+    except Exception as e:
+        raise RuntimeError(f"Invalid GHTRADER_L5_START_DATE: {raw}") from e
 
 
 def get_tqsdk_auth() -> Any:

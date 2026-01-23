@@ -1,11 +1,28 @@
-"""
-Tests for the unified L5 detection module.
-"""
-
 from __future__ import annotations
 
+from datetime import date
 import pandas as pd
 import pytest
+
+from ghtrader.util.l5_detection import l5_mask_df
+
+
+def test_l5_mask_df_detects_rows() -> None:
+    df = pd.DataFrame(
+        {
+            "bid_price2": [0.0, 1.0, 0.0],
+            "ask_volume2": [0.0, 0.0, 0.0],
+        }
+    )
+    mask = l5_mask_df(df)
+    assert mask.tolist() == [False, True, False]
+
+
+def test_get_l5_start_date_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GHTRADER_L5_START_DATE", "2019-03-11")
+    from ghtrader.config import get_l5_start_date
+
+    assert get_l5_start_date() == date(2019, 3, 11)
 
 
 class TestL5Constants:
@@ -181,9 +198,9 @@ class TestL5SqlCondition:
         assert cond.startswith("(")
         assert cond.endswith(")")
         assert " OR " in cond
-        assert "bid_price2 > 0" in cond
-        assert "ask_price5 > 0" in cond
-        assert "bid_volume2 > 0" in cond
+        assert "coalesce(bid_price2, 0) > 0" in cond
+        assert "coalesce(ask_price5, 0) > 0" in cond
+        assert "coalesce(bid_volume2, 0) > 0" in cond
 
     def test_sql_case_expression(self):
         from ghtrader.util.l5_detection import l5_sql_case_expression

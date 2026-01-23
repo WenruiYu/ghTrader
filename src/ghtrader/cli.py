@@ -126,7 +126,8 @@ def _setup_logging(verbose: bool) -> None:
     env_level = os.environ.get("GHTRADER_LOG_LEVEL", "").strip().lower()
     env_verbose = os.environ.get("GHTRADER_JOB_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
     is_dashboard = os.environ.get("GHTRADER_JOB_SOURCE", "").strip() == "dashboard"
-    force_debug = bool(is_dashboard or env_verbose or env_level in {"debug", "trace"})
+    # Default to DEBUG unless explicitly overridden via GHTRADER_LOG_LEVEL.
+    force_debug = bool(is_dashboard or env_verbose or env_level in {"debug", "trace"} or env_level == "")
     if force_debug:
         level = logging.DEBUG
     elif env_level in {"warning", "warn"}:
@@ -172,12 +173,14 @@ def _start_job_heartbeat() -> None:
     global _heartbeat_thread
     if _heartbeat_thread and _heartbeat_thread.is_alive():
         return
-    if os.environ.get("GHTRADER_JOB_SOURCE", "").strip() != "dashboard":
+    if os.environ.get("GHTRADER_JOB_HEARTBEAT_DISABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
         return
     try:
         interval = float(os.environ.get("GHTRADER_JOB_HEARTBEAT_S", "15") or "15")
     except Exception:
         interval = 15.0
+    if interval <= 0:
+        return
     interval = max(2.0, float(interval))
     _heartbeat_stop.clear()
     log = structlog.get_logger()
@@ -850,8 +853,114 @@ def data_l5_start(
     """
     Compute first L5 trading day per symbol (QuestDB index-backed) and persist a report under runs/.
     """
-    _ = ctx, exchange, variety, symbols, refresh_catalog, data_dir, runs_dir, as_json
-    raise click.ClickException("data l5-start deferred (Phase-1/2)")
+    import json
+
+    from ghtrader.tq.l5_start import resolve_l5_start_date
+
+    _ = ctx, symbols
+    ex = str(exchange).upper().strip()
+    v = str(variety).lower().strip()
+    res = resolve_l5_start_date(
+        exchange=ex,
+        variety=v,
+        end=date.today(),
+        data_dir=Path(data_dir),
+        runs_dir=Path(runs_dir),
+        refresh=True,
+        refresh_catalog=bool(refresh_catalog),
+    )
+    payload = {
+        "ok": True,
+        "exchange": res.exchange,
+        "var": res.variety,
+        "l5_start_date": res.l5_start_date.isoformat(),
+        "l5_start_contract": res.l5_start_contract,
+        "source": res.source,
+        "created_at": res.created_at,
+        "cached_at_unix": res.cached_at_unix,
+        "contracts_checked": res.contracts_checked,
+        "probes_total": res.probes_total,
+        "env_line": f"GHTRADER_L5_START_DATE={res.l5_start_date.isoformat()}",
+    }
+    if as_json:
+        click.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        click.echo(f"{res.exchange}.{res.variety} l5_start_date={res.l5_start_date.isoformat()} source={res.source}")
+        click.echo(payload["env_line"])
+
+
+@data_group.command("main-l5-validate")
+@click.option("--exchange", default="SHFE", show_default=True, help="Exchange (e.g. SHFE)")
+@click.option("--var", "variety", default="cu", show_default=True, help="Variety code (e.g. cu)")
+@click.option("--symbol", "derived_symbol", default="", show_default=False, help="Derived symbol (default: KQ.m@EX.var)")
+@click.option("--start", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional start date (YYYY-MM-DD)")
+@click.option("--end", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional end date (YYYY-MM-DD)")
+@click.option("--tqsdk-check/--no-tqsdk-check", default=True, show_default=True, help="Check provider gaps via TqSdk (slow)")
+@click.option("--tqsdk-check-max-days", default=2, show_default=True, type=int, help="Max days to probe via TqSdk")
+@click.option("--tqsdk-check-max-segments", default=8, show_default=True, type=int, help="Max gap segments to probe per day")
+@click.option("--max-segments-per-day", default=200, show_default=True, type=int, help="Max gap segments stored per day")
+@click.option("--gap-threshold-s", default=None, type=float, help="Gap threshold in seconds for missing segments")
+@click.option("--strict-ratio", default=None, type=float, help="Min ratio of seconds with >=2 ticks for strict mode")
+@click.option("--data-dir", default="data", show_default=True, help="Data directory root")
+@click.option("--runs-dir", default="runs", show_default=True, help="Runs directory root")
+@click.option("--json", "as_json", is_flag=True, help="Print full JSON report")
+@click.pass_context
+def data_main_l5_validate(
+    ctx: click.Context,
+    exchange: str,
+    variety: str,
+    derived_symbol: str,
+    start: datetime | None,
+    end: datetime | None,
+    tqsdk_check: bool,
+    tqsdk_check_max_days: int,
+    tqsdk_check_max_segments: int,
+    max_segments_per_day: int,
+    gap_threshold_s: float | None,
+    strict_ratio: float | None,
+    data_dir: str,
+    runs_dir: str,
+    as_json: bool,
+) -> None:
+    """
+    Validate main_l5 coverage against trading sessions and per-second frequency.
+    """
+    import json
+
+    from ghtrader.data.main_l5_validation import validate_main_l5
+
+    _ = ctx
+    ex = str(exchange).upper().strip()
+    v = str(variety).lower().strip()
+    start_day = start.date() if start else None
+    end_day = end.date() if end else None
+    report, out_path = validate_main_l5(
+        exchange=ex,
+        variety=v,
+        derived_symbol=derived_symbol or None,
+        data_dir=Path(data_dir),
+        runs_dir=Path(runs_dir),
+        start_day=start_day,
+        end_day=end_day,
+        tqsdk_check=bool(tqsdk_check),
+        tqsdk_check_max_days=int(tqsdk_check_max_days),
+        tqsdk_check_max_segments=int(tqsdk_check_max_segments),
+        max_segments_per_day=int(max_segments_per_day),
+        gap_threshold_s=gap_threshold_s,
+        strict_ratio=strict_ratio,
+    )
+    if out_path:
+        report = dict(report)
+        report["_path"] = str(out_path)
+    if as_json:
+        click.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+    else:
+        click.echo(
+            f"main_l5 validate {ex}.{v} missing_days={report.get('missing_days')} "
+            f"missing_segments={report.get('missing_segments_total')} "
+            f"missing_half_seconds={report.get('missing_half_seconds_total')} "
+            f"report={str(out_path or '')}"
+        )
 # ---------------------------------------------------------------------------
 # account (broker account profiles; env-only)
 # ---------------------------------------------------------------------------
@@ -1509,15 +1618,11 @@ def dashboard(ctx: click.Context, host: str, port: int, reload: bool, token: str
 
 @main.command("main-schedule")
 @click.option("--var", "variety", required=True, type=str, help="Variety code (e.g., cu, au, ag)")
-@click.option("--start", required=True, type=click.DateTime(formats=["%Y-%m-%d"]), help="Start date (YYYY-MM-DD)")
-@click.option("--end", required=True, type=click.DateTime(formats=["%Y-%m-%d"]), help="End date (YYYY-MM-DD)")
 @click.option("--data-dir", default="data", help="Data directory root")
 @click.pass_context
 def main_schedule(
     ctx: click.Context,
     variety: str,
-    start: datetime,
-    end: datetime,
     data_dir: str,
 ) -> None:
     """Build a main-contract roll schedule (date -> underlying contract)."""
@@ -1527,8 +1632,6 @@ def main_schedule(
     _acquire_locks([f"main_schedule:var={variety.lower()}"])
     res = build_main_schedule(
         var=variety,
-        start=start.date(),
-        end=end.date(),
         data_dir=Path(data_dir),
     )
     log.info(
@@ -1552,12 +1655,14 @@ def main_schedule(
     help="Derived symbol (default: KQ.m@SHFE.<var>)",
 )
 @click.option("--data-dir", default="data", help="Data directory root")
+@click.option("--update", "update_mode", is_flag=True, help="Backfill missing days only (no full rebuild)")
 @click.pass_context
 def main_l5(
     ctx: click.Context,
     variety: str,
     derived_symbol: str,
     data_dir: str,
+    update_mode: bool,
 ) -> None:
     """Build derived main_l5 ticks from schedule + TqSdk L5 per-day download."""
     from ghtrader.data.main_l5 import build_main_l5
@@ -1571,6 +1676,7 @@ def main_l5(
         derived_symbol=ds,
         exchange="SHFE",
         data_dir=str(data_dir),
+        update_mode=bool(update_mode),
     )
     log.info(
         "main_l5.done",
@@ -1724,6 +1830,12 @@ def entrypoint() -> None:
     except Exception as e:
         exit_code = 1
         error = str(e)
+        try:
+            log = structlog.get_logger()
+            cmd = " ".join(sys.argv[1:]).strip() or "ghtrader"
+            log.exception("job.failed", job_id=job_id, cmd=cmd, error=error)
+        except Exception:
+            pass
     finally:
         _stop_job_heartbeat()
         # Release locks held by this job

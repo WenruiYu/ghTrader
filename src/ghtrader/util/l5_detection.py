@@ -42,42 +42,41 @@ L5_COLUMNS: tuple[str, ...] = L5_PRICE_COLUMNS + L5_VOLUME_COLUMNS
 # DataFrame-based detection
 # ---------------------------------------------------------------------------
 
+def l5_mask_df(df: "pd.DataFrame") -> "pd.Series":
+    """
+    Return a boolean mask for rows that contain true L5 depth data.
+
+    True L5 means at least one of levels 2-5 has positive, non-NaN values
+    for price or volume columns.
+    """
+    import pandas as pd
+
+    if df is None or df.empty:
+        return pd.Series([], dtype=bool)
+
+    mask = pd.Series([False] * len(df), index=df.index)
+    for col in L5_COLUMNS:
+        if col not in df.columns:
+            continue
+        try:
+            s = pd.to_numeric(df[col], errors="coerce")
+            mask = mask | (s > 0)
+        except Exception:
+            continue
+    return mask
+
+
 def has_l5_df(df: "pd.DataFrame") -> bool:
     """
     Check if a DataFrame contains true L5 depth data.
 
     True L5 means at least one of levels 2-5 has positive, non-NaN values
     for price or volume columns.
-
-    Args:
-        df: DataFrame with tick data (must have L5 columns)
-
-    Returns:
-        True if any L5 data is present, False otherwise
     """
-    import pandas as pd
-
-    for col in L5_PRICE_COLUMNS:
-        if col not in df.columns:
-            continue
-        try:
-            s = pd.to_numeric(df[col], errors="coerce")
-            if bool((s > 0).any()):
-                return True
-        except Exception:
-            continue
-
-    for col in L5_VOLUME_COLUMNS:
-        if col not in df.columns:
-            continue
-        try:
-            s = pd.to_numeric(df[col], errors="coerce")
-            if bool((s > 0).any()):
-                return True
-        except Exception:
-            continue
-
-    return False
+    try:
+        return bool(l5_mask_df(df).any())
+    except Exception:
+        return False
 
 
 def has_l5_row(row: dict) -> bool:
@@ -118,17 +117,10 @@ def count_l5_rows(df: "pd.DataFrame") -> int:
     """
     import pandas as pd
 
-    mask = pd.Series([False] * len(df), index=df.index)
-
-    for col in L5_COLUMNS:
-        if col not in df.columns:
-            continue
-        try:
-            s = pd.to_numeric(df[col], errors="coerce")
-            mask = mask | (s > 0)
-        except Exception:
-            continue
-
+    try:
+        mask = l5_mask_df(df)
+    except Exception:
+        mask = pd.Series([False] * len(df), index=df.index)
     return int(mask.sum())
 
 
@@ -148,7 +140,7 @@ def l5_sql_condition() -> str:
     """
     parts: list[str] = []
     for col in L5_COLUMNS:
-        parts.append(f"{col} > 0")
+        parts.append(f"coalesce({col}, 0) > 0")
     return "(" + " OR ".join(parts) + ")"
 
 

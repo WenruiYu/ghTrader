@@ -1,147 +1,210 @@
 {% extends "base.html" %}
 {% block content %}
-  <div class="section-header">
-    <h2>Jobs</h2>
-    <div class="section-header-actions">
-      <a class="btn btn-secondary btn-sm" href="/jobs{{ token_qs }}">Refresh</a>
+  {% set running_jobs = jobs | selectattr("status", "equalto", "running") | list %}
+  {% set queued_jobs = jobs | selectattr("status", "equalto", "queued") | list %}
+  {% set failed_jobs = jobs | selectattr("status", "equalto", "failed") | list %}
+  {% set succeeded_jobs = jobs | selectattr("status", "equalto", "succeeded") | list %}
+
+  <div class="page page--ops page--jobs">
+    <div class="page-head">
+      <div>
+        <div class="page-subtitle">Ops Console</div>
+        <h2 class="page-title">Jobs</h2>
+        <div class="muted text-sm">Subprocess jobs with streamed logs under <span class="mono">runs/control/logs/</span></div>
+      </div>
+      <div class="page-meta">
+        <span class="pill pill-running">running {{ running_jobs | length }}</span>
+        <span class="pill pill-queued">queued {{ queued_jobs | length }}</span>
+        <span class="pill pill-failed">failed {{ failed_jobs | length }}</span>
+        <a class="btn btn-secondary btn-sm" href="/jobs{{ token_qs }}">Refresh</a>
+      </div>
     </div>
-  </div>
 
-  <div class="card">
-    <h3>Start a job (quick)</h3>
-    <p class="muted">
-      Jobs run as subprocesses and stream logs to <span class="mono">runs/control/logs/</span>.
-      For full parameter control, prefer the Ops pages (Ingest/Build/Model/Eval/Trading).
-    </p>
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpiLabel">Running</div>
+        <div class="kpiValue">{{ running_jobs | length }}</div>
+        <div class="kpiSubtext">Active processes</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpiLabel">Queued</div>
+        <div class="kpiValue">{{ queued_jobs | length }}</div>
+        <div class="kpiSubtext">Waiting for locks</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpiLabel">Succeeded</div>
+        <div class="kpiValue">{{ succeeded_jobs | length }}</div>
+        <div class="kpiSubtext">Recent completions</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpiLabel">Failed</div>
+        <div class="kpiValue">{{ failed_jobs | length }}</div>
+        <div class="kpiSubtext">Needs attention</div>
+      </div>
+    </div>
 
-    <form class="form" method="post" action="/jobs/start{{ token_qs }}" id="startJobForm">
-      <label>Job type</label>
-      <select name="job_type" id="jobType">
-        <option value="build">build (labels+features)</option>
-        <option value="train">train</option>
-        <option value="benchmark">benchmark</option>
-        <option value="main_schedule">main-schedule (roll schedule)</option>
-        <option value="main_l5">main-l5 (derived ticks)</option>
-      </select>
-
-      <div class="grid2">
-        <div>
-          <label>Symbol / Variety</label>
-          <input name="symbol_or_var" id="symbolOrVar" placeholder="e.g. SHFE.cu2602 or cu"/>
+    <div class="split-pane split-pane-2-1">
+      <div class="card card--accent">
+        <div class="card-title">
+          <span>Start a job</span>
+          <small>Phase-0: schedule + main_l5</small>
         </div>
-        <div>
-          <label>Data dir</label>
-          <input name="data_dir" value="data"/>
-        </div>
+        <form class="form" method="post" action="/jobs/start{{ token_qs }}" id="startJobForm">
+          <label>Job type</label>
+          <select name="job_type" id="jobType">
+            <option value="main_schedule">main-schedule (Phase-0)</option>
+            <option value="main_l5">main-l5 (Phase-0)</option>
+            <option value="build">build (labels+features)</option>
+            <option value="train">train</option>
+            <option value="benchmark">benchmark</option>
+          </select>
+
+          <div class="grid2">
+            <div>
+              <label>Symbol / Variety</label>
+              <input name="symbol_or_var" id="symbolOrVar" placeholder="e.g. SHFE.cu2602 or cu"/>
+            </div>
+            <div>
+              <label>Data dir</label>
+              <input name="data_dir" value="data"/>
+            </div>
+          </div>
+
+          <details id="groupModel">
+            <summary>train / benchmark options</summary>
+            <div class="grid3">
+              <div>
+                <label>Model</label>
+                <input name="model" value="xgboost"/>
+              </div>
+              <div>
+                <label>Horizon</label>
+                <input name="horizon" value="50"/>
+              </div>
+              <div>
+                <label>Artifacts dir</label>
+                <input name="artifacts_dir" value="artifacts"/>
+              </div>
+            </div>
+          </details>
+
+          <details id="groupMainSchedule">
+            <summary>main-schedule options</summary>
+          <div class="grid2">
+            <div>
+              <label>L5 start (env)</label>
+              <input value="{{ l5_start_date or '' }}" readonly/>
+            </div>
+            <div>
+              <label>End (latest trading day)</label>
+              <input value="{{ latest_trading_day or '' }}" readonly/>
+            </div>
+          </div>
+          <div class="hint">Uses <span class="mono">GHTRADER_L5_START_DATE</span> and latest trading day.</div>
+          </details>
+
+          <details id="groupMainL5">
+            <summary>main-l5 options</summary>
+            <div class="grid2">
+              <div>
+                <label>Derived symbol</label>
+                <input name="derived_symbol" value="KQ.m@SHFE.cu"/>
+              </div>
+              <div>
+                <label>Overwrite</label>
+                <select name="overwrite">
+                  <option value="0" selected>no</option>
+                  <option value="1">yes</option>
+                </select>
+              </div>
+            </div>
+            <div class="grid2">
+              <div>
+                <label><input type="checkbox" name="update_mode" value="1"/> Update only missing days</label>
+                <div class="hint">Skips days already present when schedule hash matches.</div>
+              </div>
+            </div>
+          </details>
+
+          <button type="submit">Start</button>
+        </form>
       </div>
 
-
-      <details id="groupModel">
-        <summary>train / benchmark options</summary>
-        <div class="grid3">
-          <div>
-            <label>Model</label>
-            <input name="model" value="xgboost"/>
-          </div>
-          <div>
-            <label>Horizon</label>
-            <input name="horizon" value="50"/>
-          </div>
-          <div>
-            <label>Artifacts dir</label>
-            <input name="artifacts_dir" value="artifacts"/>
+      <div class="card">
+        <div class="card-title">
+          <span>Quick guidance</span>
+          <small>Ops shortcuts</small>
+        </div>
+        <div class="stack">
+          <div class="muted text-sm">Recommended flow for Phase-0:</div>
+          <ul class="list-compact">
+            <li>1) Build schedule</li>
+            <li>2) Build main_l5</li>
+            <li>3) Validate in SQL Explorer</li>
+          </ul>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <a class="btn btn-secondary btn-sm" href="/data{{ token_qs }}">Open Data Hub</a>
+            <a class="btn btn-secondary btn-sm" href="/explorer{{ token_qs }}">SQL Explorer</a>
           </div>
         </div>
-      </details>
-
-      <details id="groupMainSchedule">
-        <summary>main-schedule options</summary>
-        <div class="grid3">
-          <div>
-            <label>Start date</label>
-            <input name="start_date" placeholder="YYYY-MM-DD"/>
-          </div>
-          <div>
-            <label>End date</label>
-            <input name="end_date" placeholder="YYYY-MM-DD"/>
-          </div>
-          <div>
-            <label>Threshold</label>
-            <input name="threshold" value="1.1"/>
-          </div>
-        </div>
-      </details>
-
-      <details id="groupMainL5">
-        <summary>main-l5 options</summary>
-        <div class="grid2">
-          <div>
-            <label>Derived symbol</label>
-            <input name="derived_symbol" value="KQ.m@SHFE.cu"/>
-          </div>
-          <div>
-            <label>Overwrite</label>
-            <select name="overwrite">
-              <option value="0" selected>no</option>
-              <option value="1">yes</option>
-            </select>
-          </div>
-        </div>
-      </details>
-
-      <button type="submit">Start</button>
-    </form>
-  </div>
-
-  <h3>Recent jobs</h3>
-  <div class="card">
-    <div class="inlineControls">
-      <label for="jobsFilter">Filter</label>
-      <input id="jobsFilter" placeholder="Search id/title/source..."/>
-      <label for="statusFilter">Status</label>
-      <select id="statusFilter">
-        <option value="" selected>(any)</option>
-        <option value="running">running</option>
-        <option value="queued">queued</option>
-        <option value="succeeded">succeeded</option>
-        <option value="failed">failed</option>
-        <option value="cancelled">cancelled</option>
-      </select>
+      </div>
     </div>
-  </div>
 
-  <div class="tableWrap">
-    <table class="table" id="jobsTable">
-      <thead>
-        <tr>
-          <th>ID</th><th>Status</th><th>Source</th><th>Title</th><th>Locks</th><th>PID</th><th>Exit</th><th>Created</th><th></th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for j in jobs %}
-        <tr data-status="{{ j.status }}">
-          <td class="mono">{{ j.id }}</td>
-          <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
-          <td class="mono">{{ j.source or "" }}</td>
-          <td>{{ j.title }}</td>
-          <td class="mono">
-            {% if j.held_locks %}
-              <div class="muted">held</div>
-              {% for k in j.held_locks %}<div>{{ k }}</div>{% endfor %}
-            {% endif %}
-            {% if j.waiting_locks %}
-              <div class="muted" style="margin-top:6px;">waiting</div>
-              {% for k in j.waiting_locks %}<div>{{ k }}</div>{% endfor %}
-            {% endif %}
-          </td>
-          <td class="mono">{{ j.pid or "" }}</td>
-          <td class="mono">{{ j.exit_code if j.exit_code is not none else "" }}</td>
-          <td class="mono">{{ j.created_at }}</td>
-          <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="card">
+      <div class="inlineControls">
+        <label for="jobsFilter">Filter</label>
+        <input id="jobsFilter" placeholder="Search id/title/source..."/>
+        <label for="statusFilter">Status</label>
+        <select id="statusFilter">
+          <option value="" selected>(any)</option>
+          <option value="running">running</option>
+          <option value="queued">queued</option>
+          <option value="succeeded">succeeded</option>
+          <option value="failed">failed</option>
+          <option value="cancelled">cancelled</option>
+        </select>
+        <button type="button" class="btn btn-secondary btn-sm" id="clearFilters">Clear</button>
+      </div>
+    </div>
+
+    <div class="tableScrollTop" id="jobsTableScrollTop" aria-hidden="true">
+      <div class="tableScrollTopInner" id="jobsTableScrollTopInner"></div>
+    </div>
+    <div class="tableWrap" id="jobsTableWrap">
+      <table class="table table-compact table-wide" id="jobsTable">
+        <thead>
+          <tr>
+            <th>ID</th><th>Status</th><th>Source</th><th>Title</th><th>Locks</th><th>PID</th><th>Exit</th><th>Created</th><th>Started</th><th>Finished</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for j in jobs %}
+          <tr data-status="{{ j.status }}">
+            <td class="mono"><a class="mono" href="/jobs/{{ j.id }}{{ token_qs }}">{{ j.id }}</a></td>
+            <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
+            <td class="mono">{{ j.source or "" }}</td>
+            <td class="cell-wrap">{{ j.title }}</td>
+            <td class="mono cell-wrap">
+              {% if j.held_locks %}
+                <div class="muted">held</div>
+                {% for k in j.held_locks %}<div>{{ k }}</div>{% endfor %}
+              {% endif %}
+              {% if j.waiting_locks %}
+                <div class="muted" style="margin-top:6px;">waiting</div>
+                {% for k in j.waiting_locks %}<div>{{ k }}</div>{% endfor %}
+              {% endif %}
+            </td>
+            <td class="mono">{{ j.pid or "" }}</td>
+            <td class="mono">{{ j.exit_code if j.exit_code is not none else "" }}</td>
+            <td class="mono">{{ j.created_at }}</td>
+            <td class="mono">{{ j.started_at or "" }}</td>
+            <td class="mono">{{ j.finished_at or "" }}</td>
+            <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   </div>
 
   <script>
@@ -183,7 +246,11 @@
 
       const filter = document.getElementById("jobsFilter");
       const status = document.getElementById("statusFilter");
+      const clearBtn = document.getElementById("clearFilters");
       const table = document.getElementById("jobsTable");
+      const tableWrap = document.getElementById("jobsTableWrap");
+      const scrollTop = document.getElementById("jobsTableScrollTop");
+      const scrollTopInner = document.getElementById("jobsTableScrollTopInner");
 
       function applyFilter() {
         if (!table) return;
@@ -200,6 +267,39 @@
       }
       if (filter) filter.addEventListener("input", applyFilter);
       if (status) status.addEventListener("change", applyFilter);
+      if (clearBtn) {
+        clearBtn.addEventListener("click", () => {
+          if (filter) filter.value = "";
+          if (status) status.value = "";
+          applyFilter();
+        });
+      }
+
+      function syncScrollWidths() {
+        if (!tableWrap || !scrollTopInner) return;
+        scrollTopInner.style.width = tableWrap.scrollWidth + "px";
+      }
+
+      function initScrollSync() {
+        if (!tableWrap || !scrollTop) return;
+        let syncing = false;
+        scrollTop.addEventListener("scroll", () => {
+          if (syncing) return;
+          syncing = true;
+          tableWrap.scrollLeft = scrollTop.scrollLeft;
+          syncing = false;
+        });
+        tableWrap.addEventListener("scroll", () => {
+          if (syncing) return;
+          syncing = true;
+          scrollTop.scrollLeft = tableWrap.scrollLeft;
+          syncing = false;
+        });
+      }
+
+      syncScrollWidths();
+      initScrollSync();
+      window.addEventListener("resize", syncScrollWidths);
     })();
   </script>
 {% endblock %}

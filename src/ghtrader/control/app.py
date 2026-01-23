@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import os
+import re
 import sys
 import threading
 import time
@@ -26,7 +27,7 @@ from ghtrader.util.json_io import read_json as _read_json, write_json_atomic as 
 log = structlog.get_logger()
 
 _TQSDK_HEAVY_SUBCOMMANDS = {"download", "download-contract-range", "record", "update", "account"}
-_TQSDK_HEAVY_DATA_SUBCOMMANDS = {"repair", "health"}
+_TQSDK_HEAVY_DATA_SUBCOMMANDS = {"repair", "health", "main-l5-validate"}
 
 _UI_STATUS_TTL_S = 5.0
 _ui_status_at: float = 0.0
@@ -1611,8 +1612,8 @@ def create_app() -> Any:
         return {"ok": False, "error": "data diagnose deferred (Phase-1/2)"}
         payload = await request.json()
 
-        runs_dir = get_runs_dir()
-        data_dir = get_data_dir()
+        runs_dir = Path(str(payload.get("runs_dir") or get_runs_dir()))
+        data_dir = Path(str(payload.get("data_dir") or get_data_dir()))
         ex = str(payload.get("exchange") or "SHFE").upper().strip()
         v = str(payload.get("var") or "cu").lower().strip()
         refresh_catalog = bool(payload.get("refresh_catalog", False))
@@ -1684,8 +1685,8 @@ def create_app() -> Any:
         return {"ok": False, "error": "data repair deferred (Phase-1/2)"}
         payload = await request.json()
 
-        runs_dir = get_runs_dir()
-        data_dir = get_data_dir()
+        runs_dir = Path(str(payload.get("runs_dir") or get_runs_dir()))
+        data_dir = Path(str(payload.get("data_dir") or get_data_dir()))
 
         report_path = str(payload.get("report_path") or "").strip()
         if not report_path:
@@ -1762,8 +1763,8 @@ def create_app() -> Any:
         return {"ok": False, "error": "data health deferred (Phase-1/2)"}
         payload = await request.json()
 
-        runs_dir = get_runs_dir()
-        data_dir = get_data_dir()
+        runs_dir = Path(str(payload.get("runs_dir") or get_runs_dir()))
+        data_dir = Path(str(payload.get("data_dir") or get_data_dir()))
         ex = str(payload.get("exchange") or "SHFE").upper().strip()
         v = str(payload.get("var") or "cu").lower().strip()
         refresh_catalog = bool(payload.get("refresh_catalog", False))
@@ -1898,6 +1899,79 @@ def create_app() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
 
+    @app.post("/api/data/enqueue-main-l5-validate", response_class=JSONResponse)
+    async def api_data_enqueue_main_l5_validate(request: Request) -> dict[str, Any]:
+        """
+        Enqueue a main_l5 validation job (runs `ghtrader data main-l5-validate ...`).
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        payload = await request.json()
+
+        runs_dir = get_runs_dir()
+        data_dir = get_data_dir()
+
+        ex = str(payload.get("exchange") or "SHFE").upper().strip()
+        v = str(payload.get("var") or "cu").lower().strip()
+        derived_symbol = str(payload.get("derived_symbol") or f"KQ.m@{ex}.{v}").strip()
+        start = str(payload.get("start") or "").strip()
+        end = str(payload.get("end") or "").strip()
+        raw_check = payload.get("tqsdk_check", True)
+        if isinstance(raw_check, str):
+            tqsdk_check = raw_check.strip().lower() not in {"0", "false", "no", "off"}
+        else:
+            tqsdk_check = bool(raw_check)
+
+        argv = python_module_argv(
+            "ghtrader.cli",
+            "data",
+            "main-l5-validate",
+            "--exchange",
+            ex,
+            "--var",
+            v,
+            "--symbol",
+            derived_symbol,
+            "--data-dir",
+            str(data_dir),
+            "--runs-dir",
+            str(runs_dir),
+        )
+        if start:
+            argv += ["--start", start]
+        if end:
+            argv += ["--end", end]
+        argv += ["--tqsdk-check" if tqsdk_check else "--no-tqsdk-check"]
+
+        for key, flag in [
+            ("tqsdk_check_max_days", "--tqsdk-check-max-days"),
+            ("tqsdk_check_max_segments", "--tqsdk-check-max-segments"),
+            ("max_segments_per_day", "--max-segments-per-day"),
+            ("gap_threshold_s", "--gap-threshold-s"),
+            ("strict_ratio", "--strict-ratio"),
+        ]:
+            raw = payload.get(key)
+            if raw not in (None, ""):
+                argv += [flag, str(raw)]
+
+        title = f"main-l5-validate {ex}.{v} {derived_symbol}"
+        store = request.app.state.job_store
+        jm = request.app.state.job_manager
+
+        try:
+            active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=2000)
+            for j in active:
+                if str(j.title or "").startswith(title):
+                    if j.pid is None and str(j.status or "") == "queued":
+                        started = jm.start_queued_job(j.id) or j
+                        return {"ok": True, "enqueued": [started.id], "count": 1, "deduped": True, "started": bool(started.pid)}
+                    return {"ok": True, "enqueued": [j.id], "count": 1, "deduped": True}
+        except Exception:
+            pass
+
+        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
+
     @app.get("/api/data/reports", response_class=JSONResponse)
     def api_data_reports(
         request: Request,
@@ -1997,6 +2071,126 @@ def create_app() -> Any:
                 obj["_path"] = str(p)
                 reports.append(obj)
         return {"ok": True, "exchange": ex, "var": v, "count": int(len(reports)), "reports": reports}
+
+    @app.get("/api/data/main-l5-validate", response_class=JSONResponse)
+    def api_data_main_l5_validate(
+        request: Request, exchange: str = "SHFE", var: str = "cu", symbol: str = "", limit: int = 1
+    ) -> dict[str, Any]:
+        """
+        Return recent main_l5 validation report(s) written under runs/control/reports/main_l5_validate/.
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        ex = str(exchange).upper().strip() or "SHFE"
+        v = str(var).lower().strip() or "cu"
+        derived_symbol = str(symbol or f"KQ.m@{ex}.{v}").strip()
+        lim = max(1, min(int(limit or 1), 20))
+
+        rd = get_runs_dir()
+        rep_dir = rd / "control" / "reports" / "main_l5_validate"
+        if not rep_dir.exists():
+            return {"ok": False, "error": "no_reports", "exchange": ex, "var": v, "reports": []}
+
+        sym = re.sub(r"[^A-Za-z0-9]+", "_", derived_symbol).strip("_").lower()
+        pat = f"main_l5_validate_exchange={ex}_var={v}_symbol={sym}_*.json"
+        paths = sorted(rep_dir.glob(pat), key=lambda p: p.stat().st_mtime_ns, reverse=True)[:lim]
+        reports: list[dict[str, Any]] = []
+        for p in paths:
+            obj = _read_json(p)
+            if obj:
+                obj = dict(obj)
+                obj["_path"] = str(p)
+                reports.append(obj)
+        return {"ok": True, "exchange": ex, "var": v, "symbol": derived_symbol, "count": int(len(reports)), "reports": reports}
+
+    @app.get("/api/data/main-l5-validate-summary", response_class=JSONResponse)
+    def api_data_main_l5_validate_summary(
+        request: Request, exchange: str = "SHFE", var: str = "cu", symbol: str = "", limit: int = 30
+    ) -> dict[str, Any]:
+        """
+        Return QuestDB-backed validation summary rows + overview.
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        ex = str(exchange).upper().strip() or "SHFE"
+        v = str(var).lower().strip() or "cu"
+        derived_symbol = str(symbol or f"KQ.m@{ex}.{v}").strip()
+        lim = max(1, min(int(limit or 30), 3650))
+        try:
+            from ghtrader.questdb.client import make_questdb_query_config_from_env
+            from ghtrader.questdb.main_l5_validate import (
+                fetch_latest_main_l5_validate_summary,
+                fetch_main_l5_validate_overview,
+            )
+
+            cfg = make_questdb_query_config_from_env()
+            overview = fetch_main_l5_validate_overview(cfg=cfg, symbol=derived_symbol)
+            rows = fetch_latest_main_l5_validate_summary(cfg=cfg, symbol=derived_symbol, limit=lim)
+            return {
+                "ok": True,
+                "exchange": ex,
+                "var": v,
+                "symbol": derived_symbol,
+                "overview": overview,
+                "count": int(len(rows)),
+                "rows": rows,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e), "exchange": ex, "var": v, "symbol": derived_symbol, "rows": []}
+
+    @app.get("/api/data/main-l5-validate-gaps", response_class=JSONResponse)
+    def api_data_main_l5_validate_gaps(
+        request: Request,
+        exchange: str = "SHFE",
+        var: str = "cu",
+        symbol: str = "",
+        start: str = "",
+        end: str = "",
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """
+        Return QuestDB-backed gap details for main_l5 validation.
+        """
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        ex = str(exchange).upper().strip() or "SHFE"
+        v = str(var).lower().strip() or "cu"
+        derived_symbol = str(symbol or f"KQ.m@{ex}.{v}").strip()
+        lim = max(1, min(int(limit or 500), 10000))
+        start_day = None
+        end_day = None
+        if start:
+            try:
+                start_day = date.fromisoformat(str(start)[:10])
+            except Exception:
+                start_day = None
+        if end:
+            try:
+                end_day = date.fromisoformat(str(end)[:10])
+            except Exception:
+                end_day = None
+        try:
+            from ghtrader.questdb.client import make_questdb_query_config_from_env
+            from ghtrader.questdb.main_l5_validate import list_main_l5_validate_gaps
+
+            cfg = make_questdb_query_config_from_env()
+            gaps = list_main_l5_validate_gaps(
+                cfg=cfg,
+                symbol=derived_symbol,
+                start_day=start_day,
+                end_day=end_day,
+                limit=lim,
+            )
+            return {
+                "ok": True,
+                "exchange": ex,
+                "var": v,
+                "symbol": derived_symbol,
+                "count": int(len(gaps)),
+                "gaps": gaps,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e), "exchange": ex, "var": v, "symbol": derived_symbol, "gaps": []}
 
     @app.get("/api/contracts", response_class=JSONResponse)
     def api_contracts(

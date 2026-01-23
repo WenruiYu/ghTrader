@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import os
 import threading
 import time
@@ -263,6 +263,7 @@ def list_trading_days_for_symbol(
     end_day: date,
     dataset_version: str,
     ticks_kind: str = "main_l5",
+    l5_only: bool = False,
 ) -> list[date]:
     """
     List distinct trading_day values for a symbol from the canonical ticks table.
@@ -276,22 +277,61 @@ def list_trading_days_for_symbol(
     d1 = end_day.isoformat()
     tbl = str(table).strip()
 
+    where = ["symbol=%s", "ticks_kind=%s", "dataset_version=%s"]
+    params: list[Any] = [sym, tk, dv]
+    if l5_only:
+        where.append(_l5_condition_sql())
+    where.append("cast(trading_day as string) >= %s")
+    where.append("cast(trading_day as string) <= %s")
+    params += [d0, d1]
     sql = (
         "SELECT DISTINCT cast(trading_day as string) AS trading_day "
         f"FROM {tbl} "
-        "WHERE symbol=%s AND ticks_kind=%s AND dataset_version=%s "
-        "AND cast(trading_day as string) >= %s AND cast(trading_day as string) <= %s "
+        f"WHERE {' AND '.join(where)} "
         "ORDER BY trading_day ASC"
     )
     out: list[date] = []
     with _connect(cfg, connect_timeout_s=2) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, [sym, tk, dv, d0, d1])
+            cur.execute(sql, params)
             for (td,) in cur.fetchall():
                 try:
                     out.append(date.fromisoformat(str(td)))
                 except Exception:
                     continue
+    return out
+
+
+def list_schedule_hashes_for_symbol(
+    *,
+    cfg: QuestDBQueryConfig,
+    table: str,
+    symbol: str,
+    dataset_version: str,
+    ticks_kind: str = "main_l5",
+) -> set[str]:
+    """
+    List distinct schedule_hash values for a symbol from the canonical ticks table.
+    """
+    sym = str(symbol or "").strip()
+    if not sym:
+        return set()
+    dv = str(dataset_version).lower().strip()
+    tk = str(ticks_kind).lower().strip()
+    tbl = str(table).strip()
+    sql = (
+        "SELECT DISTINCT schedule_hash "
+        f"FROM {tbl} "
+        "WHERE symbol=%s AND ticks_kind=%s AND dataset_version=%s"
+    )
+    out: set[str] = set()
+    with _connect(cfg, connect_timeout_s=2) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, [sym, tk, dv])
+            for (h,) in cur.fetchall():
+                hs = str(h or "").strip()
+                if hs:
+                    out.add(hs)
     return out
 
 
