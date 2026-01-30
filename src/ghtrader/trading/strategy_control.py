@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+import redis
+
 from ghtrader.util.json_io import read_json, write_json_atomic
 from ghtrader.tq.runtime import canonical_account_profile
 
@@ -163,9 +165,10 @@ class StrategyStateWriter:
     Writes a stable per-profile state surface for the dashboard and supervisor.
     """
 
-    def __init__(self, *, runs_dir: Path, profile: str, recent_events_max: int = 50) -> None:
+    def __init__(self, *, runs_dir: Path, profile: str, recent_events_max: int = 50, redis_client: redis.Redis | None = None) -> None:
         self.runs_dir = runs_dir
         self.profile = canonical_account_profile(profile)
+        self.redis_client = redis_client
         self.root = strategy_root(runs_dir=runs_dir, profile=profile)
         self.root.mkdir(parents=True, exist_ok=True)
 
@@ -212,6 +215,12 @@ class StrategyStateWriter:
             "last_meta": _jsonable(self._last_meta),
             "recent_events": _jsonable(list(self._recent_events)),
         }
+        if self.redis_client:
+            try:
+                self.redis_client.publish(f"ghtrader:strategy:updates:{self.profile}", json.dumps(payload, default=str))
+                self.redis_client.set(f"ghtrader:strategy:state:{self.profile}", json.dumps(payload, default=str))
+            except Exception:
+                pass
         try:
             write_json_atomic(self._state_path, payload)
         except Exception:

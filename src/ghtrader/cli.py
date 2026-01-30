@@ -961,6 +961,76 @@ def data_main_l5_validate(
             f"missing_half_seconds={report.get('missing_half_seconds_total')} "
             f"report={str(out_path or '')}"
         )
+
+
+@data_group.command("field-quality")
+@click.option("--exchange", default="SHFE", show_default=True, help="Exchange (e.g. SHFE)")
+@click.option("--var", "variety", default="cu", show_default=True, help="Variety code (e.g. cu)")
+@click.option("--symbol", "derived_symbol", default="", show_default=False, help="Derived symbol (default: KQ.m@EX.var)")
+@click.option("--start", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional start date (YYYY-MM-DD)")
+@click.option("--end", default=None, type=click.DateTime(formats=["%Y-%m-%d"]), help="Optional end date (YYYY-MM-DD)")
+@click.option("--max-rows", default=None, type=int, help="Optional max rows per day (safety cap)")
+@click.option("--json", "as_json", is_flag=True, help="Print full JSON payload")
+@click.pass_context
+def data_field_quality(
+    ctx: click.Context,
+    exchange: str,
+    variety: str,
+    derived_symbol: str,
+    start: datetime | None,
+    end: datetime | None,
+    max_rows: int | None,
+    as_json: bool,
+) -> None:
+    """
+    Compute field-quality and order book invariant metrics for main_l5.
+    """
+    import json
+
+    from ghtrader.data.field_quality import compute_field_quality_for_day, list_symbol_trading_days
+    from ghtrader.questdb.client import make_questdb_query_config_from_env
+    from ghtrader.questdb.field_quality import ensure_field_quality_table, upsert_field_quality_rows
+
+    _ = ctx
+    ex = str(exchange).upper().strip()
+    v = str(variety).lower().strip()
+    symbol = str(derived_symbol or f"KQ.m@{ex}.{v}").strip()
+    start_day = start.date() if start else None
+    end_day = end.date() if end else None
+
+    cfg = make_questdb_query_config_from_env()
+    ensure_field_quality_table(cfg=cfg)
+    days = list_symbol_trading_days(
+        cfg=cfg,
+        symbol=symbol,
+        start_day=start_day,
+        end_day=end_day,
+    )
+    rows = []
+    for day in days:
+        res = compute_field_quality_for_day(
+            cfg=cfg,
+            symbol=symbol,
+            trading_day=day,
+            limit=max_rows,
+        )
+        rows.append(res.row)
+    upserted = upsert_field_quality_rows(cfg=cfg, rows=rows)
+
+    payload = {
+        "ok": True,
+        "exchange": ex,
+        "var": v,
+        "symbol": symbol,
+        "days": int(len(days)),
+        "rows_upserted": int(upserted),
+        "start": (start_day.isoformat() if start_day else None),
+        "end": (end_day.isoformat() if end_day else None),
+    }
+    if as_json:
+        click.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        click.echo(f"{symbol} field_quality days={len(days)} rows_upserted={upserted}")
 # ---------------------------------------------------------------------------
 # account (broker account profiles; env-only)
 # ---------------------------------------------------------------------------

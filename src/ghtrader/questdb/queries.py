@@ -160,6 +160,50 @@ def _l5_condition_sql() -> str:
     return l5_sql_condition()
 
 
+import redis
+import json
+from functools import wraps
+
+# Redis cache setup
+try:
+    _redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+    _redis_client.ping()
+except Exception:
+    _redis_client = None
+
+def redis_cache(ttl_seconds: int = 300):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if _redis_client is None:
+                return func(*args, **kwargs)
+            
+            # Create a cache key based on function name and arguments
+            key_parts = [func.__name__]
+            key_parts.extend(str(arg) for arg in args)
+            key_parts.extend(f"{k}={v}" for k, v in sorted(kwargs.items()) if k != "cfg") # Exclude config object
+            key = "cache:" + ":".join(key_parts)
+            
+            cached_val = _redis_client.get(key)
+            if cached_val:
+                try:
+                    return json.loads(cached_val)
+                except Exception:
+                    pass
+            
+            result = func(*args, **kwargs)
+            
+            try:
+                _redis_client.setex(key, ttl_seconds, json.dumps(result, default=str))
+            except Exception:
+                pass
+                
+            return result
+        return wrapper
+    return decorator
+
+
+@redis_cache(ttl_seconds=300)
 def query_symbol_day_bounds(
     *,
     cfg: QuestDBQueryConfig,
@@ -254,6 +298,57 @@ def query_symbol_day_bounds(
     return out
 
 
+def fetch_ticks_for_day(
+    *,
+    cfg: QuestDBQueryConfig,
+    symbol: str,
+    trading_day: date,
+    table: str,
+    columns: list[str],
+    dataset_version: str = "v2",
+    ticks_kind: str = "main_l5",
+    limit: int | None = None,
+    connect_timeout_s: int = 2,
+) -> "pd.DataFrame":
+    """
+    Fetch tick rows for a single trading day with selected columns.
+
+    Uses `datetime_ns` ordering and returns a DataFrame with the requested columns.
+    """
+    import pandas as pd
+
+    tbl = str(table).strip()
+    sym = str(symbol or "").strip()
+    if not tbl or not sym:
+        return pd.DataFrame(columns=list(columns))
+
+    cols_sql = ", ".join(columns)
+    where = [
+        "symbol = %s",
+        "ticks_kind = %s",
+        "dataset_version = %s",
+        "cast(trading_day as string) = %s",
+    ]
+    params: list[Any] = [sym, str(ticks_kind), str(dataset_version), trading_day.isoformat()]
+    sql = f"SELECT {cols_sql} FROM {tbl} WHERE {' AND '.join(where)} ORDER BY datetime_ns"
+    if limit is not None:
+        lim = max(1, int(limit))
+        sql += " LIMIT %s"
+        params.append(lim)
+
+    with _connect(cfg, connect_timeout_s=int(connect_timeout_s)) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            try:
+                cols = [str(d.name) for d in (cur.description or [])]
+            except Exception:
+                cols = list(columns)
+
+    return pd.DataFrame(rows, columns=cols)
+
+
+@redis_cache(ttl_seconds=300)
 def list_trading_days_for_symbol(
     *,
     cfg: QuestDBQueryConfig,

@@ -206,6 +206,14 @@
           {{ main_l5_validation.missing_segments_total or "--" }}
         {% endif %}
       </div>
+      <div class="kv-k">Missing seconds ratio</div>
+      <div class="kv-v">
+        {% if main_l5_validation.get("missing_seconds_ratio") is not none %}
+          {{ "%.4f" | format(main_l5_validation.get("missing_seconds_ratio")) }}
+        {% else %}
+          --
+        {% endif %}
+      </div>
       {% if main_l5_validation.get("cadence_mode") == "event" %}
         <div class="kv-k">Seconds with 1 tick</div><div class="kv-v">{{ main_l5_validation.seconds_with_one_tick_total or "--" }}</div>
       {% else %}
@@ -218,15 +226,70 @@
           {% endif %}
         </div>
       {% endif %}
+      <div class="kv-k">Gap buckets</div>
+      <div class="kv-v">
+        {% set buckets = main_l5_validation.get("gap_buckets_total") or {} %}
+        {% if buckets %}
+          2-5s {{ buckets.get("2_5") or 0 }},
+          6-15s {{ buckets.get("6_15") or 0 }},
+          16-30s {{ buckets.get("16_30") or 0 }},
+          >30s {{ buckets.get("gt_30") or 0 }}
+        {% else %}
+          --
+        {% endif %}
+      </div>
+      <div class="kv-k">Timeliness p95 lag (s)</div><div class="kv-v">{{ main_l5_validation.p95_lag_s or "--" }}</div>
+      <div class="kv-k">Timeliness max lag (s)</div><div class="kv-v">{{ main_l5_validation.max_lag_s or "--" }}</div>
+      <div class="kv-k">Gaps >30s</div><div class="kv-v">{{ main_l5_validation.gap_count_gt_30s or "--" }}</div>
       <div class="kv-k">Max gap (s)</div><div class="kv-v">{{ main_l5_validation.max_gap_s or "--" }}</div>
       <div class="kv-k">Gap threshold (s)</div><div class="kv-v">{{ main_l5_validation.gap_threshold_s or "--" }}</div>
       <div class="kv-k">TqSdk missing segs</div>
       <div class="kv-v">{{ (main_l5_validation.get("tqsdk_check") or {}).get("provider_missing_segments") or "--" }}</div>
     </div>
+    <div class="card-title" style="margin-top:16px;">
+      <span>Top gap days</span>
+      <small>By max gap</small>
+    </div>
+    {% if main_l5_validation.top_gap_days %}
+      <ul class="list-compact">
+        {% for row in main_l5_validation.top_gap_days %}
+          <li>
+            <span class="mono">{{ row.trading_day }}</span>
+            <span class="muted text-xs">max {{ row.max_gap_s }}s · segs {{ row.missing_segments }}</span>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <div class="empty-state">
+        <div class="empty-state-title">No gap days</div>
+        <div class="empty-state-text">No max-gap rows available yet.</div>
+      </div>
+    {% endif %}
+    <div class="card-title" style="margin-top:16px;">
+      <span>Top lag days</span>
+      <small>By session end lag</small>
+    </div>
+    {% if main_l5_validation.top_lag_days %}
+      <ul class="list-compact">
+        {% for row in main_l5_validation.top_lag_days %}
+          <li>
+            <span class="mono">{{ row.trading_day }}</span>
+            <span class="muted text-xs">lag {{ row.session_end_lag_s }}s · max gap {{ row.max_gap_s }}</span>
+            <a class="mono" href="/api/data/main-l5-validate-gaps?exchange=SHFE&var={{ coverage_var }}&symbol={{ coverage_symbol }}&trading_day={{ row.trading_day }}&min_duration_s=30{{ token_qs | replace('?', '&') }}">gaps</a>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <div class="empty-state">
+        <div class="empty-state-title">No lag days</div>
+        <div class="empty-state-text">No lag metrics available yet.</div>
+      </div>
+    {% endif %}
     {% if main_l5_validation.report_name %}
       <a class="btn btn-secondary btn-sm" href="/data/main-l5-validate/report/{{ main_l5_validation.report_name }}{{ token_qs }}">View report</a>
     {% endif %}
     <a class="btn btn-secondary btn-sm" href="/api/data/main-l5-validate-gaps?exchange=SHFE&var={{ coverage_var }}&symbol={{ coverage_symbol }}{{ token_qs | replace('?', '&') }}">View gaps</a>
+    <a class="btn btn-secondary btn-sm" href="/api/data/main-l5-validate-gaps?exchange=SHFE&var={{ coverage_var }}&symbol={{ coverage_symbol }}&min_duration_s=30{{ token_qs | replace('?', '&') }}">View gaps &gt;30s</a>
     {% if validation_error %}
       <div class="hint">{{ validation_error }}</div>
     {% endif %}

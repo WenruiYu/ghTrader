@@ -76,6 +76,12 @@ def test_main_l5_validate_gap_threshold(monkeypatch):
     )
 
     assert report["missing_segments_total"] == 0
+    assert abs(report["missing_seconds_ratio"] - (2 / 6)) < 1e-6
+    assert report["gap_buckets_total"]["2_5"] == 0
+    assert report["gap_buckets_total"]["6_15"] == 0
+    assert report["gap_buckets_total"]["16_30"] == 0
+    assert report["gap_buckets_total"]["gt_30"] == 0
+    assert report["gap_count_gt_30s"] == 0
     assert captured["summary"][0].cadence_mode == "event"
 
 
@@ -141,7 +147,8 @@ def test_main_l5_validate_strict_cadence(monkeypatch):
     assert captured["summary"][0].cadence_mode == "fixed_0p5s"
 
 
-def test_session_start_override_shfe_delay():
+def test_exchange_event_shift_start():
+    from ghtrader.data import exchange_events as evs
     from ghtrader.data import main_l5_validation as mod
 
     day = date(2019, 12, 26)
@@ -156,15 +163,58 @@ def test_session_start_override_shfe_delay():
             "end_ts": datetime(2019, 12, 26, 1, 0, tzinfo=tz).isoformat(),
         }
     ]
-    overrides = [ov for ov in mod._session_start_overrides(exchange="SHFE") if ov.get("trading_day") == day]
+    events = evs.events_for_day(
+        evs.load_exchange_events(data_dir=Path("."), exchange="SHFE", variety="cu"),
+        day,
+    )
 
-    updated = mod._apply_session_start_overrides(
+    updated, applied = mod._apply_exchange_events(
         day=day,
         intervals=intervals,
         tz=tz,
         prev_trading_day=prev,
-        overrides=overrides,
+        events=events,
     )
 
-    assert updated
+    assert applied
     assert updated[0]["start_sec"] == int(datetime(2019, 12, 25, 22, 30, tzinfo=tz).timestamp())
+
+
+def test_exchange_event_skip_night():
+    from ghtrader.data import exchange_events as evs
+    from ghtrader.data import main_l5_validation as mod
+
+    day = date(2020, 2, 4)
+    prev = {day: date(2020, 2, 3)}
+    tz = timezone.utc
+    intervals = [
+        {
+            "session": "night",
+            "start_sec": int(datetime(2020, 2, 3, 21, 0, tzinfo=tz).timestamp()),
+            "end_sec": int(datetime(2020, 2, 4, 1, 0, tzinfo=tz).timestamp()),
+            "start_ts": datetime(2020, 2, 3, 21, 0, tzinfo=tz).isoformat(),
+            "end_ts": datetime(2020, 2, 4, 1, 0, tzinfo=tz).isoformat(),
+        },
+        {
+            "session": "day",
+            "start_sec": int(datetime(2020, 2, 4, 1, 30, tzinfo=tz).timestamp()),
+            "end_sec": int(datetime(2020, 2, 4, 7, 0, tzinfo=tz).timestamp()),
+            "start_ts": datetime(2020, 2, 4, 1, 30, tzinfo=tz).isoformat(),
+            "end_ts": datetime(2020, 2, 4, 7, 0, tzinfo=tz).isoformat(),
+        },
+    ]
+    events = evs.events_for_day(
+        evs.load_exchange_events(data_dir=Path("."), exchange="SHFE", variety="cu"),
+        day,
+    )
+
+    updated, applied = mod._apply_exchange_events(
+        day=day,
+        intervals=intervals,
+        tz=tz,
+        prev_trading_day=prev,
+        events=events,
+    )
+
+    assert applied
+    assert all(it["session"] != "night" for it in updated)

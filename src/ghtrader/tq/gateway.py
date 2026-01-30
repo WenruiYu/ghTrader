@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 import structlog
+import zmq
+import redis
 
 from ghtrader.config import get_tqsdk_auth, is_live_enabled, load_config
 from ghtrader.util.json_io import read_json, write_json_atomic
@@ -263,8 +265,10 @@ def read_gateway_targets(*, runs_dir: Path, profile: str) -> dict[str, Any]:
 
 
 class GatewayWriter:
-    def __init__(self, *, runs_dir: Path, profile: str) -> None:
+    def __init__(self, *, runs_dir: Path, profile: str, pub_socket: zmq.Socket | None = None, redis_client: redis.Redis | None = None) -> None:
         self.runs_dir = runs_dir
+        self.pub_socket = pub_socket
+        self.redis_client = redis_client
         self.profile = canonical_account_profile(profile)
         self.root = gateway_root(runs_dir=runs_dir, profile=profile)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -303,6 +307,22 @@ class GatewayWriter:
             "last_snapshot": _jsonable(self._last_snapshot) if isinstance(self._last_snapshot, dict) else None,
             "recent_events": _jsonable(list(self._recent_events)),
         }
+        if self.pub_socket:
+            try:
+                # Publish state to ZMQ subscribers
+                self.pub_socket.send_json(payload)
+            except Exception:
+                pass
+        
+        if self.redis_client:
+            try:
+                # Publish to Redis channel for WebSocket
+                self.redis_client.publish(f"ghtrader:gateway:updates:{self.profile}", json.dumps(payload, default=str))
+                # Set hot state key
+                self.redis_client.set(f"ghtrader:gateway:state:{self.profile}", json.dumps(payload, default=str))
+            except Exception:
+                pass
+
         try:
             write_json_atomic(self._state_path, payload)
         except Exception:
@@ -376,7 +396,23 @@ def run_gateway(
     """
     load_config()
     prof = canonical_account_profile(account_profile)
-    writer = GatewayWriter(runs_dir=runs_dir, profile=prof)
+
+    # ZMQ Setup (Hot Path)
+    zmq_ctx = zmq.Context()
+    pub_socket = zmq_ctx.socket(zmq.PUB)
+    pub_socket.bind(f"ipc:///tmp/ghtrader_gateway_pub_{prof}.ipc")
+    
+    rep_socket = zmq_ctx.socket(zmq.REP)
+    rep_socket.bind(f"ipc:///tmp/ghtrader_gateway_rep_{prof}.ipc")
+
+    # Redis Setup (Warm Path)
+    try:
+        redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+        redis_client.ping()
+    except Exception:
+        redis_client = None
+
+    writer = GatewayWriter(runs_dir=runs_dir, profile=prof, pub_socket=pub_socket, redis_client=redis_client)
 
     from ghtrader.trading.execution import RiskLimits, clamp_target_position
 
@@ -398,6 +434,7 @@ def run_gateway(
     exec_targetpos: TargetPosExecutor | None = None
     exec_direct: DirectOrderExecutor | None = None
     last_targets: dict[str, int] = {}
+    zmq_targets: dict[str, int] = {}
     start_balance: float | None = None
 
     last_snapshot_at = 0.0
@@ -585,6 +622,25 @@ def run_gateway(
                 except Exception:
                     exec_targetpos = None
 
+            # ZMQ Hot Path: Check for incoming targets/commands
+            try:
+                while True:
+                    msg = rep_socket.recv_json(flags=zmq.NOBLOCK)
+                    resp = {"status": "ok"}
+                    try:
+                        mtype = msg.get("type")
+                        if mtype == "set_targets":
+                            # {type: "set_targets", targets: {sym: pos}}
+                            ts = msg.get("targets", {})
+                            if isinstance(ts, dict):
+                                for k, v in ts.items():
+                                    zmq_targets[str(k)] = int(v)
+                    except Exception as e:
+                        resp = {"status": "error", "error": str(e)}
+                    rep_socket.send_json(resp)
+            except zmq.Again:
+                pass
+
             # Main update loop
             try:
                 deadline = time.time() + float(poll_interval_sec)
@@ -751,7 +807,8 @@ def run_gateway(
             if orders_enabled:
                 try:
                     t = read_gateway_targets(runs_dir=runs_dir, profile=prof)
-                    targets = t.get("targets") if isinstance(t.get("targets"), dict) else {}
+                    disk_targets = t.get("targets") if isinstance(t.get("targets"), dict) else {}
+                    targets = {**disk_targets, **zmq_targets}
                     desired_targets: dict[str, int] = {}
                     for sym, tgt in targets.items():
                         if sym not in current_symbols:

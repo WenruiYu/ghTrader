@@ -1085,12 +1085,16 @@ def build_router() -> Any:
                 from ghtrader.questdb.main_l5_validate import (
                     fetch_latest_main_l5_validate_summary,
                     fetch_main_l5_validate_overview,
+                    fetch_main_l5_validate_top_gap_days,
+                    fetch_main_l5_validate_top_lag_days,
                 )
                 from ghtrader.data.main_l5_validation import read_latest_validation_report
 
                 overview = fetch_main_l5_validate_overview(cfg=cfg, symbol=coverage_symbol)
                 latest_rows = fetch_latest_main_l5_validate_summary(cfg=cfg, symbol=coverage_symbol, limit=1)
                 latest = latest_rows[0] if latest_rows else {}
+                top_gap_days = fetch_main_l5_validate_top_gap_days(cfg=cfg, symbol=coverage_symbol, limit=8)
+                top_lag_days = fetch_main_l5_validate_top_lag_days(cfg=cfg, symbol=coverage_symbol, limit=8)
                 if overview.get("days_total"):
                     out["main_l5_validation"] = {
                         "status": "ok"
@@ -1104,14 +1108,27 @@ def build_router() -> Any:
                         "checked_days": overview.get("days_total"),
                         "missing_days": overview.get("missing_days"),
                         "missing_segments_total": overview.get("missing_segments"),
+                        "missing_seconds_total": overview.get("missing_seconds"),
                         "missing_half_seconds_total": overview.get("missing_half_seconds"),
                         "expected_seconds_strict_total": overview.get("expected_seconds_strict_total"),
                         "total_segments": overview.get("total_segments"),
                         "max_gap_s": overview.get("max_gap_s"),
                         "gap_threshold_s": overview.get("gap_threshold_s"),
+                        "missing_seconds_ratio": overview.get("missing_seconds_ratio"),
+                        "gap_buckets_total": {
+                            "2_5": overview.get("gap_bucket_2_5"),
+                            "6_15": overview.get("gap_bucket_6_15"),
+                            "16_30": overview.get("gap_bucket_16_30"),
+                            "gt_30": overview.get("gap_bucket_gt_30"),
+                        },
+                        "gap_count_gt_30s": overview.get("gap_count_gt_30"),
+                        "p95_lag_s": overview.get("p95_lag_s"),
+                        "max_lag_s": overview.get("max_lag_s"),
                         "cadence_mode": latest.get("cadence_mode"),
                         "two_plus_ratio": latest.get("two_plus_ratio"),
                         "last_run": latest.get("updated_at"),
+                        "top_gap_days": top_gap_days,
+                        "top_lag_days": top_lag_days,
                     }
                 rep = read_latest_validation_report(
                     runs_dir=runs_dir,
@@ -1123,7 +1140,15 @@ def build_router() -> Any:
                     out["main_l5_validation"]["report_name"] = Path(str(rep.get("_path"))).name
                 if rep.get("created_at") and not out["main_l5_validation"].get("last_run"):
                     out["main_l5_validation"]["last_run"] = rep.get("created_at")
-                    for key in ("max_gap_s", "gap_threshold_s", "seconds_with_one_tick_total"):
+                    for key in (
+                        "max_gap_s",
+                        "gap_threshold_s",
+                        "seconds_with_one_tick_total",
+                        "missing_seconds_ratio",
+                        "gap_buckets_total",
+                        "gap_buckets_by_session_total",
+                        "gap_count_gt_30s",
+                    ):
                         if key in rep and key not in out["main_l5_validation"]:
                             out["main_l5_validation"][key] = rep.get(key)
             except Exception as e:

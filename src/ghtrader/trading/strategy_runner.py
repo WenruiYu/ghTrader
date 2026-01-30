@@ -17,6 +17,8 @@ from typing import Any, Literal
 
 import numpy as np
 import structlog
+import zmq
+import redis
 
 from ghtrader.util.json_io import read_json, write_json_atomic
 from ghtrader.research.models import load_model
@@ -151,6 +153,16 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
     - handles symbol roll detection (resets FactorEngine state on underlying change)
     """
     prof = _canonical_profile(cfg.account_profile)
+    
+    # ZMQ Setup
+    zmq_ctx = zmq.Context()
+    sub_socket = zmq_ctx.socket(zmq.SUB)
+    sub_socket.connect(f"ipc:///tmp/ghtrader_gateway_pub_{prof}.ipc")
+    sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+    
+    req_socket = zmq_ctx.socket(zmq.REQ)
+    req_socket.connect(f"ipc:///tmp/ghtrader_gateway_rep_{prof}.ipc")
+
     requested_symbols = [str(s).strip() for s in (cfg.symbols or []) if str(s).strip()]
     if not requested_symbols:
         raise ValueError("symbols is required")
@@ -158,8 +170,15 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
     from ghtrader.datasets.features import FactorEngine
     from ghtrader.trading.symbol_resolver import is_continuous_alias
 
+    # Redis Setup (Warm Path)
+    try:
+        redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+        redis_client.ping()
+    except Exception:
+        redis_client = None
+
     writer = StrategyWriter(runs_dir=cfg.runs_dir, account_profile=prof)
-    statew = StrategyStateWriter(runs_dir=cfg.runs_dir, profile=prof)
+    statew = StrategyStateWriter(runs_dir=cfg.runs_dir, profile=prof, redis_client=redis_client)
     writer.write_config(
         {
             "account_profile": prof,
@@ -216,8 +235,14 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
     while True:
         statew.set_health(ok=True, running=True, error="", last_loop_at=_now_iso())
         try:
-            st_path = gateway_state_path(runs_dir=cfg.runs_dir, account_profile=prof)
-            st = read_json(st_path) or {}
+            # ZMQ Poll (Hot Path)
+            if sub_socket.poll(timeout=1000):
+                msg = sub_socket.recv_json()
+                st = msg.get("payload", {})
+            else:
+                # Fallback to disk if ZMQ silent (e.g. startup race)
+                st_path = gateway_state_path(runs_dir=cfg.runs_dir, account_profile=prof)
+                st = read_json(st_path) or {}
             market = st.get("market") if isinstance(st.get("market"), dict) else {}
             ticks = market.get("ticks") if isinstance(market.get("ticks"), dict) else {}
             effective = st.get("effective") if isinstance(st.get("effective"), dict) else {}
@@ -303,6 +328,14 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
                 "probs": probs_meta,
             }
             write_gateway_targets(runs_dir=cfg.runs_dir, account_profile=prof, targets=last_targets, meta=meta)
+            
+            # ZMQ Send Targets
+            try:
+                req_socket.send_json({"type": "set_targets", "targets": {str(k): int(v) for k, v in last_targets.items()}})
+                req_socket.recv_json() # Wait for ACK
+            except Exception:
+                pass
+
             writer.event({"type": "target_change", "targets": dict(last_targets)})
             statew.set_targets(dict(last_targets), dict(meta))
             statew.append_event({"type": "target_change", "targets": dict(last_targets)})
@@ -310,7 +343,8 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
             # Keep state fresh even when targets don't change.
             statew.flush_state()
 
-        time.sleep(float(max(0.05, cfg.poll_interval_sec)))
+        # No sleep in ZMQ mode (driven by SUB poll)
+        # time.sleep(float(max(0.05, cfg.poll_interval_sec)))
 
 
 __all__ = [

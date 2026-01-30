@@ -1333,16 +1333,18 @@
     }
   }
 
-  // Fast polling (1s) for Auto Monitor tab
+  // Fast polling (1s) for Auto Monitor tab (Fallback)
   setInterval(() => {
+    if (wsConnected) return;
     const tab = getActiveTab();
     if (tab === "monitor") {
       pollConsoleStatus();
     }
   }, 1000);
 
-  // Fast polling (1s) for Manual Test tab
+  // Fast polling (1s) for Manual Test tab (Fallback)
   setInterval(() => {
+    if (wsConnected) return;
     const tab = getActiveTab();
     if (tab === "test") {
       pollGatewayStatus();
@@ -1370,5 +1372,71 @@
   setInterval(loadTradingJobs, 15000);
   setInterval(loadStrategyRunHistory, 30000);
   setInterval(loadAccounts, 30000);
+
+  // WebSocket Integration
+  let ws = null;
+  let wsConnected = false;
+  let wsDebounce = { gateway: 0, strategy: 0, console: 0 };
+
+  function connectWebSocket() {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const url = proto + "//" + window.location.host + "/ws/dashboard";
+    console.log("Connecting to WS:", url);
+    ws = new WebSocket(url);
+
+    ws.onopen = () => {
+      console.log("WS connected");
+      wsConnected = true;
+      refreshAll();
+      const indicator = document.getElementById("tradingLastUpdate");
+      if (indicator) indicator.style.color = "#28a745";
+    };
+
+    ws.onclose = () => {
+      console.log("WS disconnected");
+      wsConnected = false;
+      const indicator = document.getElementById("tradingLastUpdate");
+      if (indicator) indicator.style.color = "#dc3545";
+      setTimeout(connectWebSocket, 2000);
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.channel && msg.data) {
+          handleWsUpdate(msg.channel, msg.data);
+        }
+      } catch (e) {
+        console.error("WS error", e);
+      }
+    };
+  }
+
+  function handleWsUpdate(channel, data) {
+    const parts = channel.split(":");
+    const type = parts[1]; // gateway or strategy
+    const prof = parts[3]; // profile
+
+    if (prof !== selectedAccountProfile) return;
+
+    const now = Date.now();
+    
+    if (now - wsDebounce.console > 100) {
+        wsDebounce.console = now;
+        loadConsoleStatus();
+    }
+
+    if (type === "gateway" && now - wsDebounce.gateway > 100) {
+        wsDebounce.gateway = now;
+        loadGatewayStatus();
+    }
+    
+    if (type === "strategy" && now - wsDebounce.strategy > 100) {
+        wsDebounce.strategy = now;
+        loadStrategyStatus();
+    }
+  }
+
+  connectWebSocket();
 })();
 

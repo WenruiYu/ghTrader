@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from fastapi import FastAPI, HTTPException, Request
+import asyncio
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+import redis.asyncio as redis
 
 from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
 from ghtrader.control import auth
@@ -1080,6 +1082,56 @@ def _logs_dir(runs_dir: Path) -> Path:
     return _control_root(runs_dir) / "logs"
 
 
+class ConnectionManager:
+    def __init__(self) -> None:
+        self.active_connections: list[WebSocket] = []
+        self.redis: redis.Redis | None = None
+        self.pubsub: Any = None
+        self.task: asyncio.Task | None = None
+
+    async def connect(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        if not self.redis:
+            await self._start_redis()
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str) -> None:
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except Exception:
+                pass
+
+    async def _start_redis(self) -> None:
+        try:
+            self.redis = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+            self.pubsub = self.redis.pubsub()
+            await self.pubsub.psubscribe("ghtrader:*:updates:*")
+            self.task = asyncio.create_task(self._redis_listener())
+        except Exception as e:
+            log.warning("websocket.redis_connect_failed", error=str(e))
+
+    async def _redis_listener(self) -> None:
+        if not self.pubsub:
+            return
+        try:
+            async for message in self.pubsub.listen():
+                if message["type"] == "pmessage":
+                    channel = message["channel"]
+                    data = message["data"]
+                    try:
+                        payload = json.loads(data)
+                    except Exception:
+                        payload = data
+                    await self.broadcast(json.dumps({"channel": channel, "data": payload}, default=str))
+        except Exception as e:
+            log.warning("websocket.redis_listener_error", error=str(e))
+
+
 def create_app() -> Any:
     runs_dir = get_runs_dir()
     store = JobStore(_jobs_db_path(runs_dir))
@@ -1112,6 +1164,18 @@ def create_app() -> Any:
 
     # HTML pages
     app.include_router(build_router())
+
+    # WebSocket Endpoint
+    manager = ConnectionManager()
+
+    @app.websocket("/ws/dashboard")
+    async def websocket_endpoint(websocket: WebSocket) -> None:
+        await manager.connect(websocket)
+        try:
+            while True:
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            manager.disconnect(websocket)
 
     # JSON API (kept small; UI uses HTML routes above)
     @app.get("/health", response_class=JSONResponse)
@@ -2144,8 +2208,10 @@ def create_app() -> Any:
         exchange: str = "SHFE",
         var: str = "cu",
         symbol: str = "",
+        trading_day: str = "",
         start: str = "",
         end: str = "",
+        min_duration_s: int = 0,
         limit: int = 500,
     ) -> dict[str, Any]:
         """
@@ -2157,8 +2223,14 @@ def create_app() -> Any:
         v = str(var).lower().strip() or "cu"
         derived_symbol = str(symbol or f"KQ.m@{ex}.{v}").strip()
         lim = max(1, min(int(limit or 500), 10000))
+        day = None
         start_day = None
         end_day = None
+        if trading_day:
+            try:
+                day = date.fromisoformat(str(trading_day)[:10])
+            except Exception:
+                day = None
         if start:
             try:
                 start_day = date.fromisoformat(str(start)[:10])
@@ -2177,8 +2249,10 @@ def create_app() -> Any:
             gaps = list_main_l5_validate_gaps(
                 cfg=cfg,
                 symbol=derived_symbol,
+                trading_day=day,
                 start_day=start_day,
                 end_day=end_day,
+                min_duration_s=(int(min_duration_s) if int(min_duration_s or 0) > 0 else None),
                 limit=lim,
             )
             return {

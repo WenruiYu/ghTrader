@@ -170,139 +170,205 @@ def download_main_l5_for_days(
     )
 
     try:
-        for idx, day in enumerate(unique_days, start=1):
-            log.debug(
-                "tq_main_l5.download_day_start",
-                symbol=underlying_symbol,
-                day=day.isoformat(),
-                day_index=int(idx),
-                days_total=int(days_total),
-            )
-            attempts = 0
-            while True:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
+        # Use ThreadPoolExecutor for parallel day processing
+        max_workers = int(os.environ.get("GHTRADER_INGEST_WORKERS", "4"))
+        max_workers = max(1, min(max_workers, 8))  # Cap to avoid rate limits
+
+        def _download_day_worker(
+            idx: int,
+            day: date,
+            underlying_symbol: str,
+            derived_symbol: str,
+            segment_id: int,
+            schedule_hash: str,
+            dataset_version: str,
+            days_total: int,
+            auth: Any,
+            backend: Any,
+            retry_max: int,
+            retry_base_s: float,
+            retry_max_s: float,
+            maintenance_wait_s: float,
+        ) -> tuple[str, int]:
+            """Worker function for downloading a single day."""
+            # Create per-thread TqApi instance
+            api = TqApi(auth=auth)
+            
+            def _is_maintenance_error(text: str) -> bool:
+                if not text:
+                    return False
+                lowered = text.lower()
+                return "maintenance" in lowered or "运维" in text or "维护" in text
+
+            def _reset_api(reason: str, err: str) -> None:
+                nonlocal api
                 try:
-                    df = api.get_tick_data_series(
-                        symbol=underlying_symbol,
-                        start_dt=day,
-                        end_dt=day + timedelta(days=1),
-                    )
-                    break
-                except Exception as e:
-                    err = str(e)
-                    if maintenance_wait_s > 0 and _is_maintenance_error(err):
-                        log.warning(
-                            "tq_main_l5.maintenance_wait",
-                            symbol=underlying_symbol,
-                            day=day.isoformat(),
-                            wait_s=float(maintenance_wait_s),
-                            error=err,
-                        )
-                        _reset_api("maintenance", err)
-                        time.sleep(float(maintenance_wait_s))
-                        continue
-                    attempts += 1
-                    if attempts > retry_max:
-                        log.error(
-                            "tq_main_l5.download_day_failed",
-                            symbol=underlying_symbol,
-                            day=day.isoformat(),
-                            attempts=int(attempts),
-                            error=err,
-                        )
-                        raise
-                    wait_s = min(retry_max_s, retry_base_s * (2 ** (attempts - 1)))
-                    log.warning(
-                        "tq_main_l5.download_day_retry",
-                        symbol=underlying_symbol,
-                        day=day.isoformat(),
-                        attempt=int(attempts),
-                        wait_s=float(wait_s),
-                        error=err,
-                    )
-                    _reset_api("retry", err)
-                    if wait_s > 0:
-                        time.sleep(float(wait_s))
-            if df.empty:
-                row_counts[day.isoformat()] = 0
-                log.info(
-                    "tq_main_l5.download_day_empty",
-                    symbol=underlying_symbol,
-                    day=day.isoformat(),
-                    day_index=int(idx),
-                    days_total=int(days_total),
-                )
-                continue
+                    api.close()
+                except Exception:
+                    pass
+                api = TqApi(auth=auth)
+                log.info("tq_main_l5.api_reset", reason=reason, error=str(err))
 
-            df = df.rename(columns={"id": "_tq_id"})
-            df["symbol"] = underlying_symbol
-
-            for col in TICK_COLUMN_NAMES:
-                if col not in df.columns:
-                    df[col] = float("nan")
-
-            rows_before = int(len(df))
             try:
-                from ghtrader.util.l5_detection import l5_mask_df
-
-                mask = l5_mask_df(df)
-            except Exception:
-                mask = None
-
-            if mask is not None:
-                l5_rows = int(mask.sum())
-                if l5_rows <= 0:
-                    row_counts[day.isoformat()] = 0
+                attempts = 0
+                while True:
+                    try:
+                        df = api.get_tick_data_series(
+                            symbol=underlying_symbol,
+                            start_dt=day,
+                            end_dt=day + timedelta(days=1),
+                        )
+                        break
+                    except Exception as e:
+                        err = str(e)
+                        if maintenance_wait_s > 0 and _is_maintenance_error(err):
+                            log.warning(
+                                "tq_main_l5.maintenance_wait",
+                                symbol=underlying_symbol,
+                                day=day.isoformat(),
+                                wait_s=float(maintenance_wait_s),
+                                error=err,
+                            )
+                            _reset_api("maintenance", err)
+                            time.sleep(float(maintenance_wait_s))
+                            continue
+                        attempts += 1
+                        if attempts > retry_max:
+                            log.error(
+                                "tq_main_l5.download_day_failed",
+                                symbol=underlying_symbol,
+                                day=day.isoformat(),
+                                attempts=int(attempts),
+                                error=err,
+                            )
+                            raise
+                        wait_s = min(retry_max_s, retry_base_s * (2 ** (attempts - 1)))
+                        log.warning(
+                            "tq_main_l5.download_day_retry",
+                            symbol=underlying_symbol,
+                            day=day.isoformat(),
+                            attempt=int(attempts),
+                            wait_s=float(wait_s),
+                            error=err,
+                        )
+                        _reset_api("retry", err)
+                        if wait_s > 0:
+                            time.sleep(float(wait_s))
+                
+                if df.empty:
                     log.info(
-                        "tq_main_l5.download_day_skipped_l1",
+                        "tq_main_l5.download_day_empty",
                         symbol=underlying_symbol,
                         day=day.isoformat(),
                         day_index=int(idx),
                         days_total=int(days_total),
-                        rows_total=int(total_rows),
                     )
-                    continue
-                df = df.loc[mask].copy()
+                    return day.isoformat(), 0
+
+                df = df.rename(columns={"id": "_tq_id"})
+                df["symbol"] = underlying_symbol
+
+                for col in TICK_COLUMN_NAMES:
+                    if col not in df.columns:
+                        df[col] = float("nan")
+
+                rows_before = int(len(df))
+                try:
+                    from ghtrader.util.l5_detection import l5_mask_df
+                    mask = l5_mask_df(df)
+                except Exception:
+                    mask = None
+
+                if mask is not None:
+                    l5_rows = int(mask.sum())
+                    if l5_rows <= 0:
+                        log.info(
+                            "tq_main_l5.download_day_skipped_l1",
+                            symbol=underlying_symbol,
+                            day=day.isoformat(),
+                            day_index=int(idx),
+                            days_total=int(days_total),
+                            rows_total=0, # Worker doesn't know global total
+                        )
+                        return day.isoformat(), 0
+                    df = df.loc[mask].copy()
+                    log.debug(
+                        "tq_main_l5.download_day_filtered",
+                        symbol=underlying_symbol,
+                        day=day.isoformat(),
+                        l5_rows=int(l5_rows),
+                        rows_before=int(rows_before),
+                    )
+
+                out = _questdb_df_for_main_l5(
+                    df=df,
+                    derived_symbol=derived_symbol,
+                    trading_day=day,
+                    underlying_contract=underlying_symbol,
+                    segment_id=int(segment_id),
+                    schedule_hash=str(schedule_hash),
+                    dataset_version=str(dataset_version),
+                )
+                
+                # Write to QuestDB (thread-safe if backend handles connection pooling/new connections)
+                backend.ingest_df(table=_QUESTDB_TICKS_MAIN_L5_TABLE, df=out)
+                
+                count = int(len(out))
                 log.debug(
-                    "tq_main_l5.download_day_filtered",
+                    "tq_main_l5.download_day_done",
                     symbol=underlying_symbol,
                     day=day.isoformat(),
-                    l5_rows=int(l5_rows),
-                    rows_before=int(rows_before),
-                )
-
-            out = _questdb_df_for_main_l5(
-                df=df,
-                derived_symbol=derived_symbol,
-                trading_day=day,
-                underlying_contract=underlying_symbol,
-                segment_id=int(segment_id),
-                schedule_hash=str(schedule_hash),
-                dataset_version=str(dataset_version),
-            )
-            backend.ingest_df(table=_QUESTDB_TICKS_MAIN_L5_TABLE, df=out)
-            row_counts[day.isoformat()] = int(len(out))
-            total_rows += int(len(out))
-            log.debug(
-                "tq_main_l5.download_day_done",
-                symbol=underlying_symbol,
-                day=day.isoformat(),
-                day_index=int(idx),
-                days_total=int(days_total),
-                rows=int(len(out)),
-                rows_total=int(total_rows),
-            )
-
-            if idx == 1 or idx == days_total or idx % progress_every_n == 0 or (time.time() - last_progress_ts) >= progress_every_s:
-                log.info(
-                    "tq_main_l5.progress",
-                    symbol=underlying_symbol,
                     day_index=int(idx),
                     days_total=int(days_total),
-                    rows_total=int(total_rows),
-                    last_day=day.isoformat(),
+                    rows=count,
                 )
-                last_progress_ts = time.time()
+                return day.isoformat(), count
+            finally:
+                api.close()
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _download_day_worker,
+                    idx,
+                    day,
+                    underlying_symbol,
+                    derived_symbol,
+                    segment_id,
+                    schedule_hash,
+                    dataset_version,
+                    days_total,
+                    auth,
+                    backend,
+                    retry_max,
+                    retry_base_s,
+                    retry_max_s,
+                    maintenance_wait_s,
+                ): day
+                for idx, day in enumerate(unique_days, start=1)
+            }
+            
+            for future in as_completed(futures):
+                day_iso, count = future.result()
+                row_counts[day_iso] = count
+                total_rows += count
+                
+                if (time.time() - last_progress_ts) >= progress_every_s:
+                    log.info(
+                        "tq_main_l5.progress",
+                        symbol=underlying_symbol,
+                        days_done=len(row_counts),
+                        days_total=int(days_total),
+                        rows_total=int(total_rows),
+                        last_day=day_iso,
+                    )
+                    last_progress_ts = time.time()
+
     finally:
+        # Main thread API is not used in loop anymore, but kept for structure compatibility if needed
         api.close()
 
     write_manifest(

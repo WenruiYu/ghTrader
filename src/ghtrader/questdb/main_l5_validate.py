@@ -33,7 +33,16 @@ class MainL5ValidateSummaryRow:
     total_segments: int
     missing_day: int
     missing_segments: int
+    missing_seconds: int
+    missing_seconds_ratio: float
+    gap_bucket_2_5: int
+    gap_bucket_6_15: int
+    gap_bucket_16_30: int
+    gap_bucket_gt_30: int
+    gap_count_gt_30: int
     missing_half_seconds: int
+    last_tick_ts: datetime | None
+    session_end_lag_s: int | None
     max_gap_s: int
     gap_threshold_s: float
     schedule_hash: str
@@ -73,7 +82,16 @@ def ensure_main_l5_validate_summary_table(
       total_segments LONG,
       missing_day LONG,
       missing_segments LONG,
+      missing_seconds LONG,
+      missing_seconds_ratio DOUBLE,
+      gap_bucket_2_5 LONG,
+      gap_bucket_6_15 LONG,
+      gap_bucket_16_30 LONG,
+      gap_bucket_gt_30 LONG,
+      gap_count_gt_30 LONG,
       missing_half_seconds LONG,
+      last_tick_ts TIMESTAMP,
+      session_end_lag_s LONG,
       max_gap_s LONG,
       gap_threshold_s DOUBLE,
       schedule_hash SYMBOL,
@@ -102,7 +120,16 @@ def ensure_main_l5_validate_summary_table(
                     ("total_segments", "LONG"),
                     ("missing_day", "LONG"),
                     ("missing_segments", "LONG"),
+                    ("missing_seconds", "LONG"),
+                    ("missing_seconds_ratio", "DOUBLE"),
+                    ("gap_bucket_2_5", "LONG"),
+                    ("gap_bucket_6_15", "LONG"),
+                    ("gap_bucket_16_30", "LONG"),
+                    ("gap_bucket_gt_30", "LONG"),
+                    ("gap_count_gt_30", "LONG"),
                     ("missing_half_seconds", "LONG"),
+                    ("last_tick_ts", "TIMESTAMP"),
+                    ("session_end_lag_s", "LONG"),
                     ("max_gap_s", "LONG"),
                     ("gap_threshold_s", "DOUBLE"),
                     ("schedule_hash", "SYMBOL"),
@@ -205,7 +232,16 @@ def upsert_main_l5_validate_summary_rows(
                 int(r.total_segments),
                 int(r.missing_day),
                 int(r.missing_segments),
+                int(r.missing_seconds),
+                float(r.missing_seconds_ratio),
+                int(r.gap_bucket_2_5),
+                int(r.gap_bucket_6_15),
+                int(r.gap_bucket_16_30),
+                int(r.gap_bucket_gt_30),
+                int(r.gap_count_gt_30),
                 int(r.missing_half_seconds),
+                r.last_tick_ts,
+                int(r.session_end_lag_s) if r.session_end_lag_s is not None else None,
                 int(r.max_gap_s),
                 float(r.gap_threshold_s),
                 str(r.schedule_hash).strip(),
@@ -218,8 +254,11 @@ def upsert_main_l5_validate_summary_rows(
         f"INSERT INTO {tbl} "
         "(ts, symbol, trading_day, cadence_mode, expected_seconds, expected_seconds_strict, "
         "seconds_with_ticks, seconds_with_two_plus, two_plus_ratio, observed_segments, total_segments, "
-        "missing_day, missing_segments, missing_half_seconds, max_gap_s, gap_threshold_s, schedule_hash, updated_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+        "missing_day, missing_segments, missing_seconds, missing_seconds_ratio, gap_bucket_2_5, gap_bucket_6_15, "
+        "gap_bucket_16_30, gap_bucket_gt_30, gap_count_gt_30, missing_half_seconds, last_tick_ts, "
+        "session_end_lag_s, max_gap_s, gap_threshold_s, "
+        "schedule_hash, updated_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
     )
     with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
         with conn.cursor() as cur:
@@ -343,7 +382,9 @@ def fetch_latest_main_l5_validate_summary(
     sql = (
         "SELECT trading_day, cadence_mode, expected_seconds, expected_seconds_strict, seconds_with_ticks, "
         "seconds_with_two_plus, two_plus_ratio, observed_segments, total_segments, missing_day, missing_segments, "
-        "missing_half_seconds, max_gap_s, gap_threshold_s, schedule_hash, updated_at "
+        "missing_seconds, missing_seconds_ratio, gap_bucket_2_5, gap_bucket_6_15, gap_bucket_16_30, "
+        "gap_bucket_gt_30, gap_count_gt_30, missing_half_seconds, last_tick_ts, session_end_lag_s, "
+        "max_gap_s, gap_threshold_s, schedule_hash, updated_at "
         f"FROM {tbl} WHERE symbol=%s "
         "ORDER BY cast(trading_day as string) DESC LIMIT %s"
     )
@@ -365,11 +406,88 @@ def fetch_latest_main_l5_validate_summary(
                         "total_segments": row[8],
                         "missing_day": row[9],
                         "missing_segments": row[10],
-                        "missing_half_seconds": row[11],
-                        "max_gap_s": row[12],
-                        "gap_threshold_s": row[13],
-                        "schedule_hash": row[14],
-                        "updated_at": row[15].isoformat() if row[15] else None,
+                        "missing_seconds": row[11],
+                        "missing_seconds_ratio": row[12],
+                        "gap_bucket_2_5": row[13],
+                        "gap_bucket_6_15": row[14],
+                        "gap_bucket_16_30": row[15],
+                        "gap_bucket_gt_30": row[16],
+                        "gap_count_gt_30": row[17],
+                        "missing_half_seconds": row[18],
+                        "last_tick_ts": row[19].isoformat() if row[19] else None,
+                        "session_end_lag_s": row[20],
+                        "max_gap_s": row[21],
+                        "gap_threshold_s": row[22],
+                        "schedule_hash": row[23],
+                        "updated_at": row[24].isoformat() if row[24] else None,
+                    }
+                )
+    return out
+
+
+def fetch_main_l5_validate_top_gap_days(
+    *,
+    cfg: QuestDBQueryConfig,
+    symbol: str,
+    limit: int = 10,
+    table: str = MAIN_L5_VALIDATE_SUMMARY_TABLE,
+    connect_timeout_s: int = 2,
+) -> list[dict[str, Any]]:
+    tbl = str(table).strip() or MAIN_L5_VALIDATE_SUMMARY_TABLE
+    sym = str(symbol or "").strip()
+    lim = max(1, min(int(limit or 10), 200))
+    sql = (
+        "SELECT trading_day, cadence_mode, missing_segments, missing_half_seconds, max_gap_s, schedule_hash "
+        f"FROM {tbl} WHERE symbol=%s AND max_gap_s > 0 "
+        "ORDER BY max_gap_s DESC, missing_segments DESC, cast(trading_day as string) DESC LIMIT %s"
+    )
+    out: list[dict[str, Any]] = []
+    with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, [sym, lim])
+            for row in cur.fetchall():
+                out.append(
+                    {
+                        "trading_day": row[0],
+                        "cadence_mode": row[1],
+                        "missing_segments": row[2],
+                        "missing_half_seconds": row[3],
+                        "max_gap_s": row[4],
+                        "schedule_hash": row[5],
+                    }
+                )
+    return out
+
+
+def fetch_main_l5_validate_top_lag_days(
+    *,
+    cfg: QuestDBQueryConfig,
+    symbol: str,
+    limit: int = 10,
+    table: str = MAIN_L5_VALIDATE_SUMMARY_TABLE,
+    connect_timeout_s: int = 2,
+) -> list[dict[str, Any]]:
+    tbl = str(table).strip() or MAIN_L5_VALIDATE_SUMMARY_TABLE
+    sym = str(symbol or "").strip()
+    lim = max(1, min(int(limit or 10), 200))
+    sql = (
+        "SELECT trading_day, session_end_lag_s, last_tick_ts, cadence_mode, max_gap_s, schedule_hash "
+        f"FROM {tbl} WHERE symbol=%s AND session_end_lag_s IS NOT NULL "
+        "ORDER BY session_end_lag_s DESC, cast(trading_day as string) DESC LIMIT %s"
+    )
+    out: list[dict[str, Any]] = []
+    with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, [sym, lim])
+            for row in cur.fetchall():
+                out.append(
+                    {
+                        "trading_day": row[0],
+                        "session_end_lag_s": row[1],
+                        "last_tick_ts": row[2].isoformat() if row[2] else None,
+                        "cadence_mode": row[3],
+                        "max_gap_s": row[4],
+                        "schedule_hash": row[5],
                     }
                 )
     return out
@@ -379,8 +497,10 @@ def list_main_l5_validate_gaps(
     *,
     cfg: QuestDBQueryConfig,
     symbol: str,
+    trading_day: date | None = None,
     start_day: date | None = None,
     end_day: date | None = None,
+    min_duration_s: int | None = None,
     limit: int = 500,
     table: str = MAIN_L5_VALIDATE_GAPS_TABLE,
     connect_timeout_s: int = 2,
@@ -390,12 +510,18 @@ def list_main_l5_validate_gaps(
     lim = max(1, min(int(limit or 500), 10000))
     where = ["symbol=%s"]
     params: list[Any] = [sym]
+    if trading_day is not None:
+        where.append("cast(trading_day as string) = %s")
+        params.append(trading_day.isoformat())
     if start_day is not None:
         where.append("cast(trading_day as string) >= %s")
         params.append(start_day.isoformat())
     if end_day is not None:
         where.append("cast(trading_day as string) <= %s")
         params.append(end_day.isoformat())
+    if min_duration_s is not None:
+        where.append("duration_s >= %s")
+        params.append(int(min_duration_s))
     sql = (
         "SELECT trading_day, session, start_ts, end_ts, duration_s, tqsdk_status, schedule_hash "
         f"FROM {tbl} WHERE {' AND '.join(where)} "
@@ -436,11 +562,18 @@ def fetch_main_l5_validate_overview(
         "sum(missing_day) AS missing_days, "
         "sum(case when missing_segments > 0 then 1 else 0 end) AS days_with_gaps, "
         "sum(missing_segments) AS missing_segments, "
+        "sum(missing_seconds) AS missing_seconds, "
         "sum(missing_half_seconds) AS missing_half_seconds, "
         "sum(expected_seconds_strict) AS expected_seconds_strict_total, "
         "sum(expected_seconds) AS expected_seconds_total, "
+        "sum(gap_bucket_2_5) AS gap_bucket_2_5, "
+        "sum(gap_bucket_6_15) AS gap_bucket_6_15, "
+        "sum(gap_bucket_16_30) AS gap_bucket_16_30, "
+        "sum(gap_bucket_gt_30) AS gap_bucket_gt_30, "
+        "sum(gap_count_gt_30) AS gap_count_gt_30, "
         "sum(total_segments) AS total_segments, "
         "max(max_gap_s) AS max_gap_s, "
+        "max(session_end_lag_s) AS max_lag_s, "
         "max(gap_threshold_s) AS gap_threshold_s, "
         "max(cast(trading_day as string)) AS last_day "
         f"FROM {tbl} WHERE symbol=%s"
@@ -450,11 +583,19 @@ def fetch_main_l5_validate_overview(
         "missing_days": 0,
         "days_with_gaps": 0,
         "missing_segments": 0,
+        "missing_seconds": 0,
         "missing_half_seconds": 0,
         "expected_seconds_strict_total": 0,
         "expected_seconds_total": 0,
+        "gap_bucket_2_5": 0,
+        "gap_bucket_6_15": 0,
+        "gap_bucket_16_30": 0,
+        "gap_bucket_gt_30": 0,
+        "gap_count_gt_30": 0,
         "total_segments": 0,
         "max_gap_s": 0,
+        "max_lag_s": None,
+        "p95_lag_s": None,
         "gap_threshold_s": 0.0,
         "last_day": None,
     }
@@ -467,11 +608,34 @@ def fetch_main_l5_validate_overview(
                 out["missing_days"] = int(row[1] or 0)
                 out["days_with_gaps"] = int(row[2] or 0)
                 out["missing_segments"] = int(row[3] or 0)
-                out["missing_half_seconds"] = int(row[4] or 0)
-                out["expected_seconds_strict_total"] = int(row[5] or 0)
-                out["expected_seconds_total"] = int(row[6] or 0)
-                out["total_segments"] = int(row[7] or 0)
-                out["max_gap_s"] = int(row[8] or 0)
-                out["gap_threshold_s"] = float(row[9] or 0.0)
-                out["last_day"] = row[10]
+                out["missing_seconds"] = int(row[4] or 0)
+                out["missing_half_seconds"] = int(row[5] or 0)
+                out["expected_seconds_strict_total"] = int(row[6] or 0)
+                out["expected_seconds_total"] = int(row[7] or 0)
+                out["gap_bucket_2_5"] = int(row[8] or 0)
+                out["gap_bucket_6_15"] = int(row[9] or 0)
+                out["gap_bucket_16_30"] = int(row[10] or 0)
+                out["gap_bucket_gt_30"] = int(row[11] or 0)
+                out["gap_count_gt_30"] = int(row[12] or 0)
+                out["total_segments"] = int(row[13] or 0)
+                out["max_gap_s"] = int(row[14] or 0)
+                out["max_lag_s"] = int(row[15]) if row[15] is not None else None
+                out["gap_threshold_s"] = float(row[16] or 0.0)
+                out["last_day"] = row[17]
+            try:
+                cur.execute(
+                    f"SELECT session_end_lag_s FROM {tbl} WHERE symbol=%s AND session_end_lag_s IS NOT NULL",
+                    [sym],
+                )
+                lags = [int(r[0]) for r in cur.fetchall() if r and r[0] is not None]
+                if lags:
+                    lags.sort()
+                    idx = int(0.95 * (len(lags) - 1))
+                    out[\"p95_lag_s\"] = int(lags[max(0, idx)])
+            except Exception:
+                pass
+    expected_total = out.get("expected_seconds_total") or 0
+    out["missing_seconds_ratio"] = (
+        float(out.get("missing_seconds") or 0) / float(expected_total) if expected_total else 0.0
+    )
     return out

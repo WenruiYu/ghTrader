@@ -59,8 +59,8 @@ services:
       - QDB_CAIRO_WRITER_FO_COUNT=256
 
       # O3 (Out-of-order) commit lag for time-series optimization
-      # Allow 5 minutes of out-of-order data before commit
-      - QDB_CAIRO_O3_COMMIT_LAG=300000000
+      # Allow 10 minutes of out-of-order data before commit (optimized for bulk ingest)
+      - QDB_CAIRO_O3_COMMIT_LAG=600000000
 
       # Maximum uncommitted rows before forced commit
       - QDB_CAIRO_MAX_UNCOMMITTED_ROWS=500000
