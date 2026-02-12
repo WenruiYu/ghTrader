@@ -87,7 +87,7 @@
     <div class="split-pane-2-1">
       <div class="card">
         <h3 class="mb-2">Train New Model</h3>
-        <form class="form" method="post" action="/ops/model/train{{ token_qs }}">
+        <form class="form" method="post" action="/models/model/train{{ token_qs }}">
           <div class="grid3">
             <div>
               <label>Model type</label>
@@ -151,7 +151,7 @@
 
         <div class="card">
           <h3 class="mb-2">Hyperparameter Sweep</h3>
-          <form class="form" method="post" action="/ops/model/sweep{{ token_qs }}">
+          <form class="form" method="post" action="/models/model/sweep{{ token_qs }}">
             <div class="grid2">
               <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu" value="KQ.m@SHFE.cu"/></div>
               <div><label>Model</label><input name="model" value="deeplob"/></div>
@@ -179,7 +179,7 @@
       <div>
         <div class="card">
           <h3 class="mb-2">Run Benchmark</h3>
-          <form class="form" method="post" action="/ops/eval/benchmark{{ token_qs }}">
+          <form class="form" method="post" action="/models/eval/benchmark{{ token_qs }}">
             <div class="grid3">
               <div>
                 <label>Model</label>
@@ -213,7 +213,7 @@
 
         <div class="card">
           <h3 class="mb-2">Compare Models</h3>
-          <form class="form" method="post" action="/ops/eval/compare{{ token_qs }}">
+          <form class="form" method="post" action="/models/eval/compare{{ token_qs }}">
             <div class="grid2">
               <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu" value="KQ.m@SHFE.cu"/></div>
               <div><label>Models (comma-separated)</label><input name="models" value="logistic,xgboost,deeplob"/></div>
@@ -254,7 +254,7 @@
       <div>
         <div class="card">
           <h3 class="mb-2">Backtest</h3>
-          <form class="form" method="post" action="/ops/eval/backtest{{ token_qs }}">
+          <form class="form" method="post" action="/models/eval/backtest{{ token_qs }}">
             <div class="grid2">
               <div><label>Model</label><input name="model" value="xgboost"/></div>
               <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu"/></div>
@@ -275,7 +275,7 @@
         <div class="card">
           <h3 class="mb-2">Paper (online calibrator)</h3>
           <div class="muted text-sm mb-2">No real orders are sent. For research/validation only.</div>
-          <form class="form" method="post" action="/ops/eval/paper{{ token_qs }}">
+          <form class="form" method="post" action="/models/eval/paper{{ token_qs }}">
             <div><label>Model</label><input name="model" value="xgboost"/></div>
             <div><label>Symbols (comma-separated)</label><input name="symbols" placeholder="KQ.m@SHFE.cu"/></div>
             <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
@@ -285,7 +285,7 @@
 
         <div class="card">
           <h3 class="mb-2">Daily Train</h3>
-          <form class="form" method="post" action="/ops/eval/daily_train{{ token_qs }}">
+          <form class="form" method="post" action="/models/eval/daily_train{{ token_qs }}">
             <div><label>Symbols (comma-separated)</label><input name="symbols" placeholder="KQ.m@SHFE.cu"/></div>
             <div class="grid3">
               <div><label>Model</label><input name="model" value="deeplob"/></div>
@@ -488,7 +488,7 @@
       // Navigate to benchmarks tab with prefilled values.
       document.querySelector('[data-tab="benchmarks"]').click();
       try {
-        const form = document.querySelector('#tab-benchmarks form[action^="/ops/eval/benchmark"]');
+        const form = document.querySelector('#tab-benchmarks form[action^="/models/eval/benchmark"]');
         if (form) {
           const mSel = form.querySelector('select[name="model"]');
           const sIn = form.querySelector('input[name="symbol"]');

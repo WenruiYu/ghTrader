@@ -9,8 +9,10 @@ Implements PRD §5.12:
 
 from __future__ import annotations
 
+import json
 import pickle
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -22,6 +24,113 @@ from sklearn.preprocessing import StandardScaler
 log = structlog.get_logger()
 
 RegimeType = Literal["trending", "mean_reverting", "volatile", "quiet"]
+
+REGIME_STATES_TABLE = "ghtrader_regime_states_v2"
+
+
+@dataclass(frozen=True)
+class RegimeStateRow:
+    ts: datetime
+    datetime_ns: int
+    symbol: str
+    trading_day: str
+    regime_id: int
+    regime_label: str
+    regime_probabilities: list[float]
+    detection_method: str
+    model_config_hash: str
+
+
+def ensure_regime_states_table(
+    *,
+    cfg: Any,
+    table: str = REGIME_STATES_TABLE,
+    connect_timeout_s: int = 2,
+) -> None:
+    from ghtrader.questdb.client import connect_pg
+
+    tbl = str(table).strip() or REGIME_STATES_TABLE
+    ddl = f"""
+    CREATE TABLE IF NOT EXISTS {tbl} (
+      ts TIMESTAMP,
+      datetime_ns LONG,
+      symbol SYMBOL,
+      trading_day SYMBOL,
+      regime_id INT,
+      regime_label SYMBOL,
+      regime_probabilities STRING,
+      detection_method SYMBOL,
+      model_config_hash SYMBOL,
+      updated_at TIMESTAMP
+    ) TIMESTAMP(ts) PARTITION BY DAY WAL
+      DEDUP UPSERT KEYS(ts, symbol, trading_day, detection_method)
+    """
+    with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
+        try:
+            conn.autocommit = True  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        with conn.cursor() as cur:
+            cur.execute(ddl)
+            for name, typ in [
+                ("datetime_ns", "LONG"),
+                ("symbol", "SYMBOL"),
+                ("trading_day", "SYMBOL"),
+                ("regime_id", "INT"),
+                ("regime_label", "SYMBOL"),
+                ("regime_probabilities", "STRING"),
+                ("detection_method", "SYMBOL"),
+                ("model_config_hash", "SYMBOL"),
+                ("updated_at", "TIMESTAMP"),
+            ]:
+                try:
+                    cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {name} {typ}")
+                except Exception:
+                    pass
+            try:
+                cur.execute(f"ALTER TABLE {tbl} DEDUP ENABLE UPSERT KEYS(ts, symbol, trading_day, detection_method)")
+            except Exception:
+                pass
+
+
+def upsert_regime_state_rows(
+    *,
+    cfg: Any,
+    rows: list[RegimeStateRow],
+    table: str = REGIME_STATES_TABLE,
+    connect_timeout_s: int = 2,
+) -> int:
+    from ghtrader.questdb.client import connect_pg
+
+    if not rows:
+        return 0
+    tbl = str(table).strip() or REGIME_STATES_TABLE
+    now = datetime.now(timezone.utc)
+    params: list[tuple[Any, ...]] = []
+    for r in rows:
+        params.append(
+            (
+                r.ts,
+                int(r.datetime_ns),
+                str(r.symbol).strip(),
+                str(r.trading_day).strip(),
+                int(r.regime_id),
+                str(r.regime_label).strip(),
+                json.dumps([float(x) for x in r.regime_probabilities], ensure_ascii=False),
+                str(r.detection_method).strip(),
+                str(r.model_config_hash).strip(),
+                now,
+            )
+        )
+    sql = (
+        f"INSERT INTO {tbl} "
+        "(ts, datetime_ns, symbol, trading_day, regime_id, regime_label, regime_probabilities, detection_method, model_config_hash, updated_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+    )
+    with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, params)
+    return int(len(params))
 
 @dataclass
 class RegimeFeatures:
@@ -59,7 +168,7 @@ class RegimeDetector:
 
     def _init_model(self) -> None:
         try:
-            from hmmlearn.hmm import GaussianHMM
+            from hmmlearn.hmm import GaussianHMM  # type: ignore[reportMissingImports]
         except ImportError:
             raise RuntimeError("hmmlearn not installed. Install with: pip install hmmlearn")
             
@@ -231,65 +340,94 @@ def train_regime_model(
     artifacts_dir: Path,
     n_components: int = 3,
 ) -> Path:
-    """Train and save a regime detection model for a symbol."""
-    from ghtrader.datasets.features import read_features_for_symbol
-    
-    # Load features (we use raw price/volume from features table if available, 
-    # or re-compute from ticks. Here assuming features table has price data or we fetch ticks)
-    # For simplicity, let's assume we fetch ticks directly or use a feature set that includes price.
-    # Actually, `read_features_for_symbol` returns derived features. 
-    # Better to use `fetch_ticks_for_symbol_day` loop or `read_features` if it has raw columns.
-    # Let's use `read_features_for_symbol` but we need to ensure it has price columns.
-    # If not, we might need to fetch ticks.
-    #
-    # Alternative: The RegimeDetector `prepare_features` expects a DF with price/volume.
-    # Let's assume we can get this from `ghtrader.questdb.queries.fetch_ticks_for_symbol_day`
-    # for a range of days.
-    
+    """
+    Train and save an HMM regime model for a symbol, then persist latest
+    per-day regime states to QuestDB (`ghtrader_regime_states_v2`).
+    """
+    _ = data_dir  # QuestDB-first data source
+
     from ghtrader.questdb.client import make_questdb_query_config_from_env
     from ghtrader.questdb.queries import list_trading_days_for_symbol, fetch_ticks_for_day
-    
+
     cfg = make_questdb_query_config_from_env()
-    
-    # Get last 30 days of data for training
+
+    # Get recent trading days for training.
     days = list_trading_days_for_symbol(
-        cfg=cfg, 
-        table="ghtrader_ticks_main_l5_v2", 
-        symbol=symbol, 
+        cfg=cfg,
+        table="ghtrader_ticks_main_l5_v2",
+        symbol=symbol,
         start_day=date.today() - timedelta(days=60),
         end_day=date.today(),
         dataset_version="v2",
-        ticks_kind="main_l5"
+        ticks_kind="main_l5",
     )
-    
+
     if not days:
         raise ValueError(f"No data found for {symbol}")
-        
-    # Fetch and concat
-    dfs = []
-    for d in days[-30:]: # Train on last 30 trading days
+
+    # Fetch and concat (latest 30 days).
+    dfs: list[pd.DataFrame] = []
+    for d in days[-30:]:
         df = fetch_ticks_for_day(
             cfg=cfg,
             symbol=symbol,
             trading_day=d,
             table="ghtrader_ticks_main_l5_v2",
-            columns=["bid_price1", "ask_price1", "volume"],
+            columns=["datetime_ns", "bid_price1", "ask_price1", "volume"],
             dataset_version="v2",
-            ticks_kind="main_l5"
+            ticks_kind="main_l5",
         )
         if not df.empty:
+            df = df.copy()
+            df["trading_day"] = d.isoformat()
             dfs.append(df)
-            
+
     if not dfs:
         raise ValueError(f"No tick data available for {symbol}")
-        
+
     full_df = pd.concat(dfs, ignore_index=True)
-    
+
     detector = RegimeDetector(n_components=n_components)
     detector.fit(full_df)
-    
-    # Save
+
+    # Save model artifact.
     out_path = artifacts_dir / symbol / "regime" / "hmm_model.pkl"
     detector.save(out_path)
-    
+
+    # Persist one regime state snapshot per trading day (last tick of day).
+    try:
+        states, probs = detector.predict(full_df)
+        ensure_regime_states_table(cfg=cfg)
+        rows: list[RegimeStateRow] = []
+        day_groups = full_df.groupby("trading_day", sort=True).tail(1)
+        model_cfg_hash = f"hmm:{int(detector.n_components)}:{str(detector.covariance_type)}"
+        for idx in day_groups.index.tolist():
+            try:
+                day = str(full_df.at[idx, "trading_day"])
+                dt_ns = int(full_df.at[idx, "datetime_ns"])
+                ts = datetime.fromtimestamp(float(dt_ns) / 1_000_000_000.0, tz=timezone.utc)
+                regime_id = int(states[idx])
+                label = str(detector.state_map.get(regime_id, f"regime_{regime_id}"))
+                prob_vec = probs[idx].tolist() if len(probs.shape) == 2 else []
+                rows.append(
+                    RegimeStateRow(
+                        ts=ts,
+                        datetime_ns=dt_ns,
+                        symbol=str(symbol),
+                        trading_day=day,
+                        regime_id=regime_id,
+                        regime_label=label,
+                        regime_probabilities=[float(x) for x in prob_vec],
+                        detection_method="hmm",
+                        model_config_hash=model_cfg_hash,
+                    )
+                )
+            except Exception:
+                continue
+        if rows:
+            upsert_regime_state_rows(cfg=cfg, rows=rows)
+            log.info("regime.states_persisted", symbol=symbol, rows=len(rows))
+    except Exception as e:
+        log.warning("regime.states_persist_failed", symbol=symbol, error=str(e))
+
     return out_path

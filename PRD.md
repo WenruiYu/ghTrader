@@ -16,7 +16,23 @@
 - Any future design/implementation planning must:
   - **read and understand this PRD first**, then
   - **update/evolve this PRD** before or alongside code changes.
-- Other documents (e.g. older `.cursor/plans/*`) are **historical** and must not be treated as authoritative if they conflict with this PRD.
+- Other documents (e.g. older planning docs (including `.cursor/plans/*`)) are **historical** and must not be treated as authoritative if they conflict with this PRD.
+
+---
+
+### Big-Bang alignment boundary (2026-02)
+
+This section defines the current PRD-alignment cleanup scope.
+
+- **In scope**:
+  - align already implemented modules to PRD structure and current phase boundaries,
+  - remove confirmed obsolete/deferred dead code and stale compatibility implementations,
+  - normalize CLI and control-plane entry surfaces to canonical behavior.
+- **Out of scope (this pass)**:
+  - PRD modules currently marked **Pending** remain pending unless explicitly re-scoped in a future PRD update.
+- **Compatibility policy**:
+  - backward-compatible redirects (notably `/ops` -> canonical pages) may remain,
+  - permanently deferred placeholder commands/APIs should be removed from the active surface rather than kept as dead stubs.
 
 ---
 
@@ -79,18 +95,20 @@ ghTrader employs a hybrid architecture to balance sub-millisecond trading latenc
    - **Latency**: < 1ms (Tick -> Signal -> Order).
    - **Components**: AccountGateway <-> StrategyRunner.
    - **Protocol**: Binary-safe IPC. No disk I/O. No polling.
-   - **Fallback**: None. If ZMQ fails, the system halts safely.
+   - **Failure policy**: No disk fallback for trading decisions. If ZMQ becomes unhealthy, StrategyRunner must stop emitting new targets and surface an explicit degraded/halt state.
 
 2. **Warm Path (UI/Ops)**: Redis (State Cache) + WebSockets.
    - **Latency**: < 50ms (System -> UI).
    - **Components**: Gateway/Strategy -> Redis -> FastAPI -> Web UI.
    - **Protocol**: Redis Pub/Sub + JSON over WebSockets.
    - **Role**: Decoupled observability and command injection.
+   - **UI update policy**: WebSocket-first; polling is degraded-mode fallback only (2s active tab, 30s background) when WS is unavailable.
 
 3. **Cold Path (Audit/Data)**: QuestDB + Files.
    - **Latency**: Seconds/Minutes (Async).
    - **Components**: Gateway/Strategy -> Disk (Logs/Snapshots) -> QuestDB.
    - **Role**: Immutable audit trail, historical data, post-mortem analysis.
+   - **Boundary**: Disk artifacts are audit mirrors only and must not be used as hot-path IPC inputs.
 
 **Trading + Control-Plane Flow:**
 
@@ -264,7 +282,7 @@ While TqSdk is the current data provider, ghTrader should maintain a modular arc
 **Future extensibility**:
 - Architecture allows adding alternative data providers without major refactoring
 - Potential future providers: CTP direct, other vendor APIs, replay providers
-- Simulation providers (see Section 5.8) should implement the same interfaces
+- Simulation providers (see Section 5.7) should implement the same interfaces
 
 **TqSdk-specific requirements** (current implementation):
 - TqSdk Pro (`tq_dl`) for historical L5 tick download
@@ -294,29 +312,38 @@ Implementation:
 Implementation:
 - `src/ghtrader/questdb/serving_db.py` (QuestDB schema + ingestion)
 
-#### 5.3.0.0 Dataset/version selection (v2 only)
+#### 5.2.1 Dataset/version selection (v2 only)
 
 - There is no dataset version toggle; all ingestion and downstream builds use **v2**.
 - All QuestDB tables and index rows must include `dataset_version='v2'` for future-proofing, but mixing across versions is not supported.
 
 
-#### 5.3.0.2 Data integrity validation (Phase-0 minimal)
+#### 5.2.2 Data integrity validation (Phase-0 minimal)
 
 Phase-0 focuses on **main_l5 correctness only**:
 - Each `main_l5` row includes `underlying_contract`, `segment_id`, and `schedule_hash`.
 - Ingest writes a manifest under `data/manifests/` for reproducibility.
+- Validation layering is explicit to avoid duplicated requirements:
+  - `5.2.2`: day/session coverage + cadence/gap summary (minimal integrity baseline)
+  - `5.2.6`: field-level null/anomaly checks
+  - `5.2.7`: intra-day gap ledger/statistics
 - **Main_l5 validation (Phase-0)**:
   - Validate coverage against **actual trading sessions** (night sessions + holidays) using cached `trading_time` from TqSdk.
   - **Optimization**: Support incremental validation (check only new days) and parallel execution.
   - Respect **exchange-level session overrides**:
     - Skip night sessions during known suspension windows (e.g., SHFE night trading suspended from 2020-02-03 through 2020-05-06) in addition to holiday-gap skips.
     - Handle **one-off delayed night opens** (e.g., SHFE 2019-12-25 delay to 22:30, applied to the 2019-12-26 trading day) by shifting the expected night-session start.
-  - **Hybrid cadence detection** (per trading day):\n    - If `seconds_with_two_plus / seconds_with_ticks >= strict_ratio`, treat day as **fixed 0.5s cadence** and enforce per-second frequency (2 ticks/sec, boundary seconds tolerant).\n    - Otherwise treat as **event-driven** and only flag gaps above a threshold.
+  - **Hybrid cadence detection** (per trading day):
+    - If `seconds_with_two_plus / seconds_with_ticks >= strict_ratio`, treat day as **fixed 0.5s cadence** and enforce per-second frequency (2 ticks/sec, boundary seconds tolerant).
+    - Otherwise treat as **event-driven** and only flag gaps above a threshold.
   - **Gap threshold**: gaps shorter than `gap_threshold_s` are ignored to avoid false positives from natural sparsity.
   - **Detect + report only** (no auto-repair): missing segments (>= threshold), missing half-seconds (strict days), and summary counts.
   - **Best-effort source attribution**: mark gaps as TqSdk-source when provider returns no data; otherwise `unknown`.
-  - Persist to QuestDB:\n    - Summary table: `ghtrader_main_l5_validate_summary_v2` (symbol + trading_day + cadence stats + gap counts)\n    - Gap detail table: `ghtrader_main_l5_validate_gaps_v2` (per-gap rows; capped per day)\n  - Write a validation report under `runs/control/reports/main_l5_validate/` and surface a summary in `/data`.
-#### 5.3.0.2a Update semantics (Phase-0, safe + idempotent)
+  - Persist to QuestDB:
+    - Summary table: `ghtrader_main_l5_validate_summary_v2` (symbol + trading_day + cadence stats + gap counts)
+    - Gap detail table: `ghtrader_main_l5_validate_gaps_v2` (per-gap rows; capped per day)
+  - Write a validation report under `runs/control/reports/main_l5_validate/` and surface a summary in `/data`.
+#### 5.2.3 Update semantics (Phase-0, safe + idempotent)
 
 - **main_schedule**:
   - If the computed schedule hash and latest trading day match what is already stored for `(exchange, variety)`, the build is a **no-op**.
@@ -330,7 +357,7 @@ Phase-0 focuses on **main_l5 correctness only**:
   - Update runs should emit a lightweight report under `runs/control/reports/` with expected days vs present days, plus a coverage watermark (last trading day + last tick timestamp).
 
 
-#### 5.3.0.3 Database / query layer (QuestDB-only)
+#### 5.2.4 Database / query layer (QuestDB-only)
 
 Canonical data stored in QuestDB is reduced to:
 
@@ -351,13 +378,13 @@ Canonical data stored in QuestDB is reduced to:
 
 QuestDB is the chosen canonical tick store for this phase.
 
-#### 5.3.0.4 Best-in-class data governance (alignment)
+#### 5.2.5 Best-in-class data governance (alignment)
 
 - **Lineage manifests**: each derived dataset build must emit a QuestDB‑stored manifest (config hash, source tables, schedule hash, row_hash summary).
 - **Backfill governance**: define allowed backfill windows, approval rules, and change‑log records for any historical corrections.
 - **Data SLIs/SLOs**: set explicit freshness/completeness targets and track error budgets in the control plane.
 
-#### 5.3.0.5 Field-level Quality Validation (QuestDB-first)
+#### 5.2.6 Field-level Quality Validation (QuestDB-only)
 
 Day-level completeness is necessary but not sufficient for tick data. ghTrader must validate field-level completeness and quality within each `(symbol, trading_day, ticks_kind, dataset_version)` partition.
 
@@ -388,9 +415,13 @@ Storage (QuestDB):
 Implementation:
 - `src/ghtrader/data/field_quality.py`
 
-#### 5.3.0.6 Intra-day Gap Detection (QuestDB-first) [Implemented]
+#### 5.2.7 Intra-day Gap Detection (QuestDB-only) [Partial]
 
 For high-frequency strategies, missing ticks within a trading day can invalidate backtests and live signals even when day-level completeness passes.
+
+Phase-0 status:
+- QuestDB gap ledger persistence is implemented and queryable.
+- Full inter-tick interval distribution modeling (median/p95/p99 from raw interval scan) remains pending.
 
 Inter-tick interval analysis:
 - Compute inter-tick interval statistics per `(symbol, trading_day)` using `datetime_ns`.
@@ -413,9 +444,11 @@ Storage (QuestDB):
   - abnormal gap counts and largest-gap metadata
 
 Implementation:
-- `src/ghtrader/data/gap_detection.py`
+- `src/ghtrader/questdb/main_l5_validate.py` (tick gap table schema + upsert path)
+- `src/ghtrader/data/main_l5_validation.py` (validation pipeline integration)
+- `src/ghtrader/data/gap_detection.py` (query/read surface for dashboard and diagnostics)
 
-#### 5.3.1 Derived dataset: “main-with-depth” (materialized continuity with L5)
+#### 5.2.8 Derived dataset: “main-with-depth” (materialized continuity with L5)
 
 Because `KQ.m@...` continuous symbols are L1-only, ghTrader must support a derived dataset that provides:
 
@@ -424,7 +457,7 @@ Because `KQ.m@...` continuous symbols are L1-only, ghTrader must support a deriv
 
 Definition:
 
-- The derived symbol is named like the continuous series (e.g. `KQ.m@SHFE.cu`), but it is **materialized** from L5 ticks of the underlying contract selected by the roll schedule (§5.3.2).
+- The derived symbol is named like the continuous series (e.g. `KQ.m@SHFE.cu`), but it is **materialized** from L5 ticks of the underlying contract selected by the roll schedule (§5.2.9).
 - Output is written to QuestDB table `ghtrader_ticks_main_l5_v2` (`ticks_kind='main_l5'`, `dataset_version='v2'`).
 - Provenance must be recorded (schedule hash, underlying contracts used, row counts per day).
 - **L5-only guarantee**: `main_l5` must contain **only true L5 rows** (levels 2–5 present). Any L1-only rows are filtered out, and any trading day with zero L5 rows is skipped.
@@ -451,10 +484,10 @@ Builder semantics for derived ticks (critical):
   - cross-day lookahead must be **disabled** when the underlying changes between adjacent trading days (end-of-day labels become NaN rather than leaking).
 - Materialization must persist schedule provenance (QuestDB-first):
   - store `schedule_hash` and other provenance metadata (underlying contract, segment id) in the derived tick rows and/or a small QuestDB metadata table keyed by `schedule_hash`
-  - the roll schedule is stored in QuestDB (see §5.3.2); there is no file-based schedule export
+  - the roll schedule is stored in QuestDB (see §5.2.9); there is no file-based schedule export
   - optional debugging-only artifacts (e.g. a JSON summary of a schedule build) may be written under `runs/` as reports, but must not be required for runtime resolution
 
-#### 5.3.2 Main continuous roll schedule source (TqSdk main mapping only)
+#### 5.2.9 Main continuous roll schedule source (TqSdk main mapping only)
 
 Default source: TqSdk main continuous alias `KQ.m@EXCHANGE.var`. We treat the schedule as **given**, not invented by ghTrader.
 
@@ -494,7 +527,7 @@ ghTrader’s derived “main-with-depth” dataset uses **88-style splice semant
 
 ghTrader must compute features causally (no future information leakage) and provide both offline batch and online incremental computation.
 
-#### 5.4.0.1 Factor Taxonomy
+#### 5.3.1 Factor Taxonomy
 
 Factors are organized into a structured taxonomy for maintainability and research:
 
@@ -526,7 +559,7 @@ Factors are organized into a structured taxonomy for maintainability and researc
 - **Autoencoder latents**: Learned low-dimensional representations from deep autoencoders
 - **Regime indicators**: HMM state probabilities, changepoint detector outputs
 
-#### 5.4.0.2 Computation Requirements
+#### 5.3.2 Computation Requirements
 
 - Must compute features causally (only use data up to time t for feature at time t)
 - Must provide:
@@ -535,7 +568,7 @@ Factors are organized into a structured taxonomy for maintainability and researc
 - Must support configurable lookback windows per factor
 - Must handle missing data gracefully (forward-fill, interpolation, or NaN propagation)
 
-#### 5.4.0.3 Storage (QuestDB-first)
+#### 5.3.3 Storage (QuestDB-only)
 
 Features must be stored in QuestDB table `ghtrader_features_v2` (not as filesystem files) with:
 - Primary time column `ts` and `datetime_ns`
@@ -543,7 +576,7 @@ Features must be stored in QuestDB table `ghtrader_features_v2` (not as filesyst
 - Factor columns (wide schema) or a stable long-form schema (if wide is too dynamic)
 - Build metadata recorded in QuestDB (build id/config hash, factor set, lookback config)
 
-#### 5.4.0.4 Feature Store Architecture
+#### 5.3.4 Feature Store Architecture
 
 ghTrader must implement feature store principles to ensure consistency between training and serving:
 
@@ -563,7 +596,7 @@ ghTrader must implement feature store principles to ensure consistency between t
 - Online features must have configurable TTL per feature type
 - If a feature value is older than TTL, serve null or raise staleness error (configurable)
 - Default TTL: 30 minutes for intraday features, 1 day for daily features
-- Staleness monitoring must be integrated with anomaly detection (Section 5.14)
+- Staleness monitoring must be integrated with anomaly detection (Section 5.13)
 
 **Materialization**:
 - **Batch materialization**: End-of-day or end-of-session push of computed features to online store
@@ -591,13 +624,13 @@ ghTrader must implement feature store principles to ensure consistency between t
   - `lookback_ticks`, `ttl_seconds`
   - `created_at`, `deprecated_at`
 
-#### 5.4.0.5 Best-in-class feature store hardening (alignment)
+#### 5.3.5 Best-in-class feature store hardening (alignment)
 
 - **Parity tests**: enforce offline/online feature parity with golden replays.
 - **Staleness SLAs**: per‑feature TTL SLOs; alert when breached.
 - **Schema governance**: breaking‑change protocol with automatic version bump and migration notes.
 
-#### 5.4.1 Automatic Feature Engineering
+#### 5.3.6 Automatic Feature Engineering
 
 ghTrader should support automated feature generation and selection:
 
@@ -623,7 +656,7 @@ ghTrader should support automated feature generation and selection:
 - Staleness checks (feature not updated recently)
 - Range/sanity checks (detect anomalous feature values)
 
-#### 5.4.2 Alternative Data Integration (future scope)
+#### 5.3.7 Alternative Data Integration (future scope)
 
 ghTrader architecture should support integration of alternative data sources:
 
@@ -641,11 +674,16 @@ Implementation:
 - `src/ghtrader/datasets/features.py` (`FactorEngine`)
 - `src/ghtrader/datasets/feature_store.py` (new module for registry/validation)
 
-### 5.4 Labels (event-time, multi-horizon) [Implemented]
+### 5.4 Labels (event-time, multi-horizon) [Partial]
 
 ghTrader supports multiple label types for different prediction tasks.
 
-#### 5.5.1 Direction Labels (price movement prediction)
+Phase-0 status:
+- Direction labels (`DOWN/FLAT/UP`) are implemented in the canonical pipeline.
+- Fill-probability labels are implemented (`ghtrader_fill_labels_v2`, `src/ghtrader/fill_labels.py`).
+- Execution-cost labels remain pending (see 5.4.3).
+
+#### 5.4.1 Direction Labels (price movement prediction)
 
 - Define mid price: `mid = (bid_price1 + ask_price1) / 2`.
 - Horizons: configurable list (default `{10, 50, 200}` ticks).
@@ -657,7 +695,7 @@ Storage: `ghtrader_labels_v2` table with:
 - one column per configured horizon (e.g. `label_10`, `label_50`, `label_200`)
 - label-build metadata recorded in QuestDB (threshold, horizons, config hash)
 
-#### 5.5.2 Fill Probability Labels (execution prediction)
+#### 5.4.2 Fill Probability Labels (execution prediction) [Implemented]
 
 For execution optimization models (KANFormer-style), ghTrader must support fill probability labels:
 
@@ -684,7 +722,7 @@ Storage: `ghtrader_fill_labels_v2` table with:
 - `fill_prob_{horizon}` (probability estimate)
 - `queue_position` (estimated position in queue)
 
-#### 5.5.3 Execution Cost Labels (for TCA)
+#### 5.4.3 Execution Cost Labels (for TCA)
 
 For transaction cost analysis and execution optimization:
 
@@ -704,7 +742,7 @@ Storage: `ghtrader_execution_labels_v2` table with:
 - `spread_cost`, `impact_cost`, `timing_cost` (decomposition)
 - `order_size`, `execution_duration`
 
-#### 5.5.4 Label Computation Requirements
+#### 5.4.4 Label Computation Requirements
 
 All label types must:
 - Be computed causally (no lookahead beyond the label horizon)
@@ -714,10 +752,10 @@ All label types must:
 
 Implementation:
 - `src/ghtrader/datasets/labels.py` (direction labels)
-- `src/ghtrader/fill_labels.py` (fill probability labels, new module)
+- `src/ghtrader/fill_labels.py` (fill probability labels)
 - `src/ghtrader/execution_labels.py` (execution cost labels, new module)
 
-#### 5.5.5 Best-in-class label governance (alignment)
+#### 5.4.5 Best-in-class label governance (alignment)
 
 - **Leakage guardrails**: enforce purged/embargoed splits for label generation and evaluation.
 - **Label schema versioning**: breaking changes require new label version with explicit migration notes.
@@ -729,43 +767,43 @@ We maintain a **model ladder** (simplest → most powerful), and choose winners 
 
 *Note: Tabular baselines, standard deep models (DeepLOB, Transformer, TCN, TLOB, SSM), and SOTA architectures (T-KAN, LOBERT, KANFormer) are implemented.*
 
-#### 5.6.0.1 Tabular Baselines
+#### 5.5.1 Tabular Baselines
 - Logistic Regression (interpretable baseline)
 - XGBoost (gradient boosting with regularization)
 - LightGBM (fast, handles high-cardinality features)
 
-#### 5.6.0.2 Deep Sequence Models
+#### 5.5.2 Deep Sequence Models
 - **DeepLOB-style CNN+LSTM**: Convolutional feature extraction + recurrent sequence modeling
 - **Transformer encoder**: Self-attention for tick sequences
 - **TCN (Temporal Convolutional Network)**: Dilated causal convolutions, strong latency/performance tradeoff
 - **TLOB dual-attention transformer**: Explicit spatial (LOB levels) + temporal (sequence) attention
 - **SSM/Mamba-style**: Fast linear-time sequence modeling (O(n) vs O(n²) attention)
 
-#### 5.6.0.3 Advanced Architectures (extended model zoo)
+#### 5.5.3 Advanced Architectures (extended model zoo)
 - **Temporal Fusion Transformer (TFT)**: Multi-horizon forecasting with interpretable variable selection and attention
 - **PatchTST**: Patch-based transformer for time series (channel-independent, proven SOTA on benchmarks)
 - **Informer/Autoformer**: Long-sequence efficient transformers with ProbSparse attention
 - **TimesNet**: Multi-scale temporal modeling via 2D convolutions on period-frequency representations
 - **N-BEATS/N-HiTS**: Interpretable neural basis expansion with hierarchical interpolation
 
-#### 5.6.0.4 Probabilistic Models (uncertainty quantification)
+#### 5.5.4 Probabilistic Models (uncertainty quantification)
 - **Quantile regression networks**: Direct quantile prediction for confidence intervals
 - **Mixture Density Networks (MDN)**: Multi-modal price distribution modeling
 - **Bayesian neural networks**: Epistemic uncertainty via weight distributions (MC Dropout or variational)
 - **Normalizing flows**: Flexible density estimation for return distributions
 - **Deep Ensembles**: Uncertainty via ensemble disagreement
 
-#### 5.6.0.5 Foundation Models for Finance (transfer learning)
+#### 5.5.5 Foundation Models for Finance (transfer learning)
 - **Pre-trained LOB encoders**: Self-supervised pre-training on tick sequences (masked prediction, contrastive learning)
 - **Transfer learning**: Fine-tune from larger tick datasets or cross-market pre-training
 - **Contrastive learning**: Learn market state representations via SimCLR/MoCo-style objectives
 
-#### 5.6.0.6 Reinforcement Learning (execution and strategy optimization)
+#### 5.5.6 Reinforcement Learning (execution and strategy optimization)
 - **PPO/SAC agents**: On-policy/off-policy RL for execution optimization
 - **Offline RL**: Conservative Q-Learning (CQL), Decision Transformer for learning from historical executions
 - **Multi-agent RL**: Market simulation with competing agents for robustness testing
 
-#### 5.6.0.7 SOTA LOB Architectures (2025-2026) [Implemented]
+#### 5.5.7 SOTA LOB Architectures (2025-2026) [Implemented]
 
 - **T-KAN (Temporal Kolmogorov-Arnold Networks)**: Learnable B-spline edges in LSTM gates. High interpretability and FPGA-optimizable. (arXiv:2601.02310)
 - **LOBERT (Foundation Model)**: BERT-style encoder for LOB messages with PLGS scaling and MMM pretraining. (arXiv:2511.12563)
@@ -786,7 +824,7 @@ Model selection criteria:
 Implementation:
 - `src/ghtrader/research/models.py`
 
-#### 5.6.1 Ensemble and Stacking Framework
+#### 5.5.8 Ensemble and Stacking Framework
 
 ghTrader must support model ensembles to improve prediction robustness and reduce variance:
 
@@ -819,7 +857,7 @@ ghTrader must support model ensembles to improve prediction robustness and reduc
 Implementation:
 - `src/ghtrader/ensemble.py` (new module)
 
-#### 5.6.2 Best-in-class model risk controls (alignment)
+#### 5.5.9 Best-in-class model risk controls (alignment)
 
 - **Risk tiering**: classify models by latency/complexity and apply stricter gates to higher‑risk tiers.
 - **Robustness tests**: require regime‑split validation and stress scenarios before promotion.
@@ -829,7 +867,7 @@ Implementation:
 
 - Must support intraday adaptation by fitting on delayed event-time labels.
 - Must include guardrails: disable-on-instability, performance monitoring.
-- **Drift detection**: Integrated with Section 5.14 Anomaly and Drift Detection framework
+- **Drift detection**: Integrated with Section 5.13 Anomaly and Drift Detection framework
   - Monitor feature drift (input distribution changes)
   - Monitor concept drift (label distribution changes)
   - Trigger recalibration or fallback when drift exceeds thresholds
@@ -838,9 +876,9 @@ Implementation:
 Implementation:
 - `src/ghtrader/research/online.py` (`OnlineCalibrator`, `DelayedLabelBuffer`)
 - `src/ghtrader/tq/paper.py` (`run_paper_trading`)  # TqSdk-specific loop (see §5.1.3)
-- Drift detection via `src/ghtrader/anomaly.py` (see Section 5.14)
+- Drift detection via `src/ghtrader/anomaly.py` (see Section 5.13)
 
-#### 5.7.1 Best-in-class drift SLAs (alignment)
+#### 5.6.1 Best-in-class drift SLAs (alignment)
 
 - Define **drift SLAs** (warning/critical thresholds) per model family.
 - Tie **rollback** rules to drift + execution anomaly thresholds.
@@ -850,7 +888,7 @@ Implementation:
 
 ghTrader provides a unified evaluation and simulation framework spanning backtesting, micro-simulation, and synthetic market generation.
 
-#### 5.8.1 Tier1: TqBacktest Harness
+#### 5.7.1 Tier1: TqBacktest Harness
 
 - Uses TqSdk's backtest mode for realistic order execution simulation
 - Supports paper trading evaluation against historical data
@@ -858,7 +896,7 @@ ghTrader provides a unified evaluation and simulation framework spanning backtes
 
 Implementation: `src/ghtrader/tq/eval.py` (Tier1 TqBacktest harness; TqSdk-specific)
 
-#### 5.8.2 Tier2: Offline Micro-Sim
+#### 5.7.2 Tier2: Offline Micro-Sim
 
 - Higher fidelity simulation with latency modeling and partial fill approximations
 - Queue position estimation for limit orders
@@ -867,7 +905,7 @@ Implementation: `src/ghtrader/tq/eval.py` (Tier1 TqBacktest harness; TqSdk-speci
 
 Implementation: `src/ghtrader/research/pipeline.py` (`OfflineMicroSim`)
 
-#### 5.8.3 Order Book Simulator (for RL training)
+#### 5.7.3 Order Book Simulator (for RL training)
 
 For reinforcement learning and advanced strategy testing, ghTrader must support synthetic LOB simulation:
 
@@ -877,7 +915,7 @@ For reinforcement learning and advanced strategy testing, ghTrader must support 
 - **Historical replay with order injection**: Replay real tick data while injecting hypothetical orders
 - **Synthetic tick generation**: Generate stress test scenarios (flash crash, liquidity crisis)
 
-#### 5.8.4 Market Generator
+#### 5.7.4 Market Generator
 
 For data augmentation and robustness testing:
 
@@ -887,7 +925,7 @@ For data augmentation and robustness testing:
 - **Correlation structure**: Multi-asset generation with realistic cross-correlations (CU/AU/AG)
 - **Regime-conditional generation**: Different parameters per market regime (trending/mean-reverting/volatile)
 
-#### 5.8.5 Multi-Agent Simulation
+#### 5.7.5 Multi-Agent Simulation
 
 For strategy robustness and market impact analysis:
 
@@ -896,7 +934,7 @@ For strategy robustness and market impact analysis:
 - **Market impact feedback**: Strategies affect prices, which affects other strategies
 - **Crowding detection**: Identify when strategies are too correlated
 
-#### 5.8.6 Replay with Modification
+#### 5.7.6 Replay with Modification
 
 For counterfactual analysis and execution optimization:
 
@@ -909,7 +947,7 @@ Implementation:
 - `src/ghtrader/research/pipeline.py` (`OfflineMicroSim` for Tier2)
 - `src/ghtrader/simulator.py` (new module for LOB simulation, market generation, multi-agent)
 
-#### 5.8.7 Best-in-class evaluation rigor (alignment)
+#### 5.7.7 Best-in-class evaluation rigor (alignment)
 
 - **Statistical significance**: require bootstrap CIs for core PnL metrics and Sharpe.
 - **Stress protocols**: run scenario tests (volatility spikes, liquidity droughts, spread widening).
@@ -929,7 +967,7 @@ Daily job must:
 Implementation:
 - `src/ghtrader/research/pipeline.py` (`run_daily_pipeline`, `PromotionGate` in `eval.py`)
 
-#### 5.9.1 Best-in-class continual training governance (alignment)
+#### 5.8.1 Best-in-class continual training governance (alignment)
 
 - **Pipeline SLOs**: daily run must complete within defined window; alert on breach.
 - **Reproducibility bundle**: store code hash + data manifest + config snapshot per run.
@@ -939,7 +977,7 @@ Implementation:
 
 ghTrader must provide comprehensive benchmarking that goes beyond classification accuracy to include trading-relevant metrics.
 
-#### 5.10.1 Standard Metrics
+#### 5.9.1 Standard Metrics
 
 - Must produce standardized JSON reports:
   - Offline metrics (accuracy/F1/logloss/ECE)
@@ -952,7 +990,7 @@ ghTrader must provide comprehensive benchmarking that goes beyond classification
   - **calibration bin stats** (for reliability diagrams)
 - Must support comparing multiple model families.
 
-#### 5.10.2 Transaction Cost-Adjusted Evaluation
+#### 5.9.2 Transaction Cost-Adjusted Evaluation
 
 Beyond classification accuracy, models must be evaluated under realistic trading costs:
 
@@ -973,7 +1011,7 @@ Beyond classification accuracy, models must be evaluated under realistic trading
   - Maximum drawdown (after costs)
   - Win rate and profit factor
 
-#### 5.10.3 Alpha Decay Analysis
+#### 5.9.3 Alpha Decay Analysis
 
 Performance typically degrades at longer prediction horizons. Models must be evaluated across multiple horizons:
 
@@ -987,7 +1025,7 @@ Reports must include:
 - Alpha decay visualization (accuracy vs horizon plot)
 - Comparative decay curves across model families
 
-#### 5.10.4 Calibration Diagnostics
+#### 5.9.4 Calibration Diagnostics
 
 For probabilistic models and uncertainty quantification:
 
@@ -1002,7 +1040,7 @@ Calibration breakdown by:
 - Time of day (open, midday, close)
 - Symbol
 
-#### 5.10.5 Fill Probability Metrics (for execution models)
+#### 5.9.5 Fill Probability Metrics (for execution models)
 
 For models predicting order execution (KANFormer-style):
 
@@ -1032,7 +1070,7 @@ Requirements:
     - **Data** (`/data`): Main schedule + main_l5 build
     - **Models** (`/models`): Model inventory, training, benchmarks
     - **Trading** (`/trading`): Trading console, positions, run history
-    - **Ops** (`/ops`): Pipeline operations, ingest, schedule/build, integrity, locks
+    - **Ops** (`/ops`, legacy): redirects to `/data` for backward compatibility
     - **SQL** (`/explorer`): QuestDB SQL explorer (read-only)
     - **System** (`/system`): CPU/memory/disk/GPU monitoring
   - Each page uses **tabbed layouts** to organize related functionality without excessive scrolling.
@@ -1114,13 +1152,14 @@ Requirements:
   - **Ops** (`/ops`) — **CONSOLIDATED INTO DATA HUB**:
     - The `/ops` page has been merged into `/data` (Data Hub) to provide a unified workflow.
     - All `/ops/*` routes redirect to `/data` with appropriate tab anchors for backward compatibility.
+    - Compatibility routes are redirect/proxy only; they are not a place to keep deferred business logic.
     - Former Ops tabs are now available in Data Hub:
       - Pipeline → Data Hub unified 8-step workflow (Steps 0-7)
       - Ingest → Data Hub Ingest tab
       - Schedule & Build → Data Hub Build tab
       - Integrity → Data Hub Integrity tab
       - Locks → Data Hub Locks tab
-  - `/data` is the canonical entrypoint for data operations. All `/ops/*` routes redirect to `/data` with appropriate tab anchors. Data Hub provides a single “source of truth” UI.
+  - `/data` is the canonical entrypoint for data operations and the single source-of-truth UI.
 - **Job execution model**:
   - Long-running operations must run as **subprocess jobs** (not in-process), so they are cancellable and resilient to UI restarts.
   - Job history must **persist across dashboard restarts**.
@@ -1166,7 +1205,7 @@ Requirements:
     - show job source (`terminal` vs `dashboard`)
     - show active **locks** and which job holds them
 
-#### 5.11.1 Strict resource locks (no conflicting concurrent writers)
+#### 5.10.1 Strict resource locks (no conflicting concurrent writers)
 
 Because some CLI commands overwrite shared outputs (e.g. `build` overwrites rows in `ghtrader_features_v2` / `ghtrader_labels_v2` for a symbol/config), ghTrader must enforce **strict locks** across all sessions.
 
@@ -1186,7 +1225,7 @@ Implementation:
 - `src/ghtrader/control/` (FastAPI app + job runner + SQLite store)
 - CLI command: `ghtrader dashboard`
 
-#### 5.11.2 Job Progress Observability
+#### 5.10.2 Job Progress Observability
 
 Long-running jobs (Build Schedule, main_l5) must provide **real-time progress visibility** so operators can monitor execution status without parsing raw logs.
 
@@ -1238,24 +1277,24 @@ Implementation:
 - `src/ghtrader/control/progress.py` (JobProgress class)
 - `src/ghtrader/control/templates/job_detail.html` (UI progress card)
 
-#### 5.11.3 Data Quality Monitoring Dashboard
+#### 5.10.3 Data Quality Monitoring Dashboard
 
 Phase‑1/2 deferred.
 
-#### 5.11.4 Best-in-class ops + SLOs (alignment)
+#### 5.10.4 Best-in-class ops + SLOs (alignment)
 
 - Define **SLO dashboards** (data freshness, job latency, QuestDB saturation, drift alerts).
 - Add **incident runbooks** for data corruption, QuestDB outages, and model regressions.
 - Enforce **audit retention** for job logs, trading commands, and safety actions.
 
-### 5.11 Real-Time Control Plane & Dashboard [Implemented]
+### 5.11 Trading Control Plane & Dashboard [Implemented]
 
 ghTrader must support **account monitoring and trading execution** using TqSdk in a **phased** way:
 
 - **Phase 1 (safe)**: paper + simulated execution for research/validation.
 - **Phase 2 (gated)**: real account execution, explicitly enabled, with robust safety/risk controls.
 
-#### 5.12.0 Trading architecture: AccountGateway (OMS/EMS) + StrategyRunner (AI)
+#### 5.11.1 Trading architecture: AccountGateway (OMS/EMS) + StrategyRunner (AI)
 
 To align with a mature quant system design while remaining AI-first and automation-first, ghTrader must separate:
 
@@ -1273,7 +1312,7 @@ Components:
 
 - **AccountGateway** (per `account_profile`):
   - Owns the **TqApi lifecycle** (connect/reconnect) and maintains live references for account/positions/orders/quotes.
-  - Enforces **risk controls** (PRD §5.12.4) and optional TqSdk defense-in-depth rules.
+  - Enforces **risk controls** (PRD §5.11.5) and optional TqSdk defense-in-depth rules.
   - Accepts **target updates** from StrategyRunner (or a manual override), and converts them to executor actions:
     - `TargetPosTask` (default) OR
     - direct `insert_order()`/`cancel_order()` (advanced).
@@ -1291,6 +1330,9 @@ Hot path (Gateway <-> Strategy):
   - gateway PUB -> strategy SUB: ticks + account snapshots + health
   - strategy PUSH/REQ -> gateway PULL/REP: target updates + commands
   - All messages include `schema_version`, `ts`, `seq`, `account_profile`, `payload`
+- **Hot-path safety policy**:
+  - StrategyRunner must not read gateway state from disk for trading decisions.
+  - If ZMQ data is stale/unavailable, StrategyRunner enters safe-halt (`no_new_targets`) and emits explicit health events (`safe_halt_entered`, `gateway_state_timeout`), then clears with `safe_halt_cleared` when stream health recovers.
 
 Warm path (UI + ops):
 - Redis is the hot-state store and fanout layer:
@@ -1300,6 +1342,7 @@ Warm path (UI + ops):
   - `ghtrader:commands:<PROFILE>` (stream)
   - `ghtrader:targets:<PROFILE>` (stream; optional mirror for UI)
 - FastAPI WebSocket endpoints stream updates to the dashboard from Redis.
+- Web UI uses WebSocket-first updates; fallback polling is degraded mode only (2s active tab, 30s background tab).
 
 Cold path (audit mirrors; not used for IPC):
 - Base directory: `runs/gateway/account=<PROFILE>/`
@@ -1309,14 +1352,15 @@ Cold path (audit mirrors; not used for IPC):
   - `events.jsonl`: append-only mirror of gateway events
   - `commands.jsonl`: append-only mirror of operator commands
   - `targets.json`: periodic snapshot of last target set
-  - `snapshots.jsonl`: append-only account snapshots (same schema requirements as PRD §5.12.6, but stored under the gateway root)
+  - `snapshots.jsonl`: append-only account snapshots (same schema requirements as PRD §5.11.7, but stored under the gateway root)
 
 Dashboard responsibility:
 
 - Provide UI/API to view and modify desired state (Redis), append commands to Redis streams, and display live state/events via WebSocket. Disk mirrors are read-only audit.
 - Provide a **GatewaySupervisor** that ensures a gateway process is running for profiles whose `desired.mode != idle`.
+- Provide a **StrategySupervisor** that ensures a strategy process is running for profiles whose strategy `desired.mode != idle`.
 
-#### 5.12.1 Trading modes and account types
+#### 5.11.2 Trading modes and account types
 
 **Account classification**:
 
@@ -1337,7 +1381,7 @@ Dashboard responsibility:
 - **live_monitor**: connect to the real broker account and record snapshots/events, but **never send orders**. This is the required first step before any live order routing.
 - **live_trade**: orders are allowed using `TqAccount(...)`. Requires both `GHTRADER_LIVE_ENABLED=true` and `confirm_live=I_UNDERSTAND`; if either is missing, the gateway automatically downgrades to `live_monitor`.
 
-#### 5.12.2 Account configuration (.env + dashboard-managed accounts.env)
+#### 5.11.3 Account configuration (.env + dashboard-managed accounts.env)
 
 TqSdk requires:
 
@@ -1360,7 +1404,7 @@ TqSdk requires:
     - Example (`P=MAIN`): `TQ_BROKER_ID_MAIN`, `TQ_ACCOUNT_ID_MAIN`, `TQ_ACCOUNT_PASSWORD_MAIN`
   - **Supported broker IDs**: dashboard should provide a selection list sourced from ShinnyTech’s published list (cached locally; fallback to manual entry if unavailable).
 
-##### 5.12.2.1 Account verification (read-only)
+##### 5.11.3.1 Account verification (read-only)
 
 ghTrader must provide a **verification** action for each broker account profile:
 
@@ -1371,7 +1415,7 @@ ghTrader must provide a **verification** action for each broker account profile:
   - masked broker/account identifiers (never store raw passwords; never echo full account ids)
   - timestamp and any error string
 
-#### 5.12.3 Execution styles (two executors)
+#### 5.11.4 Execution styles (two executors)
 
 ghTrader must support two execution styles:
 
@@ -1382,7 +1426,7 @@ ghTrader must support two execution styles:
   - Must support advanced order params (`FAK`/`FOK`, `BEST`/`FIVELEVEL`) when applicable.
   - Must handle SHFE close-today semantics where required.
 
-#### 5.12.4 Safety gating and risk controls
+#### 5.11.5 Safety gating and risk controls
 
 Safety gate for live trading:
 
@@ -1444,7 +1488,7 @@ Optional: attach TqSdk local risk rules (when available) for defense-in-depth:
 - Risk parity weighting across symbols
 - Regime-conditional sizing (smaller in volatile regimes)
 
-#### 5.12.5 Symbol semantics (specific vs continuous aliases)
+#### 5.11.6 Symbol semantics (specific vs continuous aliases)
 
 Trading may target:
 
@@ -1468,16 +1512,16 @@ Schedule resolution sources (in priority order):
   - QuestDB table `ghtrader_main_schedule_v2` (keyed by `exchange`, `variety`, `trading_day`, includes `main_contract`, `segment_id`, `schedule_hash`)
 - Fallback: none. If the canonical schedule is missing, continuous-alias resolution must fail fast in order-enabled modes.
 
-#### 5.12.6 Observability + persistence
+#### 5.11.7 Observability + persistence
 
 Trading runners must persist.
 
-##### 5.12.6.2 Gateway artifacts (`runs/gateway/`)
+##### 5.11.7.1 Gateway artifacts (`runs/gateway/`)
 
 AccountGateway must persist (per `account_profile`):
 
 - Root: `runs/gateway/account=<PROFILE>/`
-- `desired.json`, `targets.json`, `commands.jsonl` (audit mirrors; live control uses Redis/ZMQ per PRD §5.12.0)
+- `desired.json`, `targets.json`, `commands.jsonl` (audit mirrors; live control uses Redis/ZMQ per PRD §5.11.1)
 - `snapshots.jsonl`: account snapshots, same schema requirements as above (schema_version>=2; account/positions/orders_alive/account_meta)
 - `events.jsonl`: gateway lifecycle + execution + risk events (append-only)
 - `state.json`: periodic snapshot (mirror of Redis state)
@@ -1512,19 +1556,19 @@ Dashboard read-only APIs (local-only via SSH forwarding):
 - `POST /api/strategy/desired`: upsert strategy desired state (writes Redis desired hash and snapshots to `runs/strategy/account=<PROFILE>/desired.json`)
 - `GET /api/strategy/runs?limit=...`: list strategy run history (`runs/strategy/<run_id>/...`)
 
-#### 5.12.7 Best-in-class execution risk controls (alignment)
+#### 5.11.8 Best-in-class execution risk controls (alignment)
 
 - **Pre‑trade checks**: max order size, max position, max loss, and cooldown windows.
 - **Kill switch policy**: auto‑flatten on breach + audit log, with manual override requiring explicit confirm.
 - **Execution SLIs**: fill rate, slippage, latency, reject rates with alerts.
 
-### 5.12 Market Regime Detection [Pending]
+### 5.12 Market Regime Detection [Partial]
 
-*Note: No implementation found in codebase.*
+*Phase-0 status: core HMM training + QuestDB regime state persistence are implemented; regime-conditional strategy controls are pending.*
 
 ghTrader must detect and adapt to different market regimes (trending, mean-reverting, volatile, quiet) to improve model performance and risk management.
 
-#### 5.13.1 Regime Detection Methods
+#### 5.12.1 Regime Detection Methods
 
 **Hidden Markov Models (HMM)**:
 - Latent state models to identify unobserved market regimes
@@ -1548,7 +1592,7 @@ ghTrader must detect and adapt to different market regimes (trending, mean-rever
 - Self-supervised regime discovery via representation learning
 - Stability analysis of detected regimes
 
-#### 5.13.2 Regime-Conditional Strategies
+#### 5.12.2 Regime-Conditional Strategies
 
 **Model selection per regime**:
 - Different model weights or entirely different models per detected regime
@@ -1560,7 +1604,7 @@ ghTrader must detect and adapt to different market regimes (trending, mean-rever
 - Regime-specific position sizing (Kelly fraction adjustment)
 - Regime-specific feature weights (trend features in trending regimes)
 
-#### 5.13.3 Storage and Implementation
+#### 5.12.3 Storage and Implementation
 
 Storage: `ghtrader_regime_states_v2` table with:
 - `ts`, `datetime_ns`, `symbol`, `trading_day`
@@ -1570,38 +1614,39 @@ Storage: `ghtrader_regime_states_v2` table with:
 - `model_config_hash`
 
 Implementation:
-- `src/ghtrader/regime.py` (new module)
+- `src/ghtrader/regime.py` (HMM training/inference + QuestDB persistence)
+- `src/ghtrader/research/pipeline.py` (daily pipeline integration)
 
 ### 5.13 Anomaly and Drift Detection [Partial]
 
 *Note: Basic field quality validation is implemented. Comprehensive drift detection (PSI, ADWIN, etc.) and alert system are pending.*
 
-ghTrader must detect anomalies and distribution drift across data, execution, model, and market dimensions. This section is the authoritative reference for all drift detection requirements (referenced by Section 5.7 Online Calibrator).
+ghTrader must detect anomalies and distribution drift across data, execution, model, and market dimensions. This section is the authoritative reference for all drift detection requirements (referenced by Section 5.6 Online Calibrator).
 
-#### 5.14.1 Data Quality Anomalies
+#### 5.13.1 Data Quality Anomalies
 - Spike detection: Sudden price/volume jumps beyond N standard deviations
 - Missing data patterns: Gaps in tick stream, unusual periods of no quotes
 - Stale data detection: Timestamp anomalies, repeated identical quotes
 - Schema violations: Unexpected null values, out-of-range fields
 
-#### 5.14.2 Execution Anomalies
+#### 5.13.2 Execution Anomalies
 - Unusual slippage: Realized slippage significantly worse than expected
 - Fill rate degradation: Lower-than-expected fill rates for limit orders
 - Latency spikes: Order round-trip times exceeding thresholds
 - Rejection patterns: Elevated order rejection rates
 
-#### 5.14.3 Model Anomalies
+#### 5.13.3 Model Anomalies
 - Prediction distribution shifts: Model output distribution changes significantly
 - Confidence collapse: Model uncertainty spikes
 - Performance degradation: Rolling accuracy or Sharpe drops below thresholds
 
-#### 5.14.4 Market Anomalies
+#### 5.13.4 Market Anomalies
 - Flash events: Extreme price moves in short time windows
 - Liquidity crises: Sudden depth depletion, widening spreads
 - Volume anomalies: Unusual volume patterns outside normal session profiles
 - Correlation breaks: Cross-asset correlations deviating from historical norms
 
-#### 5.14.5 Drift Detection (consolidated)
+#### 5.13.5 Drift Detection (consolidated)
 
 All drift detection is centralized here to avoid duplication across modules:
 
@@ -1629,15 +1674,15 @@ All drift detection is centralized here to avoid duplication across modules:
 
 **Drift Response Actions**:
 - **Warning level**: Log and flag, continue with monitoring
-- **Drift level**: Trigger recalibration (Section 5.7) or fallback to simpler model
+- **Drift level**: Trigger recalibration (Section 5.6) or fallback to simpler model
 - **Critical level**: Disable trading, alert operator
 
 Integration points:
-- Online calibrator (Section 5.7): Uses drift detection for guardrails
-- Feature store (Section 5.4.0.4): Uses data drift for staleness detection
-- Model lifecycle (Section 5.16): Uses drift for automatic rollback triggers
+- Online calibrator (Section 5.6): Uses drift detection for guardrails
+- Feature store (Section 5.3.4): Uses data drift for staleness detection
+- Model lifecycle (Section 5.15): Uses drift for automatic rollback triggers
 
-#### 5.14.6 Alert System
+#### 5.13.6 Alert System
 - Configurable thresholds per anomaly/drift type
 - Severity levels: INFO, WARNING, CRITICAL
 - Dashboard integration: Real-time anomaly panel
@@ -1658,24 +1703,24 @@ Implementation:
 
 ghTrader must provide comprehensive transaction cost analysis for execution optimization:
 
-#### 5.15.1 Pre-Trade Analysis
+#### 5.14.1 Pre-Trade Analysis
 - **Expected cost estimation**: Predict spread, market impact, and timing costs before execution
 - **Optimal execution scheduling**: TWAP/VWAP/implementation shortfall optimization
 - **Urgency-cost tradeoff**: Model the cost of faster execution vs market impact
 - **Liquidity forecast**: Predict available liquidity at target price levels
 
-#### 5.15.2 Post-Trade Analysis
+#### 5.14.2 Post-Trade Analysis
 - **Actual vs expected comparison**: Measure realized costs against pre-trade estimates
 - **Execution benchmarks**: Compare to VWAP, arrival price, implementation shortfall
 - **Slippage attribution**: Decompose total slippage into components
 
-#### 5.15.3 Cost Attribution
+#### 5.14.3 Cost Attribution
 - **Spread cost**: Half-spread paid for immediate execution
 - **Market impact**: Temporary and permanent price impact from order flow
 - **Timing cost**: Cost of delayed execution (favorable/adverse price movement)
 - **Opportunity cost**: Cost of unfilled orders
 
-#### 5.15.4 Optimization Feedback
+#### 5.14.4 Optimization Feedback
 - Use TCA results to improve execution parameters over time
 - Calibrate market impact models from realized data
 - Adjust aggression/timing based on historical performance
@@ -1696,13 +1741,13 @@ Implementation:
 
 ghTrader must support robust model lifecycle management for production deployment:
 
-#### 5.16.1 Model Registry
+#### 5.15.1 Model Registry
 - **Versioned model artifacts**: Store model weights, configs, and metadata with unique version IDs
 - **Artifact storage**: Local filesystem with structured paths: `models/<model_type>/<version>/`
 - **Metadata**: Training config, data manifest, evaluation metrics, creation timestamp
 - **Lineage tracking**: Link models to training data, features, and parent models
 
-#### 5.16.2 Deployment Modes
+#### 5.15.2 Deployment Modes
 - **Shadow mode**: Run new models alongside production without execution
   - Log predictions and compare to production model
   - Measure latency and resource usage
@@ -1717,7 +1762,7 @@ ghTrader must support robust model lifecycle management for production deploymen
   - Zero-downtime model updates
   - Quick rollback capability
 
-#### 5.16.3 Promotion Gates
+#### 5.15.3 Promotion Gates
 - **Automatic promotion criteria**:
   - Backtested Sharpe ratio >= threshold
   - Maximum drawdown <= threshold
@@ -1726,12 +1771,12 @@ ghTrader must support robust model lifecycle management for production deploymen
 - **Manual approval gates**: Require human sign-off for production promotion
 - **Staged promotion**: Development → Staging → Shadow → Canary → Production
 
-#### 5.16.4 Rollback
+#### 5.15.4 Rollback
 - **Performance-triggered rollback**: Automatic revert on live performance degradation
 - **Manual rollback**: Quick switch to previous version via CLI
 - **Rollback history**: Track all version changes with timestamps and reasons
 
-#### 5.16.5 Model Cards
+#### 5.15.5 Model Cards
 - Standardized documentation per model:
   - Model architecture and hyperparameters
   - Training data description
@@ -1747,7 +1792,7 @@ Storage: `ghtrader_model_registry_v2` table with:
 Implementation:
 - `src/ghtrader/model_registry.py` (new module)
 
-#### 5.16.6 Best-in-class governance + auditability (alignment)
+#### 5.15.6 Best-in-class governance + auditability (alignment)
 
 - **Repro bundles**: require code+config+data‑manifest hashes per model artifact.
 - **Promotion checklist**: explicit automated + manual gates with recorded approvals.
@@ -1759,25 +1804,25 @@ Implementation:
 
 ghTrader must support systematic experiment tracking for research and development:
 
-#### 5.17.1 Experiment Logging
+#### 5.16.1 Experiment Logging
 - **Hyperparameter logging**: Automatically capture all training hyperparameters
 - **Metric logging**: Track training loss, validation metrics, evaluation scores
 - **Artifact logging**: Save model checkpoints, plots, and outputs
 - **Code versioning**: Link experiments to git commit hashes
 
-#### 5.17.2 Experiment Organization
+#### 5.16.2 Experiment Organization
 - **Projects**: Group related experiments
 - **Runs**: Individual training runs with unique identifiers
 - **Tags**: Label experiments for filtering (e.g., "baseline", "production", "ablation")
 - **Notes**: Attach human-readable descriptions
 
-#### 5.17.3 Comparison and Visualization
+#### 5.16.3 Comparison and Visualization
 - **Metric comparison**: Side-by-side comparison of experiment metrics
 - **Parameter diff**: Highlight hyperparameter differences between runs
 - **Learning curves**: Visualize training dynamics
 - **Dashboard integration**: Embedded experiment browser in ghTrader dashboard
 
-#### 5.17.4 Integration Options
+#### 5.16.4 Integration Options
 - Native integration: `ghtrader_experiments_v2` table
 - Optional MLflow/W&B backend for advanced visualization (plugin architecture)
 
@@ -1796,7 +1841,7 @@ Implementation:
 
 ghTrader must provide tools for understanding model decisions:
 
-#### 5.18.1 Feature Attribution
+#### 5.17.1 Feature Attribution
 - **SHAP values**: Shapley-based feature importance per prediction
   - TreeSHAP for gradient boosting models
   - DeepSHAP for neural networks
@@ -1804,7 +1849,7 @@ ghTrader must provide tools for understanding model decisions:
 - **Integrated Gradients**: Gradient-based attribution for neural networks
 - **Permutation importance**: Model-agnostic feature importance
 
-#### 5.18.2 Attention Visualization
+#### 5.17.2 Attention Visualization
 - For transformer-based models:
   - Attention weight heatmaps (temporal and spatial attention)
   - Attention head analysis
@@ -1812,18 +1857,18 @@ ghTrader must provide tools for understanding model decisions:
 - For TLOB dual-attention models:
   - Separate spatial (LOB levels) and temporal attention views
 
-#### 5.18.3 Counterfactual Explanations
+#### 5.17.3 Counterfactual Explanations
 - **What-if analysis**: How would prediction change if feature X were different?
 - **Minimal counterfactuals**: Smallest change needed to flip prediction
 - **Anchor explanations**: Sufficient conditions for prediction
 
-#### 5.18.4 Model Debugging Tools
+#### 5.17.4 Model Debugging Tools
 - **Error analysis by market condition**: Segment errors by regime, time-of-day, volatility
 - **Calibration plots**: Predicted probability vs observed frequency
 - **Confidence analysis**: When is model uncertain, and is uncertainty calibrated?
 - **Slice analysis**: Performance breakdown by symbol, session, contract
 
-#### 5.18.5 Dashboard Integration
+#### 5.17.5 Dashboard Integration
 - **Explainability panel**: Per-trade SHAP waterfall chart
 - **Feature importance trends**: Rolling importance over time
 - **Attention viewer**: Interactive attention visualization for recent predictions
@@ -1832,11 +1877,15 @@ ghTrader must provide tools for understanding model decisions:
 Implementation:
 - `src/ghtrader/explain.py` (new module)
 
-### 5.18 Hyperparameter Optimization (HPO) [Implemented]
+### 5.18 Hyperparameter Optimization (HPO) [Partial]
 
 ghTrader must support systematic hyperparameter optimization:
 
-#### 5.19.1 Optimization Methods
+Phase-0 status:
+- Ray-based sweep execution is implemented (`ghtrader sweep` + `research.pipeline.run_hyperparam_sweep`).
+- Dedicated `hpo.py` module, Optuna-first workflow, and QuestDB trial registry are pending.
+
+#### 5.18.1 Optimization Methods
 
 **Bayesian Optimization**:
 - Gaussian Process-based surrogate models
@@ -1855,7 +1904,7 @@ ghTrader must support systematic hyperparameter optimization:
 - Baselines for comparison
 - Random search often outperforms grid for limited budgets
 
-#### 5.19.2 Multi-Objective Optimization
+#### 5.18.2 Multi-Objective Optimization
 
 ghTrader HPO must support Pareto optimization across:
 - **Return metrics**: Sharpe ratio, total return, risk-adjusted return
@@ -1865,24 +1914,25 @@ ghTrader HPO must support Pareto optimization across:
 
 Pareto frontier visualization for trade-off analysis.
 
-#### 5.19.3 Early Stopping
+#### 5.18.3 Early Stopping
 
 - **Median pruner**: Stop trials worse than median of completed trials
 - **Hyperband/ASHA**: Aggressive early stopping with resource allocation
 - **Learning curve extrapolation**: Predict final performance from partial training
 
-#### 5.19.4 Distributed Sweeps
+#### 5.18.4 Distributed Sweeps
 
 - Utilize all 4 GPUs for parallel trial execution
 - Support for distributed workers (Ray Tune backend)
 - Fault-tolerant trial execution with checkpointing
 - Database-backed study storage for coordination
 
-#### 5.19.5 Integration
+#### 5.18.5 Integration
 
-- CLI: `ghtrader hpo <model_type> --n-trials 100 --timeout 3600`
+- CLI (implemented): `ghtrader sweep --symbol ... --model ... --n-trials ...`
+- CLI (roadmap): `ghtrader hpo <model_type> --n-trials 100 --timeout 3600`
 - Configuration via YAML with hyperparameter search spaces
-- Results linked to experiment tracking (Section 5.17)
+- Results linked to experiment tracking (Section 5.16)
 
 Storage: `ghtrader_hpo_trials_v2` table with:
 - `study_id`, `trial_id`, `hyperparameters` (JSON)
@@ -1891,11 +1941,9 @@ Storage: `ghtrader_hpo_trials_v2` table with:
 - `created_at`, `duration_seconds`
 
 Implementation:
-- `src/ghtrader/hpo.py` (new module)
-
-### 5.20 Real-Time Streaming Architecture (Merged into §5.0)
-
-The streaming architecture requirements have been consolidated into **Section 5.0 System Architecture**.
+- `src/ghtrader/research/pipeline.py` (Ray sweep engine)
+- `src/ghtrader/cli.py` (`sweep` command)
+- `src/ghtrader/hpo.py` (roadmap module; pending)
 
 ---
 
@@ -1974,7 +2022,7 @@ Current system profile (as tuned baseline):
 Implementation:
 - `src/ghtrader/research/pipeline.py` (`LatencyTracker`, `LatencyContext`)
 
-#### Compute utilization (server-scale)
+#### 6.3.1.1 Compute utilization (server-scale)
 
 Given the target hardware (multi-CPU + **4 GPUs**), ghTrader uses a **hybrid scaling** approach:
 
@@ -2057,21 +2105,21 @@ Implementation:
 
 ### 8.2 Model Zoo Reference
 
-The authoritative model zoo is defined in **Section 5.6 Modeling (offline)**. This includes:
-- Tabular baselines (5.6.0.1)
-- Deep sequence models (5.6.0.2): DeepLOB, Transformer, TCN, TLOB, SSM/Mamba
-- Advanced architectures (5.6.0.3): TFT, PatchTST, Informer, TimesNet, N-BEATS
-- Probabilistic models (5.6.0.4): Quantile regression, MDN, BNN, Normalizing flows
-- Foundation models (5.6.0.5): Pre-trained LOB encoders, contrastive learning
-- Reinforcement learning (5.6.0.6): PPO/SAC, offline RL, multi-agent
-- **SOTA 2025-2026 (5.6.0.7)**: T-KAN, LOBERT, KANFormer, LOBDIF, Siamese MHA+LSTM
+The authoritative model zoo is defined in **Section 5.5 Modeling (offline)**. This includes:
+- Tabular baselines (5.5.1)
+- Deep sequence models (5.5.2): DeepLOB, Transformer, TCN, TLOB, SSM/Mamba
+- Advanced architectures (5.5.3): TFT, PatchTST, Informer, TimesNet, N-BEATS
+- Probabilistic models (5.5.4): Quantile regression, MDN, BNN, Normalizing flows
+- Foundation models (5.5.5): Pre-trained LOB encoders, contrastive learning
+- Reinforcement learning (5.5.6): PPO/SAC, offline RL, multi-agent
+- **SOTA 2025-2026 (5.5.7)**: T-KAN, LOBERT, KANFormer, LOBDIF, Siamese MHA+LSTM
 
-All model architecture specifications, selection criteria, and performance requirements are maintained in Section 5.6 to avoid duplication.
+All model architecture specifications, selection criteria, and performance requirements are maintained in Section 5.5 to avoid duplication.
 
 ### 8.3 Research Methodology
 
 **Evaluation protocol**:
-- Walk-forward validation with multiple splits (see Section 5.10)
+- Walk-forward validation with multiple splits (see Section 5.9)
 - Transaction cost-adjusted returns (1 bps default)
 - Alpha decay analysis across horizons (k=10, 50, 100, 200)
 - Calibration diagnostics for probabilistic models
@@ -2103,6 +2151,11 @@ Optional (Phase‑1/2):
 - `ghtrader sweep`, `ghtrader benchmark`, `ghtrader compare`
 - `ghtrader audit` (deferred)
 
+CLI surface policy (alignment):
+- `cli.py` is a **thin entrypoint**; command implementations live under `cli_commands/` grouped by domain.
+- Commands outside the current canonical scope should not remain as permanent deferred stubs in the exposed CLI surface.
+- Deferred capabilities may be documented in PRD/roadmap, but CLI exposure is reserved for implemented/tested behavior.
+
 Database administration commands:
 
 - `ghtrader db questdb-health` - Check QuestDB connectivity
@@ -2117,24 +2170,24 @@ Database administration commands:
 
 ### 10.1 Near-Term Research Priorities (High Priority)
 
-- **Model Architecture**: Run `compare` across all baselines and deep models (§5.6). Implement probabilistic models (§5.6.0.4) and ensemble framework (§5.6.1).
-- **Market Regime**: Implement HMM-based detection and regime-conditional logic (§5.13).
-- **Risk Management**: Implement VaR/CVaR, stress testing, and adaptive position sizing (§5.12.4).
-- **HPO**: Integrate Optuna for Bayesian multi-objective optimization (§5.19).
+- **Model Architecture**: Run `compare` across all baselines and deep models (§5.5). Implement probabilistic models (§5.5.4) and ensemble framework (§5.5.8).
+- **Market Regime**: Complete regime-conditional strategy logic on top of implemented HMM detection/storage core (§5.12).
+- **Risk Management**: Implement VaR/CVaR, stress testing, and adaptive position sizing (§5.11.5).
+- **HPO**: Integrate Optuna for Bayesian multi-objective optimization (§5.18).
 
 ### 10.2 Medium-Term Research Priorities
 
-- **Feature Engineering**: Expand factor library (§5.4) and build feature store with drift detection.
-- **Online Learning**: Add concept drift detection (ADWIN/DDM) and incremental updates (§5.7, §5.14).
-- **Execution Optimization**: Implement TCA module (pre/post-trade analysis) and calibration feedback (§5.15).
-- **MLOps**: Implement model registry, shadow/canary deployments, and experiment tracking (§5.16, §5.17).
-- **Explainability**: Add SHAP attribution, attention visualization, and dashboard panels (§5.18).
+- **Feature Engineering**: Expand factor library (§5.3) and build feature store with drift detection.
+- **Online Learning**: Add concept drift detection (ADWIN/DDM) and incremental updates (§5.6, §5.13).
+- **Execution Optimization**: Implement TCA module (pre/post-trade analysis) and calibration feedback (§5.14).
+- **MLOps**: Implement model registry, shadow/canary deployments, and experiment tracking (§5.15, §5.16).
+- **Explainability**: Add SHAP attribution, attention visualization, and dashboard panels (§5.17).
 
 ### 10.3 Long-Term Research Priorities
 
-- **Reinforcement Learning**: Implement RL execution agents (PPO/SAC) and offline RL (§5.6.0.6).
-- **Simulation**: Build order book simulator, Hawkes generators, and multi-agent environments (§5.8).
-- **Alternative Data**: Ingest sentiment, macro indicators, and cross-market features (§5.4.2).
+- **Reinforcement Learning**: Implement RL execution agents (PPO/SAC) and offline RL (§5.5.6).
+- **Simulation**: Build order book simulator, Hawkes generators, and multi-agent environments (§5.7).
+- **Alternative Data**: Ingest sentiment, macro indicators, and cross-market features (§5.3.7).
 - **Real-Time**: Evaluate Kafka/Redpanda and sub-10ms inference pipelines (§3.1).
 
 ### 10.4 Engineering Priorities
@@ -2165,27 +2218,50 @@ Database administration commands:
 
 ### 10.5 Best-in-Class Alignment Roadmap (Phased)
 
-**Phase 0: Data governance + reliability (prereq for all)**:
-- Define data SLIs/SLOs (freshness, completeness, error budget) and dashboard surfacing (§6.6, §5.11)
-- Add dataset lineage/provenance manifests (source, config hash, build id) to QuestDB tables (§5.3, §5.4, §5.5)
-- Formalize backfill policy and change log for any historical corrections (§5.3)
+**Phase-0: Data governance + reliability (prereq for all)**:
+- Define data SLIs/SLOs (freshness, completeness, error budget) and dashboard surfacing (§6.6, §5.10)
+- Add dataset lineage/provenance manifests (source, config hash, build id) to QuestDB tables (§5.2, §5.3, §5.4)
+- Formalize backfill policy and change log for any historical corrections (§5.2)
 - Enforce data contract checks in CI (schema + null‑rate + row_hash integrity) (§6.4)
 
-**Phase 1: Feature/label parity + evaluation rigor**:
-- Implement training‑serving parity tests and feature TTL/staleness SLAs (§5.4)
-- Add label leakage guardrails and split discipline (purged/embargoed CV) (§5.5, §5.8)
-- Standardize robustness/stress tests and statistical significance gates (§5.8, §5.10)
+**Phase-1: Feature/label parity + evaluation rigor**:
+- Implement training‑serving parity tests and feature TTL/staleness SLAs (§5.3)
+- Add label leakage guardrails and split discipline (purged/embargoed CV) (§5.4, §5.7)
+- Standardize robustness/stress tests and statistical significance gates (§5.7, §5.9)
 
-**Phase 2: MLOps + lifecycle hardening**:
-- Expand model registry with lineage, promotion gates, and rollback runbooks (§5.16)
-- Integrate experiment tracking + reproducibility bundles (§5.17, §6.2)
-- Add champion‑challenger + shadow/canary governance (§5.16)
+**Phase-2: MLOps + lifecycle hardening**:
+- Expand model registry with lineage, promotion gates, and rollback runbooks (§5.15)
+- Integrate experiment tracking + reproducibility bundles (§5.16, §6.2)
+- Add champion‑challenger + shadow/canary governance (§5.15)
 
-**Phase 3: Execution + risk feedback loop**:
-- Implement pre‑trade risk checks, kill‑switch policy, and execution audit trails (§5.12, §6.1)
-- Build TCA feedback into execution tuning and model selection (§5.15)
-- Add simulation stress harness for execution robustness (§5.8)
+**Phase-3: Execution + risk feedback loop**:
+- Implement pre‑trade risk checks, kill‑switch policy, and execution audit trails (§5.11, §6.1)
+- Build TCA feedback into execution tuning and model selection (§5.14)
+- Add simulation stress harness for execution robustness (§5.7)
 
-**Phase 4: Real‑time streaming (optional, later)**:
-- Evaluate event streaming for sub‑10ms inference and online feature serving (§5.20)
+**Phase-4: Real‑time streaming (optional, later)**:
+- Evaluate event streaming for sub‑10ms inference and online feature serving (§3.1)
 - Introduce low‑latency inference service boundary (research → paper → live) (§6.3)
+
+### 10.6 Implementation Traceability Matrix (All Files)
+
+- Full file-level matrix (src/tests/infra, one file per row): `reports/prd_traceability_matrix.md`.
+- Coverage snapshot (current): 144 files mapped, 0 unmapped.
+- PRD-expected but currently missing modules: 10 (listed in `PRD-Expected But Missing Modules` in the same matrix).
+- Big-bang closeout report (deletions/decisions/gaps): `reports/prd_bigbang_closeout.md`.
+
+Status legend:
+- **Implemented**: module exists and is wired into current runtime or tooling.
+- **Partial**: module exists but key integrations or governance are pending.
+- **Pending**: required module/table is specified in PRD but not yet implemented.
+
+Current domain summary:
+
+| Domain | Scope | Status |
+|---|---|---|
+| Data ingest + storage | `src/ghtrader/data`, `src/ghtrader/tq`, `src/ghtrader/questdb`, `infra/questdb` | Implemented (core), Partial (advanced governance/SLO roadmap) |
+| Features + labels | `src/ghtrader/datasets`, `src/ghtrader/fill_labels.py`, `src/ghtrader/questdb/features_labels.py` | Partial (direction + fill labels implemented; execution-cost labels pending) |
+| Modeling + benchmark + HPO | `src/ghtrader/research` | Partial (core modeling/benchmark + Ray sweep implemented; advanced governance pending) |
+| Trading runtime + Web UI control plane | `src/ghtrader/trading`, `src/ghtrader/tq/gateway.py`, `src/ghtrader/control` | Implemented |
+| Regime detection | `src/ghtrader/regime.py` | Partial (HMM + QuestDB persistence + pipeline integration implemented; regime-conditional strategy pending) |
+| TCA / Explainability / Registry / Experiments / Drift modules | PRD-required modules listed in matrix | Pending |

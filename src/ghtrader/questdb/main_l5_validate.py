@@ -12,6 +12,7 @@ log = structlog.get_logger()
 
 MAIN_L5_VALIDATE_SUMMARY_TABLE = "ghtrader_main_l5_validate_summary_v2"
 MAIN_L5_VALIDATE_GAPS_TABLE = "ghtrader_main_l5_validate_gaps_v2"
+MAIN_L5_TICK_GAPS_TABLE = "ghtrader_tick_gaps_v2"
 
 
 def _day_to_ts_utc(day_s: str) -> datetime:
@@ -57,6 +58,25 @@ class MainL5ValidateGapRow:
     end_ts: datetime
     duration_s: int
     tqsdk_status: str
+    schedule_hash: str
+
+
+@dataclass(frozen=True)
+class MainL5TickGapSummaryRow:
+    symbol: str
+    trading_day: str
+    ticks_kind: str
+    dataset_version: str
+    tick_count_actual: int
+    tick_count_expected_min: int
+    tick_count_expected_max: int
+    median_interval_ms: int | None
+    p95_interval_ms: int | None
+    p99_interval_ms: int | None
+    max_interval_ms: int
+    abnormal_gaps_count: int
+    critical_gaps_count: int
+    largest_gap_duration_ms: int
     schedule_hash: str
 
 
@@ -200,6 +220,75 @@ def ensure_main_l5_validate_gaps_table(
         log.warning("questdb_main_l5_validate.gaps_ensure_failed", table=tbl, error=str(e))
 
 
+def ensure_main_l5_tick_gaps_table(
+    *,
+    cfg: QuestDBQueryConfig,
+    table: str = MAIN_L5_TICK_GAPS_TABLE,
+    connect_timeout_s: int = 2,
+) -> None:
+    tbl = str(table).strip() or MAIN_L5_TICK_GAPS_TABLE
+    ddl = f"""
+    CREATE TABLE IF NOT EXISTS {tbl} (
+      ts TIMESTAMP,
+      symbol SYMBOL,
+      trading_day SYMBOL,
+      ticks_kind SYMBOL,
+      dataset_version SYMBOL,
+      tick_count_actual LONG,
+      tick_count_expected_min LONG,
+      tick_count_expected_max LONG,
+      median_interval_ms LONG,
+      p95_interval_ms LONG,
+      p99_interval_ms LONG,
+      max_interval_ms LONG,
+      abnormal_gaps_count LONG,
+      critical_gaps_count LONG,
+      largest_gap_duration_ms LONG,
+      schedule_hash SYMBOL,
+      updated_at TIMESTAMP
+    ) TIMESTAMP(ts) PARTITION BY DAY WAL
+      DEDUP UPSERT KEYS(ts, symbol, trading_day, ticks_kind, dataset_version)
+    """
+    try:
+        with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
+            try:
+                conn.autocommit = True  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            with conn.cursor() as cur:
+                cur.execute(ddl)
+                for name, typ in [
+                    ("symbol", "SYMBOL"),
+                    ("trading_day", "SYMBOL"),
+                    ("ticks_kind", "SYMBOL"),
+                    ("dataset_version", "SYMBOL"),
+                    ("tick_count_actual", "LONG"),
+                    ("tick_count_expected_min", "LONG"),
+                    ("tick_count_expected_max", "LONG"),
+                    ("median_interval_ms", "LONG"),
+                    ("p95_interval_ms", "LONG"),
+                    ("p99_interval_ms", "LONG"),
+                    ("max_interval_ms", "LONG"),
+                    ("abnormal_gaps_count", "LONG"),
+                    ("critical_gaps_count", "LONG"),
+                    ("largest_gap_duration_ms", "LONG"),
+                    ("schedule_hash", "SYMBOL"),
+                    ("updated_at", "TIMESTAMP"),
+                ]:
+                    try:
+                        cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {name} {typ}")
+                    except Exception:
+                        pass
+                try:
+                    cur.execute(
+                        f"ALTER TABLE {tbl} DEDUP ENABLE UPSERT KEYS(ts, symbol, trading_day, ticks_kind, dataset_version)"
+                    )
+                except Exception:
+                    pass
+    except Exception as e:
+        log.warning("questdb_main_l5_validate.tick_gaps_ensure_failed", table=tbl, error=str(e))
+
+
 def upsert_main_l5_validate_summary_rows(
     *,
     cfg: QuestDBQueryConfig,
@@ -308,6 +397,105 @@ def insert_main_l5_validate_gap_rows(
         with conn.cursor() as cur:
             cur.executemany(sql, params)
     return int(len(params))
+
+
+def upsert_main_l5_tick_gaps_rows(
+    *,
+    cfg: QuestDBQueryConfig,
+    rows: Iterable[MainL5TickGapSummaryRow],
+    table: str = MAIN_L5_TICK_GAPS_TABLE,
+    connect_timeout_s: int = 2,
+) -> int:
+    tbl = str(table).strip() or MAIN_L5_TICK_GAPS_TABLE
+    rs = list(rows)
+    if not rs:
+        return 0
+    now = datetime.now(timezone.utc)
+    params: list[tuple[Any, ...]] = []
+    for r in rs:
+        td = str(r.trading_day).strip()
+        if not td:
+            continue
+        params.append(
+            (
+                _day_to_ts_utc(td),
+                str(r.symbol).strip(),
+                td,
+                str(r.ticks_kind).strip() or "main_l5",
+                str(r.dataset_version).strip() or "v2",
+                int(max(0, int(r.tick_count_actual))),
+                int(max(0, int(r.tick_count_expected_min))),
+                int(max(0, int(r.tick_count_expected_max))),
+                int(r.median_interval_ms) if r.median_interval_ms is not None else None,
+                int(r.p95_interval_ms) if r.p95_interval_ms is not None else None,
+                int(r.p99_interval_ms) if r.p99_interval_ms is not None else None,
+                int(max(0, int(r.max_interval_ms))),
+                int(max(0, int(r.abnormal_gaps_count))),
+                int(max(0, int(r.critical_gaps_count))),
+                int(max(0, int(r.largest_gap_duration_ms))),
+                str(r.schedule_hash).strip(),
+                now,
+            )
+        )
+    if not params:
+        return 0
+    sql = (
+        f"INSERT INTO {tbl} "
+        "(ts, symbol, trading_day, ticks_kind, dataset_version, tick_count_actual, tick_count_expected_min, "
+        "tick_count_expected_max, median_interval_ms, p95_interval_ms, p99_interval_ms, max_interval_ms, "
+        "abnormal_gaps_count, critical_gaps_count, largest_gap_duration_ms, schedule_hash, updated_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+    )
+    with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, params)
+    return int(len(params))
+
+
+def upsert_main_l5_tick_gaps_from_validate_summary(
+    *,
+    cfg: QuestDBQueryConfig,
+    summary_rows: Iterable[MainL5ValidateSummaryRow],
+    table: str = MAIN_L5_TICK_GAPS_TABLE,
+    connect_timeout_s: int = 2,
+) -> int:
+    mapped: list[MainL5TickGapSummaryRow] = []
+    for r in summary_rows:
+        try:
+            expected_max = int(max(0, int(r.expected_seconds)))
+            missing_seconds = int(max(0, int(r.missing_seconds)))
+            expected_min = int(max(0, expected_max - missing_seconds))
+            max_gap_ms = int(max(0, int(r.max_gap_s)) * 1000)
+            abnormal = int(
+                max(0, int(r.gap_bucket_2_5))
+                + max(0, int(r.gap_bucket_6_15))
+                + max(0, int(r.gap_bucket_16_30))
+            )
+            critical = int(max(0, int(r.gap_bucket_gt_30)))
+            mapped.append(
+                MainL5TickGapSummaryRow(
+                    symbol=str(r.symbol),
+                    trading_day=str(r.trading_day),
+                    ticks_kind="main_l5",
+                    dataset_version="v2",
+                    tick_count_actual=int(max(0, int(r.seconds_with_ticks))),
+                    tick_count_expected_min=expected_min,
+                    tick_count_expected_max=expected_max,
+                    median_interval_ms=None,
+                    p95_interval_ms=None,
+                    p99_interval_ms=None,
+                    max_interval_ms=max_gap_ms,
+                    abnormal_gaps_count=abnormal,
+                    critical_gaps_count=critical,
+                    largest_gap_duration_ms=max_gap_ms,
+                    schedule_hash=str(r.schedule_hash),
+                )
+            )
+        except Exception:
+            continue
+    if not mapped:
+        return 0
+    return upsert_main_l5_tick_gaps_rows(cfg=cfg, rows=mapped, table=table, connect_timeout_s=connect_timeout_s)
 
 
 def clear_main_l5_validate_gap_rows(
@@ -631,7 +819,7 @@ def fetch_main_l5_validate_overview(
                 if lags:
                     lags.sort()
                     idx = int(0.95 * (len(lags) - 1))
-                    out[\"p95_lag_s\"] = int(lags[max(0, idx)])
+                    out["p95_lag_s"] = int(lags[max(0, idx)])
             except Exception:
                 pass
     expected_total = out.get("expected_seconds_total") or 0

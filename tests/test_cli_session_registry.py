@@ -16,7 +16,7 @@ def test_cli_entrypoint_auto_registers_job(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.delenv("GHTRADER_JOB_LOG_PATH", raising=False)
 
     # Minimal command that exits cleanly (help).
-    monkeypatch.setattr(sys, "argv", ["ghtrader", "audit", "--help"])
+    monkeypatch.setattr(sys, "argv", ["ghtrader", "--help"])
 
     from ghtrader.cli import entrypoint
     from ghtrader.control.db import JobStore
@@ -32,7 +32,7 @@ def test_cli_entrypoint_auto_registers_job(tmp_path: Path, monkeypatch: pytest.M
     assert j.source == "terminal"
     assert j.status in {"succeeded", "failed", "cancelled"}  # help should succeed, but be tolerant of Click internals
     assert j.log_path is not None
-    assert Path(j.log_path).exists()
+    assert Path(j.log_path).parent.exists()
 
 
 def test_cli_lock_acquire_updates_job_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

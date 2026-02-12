@@ -3212,7 +3212,7 @@ def train_model(
     if (not ddp_active) or distu.is_rank0():
         model.save(model_path)
         log.info("train.saved", path=str(model_path))
-        # Persist non-secret model metadata for training-serving parity (PRD §5.12.6).
+        # Persist non-secret model metadata for training-serving parity (PRD §5.11.7).
         try:
             from datetime import datetime, timezone
 

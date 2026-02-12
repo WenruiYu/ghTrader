@@ -16,10 +16,10 @@ venv/
 # --- Secrets ---
 .env
 
-# --- Project outputs / data ---
-data/
-runs/
-artifacts/
+# --- Project outputs / data (repo root only) ---
+/data/
+/runs/
+/artifacts/
 
 # --- Misc ---
 *.log

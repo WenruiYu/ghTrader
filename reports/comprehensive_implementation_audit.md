@@ -130,14 +130,17 @@
   - Feature store: `src/ghtrader/datasets/feature_store.py` with registry
   - Training-serving parity: Same code path for offline/online
 
-**5.4 Labels** ✅ IMPLEMENTED
-- **Status**: Fully implemented
+**5.4 Labels** ⚠️ PARTIAL
+- **Status**: Partial (direction + fill labels implemented; execution-cost labels pending)
 - **Evidence**:
   - Direction labels: `src/ghtrader/datasets/labels.py::compute_multi_horizon_labels`
+  - Fill labels: `src/ghtrader/fill_labels.py::build_fill_labels_for_symbol`
   - Multi-horizon: Configurable horizons (default {10, 50, 200})
   - Storage: `ghtrader_labels_v2` table
   - Causal computation: No lookahead beyond horizon
-  - Tests: `tests/test_labels.py`
+  - Tests: `tests/test_labels.py`, `tests/test_fill_labels.py`
+- **Pending**:
+  - Execution-cost labels module: `src/ghtrader/execution_labels.py`
 
 **5.5 Modeling (Offline)** ⚠️ PARTIAL
 - **Status**: Partial (as marked in PRD)
@@ -206,9 +209,14 @@
   - Symbol resolution: `src/ghtrader/trading/symbol_resolver.py`
   - Observability: Artifacts in `runs/gateway/` and `runs/strategy/`
 
-**5.12 Market Regime Detection** ❌ PENDING
-- **Status**: Marked [Pending] in PRD
-- **Note**: No implementation found; expected in `src/ghtrader/regime.py` (not present)
+**5.12 Market Regime Detection** ⚠️ PARTIAL
+- **Status**: Partial (core implemented, strategy-conditional wiring pending)
+- **Implemented**:
+  - Core HMM regime module: `src/ghtrader/regime.py`
+  - Daily pipeline integration: `src/ghtrader/research/pipeline.py`
+  - QuestDB persistence: `ghtrader_regime_states_v2`
+- **Pending**:
+  - Regime-conditional strategy parameter switching in live trading path
 
 **5.13 Anomaly and Drift Detection** ⚠️ PARTIAL
 - **Status**: Partial (as marked in PRD)
@@ -248,12 +256,14 @@
 - **Status**: Marked [Pending] in PRD
 - **Note**: No implementation found; expected in `src/ghtrader/explain.py` (not present)
 
-**5.18 Hyperparameter Optimization** ✅ IMPLEMENTED
-- **Status**: Fully implemented
-- **Evidence**:
-  - Module: `src/ghtrader/research/pipeline.py` includes HPO support
-  - Integration: CLI commands support hyperparameter sweeps
-  - Distributed: DDP support for multi-GPU training
+**5.18 Hyperparameter Optimization** ⚠️ PARTIAL
+- **Status**: Partial (Ray sweep implemented; full HPO module/governance pending)
+- **Implemented**:
+  - Ray sweep engine: `src/ghtrader/research/pipeline.py`
+  - CLI sweep entry: `src/ghtrader/cli.py` (`ghtrader sweep`)
+- **Pending**:
+  - Dedicated `src/ghtrader/hpo.py` module
+  - Optuna-first workflow and QuestDB trial registry (`ghtrader_hpo_trials_v2`)
 
 ### 6. Non-Functional Requirements
 

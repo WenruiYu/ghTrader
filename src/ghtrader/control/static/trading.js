@@ -1333,16 +1333,16 @@
     }
   }
 
-  // Fast polling (1s) for Auto Monitor tab (Fallback)
+  // Fast polling (2s) for Auto Monitor tab (WS fallback)
   setInterval(() => {
     if (wsConnected) return;
     const tab = getActiveTab();
     if (tab === "monitor") {
       pollConsoleStatus();
     }
-  }, 1000);
+  }, 2000);
 
-  // Fast polling (1s) for Manual Test tab (Fallback)
+  // Fast polling (2s) for Manual Test tab (WS fallback)
   setInterval(() => {
     if (wsConnected) return;
     const tab = getActiveTab();
@@ -1350,10 +1350,11 @@
       pollGatewayStatus();
       pollStrategyStatus();
     }
-  }, 1000);
+  }, 2000);
 
-  // Background polling (30s) for inactive tabs
+  // Background polling (30s) for inactive tabs (WS fallback)
   setInterval(() => {
+    if (wsConnected) return;
     const tab = getActiveTab();
     if (tab !== "monitor") {
       pollConsoleStatus();
@@ -1361,6 +1362,7 @@
   }, 30000);
 
   setInterval(() => {
+    if (wsConnected) return;
     const tab = getActiveTab();
     if (tab !== "test") {
       pollGatewayStatus();

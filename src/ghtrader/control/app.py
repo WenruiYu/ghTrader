@@ -23,6 +23,7 @@ from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
 from ghtrader.control import auth
 from ghtrader.control.db import JobStore
 from ghtrader.control.jobs import JobManager, JobSpec, python_module_argv
+from ghtrader.control.routes import build_root_router
 from ghtrader.control.views import build_router
 from ghtrader.util.json_io import read_json as _read_json, write_json_atomic as _write_json_atomic
 
@@ -1164,6 +1165,7 @@ def create_app() -> Any:
 
     # HTML pages
     app.include_router(build_router())
+    app.include_router(build_root_router())
 
     # WebSocket Endpoint
     manager = ConnectionManager()
@@ -1178,50 +1180,12 @@ def create_app() -> Any:
             manager.disconnect(websocket)
 
     # JSON API (kept small; UI uses HTML routes above)
-    @app.get("/health", response_class=JSONResponse)
-    def health() -> dict[str, Any]:
-        return {"ok": True}
-
     @app.get("/api/jobs", response_class=JSONResponse)
     def api_list_jobs(request: Request, limit: int = 200) -> dict[str, Any]:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         jobs = store.list_jobs(limit=int(limit))
         return {"jobs": [asdict(j) for j in jobs]}
-
-    @app.get("/api/system", response_class=JSONResponse)
-    def api_system(request: Request, include_dir_sizes: bool = False, refresh: str = "none") -> dict[str, Any]:
-        """
-        Cached system snapshot for the dashboard System page.
-
-        Query params:
-        - include_dir_sizes: include cached directory sizes (may still be computing)
-        - refresh: none|fast|dir
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-        from ghtrader.control.system_info import system_snapshot
-
-        return system_snapshot(
-            data_dir=get_data_dir(),
-            runs_dir=get_runs_dir(),
-            artifacts_dir=get_artifacts_dir(),
-            include_dir_sizes=bool(include_dir_sizes),
-            refresh=str(refresh or "none"),
-        )
-
-    @app.get("/api/questdb/metrics", response_class=JSONResponse)
-    def api_questdb_metrics(request: Request, refresh: bool = False) -> dict[str, Any]:
-        """
-        Cached QuestDB Prometheus metrics proxy (subset).
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-        from ghtrader.control.system_info import questdb_metrics_snapshot
-
-        return questdb_metrics_snapshot(refresh=bool(refresh))
 
     @app.get("/api/data/coverage", response_class=JSONResponse)
     def api_data_coverage(
@@ -1234,7 +1198,8 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
-        return {"ok": False, "error": "data coverage deferred (Phase-1/2)"}
+        _ = (kind, limit, search, refresh)
+        raise HTTPException(status_code=410, detail="data coverage endpoint removed in current PRD phase")
 
     @app.get("/api/data/coverage/summary", response_class=JSONResponse)
     def api_data_coverage_summary(request: Request, refresh: bool = False) -> dict[str, Any]:
@@ -1243,7 +1208,8 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
-        return {"ok": False, "error": "coverage summary deferred (Phase-1/2)"}
+        _ = refresh
+        raise HTTPException(status_code=410, detail="coverage summary endpoint removed in current PRD phase")
 
     @app.get("/api/data/quality-summary", response_class=JSONResponse)
     def api_data_quality_summary(
@@ -1260,7 +1226,8 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
-        return {"ok": False, "error": "data quality deferred (Phase-1/2)"}
+        # Keep this as a best-effort read endpoint; unlike other deferred APIs it has
+        # a complete implementation and does not enqueue removed CLI surfaces.
 
         ex = str(exchange).upper().strip() or "SHFE"
         v = str(var).lower().strip() or "cu"
@@ -1556,114 +1523,8 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
-        _ = symbol, limit
-        return {"ok": False, "error": "data quality deferred (Phase-1/2)"}
-        sym = str(symbol or "").strip()
-        if not sym or len(sym) > 64:
-            raise HTTPException(status_code=400, detail="invalid symbol")
-        lim = max(1, min(int(limit or 30), 200))
-
-        fq_rows: list[dict[str, Any]] = []
-        gap_rows: list[dict[str, Any]] = []
-        repair_rows: list[dict[str, Any]] = []
-        errors: list[str] = []
-
-        try:
-            from ghtrader.questdb.client import connect_pg as _connect, make_questdb_query_config_from_env
-
-            cfg = make_questdb_query_config_from_env()
-            with _connect(cfg, connect_timeout_s=2) as conn:
-                with conn.cursor() as cur:
-                    try:
-                        cur.execute(
-                            "SELECT trading_day, rows_total, bid_price1_null_rate, ask_price1_null_rate, last_price_null_rate, volume_null_rate, open_interest_null_rate, "
-                            "l5_fields_null_rate, price_jump_outliers, volume_spike_outliers, spread_anomaly_outliers, consecutive_gaps_metadata, updated_at "
-                            "FROM ghtrader_field_quality_v2 "
-                            "WHERE symbol=%s AND ticks_kind='main_l5' AND dataset_version='v2' "
-                            "ORDER BY ts DESC LIMIT %s",
-                            [sym, lim],
-                        )
-                        for r in cur.fetchall() or []:
-                            fq_rows.append(
-                                {
-                                    "trading_day": str(r[0] or "").strip() or None,
-                                    "rows_total": (int(r[1]) if r[1] is not None else None),
-                                    "bid_price1_null_rate": (float(r[2]) if r[2] is not None else None),
-                                    "ask_price1_null_rate": (float(r[3]) if r[3] is not None else None),
-                                    "last_price_null_rate": (float(r[4]) if r[4] is not None else None),
-                                    "volume_null_rate": (float(r[5]) if r[5] is not None else None),
-                                    "open_interest_null_rate": (float(r[6]) if r[6] is not None else None),
-                                    "l5_fields_null_rate": (float(r[7]) if r[7] is not None else None),
-                                    "price_jump_outliers": (int(r[8]) if r[8] is not None else 0),
-                                    "volume_spike_outliers": (int(r[9]) if r[9] is not None else 0),
-                                    "spread_anomaly_outliers": (int(r[10]) if r[10] is not None else 0),
-                                    "consecutive_gaps_metadata": str(r[11] or "").strip(),
-                                    "updated_at": str(r[12] or "").strip() or None,
-                                }
-                            )
-                    except Exception as e:
-                        errors.append(f"field_quality: {e}")
-                    try:
-                        cur.execute(
-                            "SELECT trading_day, tick_count_actual, tick_count_expected_min, tick_count_expected_max, median_interval_ms, p95_interval_ms, p99_interval_ms, "
-                            "max_interval_ms, abnormal_gaps_count, critical_gaps_count, largest_gap_duration_ms, updated_at "
-                            "FROM ghtrader_tick_gaps_v2 "
-                            "WHERE symbol=%s AND ticks_kind='main_l5' AND dataset_version='v2' "
-                            "ORDER BY ts DESC LIMIT %s",
-                            [sym, lim],
-                        )
-                        for r in cur.fetchall() or []:
-                            gap_rows.append(
-                                {
-                                    "trading_day": str(r[0] or "").strip() or None,
-                                    "tick_count_actual": (int(r[1]) if r[1] is not None else None),
-                                    "tick_count_expected_min": (int(r[2]) if r[2] is not None else None),
-                                    "tick_count_expected_max": (int(r[3]) if r[3] is not None else None),
-                                    "median_interval_ms": (int(r[4]) if r[4] is not None else None),
-                                    "p95_interval_ms": (int(r[5]) if r[5] is not None else None),
-                                    "p99_interval_ms": (int(r[6]) if r[6] is not None else None),
-                                    "max_interval_ms": (int(r[7]) if r[7] is not None else None),
-                                    "abnormal_gaps_count": (int(r[8]) if r[8] is not None else 0),
-                                    "critical_gaps_count": (int(r[9]) if r[9] is not None else 0),
-                                    "largest_gap_duration_ms": (int(r[10]) if r[10] is not None else None),
-                                    "updated_at": str(r[11] or "").strip() or None,
-                                }
-                            )
-                    except Exception as e:
-                        errors.append(f"tick_gaps: {e}")
-                    try:
-                        cur.execute(
-                            "SELECT run_id, action_kind, status, trading_day, details, created_at "
-                            "FROM ghtrader_repair_log_v2 "
-                            "WHERE symbol=%s "
-                            "ORDER BY ts DESC LIMIT %s",
-                            [sym, lim],
-                        )
-                        for r in cur.fetchall() or []:
-                            repair_rows.append(
-                                {
-                                    "run_id": str(r[0] or "").strip(),
-                                    "action_kind": str(r[1] or "").strip(),
-                                    "status": str(r[2] or "").strip(),
-                                    "trading_day": str(r[3] or "").strip() or None,
-                                    "details": str(r[4] or "").strip(),
-                                    "created_at": str(r[5] or "").strip() or None,
-                                }
-                            )
-                    except Exception as e:
-                        errors.append(f"repair_log: {e}")
-        except Exception as e:
-            errors.append(str(e))
-
-        return {
-            "ok": True,
-            "symbol": sym,
-            "generated_at": _now_iso(),
-            "field_quality": fq_rows,
-            "tick_gaps": gap_rows,
-            "repair_log": repair_rows,
-            "errors": errors,
-        }
+        _ = (symbol, limit)
+        raise HTTPException(status_code=410, detail="data quality detail endpoint removed in current PRD phase")
 
     @app.post("/api/data/diagnose", response_class=JSONResponse)
     async def api_data_enqueue_diagnose(request: Request) -> dict[str, Any]:
@@ -1673,70 +1534,7 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = request
-        return {"ok": False, "error": "data diagnose deferred (Phase-1/2)"}
-        payload = await request.json()
-
-        runs_dir = Path(str(payload.get("runs_dir") or get_runs_dir()))
-        data_dir = Path(str(payload.get("data_dir") or get_data_dir()))
-        ex = str(payload.get("exchange") or "SHFE").upper().strip()
-        v = str(payload.get("var") or "cu").lower().strip()
-        refresh_catalog = bool(payload.get("refresh_catalog", False))
-        thoroughness = str(payload.get("thoroughness") or "comprehensive").strip().lower()
-        if thoroughness not in {"quick", "standard", "comprehensive"}:
-            thoroughness = "comprehensive"
-        check_workers = int(payload.get("check_workers") or 0)
-        force_full_scan = bool(payload.get("force_full_scan", False))
-
-        start = str(payload.get("start") or "").strip()
-        end = str(payload.get("end") or "").strip()
-
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "data",
-            "diagnose",
-            "--exchange",
-            ex,
-            "--var",
-            v,
-            "--thoroughness",
-            thoroughness,
-            "--check-workers",
-            str(int(check_workers)),
-            "--refresh-catalog",
-            ("1" if refresh_catalog else "0"),
-            "--data-dir",
-            str(data_dir),
-            "--runs-dir",
-            str(runs_dir),
-        )
-        if force_full_scan:
-            argv += ["--force-full-scan"]
-        if start:
-            argv += ["--start", start]
-        if end:
-            argv += ["--end", end]
-
-        title = f"data-diagnose {ex}.{v} ({thoroughness})"
-        if force_full_scan:
-            title += " full"
-        store = request.app.state.job_store
-        jm = request.app.state.job_manager
-
-        # Dedupe: avoid duplicate queued/active diagnose jobs for the same scope.
-        try:
-            active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=2000)
-            for j in active:
-                if str(j.title or "").startswith(title):
-                    if j.pid is None and str(j.status or "") == "queued":
-                        started = jm.start_queued_job(j.id) or j
-                        return {"ok": True, "enqueued": [started.id], "count": 1, "deduped": True, "started": bool(started.pid)}
-                    return {"ok": True, "enqueued": [j.id], "count": 1, "deduped": True}
-        except Exception:
-            pass
-
-        # Diagnose is DB-heavy but not TqSdk-heavy: start immediately.
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
+        raise HTTPException(status_code=410, detail="data diagnose endpoint removed in current PRD phase")
 
     @app.post("/api/data/repair", response_class=JSONResponse)
     async def api_data_enqueue_repair(request: Request) -> dict[str, Any]:
@@ -1746,75 +1544,7 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = request
-        return {"ok": False, "error": "data repair deferred (Phase-1/2)"}
-        payload = await request.json()
-
-        runs_dir = Path(str(payload.get("runs_dir") or get_runs_dir()))
-        data_dir = Path(str(payload.get("data_dir") or get_data_dir()))
-
-        report_path = str(payload.get("report_path") or "").strip()
-        if not report_path:
-            raise HTTPException(status_code=400, detail="report_path is required")
-        rp = Path(report_path).expanduser()
-        try:
-            rp_abs = rp.resolve()
-        except Exception:
-            rp_abs = rp
-        try:
-            if str(rp_abs).startswith(str(runs_dir.resolve())) is False:  # type: ignore[union-attr]
-                raise HTTPException(status_code=400, detail="report_path must be under runs/")
-        except Exception:
-            # If resolve fails, still require a conservative prefix match.
-            if "runs" not in str(rp_abs):
-                raise HTTPException(status_code=400, detail="report_path must be under runs/")
-
-        auto_only = bool(payload.get("auto_only", True))
-        dry_run = bool(payload.get("dry_run", False))
-        refresh_catalog = bool(payload.get("refresh_catalog", False))
-        chunk_days = int(payload.get("chunk_days") or 5)
-        download_workers = int(payload.get("download_workers") or 0)
-
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "data",
-            "repair",
-            "--report",
-            str(rp_abs),
-            "--data-dir",
-            str(data_dir),
-            "--runs-dir",
-            str(runs_dir),
-            "--chunk-days",
-            str(int(max(1, min(chunk_days, 60)))),
-            "--download-workers",
-            str(int(download_workers)),
-            "--refresh-catalog",
-            ("1" if refresh_catalog else "0"),
-        )
-        if auto_only:
-            argv += ["--auto-only"]
-        else:
-            argv += ["--no-auto-only"]
-        if dry_run:
-            argv += ["--dry-run"]
-
-        title = f"data-repair {rp_abs.name}"
-        store = request.app.state.job_store
-        jm = request.app.state.job_manager
-
-        # Dedupe: avoid enqueuing duplicate queued repair jobs for the same report.
-        try:
-            active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=5000)
-            for j in active:
-                cmd = list(getattr(j, "command", []) or [])
-                if "data" in cmd and "repair" in cmd and str(rp_abs) in cmd:
-                    return {"ok": True, "enqueued": [j.id], "count": 1, "deduped": True}
-        except Exception:
-            pass
-
-        # Repair can be TqSdk-heavy (downloads): enqueue to respect scheduler.
-        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
+        raise HTTPException(status_code=410, detail="data repair endpoint removed in current PRD phase")
 
     @app.post("/api/data/health", response_class=JSONResponse)
     async def api_data_enqueue_health(request: Request) -> dict[str, Any]:
@@ -1824,85 +1554,7 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = request
-        return {"ok": False, "error": "data health deferred (Phase-1/2)"}
-        payload = await request.json()
-
-        runs_dir = Path(str(payload.get("runs_dir") or get_runs_dir()))
-        data_dir = Path(str(payload.get("data_dir") or get_data_dir()))
-        ex = str(payload.get("exchange") or "SHFE").upper().strip()
-        v = str(payload.get("var") or "cu").lower().strip()
-        refresh_catalog = bool(payload.get("refresh_catalog", False))
-        thoroughness = str(payload.get("thoroughness") or "comprehensive").strip().lower()
-        if thoroughness not in {"quick", "standard", "comprehensive"}:
-            thoroughness = "comprehensive"
-        check_workers = int(payload.get("check_workers") or 0)
-        force_full_scan = bool(payload.get("force_full_scan", False))
-
-        # Health can run diagnose-only or diagnose+auto-repair.
-        auto_repair = bool(payload.get("auto_repair", True))
-        dry_run = bool(payload.get("dry_run", False))
-        chunk_days = int(payload.get("chunk_days") or 5)
-        download_workers = int(payload.get("download_workers") or 0)
-
-        start = str(payload.get("start") or "").strip()
-        end = str(payload.get("end") or "").strip()
-
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "data",
-            "health",
-            "--exchange",
-            ex,
-            "--var",
-            v,
-            "--thoroughness",
-            thoroughness,
-            "--check-workers",
-            str(int(check_workers)),
-            "--refresh-catalog",
-            ("1" if refresh_catalog else "0"),
-            "--chunk-days",
-            str(int(max(1, min(chunk_days, 60)))),
-            "--download-workers",
-            str(int(download_workers)),
-            "--data-dir",
-            str(data_dir),
-            "--runs-dir",
-            str(runs_dir),
-        )
-        argv += ["--auto-repair"] if auto_repair else ["--no-auto-repair"]
-        if force_full_scan:
-            argv += ["--force-full-scan"]
-        if dry_run:
-            argv += ["--dry-run"]
-        if start:
-            argv += ["--start", start]
-        if end:
-            argv += ["--end", end]
-
-        title = f"data-health {ex}.{v} ({thoroughness})"
-        if auto_repair:
-            title += " auto"
-        if force_full_scan:
-            title += " full"
-        if start or end:
-            title += f" {start or ''}..{end or ''}".strip()
-
-        store = request.app.state.job_store
-        jm = request.app.state.job_manager
-
-        # Dedupe: avoid duplicate queued/active health jobs for the same scope.
-        try:
-            active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=2000)
-            for j in active:
-                if str(j.title or "").startswith(title):
-                    return {"ok": True, "enqueued": [j.id], "count": 1, "deduped": True}
-        except Exception:
-            pass
-
-        # Health may be TqSdk-heavy (auto-repair downloads): enqueue to respect scheduler.
-        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
+        raise HTTPException(status_code=410, detail="data health endpoint removed in current PRD phase")
 
     @app.post("/api/data/enqueue-l5-start", response_class=JSONResponse)
     async def api_data_enqueue_l5_start(request: Request) -> dict[str, Any]:
@@ -2286,7 +1938,8 @@ def create_app() -> Any:
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
-        return {"ok": False, "error": "contracts explorer deferred (Phase-1/2)"}
+        _ = (exchange, var, refresh)
+        raise HTTPException(status_code=410, detail="contracts explorer endpoint removed in current PRD phase")
 
     @app.post("/api/contracts/enqueue-fill", response_class=JSONResponse)
     async def api_contracts_enqueue_fill(request: Request) -> dict[str, Any]:
@@ -2302,7 +1955,7 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = request
-        return {"ok": False, "error": "contracts fill deferred (Phase-1/2)"}
+        raise HTTPException(status_code=410, detail="contracts fill endpoint removed in current PRD phase")
 
     @app.post("/api/contracts/enqueue-update", response_class=JSONResponse)
     async def api_contracts_enqueue_update(request: Request) -> dict[str, Any]:
@@ -2318,45 +1971,7 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = request
-        return {"ok": False, "error": "update deferred (Phase-1/2)"}
-        payload = await request.json()
-
-        runs_dir = get_runs_dir()
-        data_dir = get_data_dir()
-
-        ex = str(payload.get("exchange") or "SHFE").upper().strip()
-        v = str(payload.get("var") or "cu").lower().strip()
-        recent_days = int(payload.get("recent_expired_days") or 10)
-        refresh_catalog = bool(payload.get("refresh_catalog", True))
-
-        symbols: list[str] = []
-        raw_syms = payload.get("symbols")
-        if isinstance(raw_syms, list):
-            symbols = [str(s).strip() for s in raw_syms if str(s).strip()]
-
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "update",
-            "--exchange",
-            ex,
-            "--var",
-            v,
-            "--recent-expired-days",
-            str(int(recent_days)),
-            "--data-dir",
-            str(data_dir),
-            "--runs-dir",
-            str(runs_dir),
-        )
-        if not refresh_catalog:
-            argv += ["--no-refresh-catalog"]
-        for s in symbols:
-            argv += ["--symbols", s]
-
-        title = f"update {ex}.{v}" if not symbols else (f"update {symbols[0]}" if len(symbols) == 1 else f"update {len(symbols)} symbols")
-        jm = request.app.state.job_manager
-        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return {"ok": True, "enqueued": [rec.id], "count": 1}
+        raise HTTPException(status_code=410, detail="contracts update endpoint removed in current PRD phase")
 
     @app.post("/api/contracts/enqueue-audit", response_class=JSONResponse)
     async def api_contracts_enqueue_audit(request: Request) -> dict[str, Any]:
@@ -2368,40 +1983,7 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = request
-        return {"ok": False, "error": "audit deferred (Phase-1/2)"}
-        payload = await request.json()
-
-        data_dir = get_data_dir()
-        runs_dir = get_runs_dir()
-
-        raw_syms = payload.get("symbols")
-        if not isinstance(raw_syms, list):
-            raise HTTPException(status_code=400, detail="symbols must be a list[str]")
-        symbols = [str(s).strip() for s in raw_syms if str(s).strip()]
-        if not symbols:
-            raise HTTPException(status_code=400, detail="At least one symbol is required")
-
-        lv = "v2"
-
-        started: list[str] = []
-        for sym in symbols:
-            argv = python_module_argv(
-                "ghtrader.cli",
-                "audit",
-                "--scope",
-                "ticks",
-                "--symbol",
-                sym,
-                "--data-dir",
-                str(data_dir),
-                "--runs-dir",
-                str(runs_dir),
-            )
-            title = f"audit ticks {sym}"
-            rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-            started.append(rec.id)
-
-        return {"ok": True, "started": started, "count": int(len(started))}
+        raise HTTPException(status_code=410, detail="contracts audit endpoint removed in current PRD phase")
 
     @app.post("/api/jobs", response_class=JSONResponse)
     async def api_create_job(request: Request) -> dict[str, Any]:
@@ -2940,6 +2522,30 @@ def create_app() -> Any:
         except Exception:
             return None
 
+    def _read_redis_json(key: str) -> dict[str, Any] | None:
+        """
+        Best-effort sync Redis JSON read for hot state/desired keys.
+        Falls back to file-based mirrors when Redis is unavailable.
+        """
+        try:
+            import redis as redis_sync
+
+            client = redis_sync.Redis(
+                host="localhost",
+                port=6379,
+                db=0,
+                decode_responses=True,
+                socket_connect_timeout=0.2,
+                socket_timeout=0.2,
+            )
+            raw = client.get(str(key))
+            if not raw:
+                return None
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
     def _read_jsonl_tail(path: Path, *, max_lines: int, max_bytes: int = 256 * 1024) -> list[dict[str, Any]]:
         """
         Best-effort tail reader for JSONL artifacts (snapshots/events).
@@ -3145,7 +2751,7 @@ def create_app() -> Any:
     @app.get("/api/gateway/status", response_class=JSONResponse)
     def api_gateway_status(request: Request, account_profile: str = "default") -> dict[str, Any]:
         """
-        Read gateway state for a broker account profile (runs/gateway/account=<PROFILE>/).
+        Read gateway state for a broker account profile (Redis hot state first, file mirror fallback).
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -3159,8 +2765,8 @@ def create_app() -> Any:
             prof = str(account_profile or "default").strip() or "default"
 
         root = runs_dir / "gateway" / f"account={prof}"
-        st = _read_json_file(root / "state.json") if root.exists() else None
-        desired = _read_json_file(root / "desired.json") if root.exists() else None
+        st = _read_redis_json(f"ghtrader:gateway:state:{prof}") or (_read_json_file(root / "state.json") if root.exists() else None)
+        desired = _read_redis_json(f"ghtrader:gateway:desired:{prof}") or (_read_json_file(root / "desired.json") if root.exists() else None)
         targets = _read_json_file(root / "targets.json") if root.exists() else None
 
         return {
@@ -3191,8 +2797,8 @@ def create_app() -> Any:
             if root.exists():
                 for d in sorted([p for p in root.iterdir() if p.is_dir() and p.name.startswith("account=")], key=lambda x: x.name)[:lim]:
                     prof = d.name.split("=", 1)[-1] if "=" in d.name else d.name
-                    st = _read_json_file(d / "state.json") if (d / "state.json").exists() else None
-                    desired = _read_json_file(d / "desired.json") if (d / "desired.json").exists() else None
+                    st = _read_redis_json(f"ghtrader:gateway:state:{prof}") or (_read_json_file(d / "state.json") if (d / "state.json").exists() else None)
+                    desired = _read_redis_json(f"ghtrader:gateway:desired:{prof}") or (_read_json_file(d / "desired.json") if (d / "desired.json").exists() else None)
                     health = st.get("health") if isinstance(st, dict) and isinstance(st.get("health"), dict) else {}
                     effective = st.get("effective") if isinstance(st, dict) and isinstance(st.get("effective"), dict) else {}
                     rows.append(
@@ -3249,7 +2855,7 @@ def create_app() -> Any:
     @app.post("/api/gateway/command", response_class=JSONResponse)
     async def api_gateway_command(request: Request) -> dict[str, Any]:
         """
-        Append an operator command to runs/gateway/account=<PROFILE>/commands.jsonl.
+        Append an operator command (Redis stream primary; file mirror for audit).
 
         Payload:
           {account_profile, type, params?}
@@ -3279,6 +2885,28 @@ def create_app() -> Any:
             }
             with open(p, "a", encoding="utf-8") as f:
                 f.write(json.dumps(cmd, ensure_ascii=False, default=str) + "\n")
+
+            # Primary command bus: Redis stream.
+            try:
+                r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+                params = cmd.get("params") if isinstance(cmd.get("params"), dict) else {}
+                await r.xadd(
+                    f"ghtrader:commands:{prof}",
+                    {
+                        "ts": str(cmd.get("ts") or ""),
+                        "command_id": str(cmd.get("command_id") or ""),
+                        "account_profile": prof,
+                        "type": str(cmd.get("type") or ""),
+                        "params": json.dumps(params, ensure_ascii=False, default=str),
+                        "symbol": str(params.get("symbol") or ""),
+                        "target": str(params.get("target") or ""),
+                    },
+                    maxlen=10000,
+                    approximate=True,
+                )
+                await r.aclose()
+            except Exception:
+                pass
             return {"ok": True, "account_profile": prof, "command_id": cmd["command_id"]}
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"gateway_command_failed: {e}")
@@ -3322,7 +2950,7 @@ def create_app() -> Any:
     @app.get("/api/strategy/status", response_class=JSONResponse)
     def api_strategy_status(request: Request, account_profile: str = "default") -> dict[str, Any]:
         """
-        Read StrategyRunner stable state for a profile (runs/strategy/account=<PROFILE>/...).
+        Read StrategyRunner stable state for a profile (Redis hot state first, file mirror fallback).
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
@@ -3338,8 +2966,8 @@ def create_app() -> Any:
         root = runs_dir / "strategy" / f"account={prof}"
         st_path = root / "state.json"
         desired_path = root / "desired.json"
-        state = _read_json_file(st_path) if st_path.exists() else None
-        desired = _read_json_file(desired_path) if desired_path.exists() else None
+        state = _read_redis_json(f"ghtrader:strategy:state:{prof}") or (_read_json_file(st_path) if st_path.exists() else None)
+        desired = _read_redis_json(f"ghtrader:strategy:desired:{prof}") or (_read_json_file(desired_path) if desired_path.exists() else None)
         targets = _read_json_file((runs_dir / "gateway" / f"account={prof}" / "targets.json"))  # strategy output surface
 
         age = _artifact_age_sec(st_path) if st_path.exists() else None

@@ -1,5 +1,5 @@
 """
-Strategy control-plane artifacts (PRD §5.12.0).
+Strategy control-plane artifacts (PRD §5.11.1).
 
 This module provides a stable per-account-profile directory for StrategyRunner supervision
 and dashboard reads.
@@ -103,46 +103,64 @@ def _parse_mode(x: Any) -> StrategyMode:
     return "idle"
 
 
-def read_strategy_desired(*, runs_dir: Path, profile: str) -> StrategyDesired:
+def _parse_strategy_desired_cfg(cfg: dict[str, Any]) -> StrategyDesired:
+    mode = _parse_mode(cfg.get("mode"))
+    symbols = list(cfg.get("symbols")) if isinstance(cfg.get("symbols"), list) else None
+    model_name = str(cfg.get("model_name") or "xgboost").strip() or "xgboost"
+    horizon = int(_safe_int(cfg.get("horizon")) or 50)
+    threshold_up = float(_safe_float(cfg.get("threshold_up")) or 0.6)
+    threshold_down = float(_safe_float(cfg.get("threshold_down")) or 0.6)
+    position_size = int(_safe_int(cfg.get("position_size")) or 1)
+    artifacts_dir = str(cfg.get("artifacts_dir") or "artifacts").strip() or "artifacts"
+    poll_interval_sec = float(_safe_float(cfg.get("poll_interval_sec")) or 0.5)
+    return StrategyDesired(
+        mode=mode,
+        symbols=symbols,
+        model_name=model_name,
+        horizon=horizon,
+        threshold_up=threshold_up,
+        threshold_down=threshold_down,
+        position_size=position_size,
+        artifacts_dir=artifacts_dir,
+        poll_interval_sec=poll_interval_sec,
+    )
+
+
+def read_strategy_desired(*, runs_dir: Path, profile: str, redis_client: redis.Redis | None = None) -> StrategyDesired:
     """
-    Read desired.json; returns defaults if missing/invalid.
+    Read desired state (Redis preferred, file fallback); returns defaults if missing/invalid.
     """
+    prof = canonical_account_profile(profile)
+    if redis_client is not None:
+        try:
+            raw = redis_client.get(f"ghtrader:strategy:desired:{prof}")
+            if raw:
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    cfg = obj.get("desired") if isinstance(obj.get("desired"), dict) else obj
+                    if isinstance(cfg, dict):
+                        return _parse_strategy_desired_cfg(cfg)
+        except Exception:
+            pass
+
     p = strategy_desired_path(runs_dir=runs_dir, profile=profile)
     obj = read_json(p)
     if not isinstance(obj, dict):
         return StrategyDesired()
     cfg = obj.get("desired") if isinstance(obj.get("desired"), dict) else obj
     try:
-        mode = _parse_mode(cfg.get("mode"))
-        symbols = list(cfg.get("symbols")) if isinstance(cfg.get("symbols"), list) else None
-        model_name = str(cfg.get("model_name") or "xgboost").strip() or "xgboost"
-        horizon = int(_safe_int(cfg.get("horizon")) or 50)
-        threshold_up = float(_safe_float(cfg.get("threshold_up")) or 0.6)
-        threshold_down = float(_safe_float(cfg.get("threshold_down")) or 0.6)
-        position_size = int(_safe_int(cfg.get("position_size")) or 1)
-        artifacts_dir = str(cfg.get("artifacts_dir") or "artifacts").strip() or "artifacts"
-        poll_interval_sec = float(_safe_float(cfg.get("poll_interval_sec")) or 0.5)
-        return StrategyDesired(
-            mode=mode,
-            symbols=symbols,
-            model_name=model_name,
-            horizon=horizon,
-            threshold_up=threshold_up,
-            threshold_down=threshold_down,
-            position_size=position_size,
-            artifacts_dir=artifacts_dir,
-            poll_interval_sec=poll_interval_sec,
-        )
+        return _parse_strategy_desired_cfg(cfg)
     except Exception:
         return StrategyDesired()
 
 
-def write_strategy_desired(*, runs_dir: Path, profile: str, desired: StrategyDesired) -> None:
+def write_strategy_desired(*, runs_dir: Path, profile: str, desired: StrategyDesired, redis_client: redis.Redis | None = None) -> None:
     root = strategy_root(runs_dir=runs_dir, profile=profile)
+    prof = canonical_account_profile(profile)
     payload: dict[str, Any] = {
         "schema_version": int(STRATEGY_DESIRED_SCHEMA_VERSION),
         "updated_at": _now_iso(),
-        "account_profile": canonical_account_profile(profile),
+        "account_profile": prof,
         "desired": _jsonable(
             {
                 "mode": desired.mode,
@@ -158,6 +176,14 @@ def write_strategy_desired(*, runs_dir: Path, profile: str, desired: StrategyDes
         ),
     }
     write_json_atomic(root / "desired.json", payload)
+    try:
+        rc = redis_client
+        if rc is None:
+            rc = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+        rc.set(f"ghtrader:strategy:desired:{prof}", json.dumps(payload, default=str))
+        rc.publish(f"ghtrader:strategy:updates:{prof}", json.dumps(payload, default=str))
+    except Exception:
+        pass
 
 
 class StrategyStateWriter:

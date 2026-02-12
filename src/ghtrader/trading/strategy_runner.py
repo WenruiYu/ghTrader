@@ -1,8 +1,8 @@
 """
-StrategyRunner (AI) for AccountGateway (PRD §5.12.0).
+StrategyRunner (AI) for AccountGateway (PRD §5.11.1).
 
-This module must NOT import `tqsdk` directly. It consumes market snapshots produced by
-AccountGateway under runs/gateway/account=<PROFILE>/state.json, and writes targets to:
+This module must NOT import `tqsdk` directly. It consumes market snapshots from
+AccountGateway over the local ZMQ hot path, and writes targets to:
   runs/gateway/account=<PROFILE>/targets.json
 """
 
@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -31,10 +30,6 @@ ModelType = Literal["logistic", "xgboost", "lightgbm", "deeplob", "transformer",
 
 from ghtrader.util.time import now_iso as _now_iso
 
-
-from ghtrader.util.safe_parse import safe_float as _safe_float
-
-
 def _canonical_profile(p: str) -> str:
     try:
         from ghtrader.tq.runtime import canonical_account_profile
@@ -42,11 +37,6 @@ def _canonical_profile(p: str) -> str:
         return canonical_account_profile(p)
     except Exception:
         return str(p or "").strip().lower() or "default"
-
-
-def gateway_state_path(*, runs_dir: Path, account_profile: str) -> Path:
-    prof = _canonical_profile(account_profile)
-    return runs_dir / "gateway" / f"account={prof}" / "state.json"
 
 
 def gateway_targets_path(*, runs_dir: Path, account_profile: str) -> Path:
@@ -147,7 +137,7 @@ def write_gateway_targets(
 def run_strategy_runner(cfg: StrategyConfig) -> None:
     """
     Long-running StrategyRunner loop:
-    - reads gateway market ticks from state.json
+    - reads gateway market ticks from ZMQ hot path
     - computes features + model inference
     - writes targets.json for the gateway to consume
     - handles symbol roll detection (resets FactorEngine state on underlying change)
@@ -168,7 +158,6 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
         raise ValueError("symbols is required")
 
     from ghtrader.datasets.features import FactorEngine
-    from ghtrader.trading.symbol_resolver import is_continuous_alias
 
     # Redis Setup (Warm Path)
     try:
@@ -232,17 +221,36 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
     # Track execution symbols from gateway for roll detection
     last_symbol_mapping: dict[str, str] = {}  # requested_symbol -> execution_symbol
 
+    last_zmq_timeout_event_at = 0.0
+    safe_halt_active = False
     while True:
-        statew.set_health(ok=True, running=True, error="", last_loop_at=_now_iso())
         try:
             # ZMQ Poll (Hot Path)
-            if sub_socket.poll(timeout=1000):
-                msg = sub_socket.recv_json()
-                st = msg.get("payload", {})
-            else:
-                # Fallback to disk if ZMQ silent (e.g. startup race)
-                st_path = gateway_state_path(runs_dir=cfg.runs_dir, account_profile=prof)
-                st = read_json(st_path) or {}
+            if not sub_socket.poll(timeout=1000):
+                now_ts = time.time()
+                statew.set_health(ok=False, running=True, error="gateway_zmq_timeout", last_loop_at=_now_iso())
+                if not safe_halt_active:
+                    safe_halt_active = True
+                    statew.set_effective(no_new_targets=True, halt_reason="gateway_zmq_timeout")
+                    halt_evt = {"type": "safe_halt_entered", "reason": "gateway_zmq_timeout"}
+                    writer.event(halt_evt)
+                    statew.append_event(halt_evt)
+                if (now_ts - last_zmq_timeout_event_at) >= 5.0:
+                    evt = {"type": "gateway_state_timeout", "channel": "zmq_hot_path"}
+                    writer.event(evt)
+                    statew.append_event(evt)
+                    last_zmq_timeout_event_at = now_ts
+                statew.flush_state()
+                continue
+            msg = sub_socket.recv_json()
+            st = msg.get("payload", {})
+            statew.set_health(ok=True, running=True, error="", last_loop_at=_now_iso())
+            if safe_halt_active:
+                safe_halt_active = False
+                statew.set_effective(no_new_targets=False, halt_reason="")
+                clear_evt = {"type": "safe_halt_cleared", "reason": "gateway_stream_restored"}
+                writer.event(clear_evt)
+                statew.append_event(clear_evt)
             market = st.get("market") if isinstance(st.get("market"), dict) else {}
             ticks = market.get("ticks") if isinstance(market.get("ticks"), dict) else {}
             effective = st.get("effective") if isinstance(st.get("effective"), dict) else {}
@@ -251,6 +259,12 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
             ticks = {}
             symbol_mapping = {}
             statew.set_health(ok=False, running=True, error=str(e), last_loop_at=_now_iso())
+            if not safe_halt_active:
+                safe_halt_active = True
+                statew.set_effective(no_new_targets=True, halt_reason="gateway_state_read_failed")
+                halt_evt = {"type": "safe_halt_entered", "reason": "gateway_state_read_failed"}
+                writer.event(halt_evt)
+                statew.append_event(halt_evt)
             statew.append_event({"type": "gateway_state_read_failed", "error": str(e)})
 
         # Detect roll: if execution symbol changed for any requested symbol, reset engines
@@ -350,7 +364,6 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
 __all__ = [
     "StrategyConfig",
     "compute_target",
-    "gateway_state_path",
     "gateway_targets_path",
     "run_strategy_runner",
     "write_gateway_targets",

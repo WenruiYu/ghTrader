@@ -150,9 +150,10 @@ def run_daily_pipeline(
     Steps:
     1. Refresh data: download latest ticks for each symbol
     2. Build: generate features and labels
-    3. Train: train model on historical data
-    4. Evaluate: run walk-forward backtest
-    5. Promote: if passes gates, promote to production
+    3. Regime: train HMM regime model and persist latest states
+    4. Train: train model on historical data
+    5. Evaluate: run walk-forward backtest
+    6. Promote: if passes gates, promote to production
     
     Args:
         symbols: Instruments to train
@@ -171,6 +172,7 @@ def run_daily_pipeline(
     from ghtrader.tq.eval import run_backtest
     from ghtrader.datasets.features import FactorEngine
     from ghtrader.datasets.labels import build_labels_for_symbol
+    from ghtrader.regime import train_regime_model
     from ghtrader.research.models import train_model
     from ghtrader.tq.ingest import download_historical_ticks
     
@@ -196,13 +198,27 @@ def run_daily_pipeline(
             # Step 1: Refresh data
             log.info("daily_pipeline.step", symbol=symbol, step="refresh_data")
             t0 = time.time()
-            download_historical_ticks(
-                symbol=symbol,
-                start_date=start_date,
-                end_date=today,
-                data_dir=data_dir,
-            )
-            symbol_report["steps"]["refresh_data"] = {"status": "ok", "duration": time.time() - t0}
+            refresh_status = "ok"
+            refresh_note = ""
+            try:
+                download_historical_ticks(
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=today,
+                    data_dir=data_dir,
+                )
+            except RuntimeError as e:
+                # main_l5-only pipeline: do not fail the whole daily flow on deprecated path.
+                if "deprecated" in str(e).lower():
+                    refresh_status = "skipped"
+                    refresh_note = "download_historical_ticks deprecated (main_l5-only pipeline)"
+                else:
+                    raise
+            symbol_report["steps"]["refresh_data"] = {
+                "status": refresh_status,
+                "duration": time.time() - t0,
+                "note": refresh_note,
+            }
             
             # Step 2: Build features
             log.info("daily_pipeline.step", symbol=symbol, step="build_features")
@@ -220,6 +236,20 @@ def run_daily_pipeline(
                 horizons=[horizon],
             )
             symbol_report["steps"]["build_labels"] = {"status": "ok", "duration": time.time() - t0}
+
+            # Step 3: Regime model + latest regime states
+            log.info("daily_pipeline.step", symbol=symbol, step="regime")
+            t0 = time.time()
+            regime_model_path = train_regime_model(
+                symbol=symbol,
+                data_dir=data_dir,
+                artifacts_dir=artifacts_dir,
+            )
+            symbol_report["steps"]["regime"] = {
+                "status": "ok",
+                "duration": time.time() - t0,
+                "model_path": str(regime_model_path),
+            }
             
             # Step 4: Train model
             log.info("daily_pipeline.step", symbol=symbol, step="train")

@@ -269,91 +269,20 @@ def build_router() -> Any:
     @router.post("/data/ingest/download")
     async def data_ingest_download(request: Request):
         _require_auth(request)
-        raise HTTPException(status_code=400, detail="download deferred (Phase-1/2)")
-        form = await request.form()
-        symbol = str(form.get("symbol") or "").strip()
-        start_date = str(form.get("start_date") or "").strip()
-        end_date = str(form.get("end_date") or "").strip()
-        data_dir = str(form.get("data_dir") or "data").strip()
-        chunk_days = str(form.get("chunk_days") or "5").strip()
-        if not symbol or not start_date or not end_date:
-            raise HTTPException(status_code=400, detail="symbol/start_date/end_date required")
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "download",
-            "--symbol",
-            symbol,
-            "--start",
-            start_date,
-            "--end",
-            end_date,
-            "--data-dir",
-            data_dir,
-            "--chunk-days",
-            chunk_days,
-        )
-        title = f"download {symbol} {start_date}->{end_date}"
-        jm = request.app.state.job_manager
-        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        raise HTTPException(status_code=410, detail="download endpoint removed; use main-schedule + main-l5")
 
     @router.post("/data/ingest/download_contract_range")
     async def data_ingest_download_contract_range(request: Request):
         _require_auth(request)
-        raise HTTPException(status_code=400, detail="download-contract-range deferred (Phase-1/2)")
-        form = await request.form()
-        exchange = str(form.get("exchange") or "SHFE").strip()
-        var = str(form.get("variety") or "").strip()
-        start_contract = str(form.get("start_contract") or "").strip()
-        end_contract = str(form.get("end_contract") or "").strip()
-        start_date = str(form.get("start_date") or "").strip()
-        end_date = str(form.get("end_date") or "").strip()
-        data_dir = str(form.get("data_dir") or "data").strip()
-        chunk_days = str(form.get("chunk_days") or "5").strip()
-        if not var or not start_contract or not end_contract:
-            raise HTTPException(status_code=400, detail="var/start_contract/end_contract required")
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "download-contract-range",
-            "--exchange",
-            exchange,
-            "--var",
-            var,
-            "--start-contract",
-            start_contract,
-            "--end-contract",
-            end_contract,
-            "--data-dir",
-            data_dir,
-            "--chunk-days",
-            chunk_days,
+        raise HTTPException(
+            status_code=410,
+            detail="download-contract-range endpoint removed; use main-schedule + main-l5",
         )
-        if start_date:
-            argv += ["--start-date", start_date]
-        if end_date:
-            argv += ["--end-date", end_date]
-        title = f"download-contract-range {var} {start_contract}->{end_contract}"
-        jm = request.app.state.job_manager
-        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
     @router.post("/data/ingest/record")
     async def data_ingest_record(request: Request):
         _require_auth(request)
-        raise HTTPException(status_code=400, detail="record deferred (Phase-1/2)")
-        form = await request.form()
-        symbols = str(form.get("symbols") or "").strip()
-        data_dir = str(form.get("data_dir") or "data").strip()
-        if not symbols:
-            raise HTTPException(status_code=400, detail="symbols required")
-        argv = python_module_argv("ghtrader.cli", "record")
-        for s in [s.strip() for s in symbols.split(",") if s.strip()]:
-            argv += ["--symbols", s]
-        argv += ["--data-dir", data_dir]
-        title = f"record {symbols}"
-        jm = request.app.state.job_manager
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        raise HTTPException(status_code=410, detail="record endpoint removed in current PRD phase")
 
     @router.post("/data/settings/tqsdk_scheduler")
     async def data_settings_tqsdk_scheduler(request: Request):
@@ -451,36 +380,7 @@ def build_router() -> Any:
     @router.post("/data/integrity/audit")
     async def data_integrity_audit(request: Request):
         _require_auth(request)
-        raise HTTPException(status_code=400, detail="audit deferred (Phase-1/2)")
-        form = await request.form()
-        scopes = form.getlist("scopes")
-        data_dir = str(form.get("data_dir") or "data").strip()
-        runs_dir = str(form.get("runs_dir") or "runs").strip()
-        exchange = str(form.get("exchange") or "").strip()
-        variety = str(form.get("variety") or "").strip()
-        refresh_catalog = str(form.get("refresh_catalog") or "").strip().lower() in {"true", "1", "yes", "on"}
-        scopes = [s for s in scopes if s]
-        if not scopes:
-            scopes = ["all"]
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "audit",
-            *sum([["--scope", s] for s in scopes], []),
-            "--data-dir",
-            data_dir,
-            "--runs-dir",
-            runs_dir,
-        )
-        if exchange:
-            argv += ["--exchange", exchange]
-        if variety:
-            argv += ["--var", variety]
-        if refresh_catalog:
-            argv += ["--refresh-catalog"]
-        title = f"audit {','.join(scopes)}"
-        jm = request.app.state.job_manager
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        raise HTTPException(status_code=410, detail="integrity audit endpoint removed in current PRD phase")
 
     # ---------------------------------------------------------------------
     # Legacy /ops/* POST routes (redirect to /data/*)
@@ -498,33 +398,7 @@ def build_router() -> Any:
     @router.post("/ops/ingest/update_variety")
     async def ops_ingest_update_variety(request: Request):
         _require_auth(request)
-        raise HTTPException(status_code=400, detail="update deferred (Phase-1/2)")
-        form = await request.form()
-        exchange = str(form.get("exchange") or "SHFE").strip()
-        var = str(form.get("variety") or "").strip()
-        recent_days = str(form.get("recent_expired_days") or "10").strip()
-        data_dir = str(form.get("data_dir") or "data").strip()
-        runs_dir_str = str(form.get("runs_dir") or "runs").strip()
-        if not var:
-            raise HTTPException(status_code=400, detail="variety required")
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "update",
-            "--exchange",
-            exchange,
-            "--var",
-            var,
-            "--recent-expired-days",
-            recent_days,
-            "--data-dir",
-            data_dir,
-            "--runs-dir",
-            runs_dir_str,
-        )
-        title = f"update {exchange}.{var}"
-        jm = request.app.state.job_manager
-        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        raise HTTPException(status_code=410, detail="update-variety endpoint removed in current PRD phase")
 
     @router.post("/ops/ingest/record")
     async def ops_ingest_record(request: Request):
@@ -549,6 +423,7 @@ def build_router() -> Any:
     # Note: /ops/model/* and /ops/eval/* routes are kept as-is since they
     # redirect to /models page which is separate from the Data Hub consolidation.
     # These routes submit jobs and redirect to job detail, so they work independently.
+    @router.post("/models/model/train")
     @router.post("/ops/model/train")
     async def ops_model_train(request: Request):
         _require_auth(request)
@@ -596,6 +471,7 @@ def build_router() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
+    @router.post("/models/model/sweep")
     @router.post("/ops/model/sweep")
     async def ops_model_sweep(request: Request):
         _require_auth(request)
@@ -635,6 +511,7 @@ def build_router() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
+    @router.post("/models/eval/benchmark")
     @router.post("/ops/eval/benchmark")
     async def ops_eval_benchmark(request: Request):
         _require_auth(request)
@@ -668,6 +545,7 @@ def build_router() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
+    @router.post("/models/eval/compare")
     @router.post("/ops/eval/compare")
     async def ops_eval_compare(request: Request):
         _require_auth(request)
@@ -701,6 +579,7 @@ def build_router() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
+    @router.post("/models/eval/backtest")
     @router.post("/ops/eval/backtest")
     async def ops_eval_backtest(request: Request):
         _require_auth(request)
@@ -737,6 +616,7 @@ def build_router() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
+    @router.post("/models/eval/paper")
     @router.post("/ops/eval/paper")
     async def ops_eval_paper(request: Request):
         _require_auth(request)
@@ -755,6 +635,7 @@ def build_router() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
+    @router.post("/models/eval/daily_train")
     @router.post("/ops/eval/daily_train")
     async def ops_eval_daily_train(request: Request):
         _require_auth(request)
@@ -805,27 +686,7 @@ def build_router() -> Any:
 
         # Build argv for a known-safe set of job types (no shell).
         if job_type == "download_contract_range":
-            var = symbol_or_var or "cu"
-            start_contract = str(form.get("start_contract") or "1601").strip()
-            end_contract = str(form.get("end_contract") or "auto").strip()
-            chunk_days = str(form.get("chunk_days") or "5").strip()
-            argv = python_module_argv(
-                "ghtrader.cli",
-                "download-contract-range",
-                "--exchange",
-                "SHFE",
-                "--var",
-                var,
-                "--start-contract",
-                start_contract,
-                "--end-contract",
-                end_contract,
-                "--data-dir",
-                str(data_dir),
-                "--chunk-days",
-                chunk_days,
-            )
-            title = f"download-contract-range {var} {start_contract}->{end_contract}"
+            raise HTTPException(status_code=410, detail="download_contract_range job type removed in current PRD phase")
         elif job_type == "build":
             symbol = symbol_or_var
             if not symbol:
@@ -900,14 +761,12 @@ def build_router() -> Any:
         elif job_type == "main_l5":
             var = symbol_or_var or "cu"
             derived_symbol = str(form.get("derived_symbol") or "").strip()
-            overwrite = str(form.get("overwrite") or "0").strip().lower() in {"1", "true", "yes", "on"}
             update_mode = str(form.get("update_mode") or "0").strip().lower() in {"1", "true", "yes", "on"}
             argv = python_module_argv("ghtrader.cli", "main-l5", "--var", var)
             if derived_symbol:
                 argv += ["--symbol", derived_symbol]
             if update_mode:
                 argv += ["--update"]
-            argv += ["--overwrite" if overwrite else "--no-overwrite"]
             title = f"main-l5 {var}"
         else:
             raise HTTPException(status_code=400, detail=f"Unknown job_type: {job_type}")

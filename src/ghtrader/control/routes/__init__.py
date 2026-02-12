@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from .core import router as core_router
 from .health import router as health_router
 from .jobs import router as jobs_router
 
@@ -23,4 +24,7 @@ def build_api_router() -> APIRouter:
 
 def build_root_router() -> APIRouter:
     """Build router for root-level routes (like /health)."""
-    return health_router
+    root = APIRouter()
+    root.include_router(core_router)
+    root.include_router(health_router)
+    return root

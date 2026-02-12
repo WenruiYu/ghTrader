@@ -1,13 +1,13 @@
 """
-AccountGateway (OMS/EMS) for TqSdk accounts (PRD §5.12.0).
+AccountGateway (OMS/EMS) for TqSdk accounts (PRD §5.11.1).
 
 This module intentionally contains direct TqSdk integration. Non-`ghtrader.tq.*` modules must not
 import `tqsdk` directly.
 
-Contract (file-based; local-only):
+Audit mirrors (file-based; local-only):
   runs/gateway/account=<PROFILE>/
     desired.json     # desired configuration (written by dashboard/operators)
-    targets.json     # latest targets (written by StrategyRunner)
+    targets.json     # latest targets audit snapshot (written by StrategyRunner)
     commands.jsonl   # operator commands (append-only)
     state.json       # atomic last state (fast dashboard reads)
     events.jsonl     # append-only events
@@ -190,10 +190,38 @@ def _parse_gateway_mode(x: Any) -> GatewayMode:
     return "idle"
 
 
-def read_gateway_desired(*, runs_dir: Path, profile: str) -> GatewayDesired:
+def _parse_gateway_desired_cfg(cfg: dict[str, Any]) -> GatewayDesired:
+    return GatewayDesired(
+        mode=_parse_gateway_mode(cfg.get("mode")),
+        symbols=list(cfg.get("symbols")) if isinstance(cfg.get("symbols"), list) else None,
+        executor=str(cfg.get("executor") or "targetpos").strip().lower() in {"direct"} and "direct" or "targetpos",
+        sim_account=str(cfg.get("sim_account") or "tqsim").strip().lower() in {"tqkq"} and "tqkq" or "tqsim",
+        confirm_live=str(cfg.get("confirm_live") or "").strip(),
+        max_abs_position=max(0, int(cfg.get("max_abs_position") or 1)),
+        max_order_size=max(1, int(cfg.get("max_order_size") or 1)),
+        max_ops_per_sec=max(1, int(cfg.get("max_ops_per_sec") or 10)),
+        max_daily_loss=_safe_float(cfg.get("max_daily_loss")),
+        enforce_trading_time=bool(cfg.get("enforce_trading_time")) if ("enforce_trading_time" in cfg) else True,
+    )
+
+
+def read_gateway_desired(*, runs_dir: Path, profile: str, redis_client: redis.Redis | None = None) -> GatewayDesired:
     """
-    Read desired.json; return defaults if missing/invalid.
+    Read desired state (Redis preferred, file fallback); return defaults if missing/invalid.
     """
+    prof = canonical_account_profile(profile)
+    if redis_client is not None:
+        try:
+            raw = redis_client.get(f"ghtrader:gateway:desired:{prof}")
+            if raw:
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    cfg = obj.get("desired") if isinstance(obj.get("desired"), dict) else obj
+                    if isinstance(cfg, dict):
+                        return _parse_gateway_desired_cfg(cfg)
+        except Exception:
+            pass
+
     p = desired_path(runs_dir=runs_dir, profile=profile)
     obj = read_json(p)
     if not isinstance(obj, dict):
@@ -201,28 +229,18 @@ def read_gateway_desired(*, runs_dir: Path, profile: str) -> GatewayDesired:
     cfg = obj.get("desired") if isinstance(obj.get("desired"), dict) else obj
 
     try:
-        return GatewayDesired(
-            mode=_parse_gateway_mode(cfg.get("mode")),
-            symbols=list(cfg.get("symbols")) if isinstance(cfg.get("symbols"), list) else None,
-            executor=str(cfg.get("executor") or "targetpos").strip().lower() in {"direct"} and "direct" or "targetpos",
-            sim_account=str(cfg.get("sim_account") or "tqsim").strip().lower() in {"tqkq"} and "tqkq" or "tqsim",
-            confirm_live=str(cfg.get("confirm_live") or "").strip(),
-            max_abs_position=max(0, int(cfg.get("max_abs_position") or 1)),
-            max_order_size=max(1, int(cfg.get("max_order_size") or 1)),
-            max_ops_per_sec=max(1, int(cfg.get("max_ops_per_sec") or 10)),
-            max_daily_loss=_safe_float(cfg.get("max_daily_loss")),
-            enforce_trading_time=bool(cfg.get("enforce_trading_time")) if ("enforce_trading_time" in cfg) else True,
-        )
+        return _parse_gateway_desired_cfg(cfg)
     except Exception:
         return GatewayDesired()
 
 
-def write_gateway_desired(*, runs_dir: Path, profile: str, desired: GatewayDesired) -> None:
+def write_gateway_desired(*, runs_dir: Path, profile: str, desired: GatewayDesired, redis_client: redis.Redis | None = None) -> None:
     root = gateway_root(runs_dir=runs_dir, profile=profile)
+    prof = canonical_account_profile(profile)
     payload: dict[str, Any] = {
         "schema_version": int(DESIRED_SCHEMA_VERSION),
         "updated_at": _now_iso(),
-        "account_profile": canonical_account_profile(profile),
+        "account_profile": prof,
         "desired": _jsonable(
             {
                 "mode": desired.mode,
@@ -239,6 +257,14 @@ def write_gateway_desired(*, runs_dir: Path, profile: str, desired: GatewayDesir
         ),
     }
     write_json_atomic(root / "desired.json", payload)
+    try:
+        rc = redis_client
+        if rc is None:
+            rc = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+        rc.set(f"ghtrader:gateway:desired:{prof}", json.dumps(payload, default=str))
+        rc.publish(f"ghtrader:gateway:updates:{prof}", json.dumps(payload, default=str))
+    except Exception:
+        pass
 
 
 def read_gateway_targets(*, runs_dir: Path, profile: str) -> dict[str, Any]:
@@ -454,9 +480,12 @@ def run_gateway(
     writer.append_event({"type": "gateway_start"})
 
     cmd_offset = _read_commands_cursor(runs_dir=runs_dir, profile=prof)
+    redis_cmd_stream = f"ghtrader:commands:{prof}"
+    redis_cmd_id = "$"
+    seen_command_ids: set[str] = set()
 
     while True:
-        desired = read_gateway_desired(runs_dir=runs_dir, profile=prof)
+        desired = read_gateway_desired(runs_dir=runs_dir, profile=prof, redis_client=redis_client)
         desired_mode = desired.mode
         desired_symbols = desired.symbols_list()
 
@@ -489,6 +518,7 @@ def run_gateway(
             exec_targetpos = None
             exec_direct = None
             last_targets = {}
+            zmq_targets = {}
             start_balance = None
             current_mode = effective_mode
             current_symbols = []
@@ -699,15 +729,48 @@ def run_gateway(
                     except Exception:
                         pass
                     try:
-                        write_gateway_desired(runs_dir=runs_dir, profile=prof, desired=GatewayDesired(mode="idle"))
+                        write_gateway_desired(runs_dir=runs_dir, profile=prof, desired=GatewayDesired(mode="idle"), redis_client=redis_client)
                     except Exception:
                         pass
                     time.sleep(1.0)
             except Exception:
                 pass
 
-            # Process operator commands (append-only; idempotent via cursor offset).
+            # Process operator commands (Redis stream primary + file mirror fallback).
             try:
+                incoming_commands: list[dict[str, Any]] = []
+
+                # Primary command channel: Redis stream.
+                if redis_client is not None:
+                    try:
+                        stream_rows = redis_client.xread({redis_cmd_stream: redis_cmd_id}, count=128, block=1)
+                        for _, entries in (stream_rows or []):
+                            for entry_id, fields in entries:
+                                redis_cmd_id = str(entry_id)
+                                params_obj: dict[str, Any] = {}
+                                params_raw = fields.get("params")
+                                if isinstance(params_raw, str) and params_raw.strip():
+                                    try:
+                                        dec = json.loads(params_raw)
+                                        if isinstance(dec, dict):
+                                            params_obj = dec
+                                    except Exception:
+                                        params_obj = {}
+                                incoming_commands.append(
+                                    {
+                                        "ts": fields.get("ts"),
+                                        "command_id": fields.get("command_id"),
+                                        "account_profile": fields.get("account_profile"),
+                                        "type": fields.get("type"),
+                                        "params": params_obj,
+                                        "symbol": fields.get("symbol"),
+                                        "target": fields.get("target"),
+                                    }
+                                )
+                    except Exception as e:
+                        writer.append_event({"type": "gateway_commands_stream_failed", "error": str(e)})
+
+                # Fallback/audit mirror: append-only file.
                 cmd_p = commands_path(runs_dir=runs_dir, profile=prof)
                 if cmd_p.exists():
                     with open(cmd_p, "rb") as f:
@@ -723,82 +786,84 @@ def run_gateway(
                             obj = json.loads(raw.decode("utf-8", errors="ignore"))
                         except Exception:
                             continue
-                        if not isinstance(obj, dict):
-                            continue
-                        ctype = str(obj.get("type") or "").strip()
-                        cid = str(obj.get("command_id") or "").strip()
-                        if not ctype or not cid:
-                            continue
-
-                        writer.append_event({"type": "gateway_command", "command_type": ctype, "command_id": cid})
-
-                        if ctype == "cancel_all":
-                            try:
-                                if exec_direct is not None:
-                                    n = exec_direct.cancel_all_alive()
-                                    writer.append_event({"type": "gateway_cancel_all_done", "count": int(n)})
-                            except Exception as e:
-                                writer.append_event({"type": "gateway_cancel_all_failed", "error": str(e)})
-
-                        if ctype == "flatten":
-                            try:
-                                for s in list(current_symbols):
-                                    if exec_targetpos is not None:
-                                        exec_targetpos.set_target(s, 0)
-                                    elif exec_direct is not None and s in positions and s in quotes:
-                                        exec_direct.set_target(symbol=s, target_net=0, position=positions[s], quote=quotes[s])
-                                writer.append_event({"type": "gateway_flatten_done", "symbols": list(current_symbols)})
-                            except Exception as e:
-                                writer.append_event({"type": "gateway_flatten_failed", "error": str(e)})
-
-                        if ctype == "disarm_live":
-                            try:
-                                cur = read_gateway_desired(runs_dir=runs_dir, profile=prof)
-                                nxt = GatewayDesired(
-                                    mode="live_monitor",
-                                    symbols=cur.symbols_list(),
-                                    executor=cur.executor,
-                                    sim_account=cur.sim_account,
-                                    confirm_live="",
-                                    max_abs_position=cur.max_abs_position,
-                                    max_order_size=cur.max_order_size,
-                                    max_ops_per_sec=cur.max_ops_per_sec,
-                                    max_daily_loss=cur.max_daily_loss,
-                                    enforce_trading_time=cur.enforce_trading_time,
-                                )
-                                write_gateway_desired(runs_dir=runs_dir, profile=prof, desired=nxt)
-                                writer.append_event({"type": "gateway_disarmed"})
-                            except Exception as e:
-                                writer.append_event({"type": "gateway_disarm_failed", "error": str(e)})
-
-                        if ctype == "set_target":
-                            # Manual target setting (for one-lot testing)
-                            try:
-                                params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
-                                sym = str((obj.get("symbol") if "symbol" in obj else params.get("symbol")) or "").strip()
-                                tgt_raw = obj.get("target") if "target" in obj else params.get("target")
-                                try:
-                                    tgt = int(tgt_raw) if tgt_raw is not None else 0
-                                except Exception:
-                                    tgt = 0
-                                if sym and sym in current_symbols:
-                                    # Clamp to risk limits
-                                    tgt = int(clamp_target_position(tgt, max_abs_position=int(desired.max_abs_position)))
-                                    if desired.executor == "direct" and exec_direct is not None and sym in positions and sym in quotes:
-                                        exec_direct.set_target(symbol=sym, target_net=tgt, position=positions[sym], quote=quotes[sym])
-                                        writer.append_event({"type": "manual_target_set", "symbol": sym, "target": tgt, "executor": "direct"})
-                                    elif exec_targetpos is not None:
-                                        exec_targetpos.set_target(sym, tgt)
-                                        writer.append_event({"type": "manual_target_set", "symbol": sym, "target": tgt, "executor": "targetpos"})
-                                    else:
-                                        writer.append_event({"type": "manual_target_failed", "symbol": sym, "error": "no_executor"})
-                                else:
-                                    writer.append_event({"type": "manual_target_failed", "symbol": sym, "error": "symbol_not_in_current_symbols"})
-                            except Exception as e:
-                                writer.append_event({"type": "manual_target_failed", "error": str(e)})
-
+                        if isinstance(obj, dict):
+                            incoming_commands.append(obj)
                     cmd_offset = int(new_off)
                     _write_commands_cursor(runs_dir=runs_dir, profile=prof, offset=int(cmd_offset))
+
+                for obj in incoming_commands:
+                    ctype = str(obj.get("type") or "").strip()
+                    cid = str(obj.get("command_id") or "").strip()
+                    if not ctype or not cid or cid in seen_command_ids:
+                        continue
+                    seen_command_ids.add(cid)
+
+                    writer.append_event({"type": "gateway_command", "command_type": ctype, "command_id": cid})
+
+                    if ctype == "cancel_all":
+                        try:
+                            if exec_direct is not None:
+                                n = exec_direct.cancel_all_alive()
+                                writer.append_event({"type": "gateway_cancel_all_done", "count": int(n)})
+                        except Exception as e:
+                            writer.append_event({"type": "gateway_cancel_all_failed", "error": str(e)})
+
+                    if ctype == "flatten":
+                        try:
+                            for s in list(current_symbols):
+                                if exec_targetpos is not None:
+                                    exec_targetpos.set_target(s, 0)
+                                elif exec_direct is not None and s in positions and s in quotes:
+                                    exec_direct.set_target(symbol=s, target_net=0, position=positions[s], quote=quotes[s])
+                            writer.append_event({"type": "gateway_flatten_done", "symbols": list(current_symbols)})
+                        except Exception as e:
+                            writer.append_event({"type": "gateway_flatten_failed", "error": str(e)})
+
+                    if ctype == "disarm_live":
+                        try:
+                            cur = read_gateway_desired(runs_dir=runs_dir, profile=prof, redis_client=redis_client)
+                            nxt = GatewayDesired(
+                                mode="live_monitor",
+                                symbols=cur.symbols_list(),
+                                executor=cur.executor,
+                                sim_account=cur.sim_account,
+                                confirm_live="",
+                                max_abs_position=cur.max_abs_position,
+                                max_order_size=cur.max_order_size,
+                                max_ops_per_sec=cur.max_ops_per_sec,
+                                max_daily_loss=cur.max_daily_loss,
+                                enforce_trading_time=cur.enforce_trading_time,
+                            )
+                            write_gateway_desired(runs_dir=runs_dir, profile=prof, desired=nxt, redis_client=redis_client)
+                            writer.append_event({"type": "gateway_disarmed"})
+                        except Exception as e:
+                            writer.append_event({"type": "gateway_disarm_failed", "error": str(e)})
+
+                    if ctype == "set_target":
+                        # Manual target setting (for one-lot testing)
+                        try:
+                            params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
+                            sym = str((obj.get("symbol") if "symbol" in obj else params.get("symbol")) or "").strip()
+                            tgt_raw = obj.get("target") if "target" in obj else params.get("target")
+                            try:
+                                tgt = int(tgt_raw) if tgt_raw is not None else 0
+                            except Exception:
+                                tgt = 0
+                            if sym and sym in current_symbols:
+                                # Clamp to risk limits
+                                tgt = int(clamp_target_position(tgt, max_abs_position=int(desired.max_abs_position)))
+                                if desired.executor == "direct" and exec_direct is not None and sym in positions and sym in quotes:
+                                    exec_direct.set_target(symbol=sym, target_net=tgt, position=positions[sym], quote=quotes[sym])
+                                    writer.append_event({"type": "manual_target_set", "symbol": sym, "target": tgt, "executor": "direct"})
+                                elif exec_targetpos is not None:
+                                    exec_targetpos.set_target(sym, tgt)
+                                    writer.append_event({"type": "manual_target_set", "symbol": sym, "target": tgt, "executor": "targetpos"})
+                                else:
+                                    writer.append_event({"type": "manual_target_failed", "symbol": sym, "error": "no_executor"})
+                            else:
+                                writer.append_event({"type": "manual_target_failed", "symbol": sym, "error": "symbol_not_in_current_symbols"})
+                        except Exception as e:
+                            writer.append_event({"type": "manual_target_failed", "error": str(e)})
             except Exception as e:
                 writer.append_event({"type": "gateway_commands_failed", "error": str(e)})
 
@@ -806,9 +871,8 @@ def run_gateway(
             orders_enabled = bool(current_mode in {"sim", "live_trade"})
             if orders_enabled:
                 try:
-                    t = read_gateway_targets(runs_dir=runs_dir, profile=prof)
-                    disk_targets = t.get("targets") if isinstance(t.get("targets"), dict) else {}
-                    targets = {**disk_targets, **zmq_targets}
+                    # Hot path target source is ZMQ only. Disk targets are audit mirrors.
+                    targets = dict(zmq_targets)
                     desired_targets: dict[str, int] = {}
                     for sym, tgt in targets.items():
                         if sym not in current_symbols:
@@ -885,7 +949,7 @@ def run_gateway(
                                     except Exception:
                                         pass
                                     try:
-                                        write_gateway_desired(runs_dir=runs_dir, profile=prof, desired=GatewayDesired(mode="idle"))
+                                        write_gateway_desired(runs_dir=runs_dir, profile=prof, desired=GatewayDesired(mode="idle"), redis_client=redis_client)
                                     except Exception:
                                         pass
                         except Exception:
