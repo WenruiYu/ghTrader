@@ -44,6 +44,15 @@
    - Control API dead-code chains were removed; deferred routes now return explicit `410` where retained for compatibility.
    - Core health/system endpoints were modularized into `src/ghtrader/control/routes/core.py`, and `control/app.py` now assembles these routers.
    - Models page form actions were normalized to canonical `/models/*` POST endpoints while `/ops/*` compatibility handlers remain.
+7. Hardware-aware optimization wave (PRD-first):
+   - PRD contract upgraded to 8-GPU DDP baseline and explicit external-pattern borrowing policy (Qlib/RD-Agent/Kronos are reference-only, not runtime dependencies).
+   - Data plane optimized with env-driven worker policy (no ingest hard cap), QuestDB ILP batch-write strategy, Redis/cache parameterization, and explicit connection-budget controls.
+   - Training control path now auto-selects `torchrun --nproc_per_node=<gpus>` for deep models when healthy; falls back to single-process `--no-ddp` when torchrun is unavailable.
+   - Control-plane concurrency hardened (`JobManager` cancel escalation + active-job reconciliation) and Jobs API contract moved into `control/routes/jobs.py`.
+   - `/ops` compatibility governance formalized via contract registry (`control/ops_compat.py`) + API (`/api/ops/compat`), plus SLO snapshot API (`/api/observability/slo`).
+   - Research/benchmark scaffolds added:
+     - `ghtrader research-loop-template` for closed-loop experiment templates.
+     - `ghtrader capacity-matrix` for capacity regression matrix + smoke snapshot output.
 
 ## Keep/Migrate/Delete Decisions
 
@@ -71,6 +80,10 @@ Executed in project virtual environment (`.venv`):
 4. Lint diagnostics for changed modules:
    - `ReadLints` on modified CLI/control files
    - Result: **no remaining lints**.
+5. Current hardware-optimization verification addendum:
+   - Syntax/compile guard executed for all newly edited Python modules and tests via `python3 -m py_compile`.
+   - Result: **pass**.
+   - Runtime pytest execution is **blocked in current shell image** (`python3 -m pytest` reports `No module named pytest`), so newly added regression tests are committed but not executed in this run.
 
 ## Residual Gaps (Authoritative Pending List)
 

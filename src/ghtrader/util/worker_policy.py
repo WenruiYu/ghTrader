@@ -35,7 +35,13 @@ def resolve_worker_count(
         cap = min(global_max, _env_int("GHTRADER_DIAGNOSE_MAX_WORKERS", 32), qdb_cap)
     elif kind_norm in {"download", "repair"}:
         auto = max(2, cpu // 32)
-        cap = min(global_max, _env_int("GHTRADER_DOWNLOAD_MAX_WORKERS", 16))
+        # Download/build paths can still trigger QuestDB writes/reads; keep an
+        # explicit connection budget linked to the global QuestDB PG limits.
+        download_qdb_budget = max(1, _env_int("GHTRADER_DOWNLOAD_QDB_CONN_BUDGET", max(8, qdb_cap // 4)))
+        cap = min(global_max, _env_int("GHTRADER_DOWNLOAD_MAX_WORKERS", 16), download_qdb_budget)
+    elif kind_norm in {"query", "coverage", "sql"}:
+        auto = max(2, cpu // 16)
+        cap = min(global_max, _env_int("GHTRADER_QUERY_MAX_WORKERS", 64), qdb_cap)
     elif kind_norm in {"index", "index_bootstrap", "bootstrap"}:
         auto = max(1, cpu // 4)
         cap = min(global_max, _env_int("GHTRADER_INDEX_BOOTSTRAP_WORKERS", 32), cpu)

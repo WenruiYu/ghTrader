@@ -292,6 +292,20 @@ class JobStore:
             con.commit()
             return bool(cur.rowcount == 1)
 
+    def try_mark_cancelled(self, *, job_id: str, finished_at: str, error: str | None = None) -> bool:
+        """
+        Atomically mark a job cancelled if it is still queued/running.
+        """
+        now = _now_iso()
+        with self._connect() as con:
+            cur = con.execute(
+                "UPDATE jobs SET status='cancelled', finished_at=?, error=COALESCE(?, error), updated_at=? "
+                "WHERE id=? AND status IN ('running','queued')",
+                (str(finished_at), (str(error) if error else None), now, str(job_id)),
+            )
+            con.commit()
+            return bool(cur.rowcount == 1)
+
     def _row_to_record(self, row: sqlite3.Row) -> JobRecord:
         cmd = json.loads(row["command_json"])
         waiting = row["waiting_locks_json"]

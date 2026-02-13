@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 
 from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
 from ghtrader.control import auth
+from ghtrader.control.ops_compat import ops_compat_contract
+from ghtrader.control.slo import collect_slo_snapshot
 
 router = APIRouter(tags=["core"])
 
@@ -42,3 +44,18 @@ def api_questdb_metrics(request: Request, refresh: bool = False) -> dict[str, An
     from ghtrader.control.system_info import questdb_metrics_snapshot
 
     return questdb_metrics_snapshot(refresh=bool(refresh))
+
+
+@router.get("/api/ops/compat", response_class=JSONResponse)
+def api_ops_compat(request: Request) -> dict[str, Any]:
+    if not auth.is_authorized(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return ops_compat_contract()
+
+
+@router.get("/api/observability/slo", response_class=JSONResponse)
+def api_observability_slo(request: Request) -> dict[str, Any]:
+    if not auth.is_authorized(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    store = getattr(request.app.state, "job_store", None)
+    return collect_slo_snapshot(store=store)

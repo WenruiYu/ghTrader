@@ -29,12 +29,14 @@
 | `src/ghtrader/control/db.py` | Control | `5.10, 5.11` | Implemented |  |
 | `src/ghtrader/control/jobs.py` | Control | `5.10, 5.11` | Implemented |  |
 | `src/ghtrader/control/locks.py` | Control | `5.10, 5.11` | Implemented |  |
+| `src/ghtrader/control/ops_compat.py` | Control | `5.10, 6.3.1.1` | Implemented | `/ops` compatibility governance contract + canonical mapping registry. |
 | `src/ghtrader/control/progress.py` | Control | `5.10, 5.11` | Implemented |  |
 | `src/ghtrader/control/routes/__init__.py` | Control/API | `5.10` | Implemented |  |
 | `src/ghtrader/control/routes/core.py` | Control/API | `5.10` | Implemented | Core modularized endpoints (`/health`, `/api/system`, `/api/questdb/metrics`). |
 | `src/ghtrader/control/routes/health.py` | Control/API | `5.10` | Implemented |  |
 | `src/ghtrader/control/routes/jobs.py` | Control/API | `5.10` | Implemented |  |
 | `src/ghtrader/control/settings.py` | Control | `5.10, 5.11` | Implemented |  |
+| `src/ghtrader/control/slo.py` | Control/Observability | `6.3.1.1, 5.10` | Implemented | Unified SLO snapshot across data/training/control planes (`/api/observability/slo`). |
 | `src/ghtrader/control/static/app.css` | Control/UI | `5.10, 5.11` | Implemented |  |
 | `src/ghtrader/control/static/trading.js` | Control/UI | `5.10, 5.11` | Implemented |  |
 | `src/ghtrader/control/system_info.py` | Control | `5.10, 5.11` | Implemented |  |
@@ -80,6 +82,7 @@
 | `src/ghtrader/research/benchmark.py` | Research/benchmark | `5.9` | Implemented |  |
 | `src/ghtrader/research/distributed.py` | Research | `5.5-5.9, 5.18` | Implemented |  |
 | `src/ghtrader/research/eval.py` | Research/eval | `5.7` | Implemented |  |
+| `src/ghtrader/research/loop.py` | Research workflow | `5.8, 5.18, 10.2-10.4` | Implemented | Qlib/RD-Agent/Kronos pattern-borrowed research loop template scaffold. |
 | `src/ghtrader/research/models.py` | Research/models | `5.5` | Implemented |  |
 | `src/ghtrader/research/online.py` | Research/online | `5.6` | Implemented |  |
 | `src/ghtrader/research/pipeline.py` | Research/pipeline | `5.8, 5.18` | Implemented |  |
@@ -98,6 +101,7 @@
 | `src/ghtrader/trading/strategy_control.py` | Trading runtime | `5.11` | Implemented |  |
 | `src/ghtrader/trading/strategy_runner.py` | Trading runtime | `5.11` | Implemented |  |
 | `src/ghtrader/trading/symbol_resolver.py` | Trading runtime | `5.11` | Implemented |  |
+| `src/ghtrader/capacity.py` | Capacity/Benchmark | `6.3.1.1, 6.4` | Implemented | Capacity regression matrix + smoke snapshot report scaffold (`ghtrader capacity-matrix`). |
 | `src/ghtrader/util/__init__.py` | Utilities | `3.2, 6.4` | Implemented |  |
 | `src/ghtrader/util/hash.py` | Utilities | `3.2, 6.4` | Implemented |  |
 | `src/ghtrader/util/json_io.py` | Utilities | `3.2, 6.4` | Implemented |  |
@@ -116,6 +120,7 @@
 | `tests/test_control_explorer_page.py` | Testing | `6.4` | Implemented |  |
 | `tests/test_control_gateway_api.py` | Testing | `6.4` | Implemented |  |
 | `tests/test_control_jobs.py` | Testing | `6.4` | Implemented |  |
+| `tests/test_control_train_launch.py` | Testing | `6.4, 6.3.1.1` | Implemented | Regression for torchrun auto-launch/fallback and sweep GPU governance under active DDP. |
 | `tests/test_control_locks.py` | Testing | `6.4` | Implemented |  |
 | `tests/test_control_strategy_api.py` | Testing | `6.4` | Implemented |  |
 | `tests/test_control_trading_console_api.py` | Testing | `6.4` | Implemented |  |
@@ -139,11 +144,15 @@
 | `tests/test_models.py` | Testing | `6.4` | Implemented |  |
 | `tests/test_online.py` | Testing | `6.4` | Implemented |  |
 | `tests/test_ops_page.py` | Testing | `6.4` | Implemented |  |
+| `tests/test_ops_compat_contract.py` | Testing | `6.4, 5.10` | Implemented | Locks `/ops` compatibility contract endpoint + alias route behavior. |
+| `tests/test_observability_slo.py` | Testing | `6.4, 6.3.1.1` | Implemented | SLO API shape and queue-threshold state regression. |
 | `tests/test_pipeline.py` | Testing | `6.4` | Implemented |  |
 | `tests/test_questdb_client_retry.py` | Testing | `6.4` | Implemented |  |
 | `tests/test_questdb_ingest_shape.py` | Testing | `6.4` | Implemented |  |
 | `tests/test_questdb_semantics.py` | Testing | `6.4` | Implemented |  |
 | `tests/test_questdb_sender_compat.py` | Testing | `6.4` | Implemented |  |
+| `tests/test_capacity_matrix.py` | Testing | `6.4, 6.3.1.1` | Implemented | Capacity matrix report generation regression. |
+| `tests/test_research_loop_template.py` | Testing | `6.4, 5.18` | Implemented | Research loop template command scaffold regression. |
 | `tests/test_sota_models.py` | Testing | `6.4` | Implemented |  |
 | `tests/test_strategy_control.py` | Testing | `6.4` | Implemented |  |
 | `tests/test_strategy_runner.py` | Testing | `6.4` | Implemented |  |
@@ -183,6 +192,9 @@ Default disposition for mapped files is **Keep** unless explicitly listed below.
 | `src/ghtrader/data/gap_detection.py` | Keep | Canonical query surface for `ghtrader_tick_gaps_v2`; aligned with PRD §5.2.7 after mapping correction. |
 | `src/ghtrader/cli.py` + `src/ghtrader/cli_commands/*` | Keep/Migrate | Command logic migrated out of monolithic `cli.py`; old deferred placeholders removed from exposed surface. |
 | `src/ghtrader/control/app.py` + `src/ghtrader/control/routes/core.py` | Keep/Migrate | Core endpoints split into route modules; deferred API chains removed or converted to explicit compatibility errors. |
+| `src/ghtrader/control/routes/jobs.py` | Keep/Migrate | Jobs API contract aligned with `JobManager` (`start_job/cancel_job/read_log_tail`) and mounted through `build_api_router()`. |
+| `src/ghtrader/control/ops_compat.py` + `src/ghtrader/control/slo.py` | Keep/Add | Added governance contracts for `/ops` compatibility and unified SLO observability snapshots. |
+| `src/ghtrader/research/loop.py` + `src/ghtrader/capacity.py` | Keep/Add | Added workflow template + capacity regression matrix scaffolds for PRD-first optimization cycle. |
 | `src/ghtrader/questdb/bench.py` | Deferred | Standalone performance utility; not runtime-critical, keep for profiling until dedicated perf playbook is extracted. |
 | `tests/test_ops_page.py` | Keep | Backward-compatibility validation for `/ops` → `/data` redirects in control plane. |
 | `tests/test_dashboard_ui_polish_v2.py` | Keep | UI regression coverage for trading dashboard interactions. |

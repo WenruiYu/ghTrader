@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import shutil
 from dataclasses import dataclass
@@ -86,6 +87,12 @@ class JobManager:
         self.store = store
         self.logs_dir = logs_dir
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self._spawn_lock = threading.Lock()
+        try:
+            cancel_grace_s = float(os.environ.get("GHTRADER_JOB_CANCEL_GRACE_S", "8") or "8")
+        except Exception:
+            cancel_grace_s = 8.0
+        self._cancel_grace_s = max(1.0, float(cancel_grace_s))
 
     def reconcile(self) -> None:
         """
@@ -93,17 +100,61 @@ class JobManager:
 
         If a job is marked running but the PID is no longer alive, mark it failed.
         """
+        # Running jobs without a PID are always invalid.
         for job in self.store.list_running_jobs():
             if job.pid is None:
                 self.store.update_job(job.id, status="failed", finished_at=_now_iso(), error="missing pid")
                 continue
-            if not _is_pid_alive(int(job.pid)):
-                self.store.update_job(
-                    job.id,
-                    status="failed",
-                    finished_at=_now_iso(),
-                    error="process not alive (dashboard restart or crash)",
-                )
+        # Reconcile all active jobs (running + queued jobs that already have a PID).
+        for job in self.store.list_active_jobs():
+            if job.pid is None:
+                continue
+            if _is_pid_alive(int(job.pid)):
+                continue
+            self.store.try_mark_failed(
+                job_id=job.id,
+                finished_at=_now_iso(),
+                error="process not alive (dashboard restart or crash)",
+            )
+
+    def _terminate_process_group(self, pid: int, *, grace_s: float) -> tuple[bool, bool]:
+        """
+        Terminate a process group with SIGTERM and optional SIGKILL escalation.
+
+        Returns:
+            (terminated, force_killed)
+        """
+        force_killed = False
+        try:
+            os.killpg(int(pid), signal.SIGTERM)
+        except Exception:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except Exception:
+                return False, force_killed
+
+        deadline = time.time() + max(0.1, float(grace_s))
+        while time.time() < deadline:
+            if not _is_pid_alive(int(pid)):
+                return True, force_killed
+            time.sleep(0.1)
+
+        if _is_pid_alive(int(pid)):
+            force_killed = True
+            try:
+                os.killpg(int(pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except Exception:
+                    pass
+
+        hard_deadline = time.time() + 2.0
+        while time.time() < hard_deadline:
+            if not _is_pid_alive(int(pid)):
+                return True, force_killed
+            time.sleep(0.05)
+        return (not _is_pid_alive(int(pid))), force_killed
 
     def start_job(self, spec: JobSpec) -> JobRecord:
         job_id = uuid.uuid4().hex[:12]
@@ -118,8 +169,6 @@ class JobManager:
             log_path=log_path,
         )
         started_at = _now_iso()
-
-        # Start subprocess
         env = os.environ.copy()
         env["GHTRADER_JOB_ID"] = job_id
         env["GHTRADER_JOB_SOURCE"] = "dashboard"
@@ -127,23 +176,30 @@ class JobManager:
         env["GHTRADER_JOB_VERBOSE"] = "1"
         env["GHTRADER_LOG_LEVEL"] = "debug"
         env["PYTHONUNBUFFERED"] = "1"
-        with open(log_path, "ab", buffering=0) as f:
-            proc = subprocess.Popen(
-                argv,
-                cwd=str(spec.cwd),
-                stdout=f,
-                stderr=subprocess.STDOUT,
-                env=env,
-                preexec_fn=os.setsid,  # new process group
-            )
 
-        self.store.update_job(
-            job_id,
-            status="running",
-            pid=int(proc.pid),
-            log_path=log_path,
-            started_at=started_at,
-        )
+        with self._spawn_lock:
+            with open(log_path, "ab", buffering=0) as f:
+                proc = subprocess.Popen(
+                    argv,
+                    cwd=str(spec.cwd),
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    preexec_fn=os.setsid,  # new process group
+                )
+            claimed = self.store.try_mark_started(job_id=job_id, pid=int(proc.pid), started_at=started_at, log_path=log_path)
+
+        if not claimed:
+            try:
+                os.killpg(int(proc.pid), signal.SIGTERM)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            out = self.store.get_job(job_id)
+            assert out is not None
+            return out
 
         def _waiter() -> None:
             try:
@@ -210,20 +266,21 @@ class JobManager:
         env["PYTHONUNBUFFERED"] = "1"
 
         with open(log_path, "ab", buffering=0) as f:
-            proc = subprocess.Popen(
-                argv,
-                cwd=str(cwd),
-                stdout=f,
-                stderr=subprocess.STDOUT,
-                env=env,
-                preexec_fn=os.setsid,
-            )
+            with self._spawn_lock:
+                proc = subprocess.Popen(
+                    argv,
+                    cwd=str(cwd),
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    preexec_fn=os.setsid,
+                )
 
-        claimed = False
-        try:
-            claimed = self.store.try_mark_started(job_id=job_id, pid=int(proc.pid), started_at=started_at, log_path=log_path)
-        except Exception:
-            claimed = False
+                claimed = False
+                try:
+                    claimed = self.store.try_mark_started(job_id=job_id, pid=int(proc.pid), started_at=started_at, log_path=log_path)
+                except Exception:
+                    claimed = False
 
         if not claimed:
             # Another scheduler beat us to it. Terminate our duplicate quickly.
@@ -258,8 +315,7 @@ class JobManager:
         if job.pid is None:
             if str(job.status or "").strip().lower() == "queued":
                 try:
-                    self.store.update_job(job_id, status="cancelled", finished_at=_now_iso())
-                    return True
+                    return bool(self.store.try_mark_cancelled(job_id=job_id, finished_at=_now_iso()))
                 except Exception as e:
                     self.store.update_job(job_id, error=f"cancel failed: {e}")
                     return False
@@ -267,8 +323,22 @@ class JobManager:
 
         pid = int(job.pid)
         try:
-            os.killpg(pid, signal.SIGTERM)
-            self.store.update_job(job_id, status="cancelled", finished_at=_now_iso())
+            terminated, forced = self._terminate_process_group(pid, grace_s=self._cancel_grace_s)
+            if not terminated:
+                self.store.update_job(job_id, error=f"cancel failed: pid={pid} still alive")
+                return False
+            err = None
+            if forced:
+                err = f"force-killed after timeout {self._cancel_grace_s:.1f}s"
+            finished_at = _now_iso()
+            claimed = self.store.try_mark_cancelled(job_id=job_id, finished_at=finished_at, error=err)
+            if not claimed:
+                # Waiter thread may win the race and write `failed` right after process exit.
+                # Since this path has positively terminated the process for cancellation,
+                # keep final state consistent as `cancelled`.
+                latest = self.store.get_job(job_id)
+                if latest is not None and str(latest.status or "").strip().lower() in {"queued", "running", "failed"}:
+                    self.store.update_job(job_id, status="cancelled", finished_at=finished_at, error=err)
             return True
         except Exception as e:
             self.store.update_job(job_id, error=f"cancel failed: {e}")

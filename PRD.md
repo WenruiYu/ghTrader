@@ -33,6 +33,10 @@ This section defines the current PRD-alignment cleanup scope.
 - **Compatibility policy**:
   - backward-compatible redirects (notably `/ops` -> canonical pages) may remain,
   - permanently deferred placeholder commands/APIs should be removed from the active surface rather than kept as dead stubs.
+- **External pattern policy (Qlib / RD-Agent / Kronos)**:
+  - these projects are used as **reference patterns only** (workflow/config/methodology),
+  - ghTrader must not introduce them as runtime core dependencies in this phase,
+  - any borrowed pattern must be implemented in-repo under current PRD boundaries.
 
 ---
 
@@ -1922,7 +1926,10 @@ Pareto frontier visualization for trade-off analysis.
 
 #### 5.18.4 Distributed Sweeps
 
-- Utilize all 4 GPUs for parallel trial execution
+- GPU baseline is **8 GPUs/node** for this deployment.
+- Follow **DDP speedup-first** policy:
+  - deep model training jobs should prioritize one multi-GPU DDP run (`torchrun --nproc_per_node=8`) before opening throughput-mode sweeps,
+  - sweep trials must avoid conflicting with active DDP-8 training by explicit scheduler policy.
 - Support for distributed workers (Ray Tune backend)
 - Fault-tolerant trial execution with checkpointing
 - Database-backed study storage for coordination
@@ -2024,16 +2031,27 @@ Implementation:
 
 #### 6.3.1.1 Compute utilization (server-scale)
 
-Given the target hardware (multi-CPU + **4 GPUs**), ghTrader uses a **hybrid scaling** approach:
+Given the target hardware (2x EPYC, 512GB RAM, NVMe U.2, and **8 GPUs**), ghTrader uses a **hybrid scaling** approach:
 
 - **CPU-heavy** stages (ingest, feature/label build, backtests) should parallelize across symbols and/or partitions.
 - **GPU-heavy** stages (deep sequence models) should scale using **DDP speedup-first**:
-  - Launch deep model training via `torchrun --nproc_per_node=4 ...` to use all GPUs for a **single training run**.
+  - Launch deep model training via `torchrun --nproc_per_node=8 ...` to use all GPUs for a **single training run**.
   - Each process binds to `cuda:{LOCAL_RANK}`.
   - Use `DistributedSampler` for datasets; call `set_epoch(epoch)` each epoch.
   - Use AMP (autocast/GradScaler) on GPU when beneficial.
   - Only **rank0** writes model artifacts and benchmark reports.
 - **Throughput mode** (multiple independent jobs, one GPU each) is supported later for sweeps/ablations once DDP training is stable.
+
+Capacity/SLO contract (baseline targets):
+- Data plane:
+  - main_l5 ingest/build path should be configured via env-driven worker policy (no hard-coded 8-worker cap),
+  - QuestDB PGWire connection budgeting must reserve headroom for dashboard/control APIs.
+- Training plane:
+  - deep-model train route from dashboard must support automatic torchrun path when `gpus > 1`,
+  - 8-GPU DDP run should be the default acceleration mode for deep models on this host.
+- Control plane:
+  - queue/cancel/log APIs must remain stable under concurrent dashboard operations,
+  - `/ops/*` remains compatibility layer while canonical entry stays under `/data`, `/models`, `/trading`.
 
 ### 6.4 Testing and quality gates (tests-first)
 
@@ -2196,7 +2214,7 @@ Database administration commands:
 - Add minimal coverage gate to CI
 - Add integration tests that validate short TqSdk download using `.env` (optional)
 - Harden dataset building for large-scale multi-day ingestion
-- Implement distributed training with DDP across 4 GPUs
+- Implement distributed training with DDP across 8 GPUs
 
 **Database and Performance**:
 - Optimize QuestDB partitioning for typical query patterns

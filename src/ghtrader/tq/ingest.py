@@ -171,11 +171,22 @@ def download_main_l5_for_days(
 
     try:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        import threading
+        from ghtrader.util.worker_policy import resolve_worker_count
 
-        # Use ThreadPoolExecutor for parallel day processing
-        max_workers = int(os.environ.get("GHTRADER_INGEST_WORKERS", "4"))
-        max_workers = max(1, min(max_workers, 8))  # Cap to avoid rate limits
+        # Use unified worker policy (env-driven). No hard-coded worker cap.
+        requested_workers: int | None = None
+        raw_workers = str(os.environ.get("GHTRADER_INGEST_WORKERS", "") or "").strip()
+        if raw_workers:
+            try:
+                requested_workers = int(raw_workers)
+            except Exception:
+                requested_workers = None
+        max_workers = resolve_worker_count(kind="download", requested=requested_workers)
+        log.info(
+            "tq_main_l5.worker_policy",
+            requested=(int(requested_workers) if requested_workers is not None else None),
+            selected=int(max_workers),
+        )
 
         def _download_day_worker(
             idx: int,

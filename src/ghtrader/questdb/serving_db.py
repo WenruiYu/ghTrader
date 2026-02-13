@@ -11,6 +11,8 @@ Tick ingestion writes directly to QuestDB via tq_ingest.py.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+import threading
 from typing import Literal
 
 import pandas as pd
@@ -22,6 +24,18 @@ log = structlog.get_logger()
 
 
 ServingBackendType = Literal["questdb"]
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.environ.get(key, default))
+    except Exception:
+        return int(default)
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = str(os.environ.get(key, "1" if default else "0") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -70,6 +84,75 @@ class QuestDBBackend(ServingDBBackend):
             return psycopg
         except Exception as e:
             raise RuntimeError("psycopg not installed. Install with: pip install -e '.[questdb]'") from e
+
+    def _sender_context(self):
+        Sender = self._sender()
+        host = str(self.config.host)
+        port = int(self.config.questdb_ilp_port)
+        conf = f"tcp::addr={host}:{port};"
+        if hasattr(Sender, "from_conf"):
+            return Sender.from_conf(conf)
+        try:
+            return Sender(host, port)
+        except TypeError:
+            return Sender(conf)
+
+    def _sender_thread_local(self) -> threading.local:
+        tl = getattr(self, "_sender_tls", None)
+        if tl is None:
+            tl = threading.local()
+            setattr(self, "_sender_tls", tl)
+        return tl
+
+    def _drop_thread_sender(self) -> None:
+        tl = self._sender_thread_local()
+        sender = getattr(tl, "sender", None)
+        if sender is not None:
+            try:
+                sender.close()
+            except Exception:
+                pass
+        tl.sender = None
+
+    def _get_thread_sender(self):
+        tl = self._sender_thread_local()
+        sender = getattr(tl, "sender", None)
+        if sender is not None:
+            return sender
+        sender = self._sender_context()
+        tl.sender = sender
+        return sender
+
+    def _ingest_with_sender(self, *, sender: object, table: str, df: pd.DataFrame) -> None:
+        batch_rows = max(1, _env_int("GHTRADER_QDB_ILP_BATCH_ROWS", 200_000))
+        flush_every_batches = max(1, _env_int("GHTRADER_QDB_ILP_FLUSH_EVERY_BATCHES", 2))
+
+        total_rows = int(len(df))
+        if total_rows <= 0:
+            return
+
+        if total_rows <= batch_rows:
+            sender.dataframe(df, table_name=table, at="ts")
+            try:
+                sender.flush()
+            except Exception:
+                pass
+            return
+
+        batch_idx = 0
+        for start in range(0, total_rows, batch_rows):
+            stop = min(total_rows, start + batch_rows)
+            sender.dataframe(df.iloc[start:stop], table_name=table, at="ts")
+            batch_idx += 1
+            if batch_idx % flush_every_batches == 0:
+                try:
+                    sender.flush()
+                except Exception:
+                    pass
+        try:
+            sender.flush()
+        except Exception:
+            pass
 
     def ensure_table(self, *, table: str, include_segment_metadata: bool) -> None:
         # Best-effort DDL via PGWire. ILP can auto-create but may not create WAL/partitioning settings.
@@ -138,39 +221,38 @@ class QuestDBBackend(ServingDBBackend):
             log.warning("serving_db.questdb_ddl_failed", table=table, error=str(e))
 
     def ingest_df(self, *, table: str, df: pd.DataFrame) -> None:
-        Sender = self._sender()
-
-        host = str(self.config.host)
-        port = int(self.config.questdb_ilp_port)
-
+        df2 = df.copy(deep=False)
         # Help the QuestDB client map stable tag-like columns to SYMBOL.
         # (The DataFrame ingestion API uses pandas categoricals to represent SYMBOL columns.)
         for c in ["symbol", "trading_day", "ticks_kind", "dataset_version", "underlying_contract", "schedule_hash"]:
-            if c in df.columns:
+            if c in df2.columns:
                 try:
-                    df[c] = df[c].astype("category")
+                    df2[c] = df2[c].astype("category")
                 except Exception:
                     pass
 
-        # questdb>=4 uses Sender.from_conf() for TCP ILP.
-        # The direct Sender(host, port) constructor is not supported on 4.1.0.
-        sender_ctx = None
-        conf = f"tcp::addr={host}:{port};"
-        if hasattr(Sender, "from_conf"):
-            sender_ctx = Sender.from_conf(conf)
+        persistent_sender = _env_bool("GHTRADER_QDB_ILP_PERSISTENT_SENDER", True)
+        try:
+            if persistent_sender:
+                sender = self._get_thread_sender()
+                self._ingest_with_sender(sender=sender, table=table, df=df2)
+            else:
+                with self._sender_context() as sender:
+                    self._ingest_with_sender(sender=sender, table=table, df=df2)
+        except Exception:
+            # Drop poisoned sender so the next write reconnects cleanly.
+            if persistent_sender:
+                self._drop_thread_sender()
+            raise
         else:
-            # Backward-compat (older clients): attempt the old constructor forms.
             try:
-                sender_ctx = Sender(host, port)
-            except TypeError:
-                # Some older variants accept a single config string.
-                sender_ctx = Sender(conf)
-
-        with sender_ctx as sender:
-            sender.dataframe(df, table_name=table, at="ts")
-            # Ensure buffered ILP gets sent (safe best-effort; auto_flush may already handle it).
-            try:
-                sender.flush()
+                log.debug(
+                    "serving_db.questdb_ingest",
+                    table=str(table),
+                    rows=int(len(df2)),
+                    ilp_batch_rows=int(_env_int("GHTRADER_QDB_ILP_BATCH_ROWS", 200_000)),
+                    persistent_sender=bool(persistent_sender),
+                )
             except Exception:
                 pass
 

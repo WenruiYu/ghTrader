@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+import hashlib
+import json
 import os
 import threading
 import time
@@ -8,10 +10,19 @@ from typing import Any, Literal
 
 import re
 import structlog
+from functools import wraps
+
+try:
+    import redis
+except Exception:  # pragma: no cover - optional dependency in some environments
+    redis = None  # type: ignore[assignment]
 
 log = structlog.get_logger()
 
 _thread_local = threading.local()
+_redis_lock = threading.Lock()
+_redis_client = None
+_redis_cfg_sig = ""
 
 
 def _clear_thread_conn() -> None:
@@ -69,6 +80,76 @@ def _ns_to_iso(ns: Any) -> str | None:
         return None
 
 
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.environ.get(key, default))
+    except Exception:
+        return int(default)
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, default))
+    except Exception:
+        return float(default)
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = str(os.environ.get(key, "1" if default else "0") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _query_connect_timeout(default: int = 2) -> int:
+    return max(1, _env_int("GHTRADER_QDB_QUERY_CONNECT_TIMEOUT_S", default))
+
+
+def _cache_default_ttl(default: int = 300) -> int:
+    return max(1, _env_int("GHTRADER_QDB_REDIS_TTL_S", default))
+
+
+def _redis_cfg_signature() -> str:
+    host = str(os.environ.get("GHTRADER_QDB_REDIS_HOST", "127.0.0.1"))
+    port = max(1, _env_int("GHTRADER_QDB_REDIS_PORT", 6379))
+    db = max(0, _env_int("GHTRADER_QDB_REDIS_DB", 0))
+    timeout_s = max(0.1, _env_float("GHTRADER_QDB_REDIS_TIMEOUT_S", 0.2))
+    return f"{host}|{port}|{db}|{timeout_s}"
+
+
+def _get_redis_client() -> Any | None:
+    global _redis_client, _redis_cfg_sig
+    if redis is None:
+        return None
+    if not _env_bool("GHTRADER_QDB_REDIS_CACHE_ENABLED", True):
+        return None
+
+    sig = _redis_cfg_signature()
+    with _redis_lock:
+        if _redis_client is not None and _redis_cfg_sig == sig:
+            return _redis_client
+
+        host = str(os.environ.get("GHTRADER_QDB_REDIS_HOST", "127.0.0.1"))
+        port = max(1, _env_int("GHTRADER_QDB_REDIS_PORT", 6379))
+        db = max(0, _env_int("GHTRADER_QDB_REDIS_DB", 0))
+        timeout_s = max(0.1, _env_float("GHTRADER_QDB_REDIS_TIMEOUT_S", 0.2))
+        try:
+            client = redis.Redis(
+                host=host,
+                port=port,
+                db=db,
+                decode_responses=True,
+                socket_connect_timeout=timeout_s,
+                socket_timeout=timeout_s,
+            )
+            client.ping()
+            _redis_client = client
+            _redis_cfg_sig = sig
+            return _redis_client
+        except Exception:
+            _redis_client = None
+            _redis_cfg_sig = ""
+            return None
+
+
 def sanitize_read_only_sql(query: str) -> str:
     """
     Best-effort guardrail for the dashboard SQL explorer.
@@ -102,7 +183,7 @@ def query_sql_read_only(
     cfg: QuestDBQueryConfig,
     query: str,
     limit: int = 200,
-    connect_timeout_s: int = 2,
+    connect_timeout_s: int | None = None,
 ) -> tuple[list[str], list[dict[str, str]]]:
     """
     Run a read-only SQL query against QuestDB via PGWire.
@@ -129,7 +210,8 @@ def query_sql_read_only(
 
     # Best-effort: execute a wrapped query to enforce LIMIT in the engine.
     wrapped = f"SELECT * FROM ({q}) LIMIT {lim}"
-    with _connect(cfg, connect_timeout_s=int(connect_timeout_s)) as conn:
+    timeout_s = int(connect_timeout_s) if connect_timeout_s is not None else _query_connect_timeout()
+    with _connect(cfg, connect_timeout_s=timeout_s) as conn:
         with conn.cursor() as cur:
             try:
                 cur.execute(wrapped)
@@ -160,50 +242,57 @@ def _l5_condition_sql() -> str:
     return l5_sql_condition()
 
 
-import redis
-import json
-from functools import wraps
-
-# Redis cache setup
-try:
-    _redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
-    _redis_client.ping()
-except Exception:
-    _redis_client = None
-
-def redis_cache(ttl_seconds: int = 300):
+def redis_cache(ttl_seconds: int = 300, ttl_env_key: str | None = None):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            if _redis_client is None:
+            client = _get_redis_client()
+            if client is None:
                 return func(*args, **kwargs)
-            
-            # Create a cache key based on function name and arguments
-            key_parts = [func.__name__]
-            key_parts.extend(str(arg) for arg in args)
-            key_parts.extend(f"{k}={v}" for k, v in sorted(kwargs.items()) if k != "cfg") # Exclude config object
-            key = "cache:" + ":".join(key_parts)
-            
-            cached_val = _redis_client.get(key)
-            if cached_val:
+
+            cfg = kwargs.get("cfg")
+            cfg_sig = ""
+            if cfg is not None:
+                cfg_sig = "|".join(
+                    [
+                        str(getattr(cfg, "host", "")),
+                        str(getattr(cfg, "pg_port", "")),
+                        str(getattr(cfg, "pg_dbname", "")),
+                    ]
+                )
+
+            key_source = {
+                "func": func.__name__,
+                "args": [str(arg) for arg in args],
+                "kwargs": {str(k): str(v) for k, v in sorted(kwargs.items()) if k != "cfg"},
+                "cfg": cfg_sig,
+            }
+            key_blob = json.dumps(key_source, sort_keys=True, ensure_ascii=True, default=str)
+            key = "cache:qdb:" + hashlib.sha256(key_blob.encode("utf-8")).hexdigest()
+
+            cached_val = client.get(key)
+            if cached_val is not None:
                 try:
                     return json.loads(cached_val)
                 except Exception:
                     pass
-            
+
             result = func(*args, **kwargs)
-            
+
             try:
-                _redis_client.setex(key, ttl_seconds, json.dumps(result, default=str))
+                ttl = _cache_default_ttl(ttl_seconds)
+                if ttl_env_key:
+                    ttl = max(1, _env_int(ttl_env_key, ttl))
+                client.setex(key, ttl, json.dumps(result, default=str))
             except Exception:
                 pass
-                
+
             return result
         return wrapper
     return decorator
 
 
-@redis_cache(ttl_seconds=300)
+@redis_cache(ttl_seconds=300, ttl_env_key="GHTRADER_QDB_BOUNDS_TTL_S")
 def query_symbol_day_bounds(
     *,
     cfg: QuestDBQueryConfig,
@@ -212,6 +301,7 @@ def query_symbol_day_bounds(
     dataset_version: str,
     ticks_kind: str = "main_l5",
     l5_only: bool = False,
+    connect_timeout_s: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """
     Return {symbol: {first_day, last_day, n_days, first_ns, last_ns, first_ts, last_ts}} using QuestDB canonical ticks.
@@ -260,12 +350,10 @@ def query_symbol_day_bounds(
 
     out: dict[str, dict[str, Any]] = {}
 
-    with _connect(cfg, connect_timeout_s=2) as conn:
+    timeout_s = int(connect_timeout_s) if connect_timeout_s is not None else _query_connect_timeout()
+    with _connect(cfg, connect_timeout_s=timeout_s) as conn:
         with conn.cursor() as cur:
-            try:
-                cur.execute(sql, params)
-            except Exception as e:
-                raise
+            cur.execute(sql, params)
             for row in cur.fetchall():
                 try:
                     sym = str(row[0])
@@ -348,7 +436,7 @@ def fetch_ticks_for_day(
     return pd.DataFrame(rows, columns=cols)
 
 
-@redis_cache(ttl_seconds=300)
+@redis_cache(ttl_seconds=300, ttl_env_key="GHTRADER_QDB_TRADING_DAYS_TTL_S")
 def list_trading_days_for_symbol(
     *,
     cfg: QuestDBQueryConfig,
@@ -386,7 +474,7 @@ def list_trading_days_for_symbol(
         "ORDER BY trading_day ASC"
     )
     out: list[date] = []
-    with _connect(cfg, connect_timeout_s=2) as conn:
+    with _connect(cfg, connect_timeout_s=_query_connect_timeout()) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             for (td,) in cur.fetchall():
@@ -420,7 +508,7 @@ def list_schedule_hashes_for_symbol(
         "WHERE symbol=%s AND ticks_kind=%s AND dataset_version=%s"
     )
     out: set[str] = set()
-    with _connect(cfg, connect_timeout_s=2) as conn:
+    with _connect(cfg, connect_timeout_s=_query_connect_timeout()) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, [sym, tk, dv])
             for (h,) in cur.fetchall():
@@ -437,6 +525,7 @@ def query_symbol_latest(
     symbols: list[str],
     dataset_version: str,
     ticks_kind: str = "main_l5",
+    connect_timeout_s: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """
     Return {symbol: {last_day, last_ns, last_ts}} using QuestDB's optimized LATEST query.
@@ -474,7 +563,8 @@ def query_symbol_latest(
         pass
 
     out: dict[str, dict[str, Any]] = {}
-    with _connect(cfg, connect_timeout_s=2) as conn:
+    timeout_s = int(connect_timeout_s) if connect_timeout_s is not None else _query_connect_timeout()
+    with _connect(cfg, connect_timeout_s=timeout_s) as conn:
         with conn.cursor() as cur:
             cur.execute(sql_latest_on, params)
             for row in cur.fetchall():
@@ -660,6 +750,7 @@ def query_symbol_recent_last(
     dataset_version: str,
     ticks_kind: str,
     trading_days: list[str],
+    connect_timeout_s: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """
     Fast last-tick bounds limited to a recent set of trading_day partitions.
@@ -706,7 +797,8 @@ def query_symbol_recent_last(
         pass
 
     out: dict[str, dict[str, Any]] = {}
-    with _connect(cfg, connect_timeout_s=2) as conn:
+    timeout_s = int(connect_timeout_s) if connect_timeout_s is not None else _query_connect_timeout()
+    with _connect(cfg, connect_timeout_s=timeout_s) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             for row in cur.fetchall():

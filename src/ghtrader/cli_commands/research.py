@@ -100,6 +100,15 @@ def register(main: click.Group) -> None:
         show_default=True,
         help="Use DDP when launched via torchrun (WORLD_SIZE>1). Disable to force single-process behavior.",
     )
+    @click.option("--num-workers", default=0, type=int, show_default=True, help="DataLoader workers (0=auto)")
+    @click.option("--prefetch-factor", default=2, type=int, show_default=True, help="DataLoader prefetch factor")
+    @click.option(
+        "--pin-memory",
+        default="auto",
+        type=click.Choice(["auto", "true", "false"]),
+        show_default=True,
+        help="Pin DataLoader memory (auto=true on CUDA)",
+    )
     @click.pass_context
     def train(
         ctx: click.Context,
@@ -114,6 +123,9 @@ def register(main: click.Group) -> None:
         seq_len: int,
         lr: float,
         ddp: bool,
+        num_workers: int,
+        prefetch_factor: int,
+        pin_memory: str,
     ) -> None:
         """Train a model (baseline or deep)."""
         from ghtrader.cli import _acquire_locks
@@ -132,10 +144,20 @@ def register(main: click.Group) -> None:
             seq_len=seq_len,
             lr=lr,
             ddp=ddp,
+            num_workers=int(num_workers),
+            prefetch_factor=int(prefetch_factor),
+            pin_memory=str(pin_memory),
         )
 
         deep_models = {"deeplob", "transformer", "tcn", "tlob", "ssm"}
         model_kwargs = {"seq_len": seq_len} if model in deep_models else {}
+        pin_memory_opt: bool | None
+        if str(pin_memory).lower() == "true":
+            pin_memory_opt = True
+        elif str(pin_memory).lower() == "false":
+            pin_memory_opt = False
+        else:
+            pin_memory_opt = None
 
         train_model(
             model_type=model,
@@ -148,6 +170,9 @@ def register(main: click.Group) -> None:
             batch_size=batch_size,
             lr=lr,
             ddp=ddp,
+            num_workers=int(num_workers),
+            prefetch_factor=int(prefetch_factor),
+            pin_memory=pin_memory_opt,
             **model_kwargs,
         )
         log.info("train.done", model=model, symbol=symbol)
@@ -307,6 +332,59 @@ def register(main: click.Group) -> None:
             horizon=horizon,
             lookback_days=lookback_days,
         )
+
+    @main.command("research-loop-template")
+    @click.option("--symbol", "-s", required=True, help="Symbol for this research iteration")
+    @click.option(
+        "--model",
+        "-m",
+        default="deeplob",
+        type=click.Choice(["logistic", "xgboost", "lightgbm", "deeplob", "transformer", "tcn", "tlob", "ssm", "lobert", "kanformer"]),
+        show_default=True,
+        help="Primary model under evaluation",
+    )
+    @click.option("--horizon", default=50, type=int, show_default=True, help="Prediction horizon")
+    @click.option("--runs-dir", default="runs", show_default=True, help="Runs output directory")
+    @click.option("--owner", default="", help="Iteration owner")
+    @click.option("--hypothesis", default="", help="Initial hypothesis text")
+    @click.pass_context
+    def research_loop_template(
+        ctx: click.Context,
+        symbol: str,
+        model: str,
+        horizon: int,
+        runs_dir: str,
+        owner: str,
+        hypothesis: str,
+    ) -> None:
+        """Scaffold a PRD-aligned research loop template (propose->implement->evaluate->learn)."""
+        from ghtrader.research.loop import build_research_loop_template, write_research_loop_template
+
+        _ = ctx
+        tpl = build_research_loop_template(
+            symbol=symbol,
+            model=model,
+            horizon=int(horizon),
+            owner=owner,
+            hypothesis=hypothesis,
+        )
+        out = write_research_loop_template(runs_dir=Path(runs_dir), template=tpl)
+        log.info("research.loop_template.created", path=str(out), symbol=symbol, model=model, horizon=int(horizon))
+        click.echo(str(out))
+
+    @main.command("capacity-matrix")
+    @click.option("--runs-dir", default="runs", show_default=True, help="Runs output directory")
+    @click.option("--smoke/--no-smoke", default=True, show_default=True, help="Include environment smoke checks")
+    @click.pass_context
+    def capacity_matrix(ctx: click.Context, runs_dir: str, smoke: bool) -> None:
+        """Generate capacity benchmark/regression matrix report scaffold."""
+        from ghtrader.capacity import build_capacity_report, write_capacity_report
+
+        _ = ctx
+        report = build_capacity_report(include_smoke=bool(smoke))
+        out = write_capacity_report(runs_dir=Path(runs_dir), report=report)
+        log.info("capacity.matrix.generated", path=str(out), smoke=bool(smoke))
+        click.echo(str(out))
 
     @main.command()
     @click.option("--symbol", "-s", required=True, help="Symbol to sweep on")

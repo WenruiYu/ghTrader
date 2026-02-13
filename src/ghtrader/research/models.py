@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import json
+import os
 import pickle
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -28,6 +29,42 @@ from torch.utils.data import DataLoader, Dataset
 log = structlog.get_logger()
 
 ModelType = Literal["logistic", "xgboost", "lightgbm", "deeplob", "transformer", "tcn", "tlob", "ssm", "tkan", "lobert", "kanformer"]
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.environ.get(key, default))
+    except Exception:
+        return int(default)
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = str(os.environ.get(key, "1" if default else "0") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _resolve_dataloader_kwargs(
+    *,
+    num_workers: int,
+    prefetch_factor: int | None,
+    pin_memory: bool | None,
+    device: torch.device,
+) -> dict[str, Any]:
+    workers = int(num_workers)
+    if workers <= 0:
+        auto_default = max(2, min(64, (os.cpu_count() or 8) // 8))
+        workers = max(1, _env_int("GHTRADER_TRAIN_NUM_WORKERS_AUTO", auto_default))
+
+    pin = bool(pin_memory) if pin_memory is not None else (device.type == "cuda")
+    out: dict[str, Any] = {
+        "num_workers": int(workers),
+        "pin_memory": bool(pin),
+    }
+    if workers > 0:
+        pf = int(prefetch_factor) if prefetch_factor is not None else _env_int("GHTRADER_TRAIN_PREFETCH_FACTOR", 2)
+        out["prefetch_factor"] = max(1, int(pf))
+        out["persistent_workers"] = _env_bool("GHTRADER_TRAIN_PERSISTENT_WORKERS", True)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -416,13 +453,20 @@ class DeepLOBModel(BaseModel):
 
             sampler = DistributedSampler(dataset, shuffle=True)
 
+        dl_prefetch = kwargs.pop("prefetch_factor", None)
+        dl_pin_memory = kwargs.pop("pin_memory", None)
+        loader_kwargs = _resolve_dataloader_kwargs(
+            num_workers=num_workers,
+            prefetch_factor=(int(dl_prefetch) if dl_prefetch is not None else None),
+            pin_memory=(bool(dl_pin_memory) if dl_pin_memory is not None else None),
+            device=device,
+        )
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
+            **loader_kwargs,
         )
 
         # Create model
@@ -701,13 +745,20 @@ class TransformerModel(BaseModel):
 
             sampler = DistributedSampler(dataset, shuffle=True)
 
+        dl_prefetch = kwargs.pop("prefetch_factor", None)
+        dl_pin_memory = kwargs.pop("pin_memory", None)
+        loader_kwargs = _resolve_dataloader_kwargs(
+            num_workers=num_workers,
+            prefetch_factor=(int(dl_prefetch) if dl_prefetch is not None else None),
+            pin_memory=(bool(dl_pin_memory) if dl_pin_memory is not None else None),
+            device=device,
+        )
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
+            **loader_kwargs,
         )
 
         self.model = TransformerEncoder(
@@ -1031,13 +1082,20 @@ class TCNModel(BaseModel):
 
             sampler = DistributedSampler(dataset, shuffle=True)
 
+        dl_prefetch = kwargs.pop("prefetch_factor", None)
+        dl_pin_memory = kwargs.pop("pin_memory", None)
+        loader_kwargs = _resolve_dataloader_kwargs(
+            num_workers=num_workers,
+            prefetch_factor=(int(dl_prefetch) if dl_prefetch is not None else None),
+            pin_memory=(bool(dl_pin_memory) if dl_pin_memory is not None else None),
+            device=device,
+        )
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
+            **loader_kwargs,
         )
 
         self.model = TCNNet(
@@ -1365,13 +1423,20 @@ class TLOBModel(BaseModel):
 
             sampler = DistributedSampler(dataset, shuffle=True)
 
+        dl_prefetch = kwargs.pop("prefetch_factor", None)
+        dl_pin_memory = kwargs.pop("pin_memory", None)
+        loader_kwargs = _resolve_dataloader_kwargs(
+            num_workers=num_workers,
+            prefetch_factor=(int(dl_prefetch) if dl_prefetch is not None else None),
+            pin_memory=(bool(dl_pin_memory) if dl_pin_memory is not None else None),
+            device=device,
+        )
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
+            **loader_kwargs,
         )
 
         self.model = TLOBNet(
@@ -1696,13 +1761,20 @@ class SSMModel(BaseModel):
 
             sampler = DistributedSampler(dataset, shuffle=True)
 
+        dl_prefetch = kwargs.pop("prefetch_factor", None)
+        dl_pin_memory = kwargs.pop("pin_memory", None)
+        loader_kwargs = _resolve_dataloader_kwargs(
+            num_workers=num_workers,
+            prefetch_factor=(int(dl_prefetch) if dl_prefetch is not None else None),
+            pin_memory=(bool(dl_pin_memory) if dl_pin_memory is not None else None),
+            device=device,
+        )
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
+            **loader_kwargs,
         )
 
         self.model = SSMNet(
@@ -2170,13 +2242,20 @@ class TKANModel(BaseModel):
 
             sampler = DistributedSampler(dataset, shuffle=True)
 
+        dl_prefetch = kwargs.pop("prefetch_factor", None)
+        dl_pin_memory = kwargs.pop("pin_memory", None)
+        loader_kwargs = _resolve_dataloader_kwargs(
+            num_workers=num_workers,
+            prefetch_factor=(int(dl_prefetch) if dl_prefetch is not None else None),
+            pin_memory=(bool(dl_pin_memory) if dl_pin_memory is not None else None),
+            device=device,
+        )
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
+            **loader_kwargs,
         )
 
         self.model = TKANNet(
@@ -2529,13 +2608,20 @@ class LOBERTModel(BaseModel):
 
             sampler = DistributedSampler(dataset, shuffle=True)
 
+        dl_prefetch = kwargs.pop("prefetch_factor", None)
+        dl_pin_memory = kwargs.pop("pin_memory", None)
+        loader_kwargs = _resolve_dataloader_kwargs(
+            num_workers=num_workers,
+            prefetch_factor=(int(dl_prefetch) if dl_prefetch is not None else None),
+            pin_memory=(bool(dl_pin_memory) if dl_pin_memory is not None else None),
+            device=device,
+        )
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
+            **loader_kwargs,
         )
 
         self.model = LOBERTEncoder(
@@ -2849,13 +2935,20 @@ class KANFormerModel(BaseModel):
 
             sampler = DistributedSampler(dataset, shuffle=True)
 
+        dl_prefetch = kwargs.pop("prefetch_factor", None)
+        dl_pin_memory = kwargs.pop("pin_memory", None)
+        loader_kwargs = _resolve_dataloader_kwargs(
+            num_workers=num_workers,
+            prefetch_factor=(int(dl_prefetch) if dl_prefetch is not None else None),
+            pin_memory=(bool(dl_pin_memory) if dl_pin_memory is not None else None),
+            device=device,
+        )
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
+            **loader_kwargs,
         )
 
         self.model = KANFormer(
@@ -3075,7 +3168,9 @@ def train_model(
     lr: float | None = None,
     ddp: bool = True,
     use_amp: bool | None = None,
-    num_workers: int = 4,
+    num_workers: int = 0,
+    prefetch_factor: int | None = None,
+    pin_memory: bool | None = None,
     seed: int | None = None,
     **kwargs: Any,
 ) -> Path:
@@ -3185,6 +3280,8 @@ def train_model(
         "ddp": ddp,
         "use_amp": use_amp,
         "num_workers": num_workers,
+        "prefetch_factor": prefetch_factor,
+        "pin_memory": pin_memory,
         "seed": seed,
     }
     if epochs is not None:

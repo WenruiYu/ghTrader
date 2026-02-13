@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,6 +19,7 @@ from fastapi.templating import Jinja2Templates
 from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
 from ghtrader.control import auth
 from ghtrader.control.jobs import JobSpec, python_module_argv
+from ghtrader.control.ops_compat import canonical_for_legacy
 from ghtrader.control.settings import get_tqsdk_scheduler_state, set_tqsdk_scheduler_max_parallel
 from ghtrader.control.system_info import cpu_mem_info, disk_usage, gpu_info
 
@@ -62,6 +65,170 @@ def build_router() -> Any:
 
     def _token_qs(request: Request) -> str:
         return auth.token_query_string(request)
+
+    def _log_ops_hit(legacy_path: str) -> None:
+        try:
+            log.info(
+                "ops.compat.hit",
+                legacy=str(legacy_path),
+                canonical=(canonical_for_legacy(legacy_path) or ""),
+            )
+        except Exception:
+            pass
+
+    def _safe_int(raw: Any, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+        try:
+            val = int(str(raw).strip())
+        except Exception:
+            val = int(default)
+        if min_value is not None:
+            val = max(int(min_value), val)
+        if max_value is not None:
+            val = min(int(max_value), val)
+        return int(val)
+
+    def _cuda_device_count() -> int:
+        try:
+            import torch
+
+            return max(0, int(torch.cuda.device_count()))
+        except Exception:
+            return 0
+
+    def _resolve_torchrun_path() -> str | None:
+        cand = str(os.environ.get("GHTRADER_TORCHRUN_BIN", "torchrun") or "").strip() or "torchrun"
+        return shutil.which(cand)
+
+    def _has_active_ddp_training(request: Request) -> bool:
+        store = request.app.state.job_store
+        active = []
+        try:
+            active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=2000)
+        except Exception:
+            return False
+        for j in active:
+            cmd = [str(x) for x in (j.command or [])]
+            title = str(j.title or "").lower()
+            if not cmd and not title:
+                continue
+            # torchrun --nproc_per_node>1 ... ghtrader.cli train
+            if cmd and ("torchrun" in Path(cmd[0]).name.lower() or any("torchrun" in p.lower() for p in cmd)):
+                if "ghtrader.cli" in cmd and "train" in cmd:
+                    for p in cmd:
+                        if p.startswith("--nproc_per_node="):
+                            n = _safe_int(p.split("=", 1)[1], 1, min_value=1)
+                            if n > 1:
+                                return True
+            # fallback parser for training jobs without explicit torchrun marker in title.
+            if title.startswith("train ") and "mode=torchrun-ddp-" in title:
+                return True
+        return False
+
+    def _build_train_job_argv(
+        *,
+        model: str,
+        symbol: str,
+        data_dir: str,
+        artifacts_dir: str,
+        horizon: str,
+        epochs: str,
+        batch_size: str,
+        seq_len: str,
+        lr: str,
+        gpus: int,
+        ddp_requested: bool,
+        num_workers: int,
+        prefetch_factor: int,
+        pin_memory: str,
+    ) -> tuple[list[str], dict[str, Any]]:
+        deep_models = {"deeplob", "transformer", "tcn", "tlob", "ssm"}
+        model_norm = str(model).strip().lower()
+        requested_gpus = _safe_int(gpus, 1, min_value=1, max_value=8)
+        cuda_count = _cuda_device_count()
+
+        effective_gpus = requested_gpus
+        use_ddp = bool(ddp_requested) and model_norm in deep_models and requested_gpus > 1
+        launch_mode = "single-process"
+        notes: list[str] = []
+
+        if use_ddp and cuda_count > 0 and effective_gpus > cuda_count:
+            effective_gpus = max(1, min(8, int(cuda_count)))
+            notes.append(f"gpu_clamped_to_{effective_gpus}")
+        if use_ddp and effective_gpus <= 1:
+            use_ddp = False
+            notes.append("ddp_disabled_insufficient_gpu")
+
+        torchrun_path = _resolve_torchrun_path() if use_ddp else None
+        cli_gpus = effective_gpus
+        if use_ddp and not torchrun_path:
+            # Health check failed: keep training alive via single-process fallback.
+            use_ddp = False
+            cli_gpus = 1
+            launch_mode = "fallback-single-no-torchrun"
+            notes.append("ddp_disabled_no_torchrun")
+        elif use_ddp and torchrun_path:
+            launch_mode = f"torchrun-ddp-{effective_gpus}"
+            notes.append("ddp_enabled")
+        else:
+            if model_norm not in deep_models and requested_gpus > 1:
+                cli_gpus = 1
+                notes.append("non_deep_model_forces_single_gpu")
+            launch_mode = "single-process"
+
+        cli_args = [
+            "train",
+            "--model",
+            model,
+            "--symbol",
+            symbol,
+            "--data-dir",
+            data_dir,
+            "--artifacts-dir",
+            artifacts_dir,
+            "--horizon",
+            horizon,
+            "--gpus",
+            str(cli_gpus),
+            "--epochs",
+            epochs,
+            "--batch-size",
+            batch_size,
+            "--seq-len",
+            seq_len,
+            "--lr",
+            lr,
+            "--num-workers",
+            str(max(0, int(num_workers))),
+            "--prefetch-factor",
+            str(max(1, int(prefetch_factor))),
+            "--pin-memory",
+            (str(pin_memory).strip().lower() if str(pin_memory).strip() else "auto"),
+            "--ddp" if use_ddp else "--no-ddp",
+        ]
+
+        if use_ddp and torchrun_path:
+            argv = [
+                str(torchrun_path),
+                "--standalone",
+                "--nnodes=1",
+                f"--nproc_per_node={effective_gpus}",
+                "-m",
+                "ghtrader.cli",
+                *cli_args,
+            ]
+        else:
+            argv = python_module_argv("ghtrader.cli", *cli_args)
+
+        return (
+            argv,
+            {
+                "mode": launch_mode,
+                "requested_gpus": requested_gpus,
+                "effective_gpus": int(effective_gpus if use_ddp else cli_gpus),
+                "cuda_count": int(cuda_count),
+                "notes": notes,
+            },
+        )
 
     @router.get("/")
     def index(request: Request):
@@ -197,6 +364,7 @@ def build_router() -> Any:
     def ops_redirect(request: Request):
         """Redirect /ops to /data for backward compatibility (unified workflow in Contracts tab)."""
         _require_auth(request)
+        _log_ops_hit("/ops")
         token_qs = _token_qs(request)
         # Redirect to the unified Data Hub (Contracts tab has the 8-step workflow)
         return RedirectResponse(url=f"/data{token_qs}#contracts", status_code=303)
@@ -204,42 +372,50 @@ def build_router() -> Any:
     @router.get("/ops/ingest")
     def ops_ingest_redirect(request: Request):
         _require_auth(request)
+        _log_ops_hit("/ops/ingest")
         return RedirectResponse(url=f"/data{_token_qs(request)}#ingest", status_code=303)
 
     @router.get("/ops/build")
     def ops_build_redirect(request: Request):
         _require_auth(request)
+        _log_ops_hit("/ops/build")
         return RedirectResponse(url=f"/data{_token_qs(request)}#build", status_code=303)
 
     @router.get("/ops/model")
     def ops_model_redirect(request: Request):
         _require_auth(request)
+        _log_ops_hit("/ops/model")
         return RedirectResponse(url=f"/models{_token_qs(request)}", status_code=303)
 
     @router.get("/ops/eval")
     def ops_eval_redirect(request: Request):
         _require_auth(request)
+        _log_ops_hit("/ops/eval")
         return RedirectResponse(url=f"/models{_token_qs(request)}", status_code=303)
 
     @router.get("/ops/trading")
     def ops_trading_redirect(request: Request):
         _require_auth(request)
+        _log_ops_hit("/ops/trading")
         return RedirectResponse(url=f"/trading{_token_qs(request)}", status_code=303)
 
     @router.get("/ops/locks")
     def ops_locks_redirect(request: Request):
         _require_auth(request)
+        _log_ops_hit("/ops/locks")
         return RedirectResponse(url=f"/data{_token_qs(request)}#locks", status_code=303)
 
     @router.get("/ops/integrity")
     def ops_integrity_redirect(request: Request):
         _require_auth(request)
+        _log_ops_hit("/ops/integrity")
         return RedirectResponse(url=f"/data{_token_qs(request)}#integrity", status_code=303)
 
     @router.get("/ops/integrity/report/{name}")
     def ops_integrity_report_redirect(request: Request, name: str):
         """Redirect to /data/integrity/report for backward compatibility."""
         _require_auth(request)
+        _log_ops_hit("/ops/integrity/report/{name}")
         return RedirectResponse(url=f"/data/integrity/report/{name}{_token_qs(request)}", status_code=303)
 
     # ---------------------------------------------------------------------
@@ -389,35 +565,43 @@ def build_router() -> Any:
     # Legacy /ops/* POST routes - forward to new /data/* handlers
     @router.post("/ops/ingest/download")
     async def ops_ingest_download(request: Request):
+        _log_ops_hit("/ops/ingest/download")
         return await data_ingest_download(request)
 
     @router.post("/ops/ingest/download_contract_range")
     async def ops_ingest_download_contract_range(request: Request):
+        _log_ops_hit("/ops/ingest/download_contract_range")
         return await data_ingest_download_contract_range(request)
 
     @router.post("/ops/ingest/update_variety")
     async def ops_ingest_update_variety(request: Request):
         _require_auth(request)
+        _log_ops_hit("/ops/ingest/update_variety")
         raise HTTPException(status_code=410, detail="update-variety endpoint removed in current PRD phase")
 
     @router.post("/ops/ingest/record")
     async def ops_ingest_record(request: Request):
+        _log_ops_hit("/ops/ingest/record")
         return await data_ingest_record(request)
 
     @router.post("/ops/settings/tqsdk_scheduler")
     async def ops_settings_tqsdk_scheduler(request: Request):
+        _log_ops_hit("/ops/settings/tqsdk_scheduler")
         return await data_settings_tqsdk_scheduler(request)
 
     @router.post("/ops/build/build")
     async def ops_build_build(request: Request):
+        _log_ops_hit("/ops/build/build")
         return await data_build_build(request)
 
     @router.post("/ops/build/main_schedule")
     async def ops_build_main_schedule(request: Request):
+        _log_ops_hit("/ops/build/main_schedule")
         return await data_build_main_schedule(request)
 
     @router.post("/ops/build/main_l5")
     async def ops_build_main_l5(request: Request):
+        _log_ops_hit("/ops/build/main_l5")
         return await data_build_main_l5(request)
 
     # Note: /ops/model/* and /ops/eval/* routes are kept as-is since they
@@ -427,46 +611,48 @@ def build_router() -> Any:
     @router.post("/ops/model/train")
     async def ops_model_train(request: Request):
         _require_auth(request)
+        if request.url.path.startswith("/ops/"):
+            _log_ops_hit("/ops/model/train")
         form = await request.form()
         model = str(form.get("model") or "").strip()
         symbol = str(form.get("symbol") or "").strip()
         data_dir = str(form.get("data_dir") or "data").strip()
         artifacts_dir = str(form.get("artifacts_dir") or "artifacts").strip()
         horizon = str(form.get("horizon") or "50").strip()
-        gpus = str(form.get("gpus") or "1").strip()
+        gpus = _safe_int(form.get("gpus"), 1, min_value=1, max_value=8)
         epochs = str(form.get("epochs") or "50").strip()
         batch_size = str(form.get("batch_size") or "256").strip()
         seq_len = str(form.get("seq_len") or "100").strip()
         lr = str(form.get("lr") or "0.001").strip()
         ddp = str(form.get("ddp") or "true").strip().lower() == "true"
+        num_workers = _safe_int(form.get("num_workers"), 0, min_value=0, max_value=512)
+        prefetch_factor = _safe_int(form.get("prefetch_factor"), 2, min_value=1, max_value=64)
+        pin_memory = str(form.get("pin_memory") or "auto").strip().lower() or "auto"
+        if pin_memory not in {"auto", "true", "false"}:
+            pin_memory = "auto"
         if not model or not symbol:
             raise HTTPException(status_code=400, detail="model/symbol required")
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "train",
-            "--model",
-            model,
-            "--symbol",
-            symbol,
-            "--data-dir",
-            data_dir,
-            "--artifacts-dir",
-            artifacts_dir,
-            "--horizon",
-            horizon,
-            "--gpus",
-            gpus,
-            "--epochs",
-            epochs,
-            "--batch-size",
-            batch_size,
-            "--seq-len",
-            seq_len,
-            "--lr",
-            lr,
-            "--ddp" if ddp else "--no-ddp",
+        argv, launch_meta = _build_train_job_argv(
+            model=model,
+            symbol=symbol,
+            data_dir=data_dir,
+            artifacts_dir=artifacts_dir,
+            horizon=horizon,
+            epochs=epochs,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            lr=lr,
+            gpus=gpus,
+            ddp_requested=ddp,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            pin_memory=pin_memory,
         )
-        title = f"train {model} {symbol}"
+        title = (
+            f"train {model} {symbol} "
+            f"mode={launch_meta['mode']} "
+            f"gpus={launch_meta['effective_gpus']}"
+        )
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -475,6 +661,8 @@ def build_router() -> Any:
     @router.post("/ops/model/sweep")
     async def ops_model_sweep(request: Request):
         _require_auth(request)
+        if request.url.path.startswith("/ops/"):
+            _log_ops_hit("/ops/model/sweep")
         form = await request.form()
         symbol = str(form.get("symbol") or "").strip()
         model = str(form.get("model") or "deeplob").strip()
@@ -483,9 +671,15 @@ def build_router() -> Any:
         runs_dir_str = str(form.get("runs_dir") or "runs").strip()
         n_trials = str(form.get("n_trials") or "20").strip()
         n_cpus = str(form.get("n_cpus") or "8").strip()
-        n_gpus = str(form.get("n_gpus") or "1").strip()
+        requested_n_gpus = _safe_int(form.get("n_gpus"), 1, min_value=0, max_value=8)
         if not symbol:
             raise HTTPException(status_code=400, detail="symbol required")
+        n_gpus_eff = requested_n_gpus
+        sweep_note = ""
+        if requested_n_gpus > 0 and _has_active_ddp_training(request):
+            # DDP speedup-first governance: keep sweeps off GPU while multi-GPU train runs.
+            n_gpus_eff = 0
+            sweep_note = "cpu_only_ddp_train_active"
         argv = python_module_argv(
             "ghtrader.cli",
             "sweep",
@@ -504,9 +698,11 @@ def build_router() -> Any:
             "--n-cpus",
             n_cpus,
             "--n-gpus",
-            n_gpus,
+            str(n_gpus_eff),
         )
-        title = f"sweep {model} {symbol}"
+        title = f"sweep {model} {symbol} n_gpus={n_gpus_eff}"
+        if sweep_note:
+            title += f" {sweep_note}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
@@ -515,6 +711,8 @@ def build_router() -> Any:
     @router.post("/ops/eval/benchmark")
     async def ops_eval_benchmark(request: Request):
         _require_auth(request)
+        if request.url.path.startswith("/ops/"):
+            _log_ops_hit("/ops/eval/benchmark")
         form = await request.form()
         model = str(form.get("model") or "").strip()
         symbol = str(form.get("symbol") or "").strip()
@@ -549,6 +747,8 @@ def build_router() -> Any:
     @router.post("/ops/eval/compare")
     async def ops_eval_compare(request: Request):
         _require_auth(request)
+        if request.url.path.startswith("/ops/"):
+            _log_ops_hit("/ops/eval/compare")
         form = await request.form()
         symbol = str(form.get("symbol") or "").strip()
         models = str(form.get("models") or "").strip()
@@ -583,6 +783,8 @@ def build_router() -> Any:
     @router.post("/ops/eval/backtest")
     async def ops_eval_backtest(request: Request):
         _require_auth(request)
+        if request.url.path.startswith("/ops/"):
+            _log_ops_hit("/ops/eval/backtest")
         form = await request.form()
         model = str(form.get("model") or "").strip()
         symbol = str(form.get("symbol") or "").strip()
@@ -620,6 +822,8 @@ def build_router() -> Any:
     @router.post("/ops/eval/paper")
     async def ops_eval_paper(request: Request):
         _require_auth(request)
+        if request.url.path.startswith("/ops/"):
+            _log_ops_hit("/ops/eval/paper")
         form = await request.form()
         model = str(form.get("model") or "").strip()
         symbols = str(form.get("symbols") or "").strip()
@@ -639,6 +843,8 @@ def build_router() -> Any:
     @router.post("/ops/eval/daily_train")
     async def ops_eval_daily_train(request: Request):
         _require_auth(request)
+        if request.url.path.startswith("/ops/"):
+            _log_ops_hit("/ops/eval/daily_train")
         form = await request.form()
         symbols = str(form.get("symbols") or "").strip()
         model = str(form.get("model") or "deeplob").strip()
@@ -673,6 +879,7 @@ def build_router() -> Any:
 
     @router.post("/ops/integrity/audit")
     async def ops_integrity_audit(request: Request):
+        _log_ops_hit("/ops/integrity/audit")
         return await data_integrity_audit(request)
 
     @router.post("/jobs/start")

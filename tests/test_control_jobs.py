@@ -56,3 +56,25 @@ def test_job_manager_cancel(tmp_path: Path):
     assert job is not None
     assert job.status == "cancelled"
 
+
+def test_reconcile_marks_stale_queued_job_failed(tmp_path: Path):
+    store = JobStore(tmp_path / "jobs.db")
+    jm = JobManager(store=store, logs_dir=tmp_path / "logs")
+
+    rec = store.create_job(
+        job_id="stalejob001",
+        title="stale queued",
+        command=["/usr/bin/env", "python", "-c", "print('noop')"],
+        cwd=tmp_path,
+        source="dashboard",
+        log_path=tmp_path / "logs" / "job-stalejob001.log",
+    )
+    # Simulate a stale queued record that has a dead pid after process crash/restart.
+    store.update_job(rec.id, status="queued", pid=999999)
+
+    jm.reconcile()
+    after = store.get_job(rec.id)
+    assert after is not None
+    assert after.status == "failed"
+    assert "process not alive" in str(after.error or "")
+
