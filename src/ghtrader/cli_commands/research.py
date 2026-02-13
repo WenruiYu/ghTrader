@@ -319,7 +319,7 @@ def register(main: click.Group) -> None:
         lock_keys: list[str] = []
         for s in symbols:
             lock_keys.append(f"ticks:symbol={s}")
-            lock_keys.append(f"build:symbol={s},ticks_kind=raw")
+            lock_keys.append(f"build:symbol={s},ticks_kind=main_l5")
             lock_keys.append(f"train:symbol={s},model={model},h={horizon}")
         _acquire_locks(lock_keys)
         log.info("daily_train.start", symbols=symbols, model=model)

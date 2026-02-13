@@ -105,6 +105,54 @@ def get_env(key: str, default: str | None = None, required: bool = False) -> str
     return value
 
 
+def env_int(key: str, default: int) -> int:
+    """Read an integer environment variable with safe fallback."""
+    load_config()
+    try:
+        return int(get_env(key, str(int(default))) or int(default))
+    except Exception:
+        return int(default)
+
+
+def env_float(key: str, default: float) -> float:
+    """Read a float environment variable with safe fallback."""
+    load_config()
+    try:
+        return float(get_env(key, str(float(default))) or float(default))
+    except Exception:
+        return float(default)
+
+
+def env_bool(key: str, default: bool) -> bool:
+    """Read a boolean environment variable with common truthy values."""
+    load_config()
+    raw = str(get_env(key, "1" if default else "0") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def get_qdb_redis_config() -> dict[str, Any]:
+    """
+    Canonical Redis config for QuestDB read-path cache/health checks.
+
+    This is intentionally a small dict to keep call sites lightweight.
+    """
+    load_config()
+    host = str(get_env("GHTRADER_QDB_REDIS_HOST", "127.0.0.1") or "127.0.0.1")
+    port = max(1, env_int("GHTRADER_QDB_REDIS_PORT", 6379))
+    db = max(0, env_int("GHTRADER_QDB_REDIS_DB", 0))
+    timeout_s = max(0.1, env_float("GHTRADER_QDB_REDIS_TIMEOUT_S", 0.2))
+    enabled = env_bool("GHTRADER_QDB_REDIS_CACHE_ENABLED", True)
+    ttl_s = max(1, env_int("GHTRADER_QDB_REDIS_TTL_S", 300))
+    return {
+        "enabled": bool(enabled),
+        "host": host,
+        "port": int(port),
+        "db": int(db),
+        "timeout_s": float(timeout_s),
+        "ttl_s": int(ttl_s),
+    }
+
+
 def get_l5_start_date() -> date:
     """
     Return the required global L5 start date from the environment.

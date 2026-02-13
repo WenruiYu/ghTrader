@@ -11,13 +11,13 @@ Tick ingestion writes directly to QuestDB via tq_ingest.py.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 import threading
 from typing import Literal
 
 import pandas as pd
 import structlog
 
+from ghtrader.config import env_bool, env_int
 from ghtrader.data.ticks_schema import TICK_COLUMN_NAMES
 
 log = structlog.get_logger()
@@ -27,15 +27,11 @@ ServingBackendType = Literal["questdb"]
 
 
 def _env_int(key: str, default: int) -> int:
-    try:
-        return int(os.environ.get(key, default))
-    except Exception:
-        return int(default)
+    return env_int(key, default)
 
 
 def _env_bool(key: str, default: bool) -> bool:
-    raw = str(os.environ.get(key, "1" if default else "0") or "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    return env_bool(key, default)
 
 
 @dataclass(frozen=True)

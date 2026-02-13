@@ -393,14 +393,3 @@ def download_main_l5_for_days(
 
     return {"rows_total": int(total_rows), "row_counts": row_counts}
 
-
-def download_historical_ticks(*args: Any, **kwargs: Any) -> None:
-    raise RuntimeError("download_historical_ticks is deprecated (main_l5-only pipeline)")
-
-
-def download_contract_range(*args: Any, **kwargs: Any) -> None:
-    raise RuntimeError("download_contract_range is deprecated (main_l5-only pipeline)")
-
-
-def run_live_recorder(*args: Any, **kwargs: Any) -> None:
-    raise RuntimeError("run_live_recorder is deferred (Phase-1/2)")

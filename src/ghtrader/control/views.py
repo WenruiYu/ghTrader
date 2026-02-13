@@ -20,6 +20,7 @@ from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
 from ghtrader.control import auth
 from ghtrader.control.jobs import JobSpec, python_module_argv
 from ghtrader.control.ops_compat import canonical_for_legacy
+from ghtrader.control.removed_endpoints import raise_removed_410
 from ghtrader.control.settings import get_tqsdk_scheduler_state, set_tqsdk_scheduler_max_parallel
 from ghtrader.control.system_info import cpu_mem_info, disk_usage, gpu_info
 
@@ -123,6 +124,43 @@ def build_router() -> Any:
             if title.startswith("train ") and "mode=torchrun-ddp-" in title:
                 return True
         return False
+
+    def _job_summary(*, request: Request, limit: int) -> dict[str, Any]:
+        store = request.app.state.job_store
+        jobs = store.list_jobs(limit=int(limit))
+        running = [j for j in jobs if j.status == "running"]
+        queued = [j for j in jobs if j.status == "queued"]
+        return {
+            "jobs": jobs,
+            "running": running,
+            "queued": queued,
+            "running_count": len(running),
+            "queued_count": len(queued),
+        }
+
+    def _l5_calendar_context(*, data_dir: Path) -> dict[str, str]:
+        l5_start_date = ""
+        l5_start_error = ""
+        latest_trading_day = ""
+        latest_trading_error = ""
+        try:
+            from ghtrader.config import get_l5_start_date
+
+            l5_start_date = get_l5_start_date().isoformat()
+        except Exception as e:
+            l5_start_error = str(e)
+        try:
+            from ghtrader.data.trading_calendar import latest_trading_day as _latest_trading_day
+
+            latest_trading_day = _latest_trading_day(data_dir=data_dir, refresh=False, allow_download=True).isoformat()
+        except Exception as e:
+            latest_trading_error = str(e)
+        return {
+            "l5_start_date": l5_start_date,
+            "l5_start_error": l5_start_error,
+            "latest_trading_day": latest_trading_day,
+            "latest_trading_error": latest_trading_error,
+        }
 
     def _build_train_job_argv(
         *,
@@ -233,28 +271,9 @@ def build_router() -> Any:
     @router.get("/")
     def index(request: Request):
         _require_auth(request)
-        store = request.app.state.job_store
-        jobs = store.list_jobs(limit=50)
-        running = [j for j in jobs if j.status == "running"]
-        queued = [j for j in jobs if j.status == "queued"]
-
+        summary = _job_summary(request=request, limit=50)
         data_dir = get_data_dir()
-        l5_start_date = ""
-        l5_start_error = ""
-        latest_trading_day = ""
-        latest_trading_error = ""
-        try:
-            from ghtrader.config import get_l5_start_date
-
-            l5_start_date = get_l5_start_date().isoformat()
-        except Exception as e:
-            l5_start_error = str(e)
-        try:
-            from ghtrader.data.trading_calendar import latest_trading_day as _latest_trading_day
-
-            latest_trading_day = _latest_trading_day(data_dir=data_dir, refresh=False, allow_download=True).isoformat()
-        except Exception as e:
-            latest_trading_error = str(e)
+        calendar_ctx = _l5_calendar_context(data_dir=data_dir)
 
         return templates.TemplateResponse(
             request,
@@ -263,40 +282,20 @@ def build_router() -> Any:
                 "request": request,
                 "title": "ghTrader Dashboard",
                 "token_qs": _token_qs(request),
-                "jobs": jobs,
-                "running_count": len(running),
-                "queued_count": len(queued),
-                "recent_count": len(jobs),
-                "l5_start_date": l5_start_date,
-                "l5_start_error": l5_start_error,
-                "latest_trading_day": latest_trading_day,
-                "latest_trading_error": latest_trading_error,
+                "jobs": summary["jobs"],
+                "running_count": summary["running_count"],
+                "queued_count": summary["queued_count"],
+                "recent_count": len(summary["jobs"]),
+                **calendar_ctx,
             },
         )
 
     @router.get("/jobs")
     def jobs(request: Request):
         _require_auth(request)
-        store = request.app.state.job_store
-        jobs = store.list_jobs(limit=200)
-        running = [j for j in jobs if j.status == "running"]
+        summary = _job_summary(request=request, limit=200)
         data_dir = get_data_dir()
-        l5_start_date = ""
-        l5_start_error = ""
-        latest_trading_day = ""
-        latest_trading_error = ""
-        try:
-            from ghtrader.config import get_l5_start_date
-
-            l5_start_date = get_l5_start_date().isoformat()
-        except Exception as e:
-            l5_start_error = str(e)
-        try:
-            from ghtrader.data.trading_calendar import latest_trading_day as _latest_trading_day
-
-            latest_trading_day = _latest_trading_day(data_dir=data_dir, refresh=False, allow_download=True).isoformat()
-        except Exception as e:
-            latest_trading_error = str(e)
+        calendar_ctx = _l5_calendar_context(data_dir=data_dir)
         return templates.TemplateResponse(
             request,
             "jobs.html",
@@ -304,12 +303,9 @@ def build_router() -> Any:
                 "request": request,
                 "title": "Jobs",
                 "token_qs": _token_qs(request),
-                "jobs": jobs,
-                "running_count": len(running),
-                "l5_start_date": l5_start_date,
-                "l5_start_error": l5_start_error,
-                "latest_trading_day": latest_trading_day,
-                "latest_trading_error": latest_trading_error,
+                "jobs": summary["jobs"],
+                "running_count": summary["running_count"],
+                **calendar_ctx,
             },
         )
 
@@ -445,20 +441,17 @@ def build_router() -> Any:
     @router.post("/data/ingest/download")
     async def data_ingest_download(request: Request):
         _require_auth(request)
-        raise HTTPException(status_code=410, detail="download endpoint removed; use main-schedule + main-l5")
+        raise_removed_410("data.ingest.download")
 
     @router.post("/data/ingest/download_contract_range")
     async def data_ingest_download_contract_range(request: Request):
         _require_auth(request)
-        raise HTTPException(
-            status_code=410,
-            detail="download-contract-range endpoint removed; use main-schedule + main-l5",
-        )
+        raise_removed_410("data.ingest.download_contract_range")
 
     @router.post("/data/ingest/record")
     async def data_ingest_record(request: Request):
         _require_auth(request)
-        raise HTTPException(status_code=410, detail="record endpoint removed in current PRD phase")
+        raise_removed_410("data.ingest.record")
 
     @router.post("/data/settings/tqsdk_scheduler")
     async def data_settings_tqsdk_scheduler(request: Request):
@@ -556,7 +549,7 @@ def build_router() -> Any:
     @router.post("/data/integrity/audit")
     async def data_integrity_audit(request: Request):
         _require_auth(request)
-        raise HTTPException(status_code=410, detail="integrity audit endpoint removed in current PRD phase")
+        raise_removed_410("data.integrity.audit")
 
     # ---------------------------------------------------------------------
     # Legacy /ops/* POST routes (redirect to /data/*)
@@ -577,7 +570,7 @@ def build_router() -> Any:
     async def ops_ingest_update_variety(request: Request):
         _require_auth(request)
         _log_ops_hit("/ops/ingest/update_variety")
-        raise HTTPException(status_code=410, detail="update-variety endpoint removed in current PRD phase")
+        raise_removed_410("data.ingest.update_variety")
 
     @router.post("/ops/ingest/record")
     async def ops_ingest_record(request: Request):
@@ -893,7 +886,7 @@ def build_router() -> Any:
 
         # Build argv for a known-safe set of job types (no shell).
         if job_type == "download_contract_range":
-            raise HTTPException(status_code=410, detail="download_contract_range job type removed in current PRD phase")
+            raise_removed_410("jobs.download_contract_range")
         elif job_type == "build":
             symbol = symbol_or_var
             if not symbol:
@@ -1013,14 +1006,11 @@ def build_router() -> Any:
     @router.get("/data")
     def data_page(request: Request):
         _require_auth(request)
-        store = request.app.state.job_store
+        summary = _job_summary(request=request, limit=200)
         runs_dir = get_runs_dir()
 
-        jobs = store.list_jobs(limit=200)
-        running = [j for j in jobs if j.status == "running"]
-        queued = [j for j in jobs if j.status == "queued"]
-
         data_dir = get_data_dir()
+        calendar_ctx = _l5_calendar_context(data_dir=data_dir)
         lv = "v2"
 
 
@@ -1037,23 +1027,6 @@ def build_router() -> Any:
         t0 = time.time()
         reports = _data_page_cache_get("data_page:audit_reports")
         questdb = _data_page_cache_get("data_page:questdb_status")
-
-        l5_start_date = ""
-        l5_start_error = ""
-        latest_trading_day = ""
-        latest_trading_error = ""
-        try:
-            from ghtrader.config import get_l5_start_date
-
-            l5_start_date = get_l5_start_date().isoformat()
-        except Exception as e:
-            l5_start_error = str(e)
-        try:
-            from ghtrader.data.trading_calendar import latest_trading_day as _latest_trading_day
-
-            latest_trading_day = _latest_trading_day(data_dir=data_dir, refresh=False, allow_download=True).isoformat()
-        except Exception as e:
-            latest_trading_error = str(e)
 
         # Coverage watermarks (best-effort, default CU)
         main_l5_coverage: dict[str, Any] = {}
@@ -1298,8 +1271,8 @@ def build_router() -> Any:
                 "request": request,
                 "title": "Data Hub",
                 "token_qs": _token_qs(request),
-                "running_count": len(running),
-                "queued_count": len(queued),
+                "running_count": summary["running_count"],
+                "queued_count": summary["queued_count"],
                 "dataset_version": lv,
                 "ticks_v2": [],
                 "main_l5_v2": [],
@@ -1308,10 +1281,7 @@ def build_router() -> Any:
                 "questdb": questdb,
                 "locks": locks,
                 "reports": reports,
-                "l5_start_date": l5_start_date,
-                "l5_start_error": l5_start_error,
-                "latest_trading_day": latest_trading_day,
-                "latest_trading_error": latest_trading_error,
+                **calendar_ctx,
                 "tqsdk_scheduler": tqsdk_scheduler,
                 "coverage_var": coverage_var,
                 "coverage_symbol": coverage_symbol,

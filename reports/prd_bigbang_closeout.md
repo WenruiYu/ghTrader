@@ -53,6 +53,18 @@
    - Research/benchmark scaffolds added:
      - `ghtrader research-loop-template` for closed-loop experiment templates.
      - `ghtrader capacity-matrix` for capacity regression matrix + smoke snapshot output.
+8. Deep cleanup wave (PRD-first):
+   - Removed unreachable daily-update scheduler code path from `control/app.py` (feature was hard-disabled and never started).
+   - Consolidated removed/deferred API error handling into `control/removed_endpoints.py` for consistent `410` contracts.
+   - Unified env parsing via `config.py` typed helpers and shared Redis config surface (`get_qdb_redis_config`).
+   - `daily-train` build lock and pipeline build path aligned to `ticks_kind=main_l5`.
+   - Control API composition further modularized with domain route wrappers:
+     - `control/routes/data.py`
+     - `control/routes/models.py`
+     - `control/routes/accounts.py`
+     - `control/routes/gateway.py`
+   - Deduplicated job-command parsing into `control/job_command.py` and reused by `app.py` + `routes/jobs.py`.
+   - Extracted shared page context helpers in `control/views.py` for index/jobs/data templates.
 
 ## Keep/Migrate/Delete Decisions
 
@@ -83,7 +95,12 @@ Executed in project virtual environment (`.venv`):
 5. Current hardware-optimization verification addendum:
    - Syntax/compile guard executed for all newly edited Python modules and tests via `python3 -m py_compile`.
    - Result: **pass**.
-   - Runtime pytest execution is **blocked in current shell image** (`python3 -m pytest` reports `No module named pytest`), so newly added regression tests are committed but not executed in this run.
+   - Runtime pytest execution in project `.venv` is available; targeted + full regression now pass.
+6. PRD deep-cleanup verification addendum:
+   - Targeted regression (`control/api/jobs/accounts/gateway/strategy + ops compat + worker policy`) via `.venv/bin/python -m pytest -q ...`.
+   - Full regression via `.venv/bin/python -m pytest -q`.
+   - Result: **pass** (warnings only; no test failures).
+   - `ReadLints` over modified modules: **no remaining lints**.
 
 ## Residual Gaps (Authoritative Pending List)
 

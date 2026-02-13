@@ -27,14 +27,20 @@
 | `src/ghtrader/control/app.py` | Control | `5.10, 5.11` | Implemented |  |
 | `src/ghtrader/control/auth.py` | Control | `5.10, 5.11` | Implemented |  |
 | `src/ghtrader/control/db.py` | Control | `5.10, 5.11` | Implemented |  |
+| `src/ghtrader/control/job_command.py` | Control/API | `5.10` | Implemented | Shared job-command parsing helpers used by app/jobs routes. |
 | `src/ghtrader/control/jobs.py` | Control | `5.10, 5.11` | Implemented |  |
 | `src/ghtrader/control/locks.py` | Control | `5.10, 5.11` | Implemented |  |
 | `src/ghtrader/control/ops_compat.py` | Control | `5.10, 6.3.1.1` | Implemented | `/ops` compatibility governance contract + canonical mapping registry. |
 | `src/ghtrader/control/progress.py` | Control | `5.10, 5.11` | Implemented |  |
+| `src/ghtrader/control/removed_endpoints.py` | Control/API | `5.10` | Implemented | Centralized 410 removed-endpoint contract mapping. |
 | `src/ghtrader/control/routes/__init__.py` | Control/API | `5.10` | Implemented |  |
-| `src/ghtrader/control/routes/core.py` | Control/API | `5.10` | Implemented | Core modularized endpoints (`/health`, `/api/system`, `/api/questdb/metrics`). |
-| `src/ghtrader/control/routes/health.py` | Control/API | `5.10` | Implemented |  |
+| `src/ghtrader/control/routes/accounts.py` | Control/API | `5.10, 5.11` | Implemented | Accounts-domain API router registration wrappers. |
+| `src/ghtrader/control/routes/core.py` | Control/API | `5.10` | Implemented | Core modularized endpoints (`/api/system`, `/api/questdb/metrics`, `/api/ops/compat`, `/api/observability/slo`). |
+| `src/ghtrader/control/routes/data.py` | Control/API | `5.10` | Implemented | Data/contracts API router registration wrappers. |
+| `src/ghtrader/control/routes/gateway.py` | Control/API | `5.10, 5.11` | Implemented | Gateway-domain API router registration wrappers. |
+| `src/ghtrader/control/routes/health.py` | Control/API | `5.10` | Implemented | Single canonical `/health` endpoint. |
 | `src/ghtrader/control/routes/jobs.py` | Control/API | `5.10` | Implemented |  |
+| `src/ghtrader/control/routes/models.py` | Control/API | `5.10` | Implemented | Models-domain API router registration wrappers. |
 | `src/ghtrader/control/settings.py` | Control | `5.10, 5.11` | Implemented |  |
 | `src/ghtrader/control/slo.py` | Control/Observability | `6.3.1.1, 5.10` | Implemented | Unified SLO snapshot across data/training/control planes (`/api/observability/slo`). |
 | `src/ghtrader/control/static/app.css` | Control/UI | `5.10, 5.11` | Implemented |  |
@@ -191,8 +197,9 @@ Default disposition for mapped files is **Keep** unless explicitly listed below.
 |---|---|---|
 | `src/ghtrader/data/gap_detection.py` | Keep | Canonical query surface for `ghtrader_tick_gaps_v2`; aligned with PRD §5.2.7 after mapping correction. |
 | `src/ghtrader/cli.py` + `src/ghtrader/cli_commands/*` | Keep/Migrate | Command logic migrated out of monolithic `cli.py`; old deferred placeholders removed from exposed surface. |
-| `src/ghtrader/control/app.py` + `src/ghtrader/control/routes/core.py` | Keep/Migrate | Core endpoints split into route modules; deferred API chains removed or converted to explicit compatibility errors. |
+| `src/ghtrader/control/app.py` + `src/ghtrader/control/routes/{data,models,accounts,gateway,core}.py` | Keep/Migrate | `app.py` continues to slim into composition root; domain API registrations moved to dedicated route modules. |
 | `src/ghtrader/control/routes/jobs.py` | Keep/Migrate | Jobs API contract aligned with `JobManager` (`start_job/cancel_job/read_log_tail`) and mounted through `build_api_router()`. |
+| `src/ghtrader/control/job_command.py` + `src/ghtrader/control/removed_endpoints.py` | Keep/Add | Centralized command parsing + removed-endpoint 410 contract, reducing duplicated control-plane logic. |
 | `src/ghtrader/control/ops_compat.py` + `src/ghtrader/control/slo.py` | Keep/Add | Added governance contracts for `/ops` compatibility and unified SLO observability snapshots. |
 | `src/ghtrader/research/loop.py` + `src/ghtrader/capacity.py` | Keep/Add | Added workflow template + capacity regression matrix scaffolds for PRD-first optimization cycle. |
 | `src/ghtrader/questdb/bench.py` | Deferred | Standalone performance utility; not runtime-critical, keep for profiling until dedicated perf playbook is extracted. |

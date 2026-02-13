@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import ghtrader.research.distributed as distu
+from ghtrader.config import env_bool, env_int
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
@@ -32,15 +33,11 @@ ModelType = Literal["logistic", "xgboost", "lightgbm", "deeplob", "transformer",
 
 
 def _env_int(key: str, default: int) -> int:
-    try:
-        return int(os.environ.get(key, default))
-    except Exception:
-        return int(default)
+    return env_int(key, default)
 
 
 def _env_bool(key: str, default: bool) -> bool:
-    raw = str(os.environ.get(key, "1" if default else "0") or "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    return env_bool(key, default)
 
 
 def _resolve_dataloader_kwargs(

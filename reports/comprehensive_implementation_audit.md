@@ -96,12 +96,14 @@
 - **Evidence**:
   - Module: `src/ghtrader/questdb/field_quality.py`
   - Table: `ghtrader_field_quality_v2` (lines 56-86)
-  - CLI: `ghtrader data field-quality` (lines 966-1033)
+  - CLI: `ghtrader data field-quality` in `src/ghtrader/cli_commands/data.py`
   - Tests: `test_field_quality_invariants.py`, `test_field_quality_upsert.py`
 
 **5.3.0.6 Intra-day Gap Detection** ✅ IMPLEMENTED
 - **Status**: Marked [Implemented] in PRD
-- **Note**: Implementation file `src/ghtrader/data/gap_detection.py` not found in search results; may be integrated into validation module
+- **Evidence**:
+  - Query layer: `src/ghtrader/data/gap_detection.py`
+  - Write/refresh path: `src/ghtrader/questdb/main_l5_validate.py` + `src/ghtrader/data/main_l5_validation.py`
 
 **5.3.1 Derived Dataset (main-with-depth)** ✅ IMPLEMENTED
 - **Status**: Fully implemented

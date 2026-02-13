@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 import hashlib
 import json
-import os
 import threading
 import time
 from typing import Any, Literal
@@ -11,6 +10,8 @@ from typing import Any, Literal
 import re
 import structlog
 from functools import wraps
+
+from ghtrader.config import env_bool, env_float, env_int, get_qdb_redis_config
 
 try:
     import redis
@@ -81,22 +82,15 @@ def _ns_to_iso(ns: Any) -> str | None:
 
 
 def _env_int(key: str, default: int) -> int:
-    try:
-        return int(os.environ.get(key, default))
-    except Exception:
-        return int(default)
+    return env_int(key, default)
 
 
 def _env_float(key: str, default: float) -> float:
-    try:
-        return float(os.environ.get(key, default))
-    except Exception:
-        return float(default)
+    return env_float(key, default)
 
 
 def _env_bool(key: str, default: bool) -> bool:
-    raw = str(os.environ.get(key, "1" if default else "0") or "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    return env_bool(key, default)
 
 
 def _query_connect_timeout(default: int = 2) -> int:
@@ -104,14 +98,16 @@ def _query_connect_timeout(default: int = 2) -> int:
 
 
 def _cache_default_ttl(default: int = 300) -> int:
-    return max(1, _env_int("GHTRADER_QDB_REDIS_TTL_S", default))
+    cfg = get_qdb_redis_config()
+    return max(1, int(cfg.get("ttl_s", default)))
 
 
 def _redis_cfg_signature() -> str:
-    host = str(os.environ.get("GHTRADER_QDB_REDIS_HOST", "127.0.0.1"))
-    port = max(1, _env_int("GHTRADER_QDB_REDIS_PORT", 6379))
-    db = max(0, _env_int("GHTRADER_QDB_REDIS_DB", 0))
-    timeout_s = max(0.1, _env_float("GHTRADER_QDB_REDIS_TIMEOUT_S", 0.2))
+    cfg = get_qdb_redis_config()
+    host = str(cfg.get("host", "127.0.0.1"))
+    port = max(1, int(cfg.get("port", 6379)))
+    db = max(0, int(cfg.get("db", 0)))
+    timeout_s = max(0.1, float(cfg.get("timeout_s", 0.2)))
     return f"{host}|{port}|{db}|{timeout_s}"
 
 
@@ -119,7 +115,8 @@ def _get_redis_client() -> Any | None:
     global _redis_client, _redis_cfg_sig
     if redis is None:
         return None
-    if not _env_bool("GHTRADER_QDB_REDIS_CACHE_ENABLED", True):
+    cfg = get_qdb_redis_config()
+    if not bool(cfg.get("enabled")):
         return None
 
     sig = _redis_cfg_signature()
@@ -127,10 +124,10 @@ def _get_redis_client() -> Any | None:
         if _redis_client is not None and _redis_cfg_sig == sig:
             return _redis_client
 
-        host = str(os.environ.get("GHTRADER_QDB_REDIS_HOST", "127.0.0.1"))
-        port = max(1, _env_int("GHTRADER_QDB_REDIS_PORT", 6379))
-        db = max(0, _env_int("GHTRADER_QDB_REDIS_DB", 0))
-        timeout_s = max(0.1, _env_float("GHTRADER_QDB_REDIS_TIMEOUT_S", 0.2))
+        host = str(cfg.get("host", "127.0.0.1"))
+        port = max(1, int(cfg.get("port", 6379)))
+        db = max(0, int(cfg.get("db", 0)))
+        timeout_s = max(0.1, float(cfg.get("timeout_s", 0.2)))
         try:
             client = redis.Redis(
                 host=host,

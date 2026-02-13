@@ -1,20 +1,16 @@
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from typing import Any
 
+from ghtrader.config import env_bool, env_int, get_qdb_redis_config
 
 def _env_int(key: str, default: int) -> int:
-    try:
-        return int(os.environ.get(key, default))
-    except Exception:
-        return int(default)
+    return env_int(key, default)
 
 
 def _env_bool(key: str, default: bool) -> bool:
-    raw = str(os.environ.get(key, "1" if default else "0") or "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    return env_bool(key, default)
 
 
 def _now_iso() -> str:
@@ -40,8 +36,8 @@ def _questdb_status() -> dict[str, Any]:
 
 
 def _redis_status() -> dict[str, Any]:
-    enabled = _env_bool("GHTRADER_QDB_REDIS_CACHE_ENABLED", True)
-    if not enabled:
+    cfg = get_qdb_redis_config()
+    if not bool(cfg.get("enabled")):
         return {"enabled": False, "ok": True, "status": "disabled"}
 
     try:
@@ -49,11 +45,12 @@ def _redis_status() -> dict[str, Any]:
     except Exception as e:  # pragma: no cover - optional dependency
         return {"enabled": True, "ok": False, "error": f"redis_import_failed: {e}"}
 
-    host = str(os.environ.get("GHTRADER_QDB_REDIS_HOST", "127.0.0.1"))
-    port = max(1, _env_int("GHTRADER_QDB_REDIS_PORT", 6379))
-    db = max(0, _env_int("GHTRADER_QDB_REDIS_DB", 0))
+    host = str(cfg.get("host", "127.0.0.1"))
+    port = max(1, int(cfg.get("port", 6379)))
+    db = max(0, int(cfg.get("db", 0)))
+    timeout_s = max(0.1, float(cfg.get("timeout_s", 0.2)))
     try:
-        client = redis.Redis(host=host, port=port, db=db, socket_connect_timeout=0.2, socket_timeout=0.2)
+        client = redis.Redis(host=host, port=port, db=db, socket_connect_timeout=timeout_s, socket_timeout=timeout_s)
         client.ping()
         return {"enabled": True, "ok": True, "host": host, "port": port, "db": db}
     except Exception as e:

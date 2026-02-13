@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import os
 
+from ghtrader.config import env_int
+
 
 def _env_int(key: str, default: int) -> int:
-    try:
-        return int(os.environ.get(key, default))
-    except Exception:
-        return int(default)
+    return env_int(key, default)
 
 
 def resolve_worker_count(

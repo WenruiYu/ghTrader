@@ -11,29 +11,10 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from ghtrader.config import get_runs_dir
 from ghtrader.control import auth
+from ghtrader.control.job_command import infer_job_kind
 from ghtrader.control.jobs import JobSpec
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
-
-
-def _job_kind_from_command(cmd: list[str] | None) -> str:
-    parts = [str(p) for p in (cmd or [])]
-    if not parts:
-        return "unknown"
-    if "ghtrader" in parts:
-        i = parts.index("ghtrader")
-        if i + 1 < len(parts):
-            return parts[i + 1].replace("-", "_")
-    if "ghtrader.cli" in parts:
-        i = parts.index("ghtrader.cli")
-        if i + 1 < len(parts):
-            return parts[i + 1].replace("-", "_")
-    if "-m" in parts:
-        i = parts.index("-m")
-        if i + 2 < len(parts) and parts[i + 1].endswith("ghtrader.cli"):
-            return parts[i + 2].replace("-", "_")
-    return "unknown"
-
 
 @router.get("", response_class=JSONResponse)
 def api_list_jobs(request: Request, limit: int = 200) -> dict[str, Any]:
@@ -109,7 +90,7 @@ async def api_cancel_jobs_batch(request: Request) -> dict[str, Any]:
         if st not in statuses:
             continue
 
-        kind = _job_kind_from_command(list(job.command or []))
+        kind = infer_job_kind(list(job.command or []))
         if kind not in kinds:
             continue
 

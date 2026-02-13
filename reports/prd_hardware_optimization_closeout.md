@@ -21,10 +21,21 @@
 | `benchmark-capacity-validation-pack` | Completed | `capacity.py` + CLI `capacity-matrix` for capacity regression matrix + smoke snapshot output. |
 | `docs-and-traceability-pack` | Completed | Updated `reports/prd_traceability_matrix.md` and `reports/prd_bigbang_closeout.md`; added this closeout report. |
 
+## Post-Closeout Cleanup Addendum
+
+- PRD-first deep cleanup completed on top of hardware optimization baseline:
+  - unreachable daily-update scheduler removed from `control/app.py`
+  - removed/deferred endpoint errors centralized in `control/removed_endpoints.py`
+  - env parsing and Redis config reads deduplicated via `config.py`
+  - route composition continued into `control/routes/{data,models,accounts,gateway}.py`
+  - job command parsing deduplicated via `control/job_command.py`
+
 ## Verification Notes
 
 - Syntax checks: `python3 -m py_compile` across edited modules and new tests (pass).
-- Pytest runtime in current shell is unavailable (`No module named pytest`), so new regression tests are added but not executed in this session.
+- `.venv` regression checks completed:
+  - Targeted suites for control/data-path changes (pass)
+  - Full `.venv/bin/python -m pytest -q` (pass, warnings only)
 
 ## Follow-up
 

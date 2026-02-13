@@ -15,11 +15,6 @@ from ghtrader.control.slo import collect_slo_snapshot
 router = APIRouter(tags=["core"])
 
 
-@router.get("/health", response_class=JSONResponse)
-def health() -> dict[str, Any]:
-    return {"ok": True}
-
-
 @router.get("/api/system", response_class=JSONResponse)
 def api_system(request: Request, include_dir_sizes: bool = False, refresh: str = "none") -> dict[str, Any]:
     if not auth.is_authorized(request):

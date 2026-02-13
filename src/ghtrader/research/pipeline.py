@@ -174,7 +174,6 @@ def run_daily_pipeline(
     from ghtrader.datasets.labels import build_labels_for_symbol
     from ghtrader.regime import train_regime_model
     from ghtrader.research.models import train_model
-    from ghtrader.tq.ingest import download_historical_ticks
     
     today = date.today()
     start_date = today - timedelta(days=lookback_days)
@@ -198,22 +197,10 @@ def run_daily_pipeline(
             # Step 1: Refresh data
             log.info("daily_pipeline.step", symbol=symbol, step="refresh_data")
             t0 = time.time()
-            refresh_status = "ok"
-            refresh_note = ""
-            try:
-                download_historical_ticks(
-                    symbol=symbol,
-                    start_date=start_date,
-                    end_date=today,
-                    data_dir=data_dir,
-                )
-            except RuntimeError as e:
-                # main_l5-only pipeline: do not fail the whole daily flow on deprecated path.
-                if "deprecated" in str(e).lower():
-                    refresh_status = "skipped"
-                    refresh_note = "download_historical_ticks deprecated (main_l5-only pipeline)"
-                else:
-                    raise
+            # Refresh-by-download path is intentionally disabled in main_l5-only mode.
+            # Keep the step in reports for workflow completeness.
+            refresh_status = "skipped"
+            refresh_note = "refresh download path removed (main_l5-only pipeline)"
             symbol_report["steps"]["refresh_data"] = {
                 "status": refresh_status,
                 "duration": time.time() - t0,
@@ -224,7 +211,7 @@ def run_daily_pipeline(
             log.info("daily_pipeline.step", symbol=symbol, step="build_features")
             t0 = time.time()
             engine = FactorEngine()
-            engine.build_features_for_symbol(symbol=symbol, data_dir=data_dir)
+            engine.build_features_for_symbol(symbol=symbol, data_dir=data_dir, ticks_kind="main_l5")
             symbol_report["steps"]["build_features"] = {"status": "ok", "duration": time.time() - t0}
             
             # Step 3: Build labels
@@ -234,6 +221,7 @@ def run_daily_pipeline(
                 symbol=symbol,
                 data_dir=data_dir,
                 horizons=[horizon],
+                ticks_kind="main_l5",
             )
             symbol_report["steps"]["build_labels"] = {"status": "ok", "duration": time.time() - t0}
 

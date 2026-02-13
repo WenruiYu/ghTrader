@@ -21,7 +21,13 @@ import redis.asyncio as redis
 from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
 from ghtrader.control import auth
 from ghtrader.control.db import JobStore
+from ghtrader.control.job_command import extract_cli_subcommand, extract_cli_subcommands
 from ghtrader.control.jobs import JobManager, JobSpec, python_module_argv
+from ghtrader.control.removed_endpoints import raise_removed_410
+from ghtrader.control.routes.accounts import build_accounts_router
+from ghtrader.control.routes.data import build_data_router
+from ghtrader.control.routes.gateway import build_gateway_router
+from ghtrader.control.routes.models import build_models_router
 from ghtrader.control.routes import build_api_router, build_root_router
 from ghtrader.control.views import build_router
 from ghtrader.util.json_io import read_json as _read_json, write_json_atomic as _write_json_atomic
@@ -143,47 +149,11 @@ def _scan_model_files(artifacts_dir: Path) -> list[dict[str, Any]]:
 
 
 def _job_subcommand(argv: list[str]) -> str | None:
-    """
-    Best-effort extraction of `ghtrader <subcommand>` from argv.
-    """
-    try:
-        for i, t in enumerate(argv):
-            if str(t) == "ghtrader.cli" and i + 1 < len(argv):
-                return str(argv[i + 1])
-        # Fallback for direct `ghtrader <cmd>` style
-        if len(argv) >= 2 and str(argv[0]).endswith("ghtrader") and not str(argv[1]).startswith("-"):
-            return str(argv[1])
-    except Exception:
-        return None
-    return None
+    return extract_cli_subcommand(argv)
 
 
 def _job_subcommand2(argv: list[str]) -> tuple[str | None, str | None]:
-    """
-    Best-effort extraction of `ghtrader <subcommand> [subcommand2]` from argv.
-
-    Examples:
-    - python -m ghtrader.cli data health ...
-    - ghtrader data repair ...
-    """
-    try:
-        for i, t in enumerate(argv):
-            if str(t) == "ghtrader.cli" and i + 1 < len(argv):
-                sub1 = str(argv[i + 1])
-                sub2 = None
-                if i + 2 < len(argv) and not str(argv[i + 2]).startswith("-"):
-                    sub2 = str(argv[i + 2])
-                return sub1, sub2
-        # Fallback for direct `ghtrader <cmd>` style
-        if len(argv) >= 2 and str(argv[0]).endswith("ghtrader") and not str(argv[1]).startswith("-"):
-            sub1 = str(argv[1])
-            sub2 = None
-            if len(argv) >= 3 and not str(argv[2]).startswith("-"):
-                sub2 = str(argv[2])
-            return sub1, sub2
-    except Exception:
-        return None, None
-    return None, None
+    return extract_cli_subcommands(argv)
 
 
 def _is_tqsdk_heavy_job(argv: list[str]) -> bool:
@@ -207,70 +177,6 @@ def _scheduler_enabled() -> bool:
     ).strip().lower() not in {"1", "true", "yes"}:
         return False
     return True
-
-
-def _daily_update_targets_from_env() -> list[tuple[str, str]]:
-    """
-    Parse `GHTRADER_DAILY_UPDATE_TARGETS` into [(EXCHANGE, var), ...].
-
-    Examples:
-    - "SHFE:cu"
-    - "SHFE:cu,SHFE:au"
-    - "SHFE.cu" (also accepted)
-    """
-    raw = str(os.environ.get("GHTRADER_DAILY_UPDATE_TARGETS", "")).strip()
-    if not raw:
-        return []
-    out: list[tuple[str, str]] = []
-    for part in [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]:
-        ex = ""
-        v = ""
-        if ":" in part:
-            ex, v = part.split(":", 1)
-        elif "." in part:
-            ex, v = part.split(".", 1)
-        ex = str(ex).upper().strip()
-        v = str(v).lower().strip()
-        if ex and v:
-            out.append((ex, v))
-    # De-dupe while preserving order
-    seen: set[str] = set()
-    uniq: list[tuple[str, str]] = []
-    for ex, v in out:
-        k = f"{ex}:{v}"
-        if k in seen:
-            continue
-        seen.add(k)
-        uniq.append((ex, v))
-    return uniq
-
-
-def _daily_update_enabled() -> bool:
-    return False
-
-
-def _daily_update_state_path(*, runs_dir: Path) -> Path:
-    return runs_dir / "control" / "cache" / "daily_update" / "state.json"
-
-
-def _contracts_snapshot_path(*, runs_dir: Path, exchange: str, var: str) -> Path:
-    ex = str(exchange).upper().strip()
-    v = str(var).lower().strip()
-    return runs_dir / "control" / "cache" / "contracts_snapshot" / f"contracts_exchange={ex}_var={v}.json"
-
-
-def _contracts_snapshot_age_s(*, path: Path, obj: dict[str, Any] | None) -> float:
-    try:
-        if obj is not None:
-            ts = float(obj.get("snapshot_cached_at_unix") or obj.get("cached_at_unix") or 0.0)
-            if ts > 0:
-                return float(max(0.0, time.time() - ts))
-    except Exception:
-        pass
-    try:
-        return float(max(0.0, time.time() - float(path.stat().st_mtime)))
-    except Exception:
-        return 1e9
 
 
 def _accounts_env_path(*, runs_dir: Path) -> Path:
@@ -570,200 +476,6 @@ def _argv_opt(argv: list[str], name: str) -> str | None:
     except Exception:
         return None
     return None
-
-
-def _start_daily_update_scheduler(app: FastAPI) -> None:
-    if getattr(app.state, "_daily_update_scheduler_started", False):
-        return
-    app.state._daily_update_scheduler_started = True
-
-    def _loop() -> None:
-        while True:
-            try:
-                _daily_update_tick(app=app)
-            except Exception as e:
-                log.warning("daily_update.tick_failed", error=str(e))
-            time.sleep(float(os.environ.get("GHTRADER_DAILY_UPDATE_POLL_SECONDS", "60")))
-
-    t = threading.Thread(target=_loop, name="daily-update-scheduler", daemon=True)
-    t.start()
-
-
-def _daily_update_tick(*, app: FastAPI) -> None:
-    runs_dir = get_runs_dir()
-    data_dir = get_data_dir()
-    store: JobStore = app.state.job_store
-    jm: JobManager = app.state.job_manager
-
-    targets = _daily_update_targets_from_env()
-    if not targets:
-        return
-
-    # Determine "today trading day" (UTC) so we enqueue at most once per trading day.
-    from ghtrader.data.trading_calendar import get_trading_calendar
-
-    # Dashboard scheduler: avoid network in control-plane threads unless explicitly requested elsewhere.
-    cal = get_trading_calendar(data_dir=data_dir, refresh=False, allow_download=False)
-    today = datetime.now(timezone.utc).date()
-    today_trading = today
-    if cal:
-        # last <= today
-        lo = 0
-        hi = len(cal)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if cal[mid] <= today:
-                lo = mid + 1
-            else:
-                hi = mid
-        idx = lo - 1
-        today_trading = cal[idx] if idx >= 0 else today
-    else:
-        while today_trading.weekday() >= 5:
-            today_trading -= timedelta(days=1)
-
-    st_path = _daily_update_state_path(runs_dir=runs_dir)
-    state = _read_json(st_path) or {}
-    last_by_target: dict[str, str] = dict(state.get("last_enqueued_trading_day") or {})
-    last_success_by_target: dict[str, str] = dict(state.get("last_successful_trading_day") or {})
-    last_attempt_by_target: dict[str, str] = dict(state.get("last_attempt_at") or {})
-    last_job_by_target: dict[str, str] = dict(state.get("last_job_id") or {})
-    last_status_by_target: dict[str, str] = dict(state.get("last_job_status") or {})
-    failure_count_by_target: dict[str, int] = {
-        str(k): int(v or 0) for k, v in (state.get("failure_count") or {}).items()
-    }
-
-    active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=500)
-
-    catalog_ttl_s = int(os.environ.get("GHTRADER_DAILY_UPDATE_CATALOG_TTL_SECONDS", "3600"))
-    backoff_s = int(os.environ.get("GHTRADER_DAILY_UPDATE_RETRY_BACKOFF_SECONDS", "300"))
-    max_catchup = int(os.environ.get("GHTRADER_DAILY_UPDATE_MAX_CATCHUP_DAYS", "0"))
-
-    for ex, v in targets:
-        key = f"{ex}:{v}"
-        last_success = str(last_success_by_target.get(key) or "")
-        last_attempt = str(last_attempt_by_target.get(key) or "")
-        last_enqueued = str(last_by_target.get(key) or "")
-
-        # Update status from the last job id (avoid double-counting).
-        last_job_id = str(last_job_by_target.get(key) or "")
-        if last_job_id:
-            job = store.get_job(last_job_id)
-            if job is not None and job.status:
-                st = str(job.status).lower().strip()
-                if st and st != str(last_status_by_target.get(key) or ""):
-                    last_status_by_target[key] = st
-                    if st == "succeeded":
-                        last_success_by_target[key] = last_enqueued or today_trading.isoformat()
-                        failure_count_by_target[key] = 0
-                    elif st in {"failed", "cancelled"}:
-                        failure_count_by_target[key] = int(failure_count_by_target.get(key, 0)) + 1
-
-        # Determine which trading day to enqueue (today or catch-up).
-        target_day = today_trading
-        if max_catchup > 0 and last_success:
-            try:
-                last_dt = date.fromisoformat(last_success)
-                if last_dt < today_trading:
-                    # Catch up at most N trading days.
-                    if cal:
-                        idx_last = -1
-                        for i, d in enumerate(cal):
-                            if d <= last_dt:
-                                idx_last = i
-                            else:
-                                break
-                        idx_today = cal.index(today_trading) if today_trading in cal else (len(cal) - 1)
-                        earliest = cal[max(0, idx_today - max_catchup + 1)]
-                        next_day = cal[min(len(cal) - 1, idx_last + 1)] if idx_last >= 0 else earliest
-                        target_day = next_day if next_day >= earliest else earliest
-                    else:
-                        earliest = today_trading - timedelta(days=max_catchup - 1)
-                        target_day = max(last_dt + timedelta(days=1), earliest)
-            except Exception:
-                target_day = today_trading
-
-        if last_enqueued == target_day.isoformat() and last_success == target_day.isoformat():
-            continue
-
-        # Skip if an update job for this target is already queued/running.
-        already = False
-        for j in active:
-            sub = _job_subcommand(j.command) or ""
-            if sub != "update":
-                continue
-            j_ex = _argv_opt(j.command, "--exchange")
-            j_v = _argv_opt(j.command, "--var")
-            if str(j_ex or "").upper().strip() == ex and str(j_v or "").lower().strip() == v:
-                already = True
-                break
-        if already:
-            continue
-
-        # Backoff if last attempt failed recently.
-        if last_attempt and int(failure_count_by_target.get(key, 0)) > 0:
-            try:
-                last_attempt_dt = datetime.fromisoformat(last_attempt.replace("Z", "+00:00"))
-                if (datetime.now(timezone.utc) - last_attempt_dt).total_seconds() < float(backoff_s):
-                    continue
-            except Exception:
-                pass
-
-        recent_days = int(os.environ.get("GHTRADER_DAILY_UPDATE_RECENT_EXPIRED_DAYS", "10"))
-        refresh_catalog = True
-        if last_attempt and failure_count_by_target.get(key, 0) == 0:
-            refresh_catalog = False
-        if catalog_ttl_s > 0 and last_attempt:
-            try:
-                last_attempt_dt = datetime.fromisoformat(last_attempt.replace("Z", "+00:00"))
-                if (datetime.now(timezone.utc) - last_attempt_dt).total_seconds() < float(catalog_ttl_s):
-                    refresh_catalog = False
-            except Exception:
-                pass
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "update",
-            "--exchange",
-            ex,
-            "--var",
-            v,
-            "--recent-expired-days",
-            str(int(recent_days)),
-            "--refresh-catalog" if refresh_catalog else "--no-refresh-catalog",
-            "--catalog-ttl-seconds",
-            str(int(catalog_ttl_s)),
-            "--data-dir",
-            str(data_dir),
-            "--runs-dir",
-            str(runs_dir),
-        )
-        title = f"daily-update {ex}.{v} {target_day.isoformat()}"
-        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        last_by_target[key] = target_day.isoformat()
-        last_attempt_by_target[key] = _now_iso()
-        last_job_by_target[key] = rec.id
-        log.info(
-            "daily_update.enqueued",
-            exchange=ex,
-            var=v,
-            trading_day=target_day.isoformat(),
-            refresh_catalog=refresh_catalog,
-            job_id=rec.id,
-        )
-
-    state = {
-        "updated_at": _now_iso(),
-        "last_enqueued_trading_day": last_by_target,
-        "last_successful_trading_day": last_success_by_target,
-        "last_attempt_at": last_attempt_by_target,
-        "last_job_id": last_job_by_target,
-        "last_job_status": last_status_by_target,
-        "failure_count": failure_count_by_target,
-    }
-    try:
-        _write_json_atomic(st_path, state)
-    except Exception:
-        pass
 
 
 def _start_tqsdk_scheduler(app: FastAPI, *, max_parallel_default: int = 4) -> None:
@@ -1151,8 +863,6 @@ def create_app() -> Any:
     app.state.job_manager = jm
     if _scheduler_enabled():
         _start_tqsdk_scheduler(app)
-    if _daily_update_enabled():
-        _start_daily_update_scheduler(app)
     if _gateway_supervisor_enabled():
         _start_gateway_supervisor(app)
     if _strategy_supervisor_enabled():
@@ -1179,7 +889,6 @@ def create_app() -> Any:
         except WebSocketDisconnect:
             manager.disconnect(websocket)
 
-    @app.get("/api/data/coverage", response_class=JSONResponse)
     def api_data_coverage(
         request: Request, kind: str = "ticks", limit: int = 200, search: str = "", refresh: bool = False
     ) -> dict[str, Any]:
@@ -1191,9 +900,8 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = (kind, limit, search, refresh)
-        raise HTTPException(status_code=410, detail="data coverage endpoint removed in current PRD phase")
+        raise_removed_410("api.data.coverage")
 
-    @app.get("/api/data/coverage/summary", response_class=JSONResponse)
     def api_data_coverage_summary(request: Request, refresh: bool = False) -> dict[str, Any]:
         """
         Aggregated coverage summary for Data Hub Overview KPIs.
@@ -1201,7 +909,7 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = refresh
-        raise HTTPException(status_code=410, detail="coverage summary endpoint removed in current PRD phase")
+        raise_removed_410("api.data.coverage_summary")
 
     @app.get("/api/data/quality-summary", response_class=JSONResponse)
     def api_data_quality_summary(
@@ -1508,7 +1216,6 @@ def create_app() -> Any:
             _data_quality_at = time.time()
         return payload
 
-    @app.get("/api/data/quality-detail/{symbol}", response_class=JSONResponse)
     def api_data_quality_detail(request: Request, symbol: str, limit: int = 30) -> dict[str, Any]:
         """
         Return recent quality ledger rows for a symbol (best-effort).
@@ -1516,9 +1223,8 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = (symbol, limit)
-        raise HTTPException(status_code=410, detail="data quality detail endpoint removed in current PRD phase")
+        raise_removed_410("api.data.quality_detail")
 
-    @app.post("/api/data/diagnose", response_class=JSONResponse)
     async def api_data_enqueue_diagnose(request: Request) -> dict[str, Any]:
         """
         Enqueue a data diagnose job (runs `ghtrader data diagnose ...`).
@@ -1526,9 +1232,8 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = request
-        raise HTTPException(status_code=410, detail="data diagnose endpoint removed in current PRD phase")
+        raise_removed_410("api.data.diagnose")
 
-    @app.post("/api/data/repair", response_class=JSONResponse)
     async def api_data_enqueue_repair(request: Request) -> dict[str, Any]:
         """
         Enqueue a data repair job (runs `ghtrader data repair ...`).
@@ -1536,9 +1241,8 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = request
-        raise HTTPException(status_code=410, detail="data repair endpoint removed in current PRD phase")
+        raise_removed_410("api.data.repair")
 
-    @app.post("/api/data/health", response_class=JSONResponse)
     async def api_data_enqueue_health(request: Request) -> dict[str, Any]:
         """
         Enqueue a data health job (runs `ghtrader data health ...`).
@@ -1546,7 +1250,7 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = request
-        raise HTTPException(status_code=410, detail="data health endpoint removed in current PRD phase")
+        raise_removed_410("api.data.health")
 
     @app.post("/api/data/enqueue-l5-start", response_class=JSONResponse)
     async def api_data_enqueue_l5_start(request: Request) -> dict[str, Any]:
@@ -1910,7 +1614,6 @@ def create_app() -> Any:
         except Exception as e:
             return {"ok": False, "error": str(e), "exchange": ex, "var": v, "symbol": derived_symbol, "gaps": []}
 
-    @app.get("/api/contracts", response_class=JSONResponse)
     def api_contracts(
         request: Request,
         exchange: str = "SHFE",
@@ -1931,9 +1634,8 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = (exchange, var, refresh)
-        raise HTTPException(status_code=410, detail="contracts explorer endpoint removed in current PRD phase")
+        raise_removed_410("api.contracts.explorer")
 
-    @app.post("/api/contracts/enqueue-fill", response_class=JSONResponse)
     async def api_contracts_enqueue_fill(request: Request) -> dict[str, Any]:
         """
         Enqueue per-contract download jobs (runs `ghtrader download --symbol ...`).
@@ -1947,9 +1649,8 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = request
-        raise HTTPException(status_code=410, detail="contracts fill endpoint removed in current PRD phase")
+        raise_removed_410("api.contracts.fill")
 
-    @app.post("/api/contracts/enqueue-update", response_class=JSONResponse)
     async def api_contracts_enqueue_update(request: Request) -> dict[str, Any]:
         """
         Enqueue an Update job (runs `ghtrader update ...`) to check remote contract updates.
@@ -1963,9 +1664,8 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = request
-        raise HTTPException(status_code=410, detail="contracts update endpoint removed in current PRD phase")
+        raise_removed_410("api.contracts.update")
 
-    @app.post("/api/contracts/enqueue-audit", response_class=JSONResponse)
     async def api_contracts_enqueue_audit(request: Request) -> dict[str, Any]:
         """
         Start per-contract audit jobs (ticks scope, symbol-filtered).
@@ -1975,7 +1675,7 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         _ = request
-        raise HTTPException(status_code=410, detail="contracts audit endpoint removed in current PRD phase")
+        raise_removed_410("api.contracts.audit")
 
     @app.post("/api/questdb/query", response_class=JSONResponse)
     async def api_questdb_query(request: Request) -> dict[str, Any]:
@@ -2213,7 +1913,6 @@ def create_app() -> Any:
             _ui_status_at = time.time()
         return payload
 
-    @app.get("/api/models/inventory", response_class=JSONResponse)
     def api_models_inventory(request: Request) -> dict[str, Any]:
         """
         List trained model artifacts from artifacts/ directory.
@@ -2268,7 +1967,6 @@ def create_app() -> Any:
 
         return {"ok": True, "models": models}
 
-    @app.get("/api/models/benchmarks", response_class=JSONResponse)
     def api_models_benchmarks(request: Request, limit: int = 20) -> dict[str, Any]:
         """
         List recent benchmark summaries from runs/benchmarks/**/<run_id>.json.
@@ -2399,7 +2097,6 @@ def create_app() -> Any:
         out = _read_jsonl_tail(path, max_lines=1)
         return out[-1] if out else None
 
-    @app.get("/api/accounts", response_class=JSONResponse)
     def api_accounts(request: Request) -> dict[str, Any]:
         """
         List broker account profiles (runs/control/accounts.env) + last verification + gateway/strategy summary.
@@ -2471,7 +2168,6 @@ def create_app() -> Any:
 
         return {"ok": True, "profiles": out_profiles, "generated_at": _now_iso()}
 
-    @app.post("/api/accounts/upsert", response_class=JSONResponse)
     async def api_accounts_upsert(request: Request) -> dict[str, Any]:
         """
         Upsert a broker account profile into runs/control/accounts.env.
@@ -2504,7 +2200,6 @@ def create_app() -> Any:
 
         return {"ok": True, "profile": _canonical_profile(profile)}
 
-    @app.post("/api/accounts/delete", response_class=JSONResponse)
     async def api_accounts_delete(request: Request) -> dict[str, Any]:
         """
         Delete a broker account profile from runs/control/accounts.env.
@@ -2536,7 +2231,6 @@ def create_app() -> Any:
 
         return {"ok": True, "profile": p}
 
-    @app.get("/api/brokers", response_class=JSONResponse)
     def api_brokers(request: Request) -> dict[str, Any]:
         """
         Return supported broker IDs for TqSdk (best-effort).
@@ -2550,7 +2244,6 @@ def create_app() -> Any:
         brokers, source = _get_supported_brokers(runs_dir=runs_dir)
         return {"ok": True, "brokers": brokers, "source": source, "generated_at": _now_iso()}
 
-    @app.post("/api/accounts/enqueue-verify", response_class=JSONResponse)
     async def api_accounts_enqueue_verify(request: Request) -> dict[str, Any]:
         """
         Enqueue a broker account verification job (runs `ghtrader account verify ...`).
@@ -2570,7 +2263,6 @@ def create_app() -> Any:
     # Gateway (AccountGateway; OMS/EMS per account profile)
     # ---------------------------------------------------------------------
 
-    @app.get("/api/gateway/status", response_class=JSONResponse)
     def api_gateway_status(request: Request, account_profile: str = "default") -> dict[str, Any]:
         """
         Read gateway state for a broker account profile (Redis hot state first, file mirror fallback).
@@ -2602,7 +2294,6 @@ def create_app() -> Any:
             "generated_at": _now_iso(),
         }
 
-    @app.get("/api/gateway/list", response_class=JSONResponse)
     def api_gateway_list(request: Request, limit: int = 200) -> dict[str, Any]:
         """
         List gateway profiles + summary state.
@@ -2638,7 +2329,6 @@ def create_app() -> Any:
 
         return {"ok": True, "profiles": rows, "generated_at": _now_iso()}
 
-    @app.post("/api/gateway/desired", response_class=JSONResponse)
     async def api_gateway_desired(request: Request) -> dict[str, Any]:
         """
         Upsert gateway desired.json for a profile.
@@ -2674,7 +2364,6 @@ def create_app() -> Any:
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"gateway_desired_failed: {e}")
 
-    @app.post("/api/gateway/command", response_class=JSONResponse)
     async def api_gateway_command(request: Request) -> dict[str, Any]:
         """
         Append an operator command (Redis stream primary; file mirror for audit).
@@ -3320,6 +3009,45 @@ def create_app() -> Any:
             "strategy_job": strategy_job,
             "generated_at": _now_iso(),
         }
+
+    # Continue route modularization: keep app.py as composition root.
+    app.include_router(
+        build_data_router(
+            data_coverage_handler=api_data_coverage,
+            data_coverage_summary_handler=api_data_coverage_summary,
+            data_quality_detail_handler=api_data_quality_detail,
+            data_diagnose_handler=api_data_enqueue_diagnose,
+            data_repair_handler=api_data_enqueue_repair,
+            data_health_handler=api_data_enqueue_health,
+            contracts_explorer_handler=api_contracts,
+            contracts_fill_handler=api_contracts_enqueue_fill,
+            contracts_update_handler=api_contracts_enqueue_update,
+            contracts_audit_handler=api_contracts_enqueue_audit,
+        )
+    )
+    app.include_router(
+        build_models_router(
+            models_inventory_handler=api_models_inventory,
+            models_benchmarks_handler=api_models_benchmarks,
+        )
+    )
+    app.include_router(
+        build_accounts_router(
+            accounts_handler=api_accounts,
+            accounts_upsert_handler=api_accounts_upsert,
+            accounts_delete_handler=api_accounts_delete,
+            brokers_handler=api_brokers,
+            accounts_enqueue_verify_handler=api_accounts_enqueue_verify,
+        )
+    )
+    app.include_router(
+        build_gateway_router(
+            gateway_status_handler=api_gateway_status,
+            gateway_list_handler=api_gateway_list,
+            gateway_desired_handler=api_gateway_desired,
+            gateway_command_handler=api_gateway_command,
+        )
+    )
 
     return app
 
