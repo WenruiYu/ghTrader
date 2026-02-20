@@ -12,9 +12,12 @@ import structlog
 from ghtrader.config import get_data_dir, get_runs_dir
 from ghtrader.data.exchange_events import ExchangeEvent, events_for_day, load_exchange_events
 from ghtrader.data.manifest import list_manifests, read_manifest
+from ghtrader.data.main_l5_validation_builders import build_day_validation_artifacts
+from ghtrader.data.main_l5_validation_stats import compute_day_gap_stats
+from ghtrader.data.main_l5_validation_tqsdk import verify_missing_segments_with_tqsdk
 from ghtrader.data.trading_sessions import read_trading_sessions_cache
 from ghtrader.data.trading_calendar import get_holidays
-from ghtrader.questdb.client import connect_pg, make_questdb_query_config_from_env
+from ghtrader.questdb.client import make_questdb_query_config_from_env
 from ghtrader.questdb.main_l5_validate import (
     MainL5ValidateGapRow,
     MainL5ValidateSummaryRow,
@@ -26,11 +29,15 @@ from ghtrader.questdb.main_l5_validate import (
     upsert_main_l5_tick_gaps_from_validate_summary,
     upsert_main_l5_validate_summary_rows,
 )
+from ghtrader.questdb.main_l5_validation_queries import (
+    fetch_day_second_stats as _fetch_day_second_stats,
+    fetch_per_second_counts as _fetch_per_second_counts,
+    get_last_validated_day,
+)
 from ghtrader.questdb.main_schedule import fetch_schedule
 from ghtrader.questdb.queries import query_symbol_day_bounds
-from ghtrader.tq.runtime import trading_day_from_ts_ns
+from ghtrader.tq.runtime import create_tq_data_api, trading_day_from_ts_ns
 from ghtrader.util.json_io import read_json, write_json_atomic
-from ghtrader.util.l5_detection import l5_mask_df, l5_sql_condition
 
 log = structlog.get_logger()
 
@@ -252,95 +259,6 @@ def _load_latest_manifest(*, data_dir: Path, derived_symbol: str) -> dict[str, A
     return None
 
 
-def _fetch_day_second_stats(
-    *,
-    cfg: Any,
-    symbol: str,
-    start_day: date,
-    end_day: date,
-    l5_only: bool = True,
-) -> dict[date, dict[str, int]]:
-    l5_cond = l5_sql_condition() if l5_only else ""
-    l5_where = f" AND {l5_cond} " if l5_cond else " "
-    sql = (
-        "WITH per_sec AS ("
-        "  SELECT cast(trading_day as string) AS trading_day, "
-        "         cast(datetime_ns/1000000000 as long) AS sec, "
-        "         count() AS n "
-        "  FROM ghtrader_ticks_main_l5_v2 "
-        f"  WHERE symbol=%s AND ticks_kind='main_l5' AND dataset_version='v2'{l5_where}"
-        "    AND cast(trading_day as string) >= %s AND cast(trading_day as string) <= %s "
-        "  GROUP BY trading_day, sec"
-        ") "
-        "SELECT trading_day, "
-        "       count() AS seconds_with_ticks, "
-        "       sum(case when n=1 then 1 else 0 end) AS seconds_with_one, "
-        "       sum(case when n>=2 then 1 else 0 end) AS seconds_with_two_plus "
-        "FROM per_sec GROUP BY trading_day"
-    )
-    out: dict[date, dict[str, int]] = {}
-    with connect_pg(cfg, connect_timeout_s=2) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, [str(symbol).strip(), start_day.isoformat(), end_day.isoformat()])
-            for row in cur.fetchall():
-                try:
-                    td = date.fromisoformat(str(row[0]))
-                except Exception:
-                    continue
-                out[td] = {
-                    "seconds_with_ticks": int(row[1] or 0),
-                    "seconds_with_one": int(row[2] or 0),
-                    "seconds_with_two_plus": int(row[3] or 0),
-                }
-    return out
-
-
-def _fetch_per_second_counts(
-    *,
-    cfg: Any,
-    symbol: str,
-    trading_day: date,
-    l5_only: bool = True,
-) -> dict[int, int]:
-    l5_cond = l5_sql_condition() if l5_only else ""
-    l5_where = f" AND {l5_cond} " if l5_cond else " "
-    sql = (
-        "SELECT cast(datetime_ns/1000000000 as long) AS sec, count() AS n "
-        "FROM ghtrader_ticks_main_l5_v2 "
-        f"WHERE symbol=%s AND ticks_kind='main_l5' AND dataset_version='v2'{l5_where}AND trading_day=%s "
-        "GROUP BY sec"
-    )
-    out: dict[int, int] = {}
-    with connect_pg(cfg, connect_timeout_s=2) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, [str(symbol).strip(), trading_day.isoformat()])
-            for sec, n in cur.fetchall():
-                if sec is None:
-                    continue
-                out[int(sec)] = int(n or 0)
-    return out
-
-
-def get_last_validated_day(
-    *,
-    cfg: Any,
-    symbol: str,
-    table: str = "ghtrader_main_l5_validate_summary_v2",
-) -> date | None:
-    """Get the last validated trading day for a symbol from QuestDB."""
-    sql = f"SELECT max(cast(trading_day as string)) FROM {table} WHERE symbol=%s"
-    with connect_pg(cfg, connect_timeout_s=2) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, [str(symbol).strip()])
-            row = cur.fetchone()
-            if row and row[0]:
-                try:
-                    return date.fromisoformat(str(row[0]))
-                except Exception:
-                    pass
-    return None
-
-
 def validate_main_l5(
     *,
     exchange: str,
@@ -532,10 +450,7 @@ def validate_main_l5(
     tqsdk_error = ""
     if tqsdk_check:
         try:
-            from tqsdk import TqApi  # type: ignore
-            from ghtrader.config import get_tqsdk_auth
-
-            tqsdk_api = TqApi(auth=get_tqsdk_auth(), disable_print=True)
+            tqsdk_api = create_tq_data_api(disable_print=True)
         except Exception as e:
             tqsdk_api = None
             tqsdk_error = str(e)
@@ -599,8 +514,6 @@ def validate_main_l5(
 
     last_progress_ts = time.time()
 
-    from bisect import bisect_left, bisect_right
-
     prev_trading_day: dict[date, date] = {}
     for i, d in enumerate(schedule_days):
         if i > 0:
@@ -634,251 +547,113 @@ def validate_main_l5(
         )
         day_cadence = "fixed_0p5s" if two_plus_ratio_day >= float(strict_ratio) else "event"
 
-        sec_counts = _fetch_per_second_counts(cfg=cfg, symbol=ds, trading_day=day, l5_only=True) if seconds_with_ticks_day > 0 else {}
-        secs_sorted = sorted(sec_counts.keys())
-        session_end_sec = max((int(it["end_sec"]) for it in intervals), default=None)
-        last_tick_sec = None
-        if secs_sorted and session_end_sec is not None:
-            for sec in reversed(secs_sorted):
-                for it in intervals:
-                    if int(it["start_sec"]) <= sec <= int(it["end_sec"]):
-                        last_tick_sec = sec
-                        break
-                if last_tick_sec is not None:
-                    break
-        session_end_lag_s = None
-        if session_end_sec is not None and last_tick_sec is not None:
-            session_end_lag_s = int(max(0, int(session_end_sec) - int(last_tick_sec)))
+        sec_counts = (
+            _fetch_per_second_counts(cfg=cfg, symbol=ds, trading_day=day, l5_only=True)
+            if seconds_with_ticks_day > 0
+            else {}
+        )
+        day_calc = compute_day_gap_stats(
+            intervals=intervals,
+            sec_counts=sec_counts,
+            day_cadence=day_cadence,
+            gap_threshold_s=float(gap_threshold_s),
+            gap_bucket_defs=gap_bucket_defs,
+            max_segments_per_day=max_segments_per_day,
+            sec_to_iso=_sec_to_iso,
+        )
+
+        session_end_sec = day_calc.session_end_sec
+        last_tick_sec = day_calc.last_tick_sec
+        session_end_lag_s = day_calc.session_end_lag_s
+        if session_end_lag_s is not None:
             session_end_lags.append(session_end_lag_s)
 
-        expected_seconds = 0
-        expected_seconds_strict = 0
-        boundary_seconds: set[int] = set()
-        for it in intervals:
-            start_sec = int(it["start_sec"])
-            end_sec = int(it["end_sec"])
-            if end_sec < start_sec:
-                continue
-            expected_seconds += int(end_sec - start_sec + 1)
-            boundary_seconds.add(start_sec)
-            boundary_seconds.add(end_sec)
-            eff_start = start_sec + 1
-            eff_end = end_sec - 1
-            if eff_end >= eff_start:
-                expected_seconds_strict += int(eff_end - eff_start + 1)
-
-        observed_in_sessions = 0
-        observed_outside_sessions = 0
-        seconds_with_one = 0
-        seconds_with_two_plus = 0
-        interval_idx = 0
-        for sec in secs_sorted:
-            while interval_idx < len(intervals) and sec > int(intervals[interval_idx]["end_sec"]):
-                interval_idx += 1
-            if interval_idx < len(intervals):
-                start_sec = int(intervals[interval_idx]["start_sec"])
-                end_sec = int(intervals[interval_idx]["end_sec"])
-                if start_sec <= sec <= end_sec:
-                    observed_in_sessions += 1
-                    if sec not in boundary_seconds:
-                        n = sec_counts.get(sec, 0)
-                        if n == 1:
-                            seconds_with_one += 1
-                        elif n >= 2:
-                            seconds_with_two_plus += 1
-                else:
-                    observed_outside_sessions += 1
-            else:
-                observed_outside_sessions += 1
-
-        missing_day = bool(observed_in_sessions == 0 and expected_seconds > 0)
+        expected_seconds = int(day_calc.expected_seconds)
+        expected_seconds_strict = int(day_calc.expected_seconds_strict)
+        observed_in_sessions = int(day_calc.observed_in_sessions)
+        observed_outside_sessions = int(day_calc.observed_outside_sessions)
+        seconds_with_one = int(day_calc.seconds_with_one)
+        seconds_with_two_plus = int(day_calc.seconds_with_two_plus)
+        missing_day = bool(day_calc.missing_day)
         if missing_day:
             missing_days.append(day.isoformat())
 
-        day_missing_segments: list[dict[str, Any]] = []
-        day_missing_seconds = 0
-        day_missing_half_seconds = 0
-        day_boundary_missing = 0
-        day_segments_total = 0
-        max_gap_day = 0
-        observed_segments_day = 0
-        day_gap_buckets: dict[str, int] = {label: 0 for label, _, _ in gap_bucket_defs}
-        day_gap_buckets_by_session: dict[str, dict[str, int]] = {}
-        day_gap_count_gt_30 = 0
+        day_missing_segments = list(day_calc.day_missing_segments)
+        day_missing_seconds = int(day_calc.day_missing_seconds)
+        day_missing_half_seconds = int(day_calc.day_missing_half_seconds)
+        day_boundary_missing = int(day_calc.day_boundary_missing)
+        day_segments_total = int(day_calc.day_segments_total)
+        max_gap_day = int(day_calc.max_gap_day)
+        observed_segments_day = int(day_calc.observed_segments_day)
+        day_gap_buckets = dict(day_calc.day_gap_buckets)
+        day_gap_buckets_by_session = dict(day_calc.day_gap_buckets_by_session)
+        day_gap_count_gt_30 = int(day_calc.day_gap_count_gt_30)
 
-        def record_gap(*, sess: str, gap_start: int, gap_end: int) -> None:
-            nonlocal day_segments_total, max_gap_day, day_gap_count_gt_30, gap_count_gt_30_total
-            if gap_end < gap_start:
-                return
-            duration = int(gap_end - gap_start + 1)
-            max_gap_day = max(max_gap_day, duration)
-            if duration >= gap_threshold_s:
-                day_segments_total += 1
-                bucket_label = None
-                for label, start_s, end_s in gap_bucket_defs:
-                    if duration >= int(start_s) and (end_s is None or duration <= int(end_s)):
-                        bucket_label = label
-                        break
-                if bucket_label:
-                    day_gap_buckets[bucket_label] = int(day_gap_buckets.get(bucket_label, 0)) + 1
-                    gap_bucket_totals[bucket_label] = int(gap_bucket_totals.get(bucket_label, 0)) + 1
-                    if sess:
-                        sess_key = str(sess)
-                        if sess_key not in day_gap_buckets_by_session:
-                            day_gap_buckets_by_session[sess_key] = {label: 0 for label, _, _ in gap_bucket_defs}
-                        if sess_key not in gap_bucket_totals_by_session:
-                            gap_bucket_totals_by_session[sess_key] = {label: 0 for label, _, _ in gap_bucket_defs}
-                        day_gap_buckets_by_session[sess_key][bucket_label] += 1
-                        gap_bucket_totals_by_session[sess_key][bucket_label] += 1
-                if duration > 30:
-                    day_gap_count_gt_30 += 1
-                    gap_count_gt_30_total += 1
-                if len(day_missing_segments) < max_segments_per_day:
-                    day_missing_segments.append(
-                        {
-                            "session": sess,
-                            "start_ts": _sec_to_iso(gap_start),
-                            "end_ts": _sec_to_iso(gap_end),
-                            "duration_s": duration,
-                            "tqsdk_status": "unchecked",
-                        }
-                    )
-
-        for it in intervals:
-            sess = str(it.get("session") or "")
-            start_sec = int(it["start_sec"])
-            end_sec = int(it["end_sec"])
-            if sec_counts.get(start_sec, 0) == 0:
-                day_boundary_missing += 1
-            if sec_counts.get(end_sec, 0) == 0:
-                day_boundary_missing += 1
-            eff_start = start_sec + 1
-            eff_end = end_sec - 1
-            if eff_end < eff_start:
-                continue
-            left = bisect_left(secs_sorted, eff_start)
-            right = bisect_right(secs_sorted, eff_end)
-            secs_eff = secs_sorted[left:right]
-            day_missing_seconds += int((eff_end - eff_start + 1) - len(secs_eff))
-            if day_cadence == "fixed_0p5s":
-                secs_two_plus = sum(1 for s in secs_eff if sec_counts.get(s, 0) >= 2)
-                day_missing_half_seconds += int((eff_end - eff_start + 1) - secs_two_plus)
-
-            if not secs_eff:
-                record_gap(sess=sess, gap_start=eff_start, gap_end=eff_end)
-                continue
-
-            observed_segments_session = 1
-            if secs_eff[0] > eff_start:
-                record_gap(sess=sess, gap_start=eff_start, gap_end=secs_eff[0] - 1)
-            for a, b in zip(secs_eff, secs_eff[1:]):
-                if b - a > 1:
-                    gap_len = int(b - a - 1)
-                    if gap_len >= gap_threshold_s:
-                        observed_segments_session += 1
-                    record_gap(sess=sess, gap_start=a + 1, gap_end=b - 1)
-            if secs_eff[-1] < eff_end:
-                record_gap(sess=sess, gap_start=secs_eff[-1] + 1, gap_end=eff_end)
-            observed_segments_day += int(observed_segments_session)
+        for label, delta in day_calc.gap_bucket_totals_delta.items():
+            gap_bucket_totals[label] = int(gap_bucket_totals.get(label, 0)) + int(delta)
+        for sess_key, buckets in day_calc.gap_bucket_totals_by_session_delta.items():
+            if sess_key not in gap_bucket_totals_by_session:
+                gap_bucket_totals_by_session[sess_key] = {label: 0 for label, _, _ in gap_bucket_defs}
+            for label, delta in buckets.items():
+                gap_bucket_totals_by_session[sess_key][label] = (
+                    int(gap_bucket_totals_by_session[sess_key].get(label, 0)) + int(delta)
+                )
+        gap_count_gt_30_total += int(day_calc.gap_count_gt_30_total_delta)
 
         if tqsdk_api is not None and tqsdk_check and day_segments_total > 0 and tqsdk_checked_days < tqsdk_check_max_days:
-            try:
-                df = tqsdk_api.get_tick_data_series(
-                    symbol=contract or ds, start_dt=day, end_dt=day + timedelta(days=1)
-                )
-                if df is None or df.empty:
-                    for seg in day_missing_segments[:tqsdk_check_max_segments]:
-                        seg["tqsdk_status"] = "provider_missing"
-                    checked_n = int(min(len(day_missing_segments), tqsdk_check_max_segments))
-                    tqsdk_missing_segments += checked_n
-                    tqsdk_checked_segments += checked_n
-                else:
-                    try:
-                        mask = l5_mask_df(df)
-                    except Exception:
-                        mask = None
-                    if mask is not None:
-                        df = df.loc[mask].copy()
-                    try:
-                        import pandas as pd
-
-                        tick_ns_tq = (
-                            pd.to_numeric(df.get("datetime"), errors="coerce")
-                            .dropna()
-                            .astype("int64")
-                            .tolist()
-                        )
-                    except Exception:
-                        tick_ns_tq = [int(x) for x in (df.get("datetime") if df is not None else []) if x is not None]
-                    tick_ns_tq.sort()
-                    from bisect import bisect_left
-
-                    checked = 0
-                    for seg in day_missing_segments:
-                        if checked >= tqsdk_check_max_segments:
-                            break
-                        start_sec = int(datetime.fromisoformat(str(seg["start_ts"])).timestamp())
-                        end_sec = int(datetime.fromisoformat(str(seg["end_ts"])).timestamp())
-                        start_ns = int(start_sec * 1_000_000_000)
-                        end_ns = int((end_sec + 1) * 1_000_000_000 - 1)
-                        j = bisect_left(tick_ns_tq, start_ns)
-                        has_data = bool(j < len(tick_ns_tq) and tick_ns_tq[j] <= end_ns)
-                        seg["tqsdk_status"] = "provider_has_data" if has_data else "provider_missing"
-                        checked += 1
-                        if has_data:
-                            tqsdk_present_segments += 1
-                        else:
-                            tqsdk_missing_segments += 1
-                    tqsdk_checked_segments += int(checked)
-                tqsdk_checked_days += 1
-            except Exception as e:
-                tqsdk_check_errors += 1
+            tqsdk_out = verify_missing_segments_with_tqsdk(
+                tqsdk_api=tqsdk_api,
+                symbol=(contract or ds),
+                day=day,
+                day_missing_segments=day_missing_segments,
+                tqsdk_check_max_segments=tqsdk_check_max_segments,
+            )
+            tqsdk_checked_days += int(tqsdk_out.get("checked_days") or 0)
+            tqsdk_checked_segments += int(tqsdk_out.get("checked_segments") or 0)
+            tqsdk_missing_segments += int(tqsdk_out.get("provider_missing_segments") or 0)
+            tqsdk_present_segments += int(tqsdk_out.get("provider_has_data_segments") or 0)
+            err_count = int(tqsdk_out.get("errors") or 0)
+            if err_count > 0:
+                tqsdk_check_errors += int(err_count)
                 log.warning(
                     "main_l5_validate.tqsdk_check_failed",
                     trading_day=day.isoformat(),
-                    error=str(e),
+                    error=str(tqsdk_out.get("error") or "unknown"),
                 )
 
-        manifest_rows = None
-        manifest_inference = "unknown"
-        if row_counts:
-            manifest_rows = row_counts.get(day.isoformat())
-            if manifest_rows == 0:
-                manifest_inference = "provider_empty_day"
-            elif manifest_rows is not None:
-                manifest_inference = "unknown_partial"
-
-        day_out = {
-            "trading_day": day.isoformat(),
-            "underlying_contract": contract,
-            "cadence_mode": day_cadence,
-            "two_plus_ratio": two_plus_ratio_day,
-            "expected_seconds": int(expected_seconds),
-            "expected_seconds_strict": int(expected_seconds_strict),
-            "observed_seconds": int(observed_in_sessions),
-            "seconds_with_one_tick": int(seconds_with_one),
-            "seconds_with_two_plus": int(seconds_with_two_plus),
-            "ticks_outside_sessions_seconds": int(observed_outside_sessions),
-            "last_tick_ts": (_sec_to_iso(last_tick_sec) if last_tick_sec is not None else None),
-            "session_end_ts": (_sec_to_iso(session_end_sec) if session_end_sec is not None else None),
-            "session_end_lag_s": session_end_lag_s,
-            "missing_seconds": int(day_missing_seconds),
-            "missing_half_seconds": int(day_missing_half_seconds),
-            "boundary_missing_seconds": int(day_boundary_missing),
-            "missing_segments_total": int(day_segments_total),
-            "missing_segments": day_missing_segments,
-            "missing_segments_truncated": bool(day_segments_total > len(day_missing_segments)),
-            "missing_seconds_ratio": (float(day_missing_seconds) / float(expected_seconds) if expected_seconds > 0 else 0.0),
-            "gap_buckets": day_gap_buckets,
-            "gap_buckets_by_session": day_gap_buckets_by_session,
-            "gap_count_gt_30s": int(day_gap_count_gt_30),
-            "manifest_rows": manifest_rows,
-            "tqsdk_inference": manifest_inference,
-        }
-        day_out["_has_gap"] = bool(day_segments_total > 0)
-        day_out["_has_half"] = bool(day_missing_half_seconds > 0 and day_cadence == "fixed_0p5s")
-        day_out["_has_outside"] = bool(observed_outside_sessions > 0)
-        day_out["_has_missing_day"] = bool(missing_day)
+        day_out, summary_row, day_gap_rows = build_day_validation_artifacts(
+            symbol=ds,
+            trading_day=day,
+            underlying_contract=contract,
+            cadence_mode=day_cadence,
+            two_plus_ratio=two_plus_ratio_day,
+            expected_seconds=expected_seconds,
+            expected_seconds_strict=expected_seconds_strict,
+            observed_seconds_in_sessions=observed_in_sessions,
+            seconds_with_one_tick=seconds_with_one,
+            seconds_with_two_plus=seconds_with_two_plus,
+            summary_seconds_with_ticks=seconds_with_ticks_day,
+            summary_seconds_with_two_plus=seconds_with_two_plus_day,
+            ticks_outside_sessions_seconds=observed_outside_sessions,
+            last_tick_sec=last_tick_sec,
+            session_end_sec=session_end_sec,
+            session_end_lag_s=session_end_lag_s,
+            missing_seconds=day_missing_seconds,
+            missing_half_seconds=day_missing_half_seconds,
+            boundary_missing_seconds=day_boundary_missing,
+            missing_segments_total=day_segments_total,
+            missing_segments=day_missing_segments,
+            gap_buckets=day_gap_buckets,
+            gap_buckets_by_session=day_gap_buckets_by_session,
+            gap_count_gt_30s=day_gap_count_gt_30,
+            missing_day=missing_day,
+            observed_segments=observed_segments_day,
+            max_gap_s=max_gap_day,
+            gap_threshold_s=gap_threshold_s,
+            schedule_hash=schedule_hash,
+            row_counts=row_counts,
+            sec_to_iso=_sec_to_iso,
+        )
         days_all.append(day_out)
 
         missing_segments_total += int(day_segments_total)
@@ -892,58 +667,10 @@ def validate_main_l5(
         max_gap_s = max(max_gap_s, int(max_gap_day))
         expected_seconds_total += int(expected_seconds)
         expected_seconds_strict_total += int(expected_seconds_strict)
-        total_segments_day = int(observed_segments_day + day_segments_total)
+        total_segments_day = int(summary_row.total_segments)
         total_segments_total += int(total_segments_day)
-        summary_rows.append(
-            MainL5ValidateSummaryRow(
-                symbol=ds,
-                trading_day=day.isoformat(),
-                cadence_mode=day_cadence,
-                expected_seconds=int(expected_seconds),
-                expected_seconds_strict=int(expected_seconds_strict),
-                seconds_with_ticks=int(seconds_with_ticks_day),
-                seconds_with_two_plus=int(seconds_with_two_plus_day),
-                two_plus_ratio=float(two_plus_ratio_day),
-                observed_segments=int(observed_segments_day),
-                total_segments=int(total_segments_day),
-                missing_day=int(missing_day),
-                missing_segments=int(day_segments_total),
-                missing_seconds=int(day_missing_seconds),
-                missing_seconds_ratio=(
-                    float(day_missing_seconds) / float(expected_seconds) if expected_seconds > 0 else 0.0
-                ),
-                gap_bucket_2_5=int(day_gap_buckets.get("2_5") or 0),
-                gap_bucket_6_15=int(day_gap_buckets.get("6_15") or 0),
-                gap_bucket_16_30=int(day_gap_buckets.get("16_30") or 0),
-                gap_bucket_gt_30=int(day_gap_buckets.get("gt_30") or 0),
-                gap_count_gt_30=int(day_gap_count_gt_30),
-                missing_half_seconds=int(day_missing_half_seconds if day_cadence == "fixed_0p5s" else 0),
-                last_tick_ts=(
-                    datetime.fromtimestamp(float(last_tick_sec), tz=timezone.utc) if last_tick_sec is not None else None
-                ),
-                session_end_lag_s=int(session_end_lag_s) if session_end_lag_s is not None else None,
-                max_gap_s=int(max_gap_day),
-                gap_threshold_s=float(gap_threshold_s),
-                schedule_hash=str(schedule_hash),
-            )
-        )
-
-        for seg in day_missing_segments:
-            try:
-                gap_rows.append(
-                    MainL5ValidateGapRow(
-                        symbol=ds,
-                        trading_day=day.isoformat(),
-                        session=str(seg.get("session") or ""),
-                        start_ts=datetime.fromisoformat(str(seg.get("start_ts"))),
-                        end_ts=datetime.fromisoformat(str(seg.get("end_ts"))),
-                        duration_s=int(seg.get("duration_s") or 0),
-                        tqsdk_status=str(seg.get("tqsdk_status") or ""),
-                        schedule_hash=str(schedule_hash),
-                    )
-                )
-            except Exception:
-                continue
+        summary_rows.append(summary_row)
+        gap_rows.extend(day_gap_rows)
 
         if idx == 1 or idx == len(schedule_days) or idx % progress_every_n == 0 or (time.time() - last_progress_ts) >= progress_every_s:
             log.info(

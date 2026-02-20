@@ -885,9 +885,7 @@ def build_router() -> Any:
         data_dir = Path(str(form.get("data_dir") or "data"))
 
         # Build argv for a known-safe set of job types (no shell).
-        if job_type == "download_contract_range":
-            raise_removed_410("jobs.download_contract_range")
-        elif job_type == "build":
+        if job_type == "build":
             symbol = symbol_or_var
             if not symbol:
                 raise HTTPException(status_code=400, detail="symbol_or_var must be a symbol for build")

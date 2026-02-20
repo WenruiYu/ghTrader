@@ -231,6 +231,21 @@ def create_tq_api(*, account: Any, web_gui: bool | str = False) -> Any:
     return TqApi(account=account, auth=auth, web_gui=web_gui)
 
 
+def create_tq_data_api(*, disable_print: bool = True) -> Any:
+    """
+    Create a TqApi instance for data probing (no account/session binding).
+
+    Direct `tqsdk` imports stay isolated in `ghtrader.tq.*` per PRD §5.1.3.
+    """
+    try:
+        from tqsdk import TqApi  # type: ignore
+    except Exception as e:
+        raise RuntimeError("tqsdk not installed. Install with: pip install tqsdk") from e
+
+    auth = get_tqsdk_auth()
+    return TqApi(auth=auth, disable_print=bool(disable_print))
+
+
 from ghtrader.util.safe_parse import safe_float as _safe_float
 
 

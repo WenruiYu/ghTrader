@@ -5,7 +5,7 @@
 - **Product**: ghTrader (research-only AI-centric SHFE tick system)
 - **Scope**: SHFE CU/AU/AG directional micro-alpha research at tick/HFT granularity
 - **Status**: Active (canonical)
-- **Last updated**: 2026-01-16
+- **Last updated**: 2026-02-21
 - **Owner**: ghTrader maintainers
 
 ---
@@ -2211,6 +2211,13 @@ Database administration commands:
 ### 10.4 Engineering Priorities
 
 **Core Infrastructure**:
+- Enforce PRD §5.1.3 boundary hardening: remove non-`tq/` direct `tqsdk` imports and add guard checks.
+- Continue control-plane modularization: extract account-env/cache/supervisor helper logic from `control/app.py` while preserving API behavior.
+- Continue control-plane modularization (next wave): extract supervisor tick/start-loop logic into dedicated control modules, keeping API contracts unchanged.
+- Start data validation modularization (Wave-B2): move `main_l5_validation` QuestDB query/stat helpers into `questdb/` while keeping `data/` as orchestration layer.
+- Continue data validation modularization (Wave-B2 next): extract per-day gap/bucket computation from `main_l5_validation` into reusable data helpers.
+- Continue data validation modularization (Wave-B2 next): extract `tqsdk` gap-segment verification into dedicated helpers while preserving report fields and counters.
+- Continue data validation modularization (Wave-B2 next): extract day artifact builders (`day_out`/summary/gap rows) into reusable helpers to keep validation function orchestration-only.
 - Add minimal coverage gate to CI
 - Add integration tests that validate short TqSdk download using `.env` (optional)
 - Harden dataset building for large-scale multi-day ingestion

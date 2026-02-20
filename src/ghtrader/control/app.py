@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 import threading
 import time
 import json
@@ -23,6 +22,41 @@ from ghtrader.control import auth
 from ghtrader.control.db import JobStore
 from ghtrader.control.job_command import extract_cli_subcommand, extract_cli_subcommands
 from ghtrader.control.jobs import JobManager, JobSpec, python_module_argv
+from ghtrader.control.accounts_env import (
+    accounts_env_delete_profile as _accounts_env_delete_profile,
+    accounts_env_get_profile_values as _accounts_env_get_profile_values,
+    accounts_env_is_configured as _accounts_env_is_configured,
+    accounts_env_upsert_profile as _accounts_env_upsert_profile,
+    canonical_profile as _canonical_profile,
+    parse_profiles_csv as _parse_profiles_csv,
+    read_accounts_env_values as _read_accounts_env_values,
+)
+from ghtrader.control.brokers import get_supported_brokers as _get_supported_brokers
+from ghtrader.control.state_helpers import (
+    artifact_age_sec as _artifact_age_sec,
+    health_error as _health_error,
+    read_json_file as _read_json_file,
+    read_jsonl_tail as _read_jsonl_tail,
+    read_last_jsonl_obj as _read_last_jsonl_obj,
+    read_redis_json as _read_redis_json,
+    status_from_desired_and_state as _status_from_desired_and_state,
+)
+from ghtrader.control.supervisor_helpers import (
+    argv_opt as _argv_opt,
+    is_gateway_job as _is_gateway_job,
+    is_strategy_job as _is_strategy_job,
+)
+from ghtrader.control.supervisors import (
+    gateway_supervisor_enabled as _gateway_supervisor_enabled_impl,
+    gateway_supervisor_tick as _gateway_supervisor_tick_impl,
+    scheduler_enabled as _scheduler_enabled_impl,
+    start_gateway_supervisor as _start_gateway_supervisor_impl,
+    start_strategy_supervisor as _start_strategy_supervisor_impl,
+    start_tqsdk_scheduler as _start_tqsdk_scheduler_impl,
+    strategy_supervisor_enabled as _strategy_supervisor_enabled_impl,
+    strategy_supervisor_tick as _strategy_supervisor_tick_impl,
+    tqsdk_scheduler_tick as _tqsdk_scheduler_tick_impl,
+)
 from ghtrader.control.removed_endpoints import raise_removed_410
 from ghtrader.control.routes.accounts import build_accounts_router
 from ghtrader.control.routes.data import build_data_router
@@ -30,11 +64,11 @@ from ghtrader.control.routes.gateway import build_gateway_router
 from ghtrader.control.routes.models import build_models_router
 from ghtrader.control.routes import build_api_router, build_root_router
 from ghtrader.control.views import build_router
-from ghtrader.util.json_io import read_json as _read_json, write_json_atomic as _write_json_atomic
+from ghtrader.util.json_io import read_json as _read_json
 
 log = structlog.get_logger()
 
-_TQSDK_HEAVY_SUBCOMMANDS = {"download", "download-contract-range", "record", "update", "account"}
+_TQSDK_HEAVY_SUBCOMMANDS = {"account"}
 _TQSDK_HEAVY_DATA_SUBCOMMANDS = {"repair", "health", "main-l5-validate"}
 
 _UI_STATUS_TTL_S = 5.0
@@ -169,334 +203,24 @@ def _is_tqsdk_heavy_job(argv: list[str]) -> bool:
 
 
 def _scheduler_enabled() -> bool:
-    if str(os.environ.get("GHTRADER_DISABLE_TQSDK_SCHEDULER", "")).strip().lower() in {"1", "true", "yes"}:
-        return False
-    # Avoid background threads during pytest unless explicitly enabled.
-    if ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")) and str(
-        os.environ.get("GHTRADER_ENABLE_TQSDK_SCHEDULER_IN_TESTS", "")
-    ).strip().lower() not in {"1", "true", "yes"}:
-        return False
-    return True
-
-
-def _accounts_env_path(*, runs_dir: Path) -> Path:
-    return runs_dir / "control" / "accounts.env"
-
-
-def _read_accounts_env_values(*, runs_dir: Path) -> dict[str, str]:
-    path = _accounts_env_path(runs_dir=runs_dir)
-    if not path.exists():
-        return {}
-    try:
-        from dotenv import dotenv_values
-
-        raw = dotenv_values(path)
-        out: dict[str, str] = {}
-        for k, v in raw.items():
-            if not k:
-                continue
-            out[str(k)] = "" if v is None else str(v)
-        return out
-    except Exception:
-        # Fall back to an empty mapping; callers should handle "no accounts" gracefully.
-        return {}
-
-
-def _dotenv_quote(value: str) -> str:
-    v = str(value or "")
-    v = v.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "\\r").replace("\n", "\\n")
-    return f'"{v}"'
-
-
-def _write_accounts_env_atomic(*, runs_dir: Path, env: dict[str, str]) -> None:
-    path = _accounts_env_path(runs_dir=runs_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    header = [
-        "# ghTrader dashboard-managed broker accounts",
-        "# WARNING: contains secrets. Do not commit.",
-        "",
-    ]
-
-    # Deterministic-ish ordering for readability.
-    keys: list[str] = []
-    if "GHTRADER_TQ_ACCOUNT_PROFILES" in env:
-        keys.append("GHTRADER_TQ_ACCOUNT_PROFILES")
-    for k in ["TQ_BROKER_ID", "TQ_ACCOUNT_ID", "TQ_ACCOUNT_PASSWORD"]:
-        if k in env:
-            keys.append(k)
-    for k in sorted([k for k in env.keys() if k not in set(keys)]):
-        keys.append(k)
-
-    lines: list[str] = []
-    lines.extend(header)
-    for k in keys:
-        kk = str(k).strip()
-        if not kk:
-            continue
-        vv = env.get(k, "")
-        lines.append(f"{kk}={_dotenv_quote(vv)}")
-    lines.append("")  # trailing newline
-    content = "\n".join(lines)
-
-    tmp = path.with_suffix(f".tmp-{uuid.uuid4().hex}")
-    tmp.write_text(content, encoding="utf-8")
-    try:
-        tmp.chmod(0o600)
-    except Exception:
-        pass
-    tmp.replace(path)
-    try:
-        path.chmod(0o600)
-    except Exception:
-        pass
-
-
-def _canonical_profile(p: str) -> str:
-    try:
-        from ghtrader.tq.runtime import canonical_account_profile
-
-        return canonical_account_profile(p)
-    except Exception:
-        return str(p or "").strip().lower() or "default"
-
-
-def _profile_env_suffixes(profile: str) -> list[str]:
-    p = _canonical_profile(profile)
-    if p == "default":
-        return [""]
-    up = "".join([ch.upper() if ch.isalnum() else "_" for ch in p]).strip("_")
-    lo = "".join([ch.lower() if ch.isalnum() else "_" for ch in p]).strip("_")
-    out: list[str] = []
-    for s in [up, lo]:
-        if s and s not in out:
-            out.append(s)
-    return out
-
-
-def _parse_profiles_csv(raw: str) -> list[str]:
-    out: list[str] = []
-    for part in [p.strip() for p in str(raw or "").split(",") if p.strip()]:
-        p = _canonical_profile(part)
-        if p and p != "default" and p not in out:
-            out.append(p)
-    return out
-
-
-def _set_profiles_csv(env: dict[str, str], profiles: list[str]) -> None:
-    ps = [p for p in profiles if p and p != "default"]
-    if ps:
-        env["GHTRADER_TQ_ACCOUNT_PROFILES"] = ",".join(ps)
-    else:
-        env.pop("GHTRADER_TQ_ACCOUNT_PROFILES", None)
-
-
-def _accounts_env_upsert_profile(
-    *,
-    runs_dir: Path,
-    profile: str,
-    broker_id: str,
-    account_id: str,
-    password: str,
-) -> None:
-    p = _canonical_profile(profile)
-    env = _read_accounts_env_values(runs_dir=runs_dir)
-
-    # Maintain profile registry (excluding default).
-    profiles = _parse_profiles_csv(env.get("GHTRADER_TQ_ACCOUNT_PROFILES", ""))
-    if p != "default" and p not in profiles:
-        profiles.append(p)
-    _set_profiles_csv(env, profiles)
-
-    b = str(broker_id or "").strip()
-    a = str(account_id or "").strip()
-    pw = str(password or "").strip()
-
-    if p == "default":
-        env["TQ_BROKER_ID"] = b
-        env["TQ_ACCOUNT_ID"] = a
-        env["TQ_ACCOUNT_PASSWORD"] = pw
-    else:
-        suf = _profile_env_suffixes(p)[0]  # uppercase preferred
-        env[f"TQ_BROKER_ID_{suf}"] = b
-        env[f"TQ_ACCOUNT_ID_{suf}"] = a
-        env[f"TQ_ACCOUNT_PASSWORD_{suf}"] = pw
-
-    _write_accounts_env_atomic(runs_dir=runs_dir, env=env)
-
-
-def _accounts_env_delete_profile(*, runs_dir: Path, profile: str) -> None:
-    p = _canonical_profile(profile)
-    env = _read_accounts_env_values(runs_dir=runs_dir)
-
-    if p == "default":
-        env.pop("TQ_BROKER_ID", None)
-        env.pop("TQ_ACCOUNT_ID", None)
-        env.pop("TQ_ACCOUNT_PASSWORD", None)
-    else:
-        for suf in _profile_env_suffixes(p):
-            if not suf:
-                continue
-            env.pop(f"TQ_BROKER_ID_{suf}", None)
-            env.pop(f"TQ_ACCOUNT_ID_{suf}", None)
-            env.pop(f"TQ_ACCOUNT_PASSWORD_{suf}", None)
-
-        profiles = _parse_profiles_csv(env.get("GHTRADER_TQ_ACCOUNT_PROFILES", ""))
-        profiles = [x for x in profiles if x != p]
-        _set_profiles_csv(env, profiles)
-
-    _write_accounts_env_atomic(runs_dir=runs_dir, env=env)
-
-
-def _accounts_env_get_profile_values(*, env: dict[str, str], profile: str) -> dict[str, str]:
-    p = _canonical_profile(profile)
-    if p == "default":
-        return {
-            "broker_id": str(env.get("TQ_BROKER_ID", "") or "").strip(),
-            "account_id": str(env.get("TQ_ACCOUNT_ID", "") or "").strip(),
-        }
-
-    for suf in _profile_env_suffixes(p):
-        if not suf:
-            continue
-        broker = str(env.get(f"TQ_BROKER_ID_{suf}", "") or "").strip()
-        acc = str(env.get(f"TQ_ACCOUNT_ID_{suf}", "") or "").strip()
-        if broker or acc:
-            return {"broker_id": broker, "account_id": acc}
-    return {"broker_id": "", "account_id": ""}
-
-
-def _accounts_env_is_configured(*, env: dict[str, str], profile: str) -> bool:
-    p = _canonical_profile(profile)
-    if p == "default":
-        broker = str(env.get("TQ_BROKER_ID", "") or "").strip()
-        acc = str(env.get("TQ_ACCOUNT_ID", "") or "").strip()
-        pwd = str(env.get("TQ_ACCOUNT_PASSWORD", "") or "").strip()
-        return bool(broker and acc and pwd)
-    for suf in _profile_env_suffixes(p):
-        if not suf:
-            continue
-        broker = str(env.get(f"TQ_BROKER_ID_{suf}", "") or "").strip()
-        acc = str(env.get(f"TQ_ACCOUNT_ID_{suf}", "") or "").strip()
-        pwd = str(env.get(f"TQ_ACCOUNT_PASSWORD_{suf}", "") or "").strip()
-        if broker and acc and pwd:
-            return True
-    return False
+    return _scheduler_enabled_impl()
 
 
 def _mask_account_id(aid: str) -> str:
     s = str(aid or "")
     return (s[:2] + "***" + s[-2:]) if len(s) >= 6 else "***"
 
-
-def _brokers_cache_path(*, runs_dir: Path) -> Path:
-    return runs_dir / "control" / "cache" / "brokers.json"
-
-
-def _fallback_brokers() -> list[str]:
-    # Keep this list tiny; it is only a UX fallback when network is unavailable.
-    return ["T铜冠金源"]
-
-
-def _parse_brokers_from_shinny_html(html: str) -> list[str]:
-    try:
-        import html as html_mod
-        import re
-
-        # Quick-and-dirty tag strip to get searchable text.
-        text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", "\n", str(html))
-        text = re.sub(r"(?s)<[^>]+>", "\n", text)
-        text = html_mod.unescape(text)
-
-        # Broker IDs are typically like: "T铜冠金源", "H海通期货", "SIMNOW", etc.
-        # We only extract the ones containing at least one CJK character.
-        pat = re.compile(r"(?<![A-Za-z0-9_])([A-Z][A-Za-z0-9_]*[\u4e00-\u9fff][\u4e00-\u9fffA-Za-z0-9_]*)(?![A-Za-z0-9_])")
-        found = pat.findall(text)
-
-        out: list[str] = []
-        for s in found:
-            s = str(s).strip()
-            if not s or len(s) > 32:
-                continue
-            if s not in out:
-                out.append(s)
-        return out
-    except Exception:
-        return []
-
-
-def _fetch_shinny_brokers(*, timeout_s: float = 5.0) -> list[str]:
-    url = "https://www.shinnytech.com/articles/reference/tqsdk-brokers"
-    try:
-        import urllib.request
-
-        with urllib.request.urlopen(url, timeout=float(timeout_s)) as resp:  # nosec - expected public doc URL
-            raw = resp.read()
-        html = raw.decode("utf-8", errors="ignore")
-        return _parse_brokers_from_shinny_html(html)
-    except Exception:
-        return []
-
-
-def _get_supported_brokers(*, runs_dir: Path) -> tuple[list[str], str]:
-    """
-    Return (brokers, source) where source is one of: cache|fetched|fallback.
-    """
-    cache = _brokers_cache_path(runs_dir=runs_dir)
-    cached = _read_json(cache) if cache.exists() else None
-    if isinstance(cached, dict) and isinstance(cached.get("brokers"), list) and cached.get("brokers"):
-        brokers = [str(x) for x in cached["brokers"] if str(x).strip()]
-        if brokers:
-            return brokers, "cache"
-
-    # Avoid network in tests.
-    if os.environ.get("PYTEST_CURRENT_TEST") or "pytest" in sys.modules:
-        return _fallback_brokers(), "fallback"
-
-    brokers = _fetch_shinny_brokers()
-    if brokers:
-        _write_json_atomic(
-            cache,
-            {
-                "brokers": brokers,
-                "fetched_at": _now_iso(),
-                "source_url": "https://www.shinnytech.com/articles/reference/tqsdk-brokers",
-            },
-        )
-        return brokers, "fetched"
-
-    return _fallback_brokers(), "fallback"
-
-
-def _argv_opt(argv: list[str], name: str) -> str | None:
-    try:
-        for i, t in enumerate(argv):
-            if str(t) == str(name) and i + 1 < len(argv):
-                return str(argv[i + 1])
-    except Exception:
-        return None
-    return None
-
-
 def _start_tqsdk_scheduler(app: FastAPI, *, max_parallel_default: int = 4) -> None:
-    if getattr(app.state, "_tqsdk_scheduler_started", False):
-        return
-    app.state._tqsdk_scheduler_started = True
-
-    def _loop() -> None:
-        while True:
-            try:
-                store = app.state.job_store
-                jm = app.state.job_manager
-                max_parallel = int(os.environ.get("GHTRADER_MAX_PARALLEL_TQSDK_JOBS", str(max_parallel_default)))
-                max_parallel = max(1, max_parallel)
-                _tqsdk_scheduler_tick(store=store, jm=jm, max_parallel=max_parallel)
-            except Exception as e:
-                log.warning("tqsdk_scheduler.tick_failed", error=str(e))
-            time.sleep(1.0)
-
-    t = threading.Thread(target=_loop, name="tqsdk-job-scheduler", daemon=True)
-    t.start()
+    _start_tqsdk_scheduler_impl(
+        app=app,
+        log=log,
+        tick=lambda store, jm, max_parallel: _tqsdk_scheduler_tick(
+            store=store,
+            jm=jm,
+            max_parallel=max_parallel,
+        ),
+        max_parallel_default=max_parallel_default,
+    )
 
 
 def _tqsdk_scheduler_tick(*, store: JobStore, jm: JobManager, max_parallel: int) -> int:
@@ -505,103 +229,20 @@ def _tqsdk_scheduler_tick(*, store: JobStore, jm: JobManager, max_parallel: int)
 
     Exposed for unit tests.
     """
-    active = [j for j in store.list_active_jobs() if _is_tqsdk_heavy_job(j.command)]
-    slots = int(max_parallel) - int(len(active))
-    if slots <= 0:
-        return 0
-    queued = [j for j in store.list_unstarted_queued_jobs(limit=5000) if _is_tqsdk_heavy_job(j.command)]
-    started = 0
-    for j in queued[:slots]:
-        out = jm.start_queued_job(j.id)
-        if out is not None and out.pid is not None:
-            started += 1
-    return started
+    return _tqsdk_scheduler_tick_impl(
+        store=store,
+        jm=jm,
+        max_parallel=max_parallel,
+        is_tqsdk_heavy_job=_is_tqsdk_heavy_job,
+    )
 
 
 def _gateway_supervisor_enabled() -> bool:
-    """
-    Whether the dashboard should supervise AccountGateway processes.
-
-    Disabled by default during pytest to avoid background process management in unit tests.
-    """
-    if str(os.environ.get("GHTRADER_DISABLE_GATEWAY_SUPERVISOR", "")).strip().lower() in {"1", "true", "yes"}:
-        return False
-    if ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")) and str(
-        os.environ.get("GHTRADER_ENABLE_GATEWAY_SUPERVISOR_IN_TESTS", "")
-    ).strip().lower() not in {"1", "true", "yes"}:
-        return False
-    return True
-
-
-def _is_gateway_job(argv: list[str]) -> bool:
-    sub1, sub2 = _job_subcommand2(argv)
-    return bool((sub1 or "") == "gateway" and (sub2 or "") in {"run"})
-
-
-def _scan_gateway_desired(*, runs_dir: Path) -> dict[str, str]:
-    """
-    Return mapping {profile -> desired_mode} for gateway profiles.
-
-    Source: runs/gateway/account=<profile>/desired.json
-    """
-    root = runs_dir / "gateway"
-    out: dict[str, str] = {}
-    try:
-        if not root.exists():
-            return out
-        for d in [p for p in root.iterdir() if p.is_dir() and p.name.startswith("account=")]:
-            prof = d.name.split("=", 1)[-1] if "=" in d.name else d.name
-            desired = _read_json(d / "desired.json") or {}
-            cfg = desired.get("desired") if isinstance(desired.get("desired"), dict) else desired
-            mode = str((cfg or {}).get("mode") or "idle").strip().lower()
-            if prof:
-                out[str(prof)] = mode
-    except Exception:
-        return {}
-    return out
+    return _gateway_supervisor_enabled_impl()
 
 
 def _strategy_supervisor_enabled() -> bool:
-    """
-    Whether the dashboard should supervise StrategyRunner processes.
-
-    Disabled by default during pytest to avoid background process management in unit tests.
-    """
-    if str(os.environ.get("GHTRADER_DISABLE_STRATEGY_SUPERVISOR", "")).strip().lower() in {"1", "true", "yes"}:
-        return False
-    if ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")) and str(
-        os.environ.get("GHTRADER_ENABLE_STRATEGY_SUPERVISOR_IN_TESTS", "")
-    ).strip().lower() not in {"1", "true", "yes"}:
-        return False
-    return True
-
-
-def _is_strategy_job(argv: list[str]) -> bool:
-    sub1, sub2 = _job_subcommand2(argv)
-    return bool((sub1 or "") == "strategy" and (sub2 or "") in {"run"})
-
-
-def _scan_strategy_desired(*, runs_dir: Path) -> dict[str, dict[str, Any]]:
-    """
-    Return mapping {profile -> desired_config_dict} for strategies.
-
-    Source: runs/strategy/account=<profile>/desired.json
-    """
-    root = runs_dir / "strategy"
-    out: dict[str, dict[str, Any]] = {}
-    try:
-        if not root.exists():
-            return out
-        for d in [p for p in root.iterdir() if p.is_dir() and p.name.startswith("account=")]:
-            prof = d.name.split("=", 1)[-1] if "=" in d.name else d.name
-            desired = _read_json(d / "desired.json") or {}
-            cfg = desired.get("desired") if isinstance(desired.get("desired"), dict) else desired
-            cfg = cfg if isinstance(cfg, dict) else {}
-            if prof:
-                out[str(prof)] = dict(cfg)
-    except Exception:
-        return {}
-    return out
+    return _strategy_supervisor_enabled_impl()
 
 
 def _strategy_supervisor_tick(*, store: JobStore, jm: Any, runs_dir: Path) -> dict[str, int]:
@@ -610,176 +251,42 @@ def _strategy_supervisor_tick(*, store: JobStore, jm: Any, runs_dir: Path) -> di
 
     Exposed for unit tests (pass fake `jm` to avoid launching subprocesses).
     """
-    desired_by_profile = _scan_strategy_desired(runs_dir=runs_dir)
+    return _strategy_supervisor_tick_impl(store=store, jm=jm, runs_dir=runs_dir)
 
-    active_jobs = store.list_active_jobs()
-    active_strategy: dict[str, Any] = {}
-    for j in active_jobs:
-        if not _is_strategy_job(j.command):
-            continue
-        prof = _argv_opt(j.command, "--account") or ""
-        try:
-            from ghtrader.tq.runtime import canonical_account_profile
 
-            prof = canonical_account_profile(prof)
-        except Exception:
-            prof = str(prof).strip().lower() or "default"
-        active_strategy[prof] = j
+def _gateway_supervisor_tick(*, store: JobStore, jm: Any, runs_dir: Path) -> dict[str, int]:
+    """
+    Run one GatewaySupervisor tick.
 
-    stopped = 0
-    started = 0
-
-    # Stop strategies whose desired mode is explicitly idle.
-    for prof, job in active_strategy.items():
-        cfg = desired_by_profile.get(prof) or {}
-        dm = str(cfg.get("mode") or "idle").strip().lower()
-        if dm in {"", "idle"}:
-            try:
-                if bool(jm.cancel_job(job.id)):
-                    stopped += 1
-            except Exception:
-                pass
-
-    # Start at most one strategy per tick.
-    for prof, cfg in desired_by_profile.items():
-        dm = str(cfg.get("mode") or "idle").strip().lower()
-        if dm in {"", "idle"}:
-            continue
-        if prof in active_strategy:
-            continue
-
-        symbols: list[str] = []
-        raw_syms = cfg.get("symbols")
-        if isinstance(raw_syms, list):
-            symbols = [str(s).strip() for s in raw_syms if str(s).strip()]
-        if not symbols:
-            continue
-
-        model_name = str(cfg.get("model_name") or "xgboost").strip() or "xgboost"
-        horizon = str(cfg.get("horizon") or "50").strip()
-        threshold_up = str(cfg.get("threshold_up") or "0.6").strip()
-        threshold_down = str(cfg.get("threshold_down") or "0.6").strip()
-        position_size = str(cfg.get("position_size") or "1").strip()
-        artifacts_dir = str(cfg.get("artifacts_dir") or "artifacts").strip()
-        poll_interval_sec = str(cfg.get("poll_interval_sec") or "0.5").strip()
-
-        argv = python_module_argv(
-            "ghtrader.cli",
-            "strategy",
-            "run",
-            "--account",
-            prof,
-            "--model",
-            model_name,
-            "--horizon",
-            horizon,
-            "--threshold-up",
-            threshold_up,
-            "--threshold-down",
-            threshold_down,
-            "--position-size",
-            position_size,
-            "--artifacts-dir",
-            artifacts_dir,
-            "--runs-dir",
-            str(runs_dir),
-            "--poll-interval-sec",
-            poll_interval_sec,
-        )
-        for s in symbols:
-            argv += ["--symbols", s]
-        title = f"strategy {prof} {model_name} h={horizon}"
-        try:
-            jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-            started += 1
-        except Exception:
-            pass
-        break
-
-    return {"started": int(started), "stopped": int(stopped)}
+    Exposed for unit tests (pass fake `jm` to avoid launching subprocesses).
+    """
+    return _gateway_supervisor_tick_impl(store=store, jm=jm, runs_dir=runs_dir)
 
 
 def _start_strategy_supervisor(app: FastAPI) -> None:
-    if getattr(app.state, "_strategy_supervisor_started", False):
-        return
-    app.state._strategy_supervisor_started = True
-
-    def _loop() -> None:
-        while True:
-            try:
-                store = app.state.job_store
-                jm = app.state.job_manager
-                runs_dir = get_runs_dir()
-                _strategy_supervisor_tick(store=store, jm=jm, runs_dir=runs_dir)
-            except Exception as e:
-                log.warning("strategy_supervisor.tick_failed", error=str(e))
-            time.sleep(float(os.environ.get("GHTRADER_STRATEGY_SUPERVISOR_POLL_SECONDS", "2.0")))
-
-    t = threading.Thread(target=_loop, name="strategy-supervisor", daemon=True)
-    t.start()
+    _start_strategy_supervisor_impl(
+        app=app,
+        log=log,
+        tick=lambda store, jm, runs_dir: _strategy_supervisor_tick(
+            store=store,
+            jm=jm,
+            runs_dir=runs_dir,
+        ),
+        get_runs_dir=get_runs_dir,
+    )
 
 
 def _start_gateway_supervisor(app: FastAPI) -> None:
-    if getattr(app.state, "_gateway_supervisor_started", False):
-        return
-    app.state._gateway_supervisor_started = True
-
-    def _loop() -> None:
-        while True:
-            try:
-                store = app.state.job_store
-                jm = app.state.job_manager
-                runs_dir = get_runs_dir()
-                desired_by_profile = _scan_gateway_desired(runs_dir=runs_dir)
-
-                active_jobs = store.list_active_jobs()
-                active_gateway: dict[str, Any] = {}
-                for j in active_jobs:
-                    if not _is_gateway_job(j.command):
-                        continue
-                    prof = _argv_opt(j.command, "--account") or ""
-                    try:
-                        from ghtrader.tq.runtime import canonical_account_profile
-
-                        prof = canonical_account_profile(prof)
-                    except Exception:
-                        prof = str(prof).strip().lower() or "default"
-                    active_gateway[prof] = j
-
-                # Stop gateways whose desired mode is explicitly idle.
-                for prof, job in active_gateway.items():
-                    dm = str(desired_by_profile.get(prof) or "").strip().lower()
-                    if dm == "idle":
-                        try:
-                            jm.cancel_job(job.id)
-                        except Exception:
-                            pass
-
-                # Start at most one gateway per tick to avoid a thundering herd.
-                for prof, dm in desired_by_profile.items():
-                    dm2 = str(dm or "").strip().lower()
-                    if dm2 in {"", "idle"}:
-                        continue
-                    if prof in active_gateway:
-                        continue
-                    argv = python_module_argv(
-                        "ghtrader.cli",
-                        "gateway",
-                        "run",
-                        "--account",
-                        prof,
-                        "--runs-dir",
-                        str(runs_dir),
-                    )
-                    title = f"gateway {prof}"
-                    jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-                    break
-            except Exception as e:
-                log.warning("gateway_supervisor.tick_failed", error=str(e))
-            time.sleep(float(os.environ.get("GHTRADER_GATEWAY_SUPERVISOR_POLL_SECONDS", "2.0")))
-
-    t = threading.Thread(target=_loop, name="gateway-supervisor", daemon=True)
-    t.start()
+    _start_gateway_supervisor_impl(
+        app=app,
+        log=log,
+        tick=lambda store, jm, runs_dir: _gateway_supervisor_tick(
+            store=store,
+            jm=jm,
+            runs_dir=runs_dir,
+        ),
+        get_runs_dir=get_runs_dir,
+    )
 
 
 def _control_root(runs_dir: Path) -> Path:
@@ -2034,69 +1541,6 @@ def create_app() -> Any:
     # Trading artifacts helpers
     # ---------------------------------------------------------------------
 
-    def _read_json_file(path: Path) -> dict[str, Any] | None:
-        try:
-            if not path.exists():
-                return None
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-
-    def _read_redis_json(key: str) -> dict[str, Any] | None:
-        """
-        Best-effort sync Redis JSON read for hot state/desired keys.
-        Falls back to file-based mirrors when Redis is unavailable.
-        """
-        try:
-            import redis as redis_sync
-
-            client = redis_sync.Redis(
-                host="localhost",
-                port=6379,
-                db=0,
-                decode_responses=True,
-                socket_connect_timeout=0.2,
-                socket_timeout=0.2,
-            )
-            raw = client.get(str(key))
-            if not raw:
-                return None
-            obj = json.loads(raw)
-            return obj if isinstance(obj, dict) else None
-        except Exception:
-            return None
-
-    def _read_jsonl_tail(path: Path, *, max_lines: int, max_bytes: int = 256 * 1024) -> list[dict[str, Any]]:
-        """
-        Best-effort tail reader for JSONL artifacts (snapshots/events).
-        Returns parsed objects in chronological order (oldest -> newest).
-        """
-        try:
-            if not path.exists() or int(max_lines) <= 0:
-                return []
-            with open(path, "rb") as f:
-                f.seek(0, 2)
-                size = f.tell()
-                offset = max(0, size - int(max_bytes))
-                f.seek(offset)
-                chunk = f.read().decode("utf-8", errors="ignore")
-            lines = [ln for ln in chunk.splitlines() if ln.strip()]
-            out: list[dict[str, Any]] = []
-            for ln in lines[-int(max_lines) :]:
-                try:
-                    obj = json.loads(ln)
-                    if isinstance(obj, dict):
-                        out.append(obj)
-                except Exception:
-                    continue
-            return out
-        except Exception:
-            return []
-
-    def _read_last_jsonl_obj(path: Path) -> dict[str, Any] | None:
-        out = _read_jsonl_tail(path, max_lines=1)
-        return out[-1] if out else None
-
     def api_accounts(request: Request) -> dict[str, Any]:
         """
         List broker account profiles (runs/control/accounts.env) + last verification + gateway/strategy summary.
@@ -2425,38 +1869,6 @@ def create_app() -> Any:
     # ---------------------------------------------------------------------
     # Strategy (AI StrategyRunner; consumes gateway state, writes targets)
     # ---------------------------------------------------------------------
-
-    def _artifact_age_sec(p: Path) -> float | None:
-        try:
-            return float(time.time() - float(p.stat().st_mtime))
-        except Exception:
-            return None
-
-    def _health_error(state: Any) -> str:
-        try:
-            if isinstance(state, dict) and isinstance(state.get("health"), dict):
-                return str(state["health"].get("error") or "")
-        except Exception:
-            return ""
-        return ""
-
-    def _status_from_desired_and_state(*, root_exists: bool, desired_mode: str, state_age: float | None) -> str:
-        """
-        Shared status mapping used by the Trading Console.
-
-        Statuses: not_initialized | desired_idle | starting | running | degraded
-        """
-        if not bool(root_exists):
-            return "not_initialized"
-        dm = str(desired_mode or "").strip().lower()
-        if dm in {"", "idle"}:
-            if state_age is not None and float(state_age) < 15.0:
-                return "running"
-            return "desired_idle"
-        # desired is non-idle
-        if state_age is None:
-            return "starting"
-        return "running" if float(state_age) < 15.0 else "degraded"
 
     @app.get("/api/strategy/status", response_class=JSONResponse)
     def api_strategy_status(request: Request, account_profile: str = "default") -> dict[str, Any]:
