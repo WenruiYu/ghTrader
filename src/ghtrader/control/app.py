@@ -57,9 +57,7 @@ from ghtrader.control.supervisors import (
     strategy_supervisor_tick as _strategy_supervisor_tick_impl,
     tqsdk_scheduler_tick as _tqsdk_scheduler_tick_impl,
 )
-from ghtrader.control.removed_endpoints import raise_removed_410
 from ghtrader.control.routes.accounts import build_accounts_router
-from ghtrader.control.routes.data import build_data_router
 from ghtrader.control.routes.gateway import build_gateway_router
 from ghtrader.control.routes.models import build_models_router
 from ghtrader.control.routes import build_api_router, build_root_router
@@ -85,17 +83,6 @@ _BENCHMARKS_TTL_S = 10.0
 _benchmarks_at: float = 0.0
 _benchmarks_payload: dict[str, Any] | None = None
 _benchmarks_lock = threading.Lock()
-
-_DATA_COVERAGE_TTL_S = 10.0
-_data_coverage_at: float = 0.0
-_data_coverage_cache_key: str = ""
-_data_coverage_payload: dict[str, Any] | None = None
-_data_coverage_lock = threading.Lock()
-
-_DATA_COVERAGE_SUMMARY_TTL_S = 10.0
-_data_coverage_summary_at: float = 0.0
-_data_coverage_summary_payload: dict[str, Any] | None = None
-_data_coverage_summary_lock = threading.Lock()
 
 _DATA_QUALITY_TTL_S = 60.0
 _data_quality_at: float = 0.0
@@ -395,28 +382,6 @@ def create_app() -> Any:
                 await websocket.receive_text()
         except WebSocketDisconnect:
             manager.disconnect(websocket)
-
-    def api_data_coverage(
-        request: Request, kind: str = "ticks", limit: int = 200, search: str = "", refresh: bool = False
-    ) -> dict[str, Any]:
-        """
-        Lightweight coverage listing for Data Hub (lazy-loaded).
-
-        kind: ticks|main_l5|features|labels
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        _ = (kind, limit, search, refresh)
-        raise_removed_410("api.data.coverage")
-
-    def api_data_coverage_summary(request: Request, refresh: bool = False) -> dict[str, Any]:
-        """
-        Aggregated coverage summary for Data Hub Overview KPIs.
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        _ = refresh
-        raise_removed_410("api.data.coverage_summary")
 
     @app.get("/api/data/quality-summary", response_class=JSONResponse)
     def api_data_quality_summary(
@@ -722,42 +687,6 @@ def create_app() -> Any:
             _data_quality_cache_key = cache_key
             _data_quality_at = time.time()
         return payload
-
-    def api_data_quality_detail(request: Request, symbol: str, limit: int = 30) -> dict[str, Any]:
-        """
-        Return recent quality ledger rows for a symbol (best-effort).
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        _ = (symbol, limit)
-        raise_removed_410("api.data.quality_detail")
-
-    async def api_data_enqueue_diagnose(request: Request) -> dict[str, Any]:
-        """
-        Enqueue a data diagnose job (runs `ghtrader data diagnose ...`).
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        _ = request
-        raise_removed_410("api.data.diagnose")
-
-    async def api_data_enqueue_repair(request: Request) -> dict[str, Any]:
-        """
-        Enqueue a data repair job (runs `ghtrader data repair ...`).
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        _ = request
-        raise_removed_410("api.data.repair")
-
-    async def api_data_enqueue_health(request: Request) -> dict[str, Any]:
-        """
-        Enqueue a data health job (runs `ghtrader data health ...`).
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        _ = request
-        raise_removed_410("api.data.health")
 
     @app.post("/api/data/enqueue-l5-start", response_class=JSONResponse)
     async def api_data_enqueue_l5_start(request: Request) -> dict[str, Any]:
@@ -1121,69 +1050,6 @@ def create_app() -> Any:
         except Exception as e:
             return {"ok": False, "error": str(e), "exchange": ex, "var": v, "symbol": derived_symbol, "gaps": []}
 
-    def api_contracts(
-        request: Request,
-        exchange: str = "SHFE",
-        var: str = "cu",
-        refresh: str = "0",
-    ) -> dict[str, Any]:
-        """
-        Contract explorer backend (QuestDB-first, snapshot-backed per PRD §5.11).
-
-        The Contracts table is always served from a cached snapshot produced by a background
-        job (`contracts-snapshot-build`). This keeps the request path fast and responsive.
-
-        Query params:
-        - exchange: SHFE
-        - var: cu|au|ag
-        - refresh: 1 to force refresh (enqueues snapshot rebuild job if stale/missing)
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        _ = (exchange, var, refresh)
-        raise_removed_410("api.contracts.explorer")
-
-    async def api_contracts_enqueue_fill(request: Request) -> dict[str, Any]:
-        """
-        Enqueue per-contract download jobs (runs `ghtrader download --symbol ...`).
-
-        Payload:
-        - symbols: optional list[str] (explicit)
-        - scope: "missing" (default) | "all"
-        - exchange/var: used when scope is set (to select contracts)
-        - start/end: optional manual bounds (YYYY-MM-DD) used when active-ranges are missing
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        _ = request
-        raise_removed_410("api.contracts.fill")
-
-    async def api_contracts_enqueue_update(request: Request) -> dict[str, Any]:
-        """
-        Enqueue an Update job (runs `ghtrader update ...`) to check remote contract updates.
-
-        Payload:
-        - exchange/var: required for variety update
-        - symbols: optional list[str] to update a subset
-        - recent_expired_days: optional int (default 10)
-        - refresh_catalog: optional bool (default true)
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        _ = request
-        raise_removed_410("api.contracts.update")
-
-    async def api_contracts_enqueue_audit(request: Request) -> dict[str, Any]:
-        """
-        Start per-contract audit jobs (ticks scope, symbol-filtered).
-
-        Unlike download/probe, audits are local and start immediately.
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        _ = request
-        raise_removed_410("api.contracts.audit")
-
     @app.post("/api/questdb/query", response_class=JSONResponse)
     async def api_questdb_query(request: Request) -> dict[str, Any]:
         """
@@ -1253,9 +1119,9 @@ def create_app() -> Any:
         except Exception:
             questdb_ok = False
 
-        # Data symbols counts (Phase-1/2 deferred)
+        # Data symbols / status derived from canonical main_l5 table.
         data_symbols = 0
-        data_status = "deferred"
+        data_status = "offline" if not questdb_ok else "unknown"
 
         # Model count (count actual model files, not arbitrary artifacts/ subdirs)
         model_files: list[dict[str, Any]] = []
@@ -1300,7 +1166,7 @@ def create_app() -> Any:
             "train": {"state": "ok" if model_count > 0 else "warn", "text": f"{model_count} models"},
         }
 
-        # Check schedule exists (QuestDB canonical table)
+        # Check schedule + main_l5 availability (QuestDB canonical tables).
         try:
             if questdb_ok:
                 from ghtrader.questdb.client import connect_pg, make_questdb_query_config_from_env
@@ -1314,13 +1180,24 @@ def create_app() -> Any:
                             ["SHFE", "cu"],
                         )
                         n = int((cur.fetchone() or [0])[0] or 0)
+                        cur.execute(
+                            "SELECT count(DISTINCT symbol) "
+                            "FROM ghtrader_ticks_main_l5_v2 "
+                            "WHERE ticks_kind='main_l5' AND dataset_version='v2'"
+                        )
+                        data_symbols = int((cur.fetchone() or [0])[0] or 0)
                 if n > 0:
                     pipeline["schedule"] = {"state": "ok", "text": "cu ready"}
+                if data_symbols > 0:
+                    pipeline["main_l5"] = {"state": "ok", "text": f"{data_symbols} symbols"}
+                    data_status = "ready"
+                else:
+                    pipeline["main_l5"] = {"state": "warn", "text": "empty"}
+                    data_status = "empty"
         except Exception:
-            pass
-
-        # main_l5 status (Phase-1/2 deferred)
-        pipeline["main_l5"] = {"state": "deferred", "text": "deferred"}
+            if questdb_ok:
+                pipeline["main_l5"] = {"state": "error", "text": "query error"}
+                data_status = "error"
 
         # Check features/labels builds exist (QuestDB build tables)
         try:
@@ -2422,21 +2299,6 @@ def create_app() -> Any:
             "generated_at": _now_iso(),
         }
 
-    # Continue route modularization: keep app.py as composition root.
-    app.include_router(
-        build_data_router(
-            data_coverage_handler=api_data_coverage,
-            data_coverage_summary_handler=api_data_coverage_summary,
-            data_quality_detail_handler=api_data_quality_detail,
-            data_diagnose_handler=api_data_enqueue_diagnose,
-            data_repair_handler=api_data_enqueue_repair,
-            data_health_handler=api_data_enqueue_health,
-            contracts_explorer_handler=api_contracts,
-            contracts_fill_handler=api_contracts_enqueue_fill,
-            contracts_update_handler=api_contracts_enqueue_update,
-            contracts_audit_handler=api_contracts_enqueue_audit,
-        )
-    )
     app.include_router(
         build_models_router(
             models_inventory_handler=api_models_inventory,

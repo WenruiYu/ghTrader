@@ -249,7 +249,7 @@ def register(main: click.Group) -> None:
         )
         run_strategy_runner(cfg)
 
-    @main.command()
+    @main.command("dashboard")
     @click.option("--host", default="127.0.0.1", show_default=True, help="Bind host (use 127.0.0.1 for SSH-only access)")
     @click.option("--port", default=8000, type=int, show_default=True, help="Bind port")
     @click.option("--reload/--no-reload", default=False, show_default=True, help="Auto-reload on code changes (dev only)")

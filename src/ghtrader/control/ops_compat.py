@@ -27,11 +27,6 @@ OPS_COMPAT_RULES: list[dict[str, str]] = [
     {"legacy": "/ops/eval/backtest", "canonical": "/models/eval/backtest", "mode": "alias"},
     {"legacy": "/ops/eval/paper", "canonical": "/models/eval/paper", "mode": "alias"},
     {"legacy": "/ops/eval/daily_train", "canonical": "/models/eval/daily_train", "mode": "alias"},
-    {"legacy": "/ops/ingest/download", "canonical": "/data/ingest/download", "mode": "removed_410"},
-    {"legacy": "/ops/ingest/download_contract_range", "canonical": "/data/ingest/download_contract_range", "mode": "removed_410"},
-    {"legacy": "/ops/ingest/record", "canonical": "/data/ingest/record", "mode": "removed_410"},
-    {"legacy": "/ops/ingest/update_variety", "canonical": "/data/ingest/update_variety", "mode": "removed_410"},
-    {"legacy": "/ops/integrity/audit", "canonical": "/data/integrity/audit", "mode": "removed_410"},
 ]
 
 

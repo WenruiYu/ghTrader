@@ -14,7 +14,7 @@ def register(main: click.Group) -> None:
     Register research/model lifecycle commands on the root CLI group.
     """
 
-    @main.command()
+    @main.command("build")
     @click.option("--symbol", "-s", required=True, help="Symbol to build features for")
     @click.option("--data-dir", default="data", help="Data directory root")
     @click.option("--horizons", default="10,50,200", help="Comma-separated label horizons (ticks)")
@@ -77,7 +77,7 @@ def register(main: click.Group) -> None:
 
         log.info("build.done", symbol=symbol)
 
-    @main.command()
+    @main.command("train")
     @click.option(
         "--model",
         "-m",
@@ -177,7 +177,7 @@ def register(main: click.Group) -> None:
         )
         log.info("train.done", model=model, symbol=symbol)
 
-    @main.command()
+    @main.command("backtest")
     @click.option("--model", "-m", required=True, help="Model name/path to backtest")
     @click.option("--symbol", "-s", required=True, help="Symbol to backtest on")
     @click.option("--start", "-S", required=True, type=click.DateTime(formats=["%Y-%m-%d"]), help="Backtest start date")
@@ -212,7 +212,7 @@ def register(main: click.Group) -> None:
         )
         log.info("backtest.done", model=model, symbol=symbol)
 
-    @main.command()
+    @main.command("paper")
     @click.option("--model", "-m", required=True, help="Model name/path for inference")
     @click.option("--symbols", "-s", required=True, multiple=True, help="Symbols to trade (can specify multiple)")
     @click.option("--artifacts-dir", default="artifacts", help="Artifacts directory")
@@ -229,7 +229,7 @@ def register(main: click.Group) -> None:
             artifacts_dir=Path(artifacts_dir),
         )
 
-    @main.command()
+    @main.command("benchmark")
     @click.option(
         "--model",
         "-m",
@@ -259,7 +259,7 @@ def register(main: click.Group) -> None:
         )
         log.info("benchmark.result", accuracy=f"{report.offline.accuracy:.3f}")
 
-    @main.command()
+    @main.command("compare")
     @click.option("--symbol", "-s", required=True, help="Symbol to compare on")
     @click.option("--models", "-m", default="logistic,xgboost,deeplob", help="Comma-separated list of models to compare")
     @click.option("--data-dir", default="data", help="Data directory root")
@@ -386,7 +386,7 @@ def register(main: click.Group) -> None:
         log.info("capacity.matrix.generated", path=str(out), smoke=bool(smoke))
         click.echo(str(out))
 
-    @main.command()
+    @main.command("sweep")
     @click.option("--symbol", "-s", required=True, help="Symbol to sweep on")
     @click.option(
         "--model",

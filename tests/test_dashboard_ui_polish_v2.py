@@ -59,6 +59,8 @@ def test_api_dashboard_summary_shape(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert "pipeline" in data
     assert isinstance(data["data_symbols_v2"], int)
     assert isinstance(data["model_count"], int)
+    assert data["data_status"] == "offline"
+    assert data["pipeline"]["main_l5"]["state"] != "deferred"
 
 
 def test_api_models_inventory_scans_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

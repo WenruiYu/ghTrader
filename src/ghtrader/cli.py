@@ -259,10 +259,10 @@ from ghtrader.cli_commands.research import register as _register_research
 from ghtrader.cli_commands.runtime import register as _register_runtime
 
 _register_data(main)
+_register_db(main)
+_register_features(main)
 _register_research(main)
 _register_runtime(main)
-_register_features(main)
-_register_db(main)
 
 
 def entrypoint() -> None:

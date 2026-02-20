@@ -20,7 +20,6 @@ from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
 from ghtrader.control import auth
 from ghtrader.control.jobs import JobSpec, python_module_argv
 from ghtrader.control.ops_compat import canonical_for_legacy
-from ghtrader.control.removed_endpoints import raise_removed_410
 from ghtrader.control.settings import get_tqsdk_scheduler_state, set_tqsdk_scheduler_max_parallel
 from ghtrader.control.system_info import cpu_mem_info, disk_usage, gpu_info
 
@@ -438,21 +437,6 @@ def build_router() -> Any:
             raise HTTPException(status_code=404, detail="report not found")
         return PlainTextResponse(p.read_text(), media_type="application/json")
 
-    @router.post("/data/ingest/download")
-    async def data_ingest_download(request: Request):
-        _require_auth(request)
-        raise_removed_410("data.ingest.download")
-
-    @router.post("/data/ingest/download_contract_range")
-    async def data_ingest_download_contract_range(request: Request):
-        _require_auth(request)
-        raise_removed_410("data.ingest.download_contract_range")
-
-    @router.post("/data/ingest/record")
-    async def data_ingest_record(request: Request):
-        _require_auth(request)
-        raise_removed_410("data.ingest.record")
-
     @router.post("/data/settings/tqsdk_scheduler")
     async def data_settings_tqsdk_scheduler(request: Request):
         _require_auth(request)
@@ -546,36 +530,9 @@ def build_router() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
 
-    @router.post("/data/integrity/audit")
-    async def data_integrity_audit(request: Request):
-        _require_auth(request)
-        raise_removed_410("data.integrity.audit")
-
     # ---------------------------------------------------------------------
-    # Legacy /ops/* POST routes (redirect to /data/*)
+    # Legacy /ops/* POST routes (alias to canonical active handlers)
     # ---------------------------------------------------------------------
-
-    # Legacy /ops/* POST routes - forward to new /data/* handlers
-    @router.post("/ops/ingest/download")
-    async def ops_ingest_download(request: Request):
-        _log_ops_hit("/ops/ingest/download")
-        return await data_ingest_download(request)
-
-    @router.post("/ops/ingest/download_contract_range")
-    async def ops_ingest_download_contract_range(request: Request):
-        _log_ops_hit("/ops/ingest/download_contract_range")
-        return await data_ingest_download_contract_range(request)
-
-    @router.post("/ops/ingest/update_variety")
-    async def ops_ingest_update_variety(request: Request):
-        _require_auth(request)
-        _log_ops_hit("/ops/ingest/update_variety")
-        raise_removed_410("data.ingest.update_variety")
-
-    @router.post("/ops/ingest/record")
-    async def ops_ingest_record(request: Request):
-        _log_ops_hit("/ops/ingest/record")
-        return await data_ingest_record(request)
 
     @router.post("/ops/settings/tqsdk_scheduler")
     async def ops_settings_tqsdk_scheduler(request: Request):
@@ -869,11 +826,6 @@ def build_router() -> Any:
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
-
-    @router.post("/ops/integrity/audit")
-    async def ops_integrity_audit(request: Request):
-        _log_ops_hit("/ops/integrity/audit")
-        return await data_integrity_audit(request)
 
     @router.post("/jobs/start")
     async def jobs_start(request: Request):

@@ -45,7 +45,8 @@ def test_api_ops_compat_contract_exposes_canonical_mapping(tmp_path: Path, monke
     rules = payload.get("rules") or []
     mapping = {r["legacy"]: r["canonical"] for r in rules if isinstance(r, dict)}
     assert mapping.get("/ops/model/train") == "/models/model/train"
-    assert mapping.get("/ops/ingest/download") == "/data/ingest/download"
+    assert "/ops/ingest/download" not in mapping
+    assert all(str((r or {}).get("mode")) in {"redirect", "alias"} for r in rules if isinstance(r, dict))
 
 
 def test_ops_model_train_alias_still_submits_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

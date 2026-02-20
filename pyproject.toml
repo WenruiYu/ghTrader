@@ -68,3 +68,20 @@ markers = [
   "ddp_integration: tests that require torchrun multi-process",
 ]
 
+[tool.coverage.run]
+omit = [
+  # Deferred / optional modules kept out of Phase-0 quality gate.
+  "src/ghtrader/data_provider.py",
+  "src/ghtrader/questdb/bench.py",
+  "src/ghtrader/questdb/features_labels.py",
+  "src/ghtrader/questdb/migrate.py",
+  "src/ghtrader/regime.py",
+  "src/ghtrader/research/eval.py",
+  "src/ghtrader/tq/catalog.py",
+  "src/ghtrader/tq/eval.py",
+  "src/ghtrader/tq/execution.py",
+  "src/ghtrader/tq/l5_start.py",
+  "src/ghtrader/tq/main_schedule.py",
+  "src/ghtrader/tq/paper.py",
+]
+

@@ -33,6 +33,8 @@ This section defines the current PRD-alignment cleanup scope.
 - **Compatibility policy**:
   - backward-compatible redirects (notably `/ops` -> canonical pages) may remain,
   - permanently deferred placeholder commands/APIs should be removed from the active surface rather than kept as dead stubs.
+  - `/ops/*` compatibility is limited to redirect/alias behavior for active canonical workflows under `/data`, `/models`, `/trading`.
+  - removed/deferred operations are not kept as permanently-registered `410` placeholders once migration is complete; historical decisions are tracked in closeout documentation.
 - **External pattern policy (Qlib / RD-Agent / Kronos)**:
   - these projects are used as **reference patterns only** (workflow/config/methodology),
   - ghTrader must not introduce them as runtime core dependencies in this phase,
@@ -2271,8 +2273,7 @@ Database administration commands:
 ### 10.6 Implementation Traceability Matrix (All Files)
 
 - Full file-level matrix (src/tests/infra, one file per row): `reports/prd_traceability_matrix.md`.
-- Coverage snapshot (current): 144 files mapped, 0 unmapped.
-- PRD-expected but currently missing modules: 10 (listed in `PRD-Expected But Missing Modules` in the same matrix).
+- Coverage and missing-module snapshots are maintained in the matrix report.
 - Big-bang closeout report (deletions/decisions/gaps): `reports/prd_bigbang_closeout.md`.
 
 Status legend:
