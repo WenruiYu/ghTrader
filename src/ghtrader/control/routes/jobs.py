@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -13,16 +15,148 @@ from ghtrader.config import get_runs_dir
 from ghtrader.control import auth
 from ghtrader.control.job_command import infer_job_kind
 from ghtrader.control.jobs import JobSpec
+from ghtrader.control.variety_context import (
+    allowed_varieties as _allowed_varieties,
+    symbol_matches_variety as _symbol_matches_variety,
+)
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _job_matches_variety(job: Any, variety: str) -> bool:
+    v = str(variety or "").strip().lower()
+    if not v or v not in set(_allowed_varieties()):
+        return True
+
+    meta = getattr(job, "metadata", None)
+    if isinstance(meta, dict):
+        mv = str(meta.get("variety") or "").strip().lower()
+        if mv in set(_allowed_varieties()):
+            return mv == v
+        ms = str(meta.get("symbol") or "").strip()
+        if ms:
+            return _symbol_matches_variety(ms, v)
+        mss = meta.get("symbols")
+        if isinstance(mss, list) and mss:
+            return any(_symbol_matches_variety(str(x or ""), v) for x in mss)
+
+    cmd = [str(x or "").lower() for x in (getattr(job, "command", None) or [])]
+    for i, tok in enumerate(cmd[:-1]):
+        if tok == "--var" and cmd[i + 1] == v:
+            return True
+    if any(_symbol_matches_variety(tok, v) for tok in cmd):
+        return True
+
+    title = str(getattr(job, "title", "") or "").lower()
+    if _symbol_matches_variety(title, v):
+        return True
+    return bool(re.search(rf"(^|\s){re.escape(v)}(\s|$)", title))
+
+
+def _job_kind(job: Any) -> str:
+    meta = getattr(job, "metadata", None)
+    if isinstance(meta, dict):
+        mk = str(meta.get("kind") or "").strip().lower()
+        if mk:
+            return mk
+    return str(infer_job_kind(list(getattr(job, "command", None) or [])) or "").strip().lower()
+
+
+def _parse_iso_utc(value: str) -> datetime | None:
+    txt = str(value or "").strip()
+    if not txt:
+        return None
+    try:
+        return datetime.fromisoformat(txt.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _progress_state(*, job_status: str, pct: float | None, error: str | None) -> str:
+    st = str(job_status or "").strip().lower()
+    if error:
+        return "error"
+    if st in {"queued", "running", "succeeded", "failed", "cancelled"}:
+        return st
+    p = float(pct or 0.0)
+    if p >= 1.0:
+        return "succeeded"
+    if p > 0:
+        return "running"
+    return "unknown"
+
 @router.get("", response_class=JSONResponse)
-def api_list_jobs(request: Request, limit: int = 200) -> dict[str, Any]:
+def api_list_jobs(
+    request: Request,
+    limit: int = 200,
+    offset: int = 0,
+    status: str = "",
+    kind: str = "",
+    var: str = "",
+    q: str = "",
+) -> dict[str, Any]:
     if not auth.is_authorized(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
     store = request.app.state.job_store
-    jobs = store.list_jobs(limit=int(limit))
-    return {"jobs": [asdict(j) for j in jobs]}
+    lim = max(1, min(int(limit or 200), 1000))
+    off = max(0, int(offset or 0))
+    status_filter = str(status or "").strip().lower()
+    kind_filter = str(kind or "").strip().lower()
+    var_filter = str(var or "").strip().lower()
+    query = str(q or "").strip().lower()
+
+    # Pull a bounded window large enough for common filtering/pagination use-cases.
+    jobs_all = store.list_jobs(limit=max(2000, lim + off + 200))
+    filtered: list[Any] = []
+    for job in jobs_all:
+        st = str(getattr(job, "status", "") or "").strip().lower()
+        if status_filter and st != status_filter:
+            continue
+        jk = _job_kind(job)
+        if kind_filter and jk != kind_filter:
+            continue
+        if var_filter and not _job_matches_variety(job, var_filter):
+            continue
+        if query:
+            hay = " ".join(
+                [
+                    str(getattr(job, "id", "") or ""),
+                    str(getattr(job, "title", "") or ""),
+                    str(getattr(job, "source", "") or ""),
+                    " ".join([str(x or "") for x in (getattr(job, "command", None) or [])]),
+                ]
+            ).lower()
+            if query not in hay:
+                continue
+        filtered.append(job)
+
+    total = len(filtered)
+    rows = filtered[off : off + lim]
+    next_offset = off + lim if (off + lim) < total else None
+    return {
+        "ok": True,
+        "jobs": [asdict(j) for j in rows],
+        "total": int(total),
+        "offset": int(off),
+        "limit": int(lim),
+        "next_offset": next_offset,
+        "state": "ok",
+        "text": f"{len(rows)}/{total} jobs",
+        "error": "",
+        "stale": False,
+        "updated_at": _now_iso(),
+        "filters": {
+            "status": status_filter or None,
+            "kind": kind_filter or None,
+            "var": var_filter or None,
+            "q": query or None,
+        },
+    }
 
 
 @router.post("", response_class=JSONResponse)
@@ -37,8 +171,11 @@ async def api_create_job(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="argv must be a list[str]")
 
     cwd = Path(str(payload.get("cwd") or Path.cwd()))
+    metadata = payload.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise HTTPException(status_code=400, detail="metadata must be an object")
     jm = request.app.state.job_manager
-    rec = jm.start_job(JobSpec(title=title, argv=list(argv), cwd=cwd))
+    rec = jm.start_job(JobSpec(title=title, argv=list(argv), cwd=cwd, metadata=(dict(metadata) if isinstance(metadata, dict) else None)))
     return {"job": asdict(rec)}
 
 
@@ -167,11 +304,32 @@ def api_job_progress(request: Request, job_id: str) -> dict[str, Any]:
         return {
             "job_id": job.id,
             "job_status": job.status,
+            "state": str(job.status or "").strip().lower() or "unknown",
             "available": False,
             "message": "No progress tracking for this job",
         }
 
+    stale_s_raw = str((request.headers.get("x-ghtrader-progress-stale-s") or "")).strip()
+    try:
+        stale_threshold_s = int(stale_s_raw) if stale_s_raw else 45
+    except Exception:
+        stale_threshold_s = 45
+    stale_threshold_s = max(5, stale_threshold_s)
+    updated_age_s: int | None = None
+    updated_at_dt = _parse_iso_utc(str(progress.get("updated_at") or ""))
+    if updated_at_dt is not None:
+        updated_age_s = max(0, int((datetime.now(timezone.utc) - updated_at_dt).total_seconds()))
+    running_like = str(job.status or "").strip().lower() in {"queued", "running"}
+    stale = bool(running_like and updated_age_s is not None and updated_age_s > stale_threshold_s)
+
     progress["job_status"] = job.status
+    progress["state"] = _progress_state(
+        job_status=str(job.status or ""),
+        pct=(float(progress.get("pct") or 0.0) if progress.get("pct") is not None else None),
+        error=(str(progress.get("error") or "") or None),
+    )
+    progress["updated_age_s"] = updated_age_s
+    progress["stale"] = bool(stale)
     progress["available"] = True
     return progress
 

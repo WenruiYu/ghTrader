@@ -157,42 +157,25 @@ def clear_main_schedule_rows(
 ) -> int:
     """
     Delete all schedule rows for a given exchange/variety.
-
-    Falls back to table rebuild if DELETE is not supported.
     """
     tbl = str(table).strip() or MAIN_SCHEDULE_TABLE_V2
     ex = str(exchange).upper().strip()
     var = str(variety).lower().strip()
+    from .row_cleanup import replace_table_delete_where
+
     where = "exchange=%s AND variety=%s"
-    count_sql = f"SELECT count() FROM {tbl} WHERE {where}"
-    delete_sql = f"DELETE FROM {tbl} WHERE {where}"
-    cols = "ts, exchange, variety, trading_day, main_contract, segment_id, schedule_hash, updated_at"
-    tmp_table = f"{tbl}_clean"
-    with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
-        try:
-            conn.autocommit = True  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        with conn.cursor() as cur:
-            try:
-                cur.execute(count_sql, [ex, var])
-                (count,) = cur.fetchone() or (0,)
-            except Exception:
-                count = 0
-            try:
-                cur.execute(delete_sql, [ex, var])
-                return int(count)
-            except Exception as e:
-                log.warning("questdb_main_schedule.delete_failed", table=tbl, error=str(e))
-                ensure_main_schedule_table(cfg=cfg, table=tmp_table, connect_timeout_s=connect_timeout_s)
-                insert_sql = (
-                    f"INSERT INTO {tmp_table} ({cols}) "
-                    f"SELECT {cols} FROM {tbl} WHERE NOT ({where})"
-                )
-                cur.execute(insert_sql, [ex, var])
-                cur.execute(f"DROP TABLE {tbl}")
-                cur.execute(f"RENAME TABLE {tmp_table} TO {tbl}")
-                return int(count)
+    cols = ["ts", "exchange", "variety", "trading_day", "main_contract", "segment_id", "schedule_hash", "updated_at"]
+    return int(
+        replace_table_delete_where(
+            cfg=cfg,
+            table=tbl,
+            columns=cols,
+            delete_where_sql=where,
+            delete_params=[ex, var],
+            ensure_table=lambda t: ensure_main_schedule_table(cfg=cfg, table=t, connect_timeout_s=connect_timeout_s),
+            connect_timeout_s=connect_timeout_s,
+        )
+    )
 
 
 def trim_main_schedule_before(
@@ -206,45 +189,28 @@ def trim_main_schedule_before(
 ) -> int:
     """
     Delete schedule rows for (exchange, variety) earlier than `start_day`.
-
-    Falls back to table rebuild if DELETE is not supported.
     """
     tbl = str(table).strip() or MAIN_SCHEDULE_TABLE_V2
     ex = str(exchange).upper().strip()
     var = str(variety).lower().strip()
     if start_day is None:
         return 0
+    from .row_cleanup import replace_table_delete_where
+
     cutoff = start_day.isoformat()
     where = "exchange=%s AND variety=%s AND cast(trading_day as string) < %s"
-    count_sql = f"SELECT count() FROM {tbl} WHERE {where}"
-    delete_sql = f"DELETE FROM {tbl} WHERE {where}"
-    cols = "ts, exchange, variety, trading_day, main_contract, segment_id, schedule_hash, updated_at"
-    tmp_table = f"{tbl}_clean"
-    with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
-        try:
-            conn.autocommit = True  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        with conn.cursor() as cur:
-            try:
-                cur.execute(count_sql, [ex, var, cutoff])
-                (count,) = cur.fetchone() or (0,)
-            except Exception:
-                count = 0
-            try:
-                cur.execute(delete_sql, [ex, var, cutoff])
-                return int(count)
-            except Exception as e:
-                log.warning("questdb_main_schedule.trim_failed", table=tbl, error=str(e))
-                ensure_main_schedule_table(cfg=cfg, table=tmp_table, connect_timeout_s=connect_timeout_s)
-                insert_sql = (
-                    f"INSERT INTO {tmp_table} ({cols}) "
-                    f"SELECT {cols} FROM {tbl} WHERE NOT ({where})"
-                )
-                cur.execute(insert_sql, [ex, var, cutoff])
-                cur.execute(f"DROP TABLE {tbl}")
-                cur.execute(f"RENAME TABLE {tmp_table} TO {tbl}")
-                return int(count)
+    cols = ["ts", "exchange", "variety", "trading_day", "main_contract", "segment_id", "schedule_hash", "updated_at"]
+    return int(
+        replace_table_delete_where(
+            cfg=cfg,
+            table=tbl,
+            columns=cols,
+            delete_where_sql=where,
+            delete_params=[ex, var, cutoff],
+            ensure_table=lambda t: ensure_main_schedule_table(cfg=cfg, table=t, connect_timeout_s=connect_timeout_s),
+            connect_timeout_s=connect_timeout_s,
+        )
+    )
 
 
 def upsert_main_schedule_rows(

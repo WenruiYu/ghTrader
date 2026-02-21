@@ -61,6 +61,10 @@ from ghtrader.control.routes.accounts import build_accounts_router
 from ghtrader.control.routes.gateway import build_gateway_router
 from ghtrader.control.routes.models import build_models_router
 from ghtrader.control.routes import build_api_router, build_root_router
+from ghtrader.control.variety_context import allowed_varieties as _allowed_varieties
+from ghtrader.control.variety_context import default_variety as _default_variety
+from ghtrader.control.variety_context import derived_symbol_for_variety as _derived_symbol_for_variety
+from ghtrader.control.variety_context import symbol_matches_variety as _symbol_matches_variety_impl
 from ghtrader.control.views import build_router
 from ghtrader.util.json_io import read_json as _read_json
 
@@ -187,6 +191,132 @@ def _is_tqsdk_heavy_job(argv: list[str]) -> bool:
     if s1 == "data" and s2 in _TQSDK_HEAVY_DATA_SUBCOMMANDS:
         return True
     return False
+
+
+def _normalize_variety_for_api(raw: str | None, *, allow_legacy_default: bool = False) -> str:
+    v = str(raw or "").strip().lower()
+    if not v:
+        if allow_legacy_default:
+            return _default_variety()
+        raise HTTPException(status_code=400, detail="var is required")
+    if v not in _allowed_varieties():
+        allowed = ",".join(_allowed_varieties())
+        raise HTTPException(status_code=400, detail=f"invalid var '{v}', allowed: {allowed}")
+    return v
+
+
+def _symbol_matches_variety(symbol: str | None, variety: str | None) -> bool:
+    return _symbol_matches_variety_impl(symbol, variety)
+
+
+def _job_matches_variety(job: Any, variety: str) -> bool:
+    v = str(variety or "").strip().lower()
+    if not v:
+        return True
+    meta = getattr(job, "metadata", None)
+    if isinstance(meta, dict):
+        mv = str(meta.get("variety") or "").strip().lower()
+        if mv in set(_allowed_varieties()):
+            return mv == v
+        ms = str(meta.get("symbol") or "").strip()
+        if ms:
+            return _symbol_matches_variety(ms, v)
+        mss = meta.get("symbols")
+        if isinstance(mss, list) and mss:
+            return any(_symbol_matches_variety(str(x or ""), v) for x in mss)
+    cmd = [str(x or "").lower() for x in (getattr(job, "command", None) or [])]
+    for i, tok in enumerate(cmd[:-1]):
+        if tok == "--var" and cmd[i + 1] == v:
+            return True
+    if any(_symbol_matches_variety(tok, v) for tok in cmd):
+        return True
+    title = str(getattr(job, "title", "") or "").lower()
+    if _symbol_matches_variety(title, v):
+        return True
+    return f" {v} " in f" {title} "
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(os.environ.get(name, "1" if default else "0") or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _env_float(name: str, default: float, *, min_value: float | None = None) -> float:
+    try:
+        val = float(str(os.environ.get(name, default) or default).strip())
+    except Exception:
+        val = float(default)
+    if min_value is not None:
+        val = max(float(min_value), float(val))
+    return float(val)
+
+
+def _env_int(name: str, default: int, *, min_value: int | None = None) -> int:
+    try:
+        val = int(str(os.environ.get(name, default) or default).strip())
+    except Exception:
+        val = int(default)
+    if min_value is not None:
+        val = max(int(min_value), int(val))
+    return int(val)
+
+
+def _dashboard_guardrails_context() -> dict[str, Any]:
+    enforce_health_global = _env_bool("GHTRADER_PIPELINE_ENFORCE_HEALTH", True)
+    enforce_health_schedule = _env_bool("GHTRADER_MAIN_SCHEDULE_ENFORCE_HEALTH", enforce_health_global)
+    enforce_health_main_l5 = _env_bool("GHTRADER_MAIN_L5_ENFORCE_HEALTH", enforce_health_global)
+
+    lock_wait_timeout_s = _env_float("GHTRADER_LOCK_WAIT_TIMEOUT_S", 120.0, min_value=0.0)
+    lock_poll_interval_s = _env_float("GHTRADER_LOCK_POLL_INTERVAL_S", 1.0, min_value=0.1)
+    lock_force_cancel = _env_bool("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", True)
+    lock_preempt_grace_s = _env_float("GHTRADER_LOCK_PREEMPT_GRACE_S", 8.0, min_value=1.0)
+
+    total_workers_raw = str(os.environ.get("GHTRADER_MAIN_L5_TOTAL_WORKERS", "") or "").strip()
+    segment_workers_raw = str(os.environ.get("GHTRADER_MAIN_L5_SEGMENT_WORKERS", "") or "").strip()
+    total_workers = _env_int("GHTRADER_MAIN_L5_TOTAL_WORKERS", 0, min_value=0) if total_workers_raw else 0
+    segment_workers = _env_int("GHTRADER_MAIN_L5_SEGMENT_WORKERS", 0, min_value=0) if segment_workers_raw else 0
+    health_gate_strict = bool(enforce_health_schedule and enforce_health_main_l5)
+
+    return {
+        "enforce_health_global": bool(enforce_health_global),
+        "enforce_health_schedule": bool(enforce_health_schedule),
+        "enforce_health_main_l5": bool(enforce_health_main_l5),
+        "health_gate_state": ("ok" if health_gate_strict else "warn"),
+        "health_gate_label": ("strict" if health_gate_strict else "partial"),
+        "lock_wait_timeout_s": float(lock_wait_timeout_s),
+        "lock_poll_interval_s": float(lock_poll_interval_s),
+        "lock_force_cancel_on_timeout": bool(lock_force_cancel),
+        "lock_preempt_grace_s": float(lock_preempt_grace_s),
+        "lock_recovery_state": ("ok" if lock_force_cancel else "warn"),
+        "main_l5_total_workers": int(total_workers),
+        "main_l5_segment_workers": int(segment_workers),
+        "main_l5_worker_mode": ("bounded" if (total_workers > 0 or segment_workers > 0) else "auto"),
+    }
+
+
+def _ui_state_payload(
+    *,
+    state: str,
+    text: str,
+    error: str = "",
+    stale: bool = False,
+    updated_at: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "state": str(state or "unknown"),
+        "text": str(text or ""),
+        "error": str(error or ""),
+        "stale": bool(stale),
+        "updated_at": str(updated_at or _now_iso()),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 def _scheduler_enabled() -> bool:
@@ -387,7 +517,7 @@ def create_app() -> Any:
     def api_data_quality_summary(
         request: Request,
         exchange: str = "SHFE",
-        var: str = "cu",
+        var: str = "",
         limit: int = 300,
         search: str = "",
         issues_only: bool = False,
@@ -402,7 +532,7 @@ def create_app() -> Any:
         # a complete implementation and does not enqueue removed CLI surfaces.
 
         ex = str(exchange).upper().strip() or "SHFE"
-        v = str(var).lower().strip() or "cu"
+        v = _normalize_variety_for_api(var)
         lim = max(1, min(int(limit or 300), 500))
         q = str(search or "").strip().lower()
         only_issues = bool(issues_only)
@@ -697,11 +827,13 @@ def create_app() -> Any:
             raise HTTPException(status_code=401, detail="Unauthorized")
         payload = await request.json()
 
-        runs_dir = get_runs_dir()
-        data_dir = get_data_dir()
+        runs_dir_default = get_runs_dir()
+        data_dir_default = get_data_dir()
+        runs_dir = Path(str(payload.get("runs_dir") or str(runs_dir_default)).strip() or str(runs_dir_default))
+        data_dir = Path(str(payload.get("data_dir") or str(data_dir_default)).strip() or str(data_dir_default))
 
         ex = str(payload.get("exchange") or "SHFE").upper().strip()
-        v = str(payload.get("var") or "cu").lower().strip()
+        v = _normalize_variety_for_api(payload.get("var"))
         refresh_catalog = bool(payload.get("refresh_catalog", False))
 
         symbols: list[str] = []
@@ -744,7 +876,20 @@ def create_app() -> Any:
             pass
 
         # L5-start is index-backed and light: start immediately.
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        rec = jm.start_job(
+            JobSpec(
+                title=title,
+                argv=argv,
+                cwd=Path.cwd(),
+                metadata={
+                    "kind": "data_l5_start",
+                    "exchange": ex,
+                    "variety": v,
+                    "symbol": _derived_symbol_for_variety(v, exchange=ex),
+                    "symbols": symbols,
+                },
+            )
+        )
         return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
 
     @app.post("/api/data/enqueue-main-l5-validate", response_class=JSONResponse)
@@ -760,8 +905,8 @@ def create_app() -> Any:
         data_dir = get_data_dir()
 
         ex = str(payload.get("exchange") or "SHFE").upper().strip()
-        v = str(payload.get("var") or "cu").lower().strip()
-        derived_symbol = str(payload.get("derived_symbol") or f"KQ.m@{ex}.{v}").strip()
+        v = _normalize_variety_for_api(payload.get("var"))
+        derived_symbol = str(payload.get("derived_symbol") or _derived_symbol_for_variety(v, exchange=ex)).strip()
         start = str(payload.get("start") or "").strip()
         end = str(payload.get("end") or "").strip()
         raw_check = payload.get("tqsdk_check", True)
@@ -769,6 +914,11 @@ def create_app() -> Any:
             tqsdk_check = raw_check.strip().lower() not in {"0", "false", "no", "off"}
         else:
             tqsdk_check = bool(raw_check)
+        raw_incremental = payload.get("incremental", False)
+        if isinstance(raw_incremental, str):
+            incremental = raw_incremental.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            incremental = bool(raw_incremental)
 
         argv = python_module_argv(
             "ghtrader.cli",
@@ -789,6 +939,8 @@ def create_app() -> Any:
             argv += ["--start", start]
         if end:
             argv += ["--end", end]
+        if incremental:
+            argv += ["--incremental"]
         argv += ["--tqsdk-check" if tqsdk_check else "--no-tqsdk-check"]
 
         for key, flag in [
@@ -817,7 +969,20 @@ def create_app() -> Any:
         except Exception:
             pass
 
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        rec = jm.start_job(
+            JobSpec(
+                title=title,
+                argv=argv,
+                cwd=Path.cwd(),
+                metadata={
+                    "kind": "main_l5_validate",
+                    "exchange": ex,
+                    "variety": v,
+                    "symbol": derived_symbol,
+                    "incremental": bool(incremental),
+                },
+            )
+        )
         return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
 
     @app.get("/api/data/reports", response_class=JSONResponse)
@@ -825,7 +990,7 @@ def create_app() -> Any:
         request: Request,
         kind: str = "diagnose",
         exchange: str = "SHFE",
-        var: str = "cu",
+        var: str = "",
         limit: int = 5,
     ) -> dict[str, Any]:
         """
@@ -839,7 +1004,7 @@ def create_app() -> Any:
             raise HTTPException(status_code=401, detail="Unauthorized")
         k = str(kind or "").strip().lower()
         ex = str(exchange).upper().strip() or "SHFE"
-        v = str(var).lower().strip() or "cu"
+        v = _normalize_variety_for_api(var)
         lim = max(1, min(int(limit or 5), 50))
 
         rd = get_runs_dir()
@@ -894,14 +1059,14 @@ def create_app() -> Any:
         raise HTTPException(status_code=400, detail="kind must be one of: diagnose, repair")
 
     @app.get("/api/data/l5-start", response_class=JSONResponse)
-    def api_data_l5_start(request: Request, exchange: str = "SHFE", var: str = "cu", limit: int = 1) -> dict[str, Any]:
+    def api_data_l5_start(request: Request, exchange: str = "SHFE", var: str = "", limit: int = 1) -> dict[str, Any]:
         """
         Return the most recent L5-start report(s) written under runs/control/reports/l5_start/.
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         ex = str(exchange).upper().strip() or "SHFE"
-        v = str(var).lower().strip() or "cu"
+        v = _normalize_variety_for_api(var)
         lim = max(1, min(int(limit or 1), 20))
 
         rd = get_runs_dir()
@@ -922,7 +1087,7 @@ def create_app() -> Any:
 
     @app.get("/api/data/main-l5-validate", response_class=JSONResponse)
     def api_data_main_l5_validate(
-        request: Request, exchange: str = "SHFE", var: str = "cu", symbol: str = "", limit: int = 1
+        request: Request, exchange: str = "SHFE", var: str = "", symbol: str = "", limit: int = 1
     ) -> dict[str, Any]:
         """
         Return recent main_l5 validation report(s) written under runs/control/reports/main_l5_validate/.
@@ -930,8 +1095,8 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         ex = str(exchange).upper().strip() or "SHFE"
-        v = str(var).lower().strip() or "cu"
-        derived_symbol = str(symbol or f"KQ.m@{ex}.{v}").strip()
+        v = _normalize_variety_for_api(var)
+        derived_symbol = str(symbol or _derived_symbol_for_variety(v, exchange=ex)).strip()
         lim = max(1, min(int(limit or 1), 20))
 
         rd = get_runs_dir()
@@ -953,7 +1118,7 @@ def create_app() -> Any:
 
     @app.get("/api/data/main-l5-validate-summary", response_class=JSONResponse)
     def api_data_main_l5_validate_summary(
-        request: Request, exchange: str = "SHFE", var: str = "cu", symbol: str = "", limit: int = 30
+        request: Request, exchange: str = "SHFE", var: str = "", symbol: str = "", schedule_hash: str = "", limit: int = 30
     ) -> dict[str, Any]:
         """
         Return QuestDB-backed validation summary rows + overview.
@@ -961,8 +1126,9 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         ex = str(exchange).upper().strip() or "SHFE"
-        v = str(var).lower().strip() or "cu"
-        derived_symbol = str(symbol or f"KQ.m@{ex}.{v}").strip()
+        v = _normalize_variety_for_api(var)
+        derived_symbol = str(symbol or _derived_symbol_for_variety(v, exchange=ex)).strip()
+        sh = str(schedule_hash or "").strip()
         lim = max(1, min(int(limit or 30), 3650))
         try:
             from ghtrader.questdb.client import make_questdb_query_config_from_env
@@ -972,26 +1138,45 @@ def create_app() -> Any:
             )
 
             cfg = make_questdb_query_config_from_env()
-            overview = fetch_main_l5_validate_overview(cfg=cfg, symbol=derived_symbol)
-            rows = fetch_latest_main_l5_validate_summary(cfg=cfg, symbol=derived_symbol, limit=lim)
+            overview = fetch_main_l5_validate_overview(
+                cfg=cfg,
+                symbol=derived_symbol,
+                schedule_hash=(sh or None),
+            )
+            rows = fetch_latest_main_l5_validate_summary(
+                cfg=cfg,
+                symbol=derived_symbol,
+                schedule_hash=(sh or None),
+                limit=lim,
+            )
             return {
                 "ok": True,
                 "exchange": ex,
                 "var": v,
                 "symbol": derived_symbol,
+                "schedule_hash": (sh or None),
                 "overview": overview,
                 "count": int(len(rows)),
                 "rows": rows,
             }
         except Exception as e:
-            return {"ok": False, "error": str(e), "exchange": ex, "var": v, "symbol": derived_symbol, "rows": []}
+            return {
+                "ok": False,
+                "error": str(e),
+                "exchange": ex,
+                "var": v,
+                "symbol": derived_symbol,
+                "schedule_hash": (sh or None),
+                "rows": [],
+            }
 
     @app.get("/api/data/main-l5-validate-gaps", response_class=JSONResponse)
     def api_data_main_l5_validate_gaps(
         request: Request,
         exchange: str = "SHFE",
-        var: str = "cu",
+        var: str = "",
         symbol: str = "",
+        schedule_hash: str = "",
         trading_day: str = "",
         start: str = "",
         end: str = "",
@@ -1004,8 +1189,9 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
         ex = str(exchange).upper().strip() or "SHFE"
-        v = str(var).lower().strip() or "cu"
-        derived_symbol = str(symbol or f"KQ.m@{ex}.{v}").strip()
+        v = _normalize_variety_for_api(var)
+        derived_symbol = str(symbol or _derived_symbol_for_variety(v, exchange=ex)).strip()
+        sh = str(schedule_hash or "").strip()
         lim = max(1, min(int(limit or 500), 10000))
         day = None
         start_day = None
@@ -1033,6 +1219,7 @@ def create_app() -> Any:
             gaps = list_main_l5_validate_gaps(
                 cfg=cfg,
                 symbol=derived_symbol,
+                schedule_hash=(sh or None),
                 trading_day=day,
                 start_day=start_day,
                 end_day=end_day,
@@ -1044,11 +1231,20 @@ def create_app() -> Any:
                 "exchange": ex,
                 "var": v,
                 "symbol": derived_symbol,
+                "schedule_hash": (sh or None),
                 "count": int(len(gaps)),
                 "gaps": gaps,
             }
         except Exception as e:
-            return {"ok": False, "error": str(e), "exchange": ex, "var": v, "symbol": derived_symbol, "gaps": []}
+            return {
+                "ok": False,
+                "error": str(e),
+                "exchange": ex,
+                "var": v,
+                "symbol": derived_symbol,
+                "schedule_hash": (sh or None),
+                "gaps": [],
+            }
 
     @app.post("/api/questdb/query", response_class=JSONResponse)
     async def api_questdb_query(request: Request) -> dict[str, Any]:
@@ -1087,18 +1283,25 @@ def create_app() -> Any:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
     @app.get("/api/dashboard/summary", response_class=JSONResponse)
-    def api_dashboard_summary(request: Request) -> dict[str, Any]:
+    def api_dashboard_summary(request: Request, var: str = "") -> dict[str, Any]:
         """
         Aggregated KPIs for the dashboard home page.
         """
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
+        v = _normalize_variety_for_api(var, allow_legacy_default=True)
         global _dash_summary_at, _dash_summary_payload
         now = time.time()
         with _dash_summary_lock:
-            if _dash_summary_payload is not None and (now - float(_dash_summary_at)) <= float(_DASH_SUMMARY_TTL_S):
-                return dict(_dash_summary_payload)
+            if (
+                _dash_summary_payload is not None
+                and (now - float(_dash_summary_at)) <= float(_DASH_SUMMARY_TTL_S)
+                and str((_dash_summary_payload or {}).get("_cache_var") or "") == v
+            ):
+                out = dict(_dash_summary_payload)
+                out.pop("_cache_var", None)
+                return out
 
         data_dir = get_data_dir()
         runs_dir = get_runs_dir()
@@ -1106,8 +1309,9 @@ def create_app() -> Any:
 
         # Job counts
         jobs = store.list_jobs(limit=200)
-        running_count = len([j for j in jobs if j.status == "running"])
-        queued_count = len([j for j in jobs if j.status == "queued"])
+        jobs_filtered = [j for j in jobs if _job_matches_variety(j, v)]
+        running_count = len([j for j in jobs_filtered if j.status == "running"])
+        queued_count = len([j for j in jobs_filtered if j.status == "queued"])
 
         # QuestDB reachability
         questdb_ok = False
@@ -1127,7 +1331,8 @@ def create_app() -> Any:
         model_files: list[dict[str, Any]] = []
         model_status = ""
         try:
-            model_files = _scan_model_files(artifacts_dir)
+            model_files_all = _scan_model_files(artifacts_dir)
+            model_files = [m for m in model_files_all if _symbol_matches_variety(str(m.get("symbol") or ""), v)]
             if model_files:
                 latest = sorted(model_files, key=lambda x: float(x.get("mtime") or 0.0), reverse=True)[0]
                 model_status = f"{latest.get('model_type')} {latest.get('symbol')} h{latest.get('horizon')}"
@@ -1156,14 +1361,30 @@ def create_app() -> Any:
         except Exception:
             pass
 
+        summary_updated_at = _now_iso()
+        validation_rows = 0
+
         # Pipeline status (simplified)
         pipeline = {
-            "ingest": {"state": "ok" if data_symbols > 0 else "warn", "text": f"{data_symbols} symbols"},
-            "sync": {"state": "ok" if questdb_ok else "error", "text": "connected" if questdb_ok else "offline"},
-            "schedule": {"state": "unknown", "text": "--"},
-            "main_l5": {"state": "unknown", "text": "--"},
-            "build": {"state": "unknown", "text": "--"},
-            "train": {"state": "ok" if model_count > 0 else "warn", "text": f"{model_count} models"},
+            "ingest": _ui_state_payload(
+                state=("ok" if data_symbols > 0 else "warn"),
+                text=f"{data_symbols} symbols",
+                updated_at=summary_updated_at,
+            ),
+            "sync": _ui_state_payload(
+                state=("ok" if questdb_ok else "error"),
+                text=("connected" if questdb_ok else "offline"),
+                updated_at=summary_updated_at,
+            ),
+            "schedule": _ui_state_payload(state="unknown", text="--", updated_at=summary_updated_at),
+            "main_l5": _ui_state_payload(state="unknown", text="--", updated_at=summary_updated_at),
+            "validation": _ui_state_payload(state="warn", text="not run", updated_at=summary_updated_at),
+            "build": _ui_state_payload(state="unknown", text="--", updated_at=summary_updated_at),
+            "train": _ui_state_payload(
+                state=("ok" if model_count > 0 else "warn"),
+                text=f"{model_count} models",
+                updated_at=summary_updated_at,
+            ),
         }
 
         # Check schedule + main_l5 availability (QuestDB canonical tables).
@@ -1177,26 +1398,61 @@ def create_app() -> Any:
                     with conn.cursor() as cur:
                         cur.execute(
                             f"SELECT count() FROM {MAIN_SCHEDULE_TABLE_V2} WHERE exchange=%s AND variety=%s",
-                            ["SHFE", "cu"],
+                            ["SHFE", v],
                         )
                         n = int((cur.fetchone() or [0])[0] or 0)
                         cur.execute(
                             "SELECT count(DISTINCT symbol) "
                             "FROM ghtrader_ticks_main_l5_v2 "
-                            "WHERE ticks_kind='main_l5' AND dataset_version='v2'"
+                            "WHERE ticks_kind='main_l5' AND dataset_version='v2' "
+                            "AND lower(symbol) LIKE %s",
+                            [f"%shfe.{v}%"],
                         )
                         data_symbols = int((cur.fetchone() or [0])[0] or 0)
+                        cur.execute(
+                            "SELECT count() FROM ghtrader_main_l5_validate_summary_v2 "
+                            "WHERE lower(symbol) LIKE %s",
+                            [f"%shfe.{v}%"],
+                        )
+                        validation_rows = int((cur.fetchone() or [0])[0] or 0)
                 if n > 0:
-                    pipeline["schedule"] = {"state": "ok", "text": "cu ready"}
+                    pipeline["schedule"] = _ui_state_payload(state="ok", text=f"{v} ready", updated_at=summary_updated_at)
                 if data_symbols > 0:
-                    pipeline["main_l5"] = {"state": "ok", "text": f"{data_symbols} symbols"}
+                    pipeline["ingest"] = _ui_state_payload(
+                        state="ok",
+                        text=f"{data_symbols} symbols",
+                        updated_at=summary_updated_at,
+                    )
+                    pipeline["main_l5"] = _ui_state_payload(
+                        state="ok",
+                        text=f"{data_symbols} symbols",
+                        updated_at=summary_updated_at,
+                    )
                     data_status = "ready"
                 else:
-                    pipeline["main_l5"] = {"state": "warn", "text": "empty"}
+                    pipeline["ingest"] = _ui_state_payload(state="warn", text="0 symbols", updated_at=summary_updated_at)
+                    pipeline["main_l5"] = _ui_state_payload(state="warn", text="empty", updated_at=summary_updated_at)
                     data_status = "empty"
+                if validation_rows > 0:
+                    pipeline["validation"] = _ui_state_payload(
+                        state="ok",
+                        text=f"{validation_rows} rows",
+                        updated_at=summary_updated_at,
+                    )
         except Exception:
             if questdb_ok:
-                pipeline["main_l5"] = {"state": "error", "text": "query error"}
+                pipeline["main_l5"] = _ui_state_payload(
+                    state="error",
+                    text="query error",
+                    error="main_l5 query failed",
+                    updated_at=summary_updated_at,
+                )
+                pipeline["validation"] = _ui_state_payload(
+                    state="warn",
+                    text="query unavailable",
+                    error="validation summary unavailable",
+                    updated_at=summary_updated_at,
+                )
                 data_status = "error"
 
         # Check features/labels builds exist (QuestDB build tables)
@@ -1208,15 +1464,27 @@ def create_app() -> Any:
                 cfg = make_questdb_query_config_from_env()
                 with connect_pg(cfg, connect_timeout_s=1) as conn:
                     with conn.cursor() as cur:
-                        cur.execute(f"SELECT count(DISTINCT symbol) FROM {FEATURE_BUILDS_TABLE_V2} WHERE dataset_version='v2'")
+                        cur.execute(
+                            f"SELECT count(DISTINCT symbol) FROM {FEATURE_BUILDS_TABLE_V2} "
+                            "WHERE dataset_version='v2' AND lower(symbol) LIKE %s",
+                            [f"%shfe.{v}%"],
+                        )
                         n = int((cur.fetchone() or [0])[0] or 0)
                 if n > 0:
-                    pipeline["build"] = {"state": "ok", "text": f"{n} symbols"}
+                    pipeline["build"] = _ui_state_payload(state="ok", text=f"{n} symbols", updated_at=summary_updated_at)
         except Exception:
             pass
 
+        guardrails = _dashboard_guardrails_context()
+
         payload = {
             "ok": True,
+            "var": v,
+            "state": "ok",
+            "text": "summary ready",
+            "error": "",
+            "stale": False,
+            "updated_at": summary_updated_at,
             "running_count": running_count,
             "queued_count": queued_count,
             "questdb_ok": questdb_ok,
@@ -1228,9 +1496,10 @@ def create_app() -> Any:
             "trading_mode": trading_mode,
             "trading_status": trading_status,
             "pipeline": pipeline,
+            "guardrails": guardrails,
         }
         with _dash_summary_lock:
-            _dash_summary_payload = dict(payload)
+            _dash_summary_payload = {**dict(payload), "_cache_var": v}
             _dash_summary_at = time.time()
         return payload
 
@@ -1285,8 +1554,14 @@ def create_app() -> Any:
         except Exception:
             questdb_ok = False
 
+        status_updated_at = _now_iso()
         payload = {
             "ok": True,
+            "state": ("ok" if questdb_ok else "warn"),
+            "text": ("QuestDB connected" if questdb_ok else "QuestDB offline"),
+            "error": ("" if questdb_ok else "questdb_unreachable"),
+            "stale": False,
+            "updated_at": status_updated_at,
             "questdb_ok": bool(questdb_ok),
             "gpu_status": gpu_status,
             "running_count": int(running_count),
@@ -1297,7 +1572,7 @@ def create_app() -> Any:
             _ui_status_at = time.time()
         return payload
 
-    def api_models_inventory(request: Request) -> dict[str, Any]:
+    def api_models_inventory(request: Request, var: str = "") -> dict[str, Any]:
         """
         List trained model artifacts from artifacts/ directory.
         """
@@ -1306,6 +1581,7 @@ def create_app() -> Any:
 
         artifacts_dir = get_artifacts_dir()
         models: list[dict[str, Any]] = []
+        var_filter = _normalize_variety_for_api(var) if str(var or "").strip() else ""
 
         try:
             if not artifacts_dir.exists():
@@ -1349,9 +1625,11 @@ def create_app() -> Any:
             log.warning("api_models_inventory.error", error=str(e))
             return {"ok": False, "models": [], "error": str(e)}
 
-        return {"ok": True, "models": models}
+        if var_filter:
+            models = [m for m in models if _symbol_matches_variety(str(m.get("symbol") or ""), var_filter)]
+        return {"ok": True, "models": models, "var": (var_filter or None)}
 
-    def api_models_benchmarks(request: Request, limit: int = 20) -> dict[str, Any]:
+    def api_models_benchmarks(request: Request, limit: int = 20, var: str = "") -> dict[str, Any]:
         """
         List recent benchmark summaries from runs/benchmarks/**/<run_id>.json.
         """
@@ -1359,18 +1637,23 @@ def create_app() -> Any:
             raise HTTPException(status_code=401, detail="Unauthorized")
 
         global _benchmarks_at, _benchmarks_payload
+        var_filter = _normalize_variety_for_api(var) if str(var or "").strip() else ""
+        lim = max(1, min(int(limit or 20), 200))
         now = time.time()
         with _benchmarks_lock:
             if _benchmarks_payload is not None and (now - float(_benchmarks_at)) <= float(_BENCHMARKS_TTL_S):
                 payload = dict(_benchmarks_payload)
-                # Apply limit at read time (cheap)
-                payload["benchmarks"] = list(payload.get("benchmarks") or [])[: max(1, int(limit or 20))]
+                rows = list(payload.get("benchmarks") or [])
+                if var_filter:
+                    rows = [r for r in rows if _symbol_matches_variety(str((r or {}).get("symbol") or ""), var_filter)]
+                payload["benchmarks"] = rows[:lim]
+                payload["var"] = var_filter or None
                 return payload
 
         runs_dir = get_runs_dir()
         root = runs_dir / "benchmarks"
         if not root.exists():
-            return {"ok": True, "benchmarks": []}
+            return {"ok": True, "benchmarks": [], "var": var_filter or None}
 
         out: list[dict[str, Any]] = []
         from datetime import datetime, timezone
@@ -1408,11 +1691,14 @@ def create_app() -> Any:
             return {"ok": False, "benchmarks": [], "error": str(e)}
 
         out = sorted(out, key=lambda x: (str(x.get("timestamp") or ""), str(x.get("created_at") or "")), reverse=True)
-        payload2 = {"ok": True, "benchmarks": out[: max(1, int(limit or 20))]}
+        payload2 = {"ok": True, "benchmarks": out}
         with _benchmarks_lock:
             _benchmarks_payload = dict(payload2)
             _benchmarks_at = time.time()
-        return payload2
+        rows = list(out)
+        if var_filter:
+            rows = [r for r in rows if _symbol_matches_variety(str((r or {}).get("symbol") or ""), var_filter)]
+        return {"ok": True, "benchmarks": rows[:lim], "var": var_filter or None}
 
     # ---------------------------------------------------------------------
     # Trading artifacts helpers
@@ -1577,7 +1863,14 @@ def create_app() -> Any:
         argv = python_module_argv("ghtrader.cli", "account", "verify", "--account", prof, "--json")
         title = f"account-verify {prof}"
         jm = request.app.state.job_manager
-        rec = jm.enqueue_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        rec = jm.enqueue_job(
+            JobSpec(
+                title=title,
+                argv=argv,
+                cwd=Path.cwd(),
+                metadata={"kind": "account_verify", "account_profile": prof},
+            )
+        )
         return {"ok": True, "enqueued": [rec.id], "count": 1}
 
     # ---------------------------------------------------------------------
@@ -1911,7 +2204,21 @@ def create_app() -> Any:
         argv = python_module_argv("ghtrader.cli", "gateway", "run", "--account", prof, "--runs-dir", str(runs_dir))
         title = f"gateway {prof}"
         jm2: JobManager = request.app.state.job_manager
-        rec = jm2.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        gw_symbols = []
+        if desired_in and isinstance(desired_in.get("symbols"), list):
+            gw_symbols = [str(s).strip() for s in list(desired_in.get("symbols") or []) if str(s).strip()]
+        rec = jm2.start_job(
+            JobSpec(
+                title=title,
+                argv=argv,
+                cwd=Path.cwd(),
+                metadata={
+                    "kind": "gateway",
+                    "account_profile": prof,
+                    "symbols": gw_symbols,
+                },
+            )
+        )
         return {"ok": True, "account_profile": prof, "job_id": rec.id}
 
     @app.post("/api/gateway/stop", response_class=JSONResponse)
@@ -1955,12 +2262,12 @@ def create_app() -> Any:
         # Also set desired mode to idle so supervisor doesn't restart
         runs_dir = get_runs_dir()
         try:
-            from ghtrader.tq.gateway import GatewayDesired, read_gateway_desired, write_gateway_desired
+            from dataclasses import replace
+            from ghtrader.tq.gateway import read_gateway_desired, write_gateway_desired
 
             existing = read_gateway_desired(runs_dir=runs_dir, profile=prof)
             if existing and existing.mode != "idle":
-                existing.mode = "idle"  # type: ignore[assignment]
-                write_gateway_desired(runs_dir=runs_dir, profile=prof, desired=existing)
+                write_gateway_desired(runs_dir=runs_dir, profile=prof, desired=replace(existing, mode="idle"))
         except Exception:
             pass
 
@@ -2079,7 +2386,20 @@ def create_app() -> Any:
 
         title = f"strategy {prof} {model_name} h={horizon}"
         jm2: JobManager = request.app.state.job_manager
-        rec = jm2.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
+        rec = jm2.start_job(
+            JobSpec(
+                title=title,
+                argv=argv,
+                cwd=Path.cwd(),
+                metadata={
+                    "kind": "strategy",
+                    "account_profile": prof,
+                    "model": model_name,
+                    "horizon": str(cfg.horizon or 50),
+                    "symbols": [str(s).strip() for s in symbols if str(s).strip()],
+                },
+            )
+        )
         return {"ok": True, "account_profile": prof, "job_id": rec.id}
 
     @app.post("/api/strategy/stop", response_class=JSONResponse)
@@ -2123,12 +2443,12 @@ def create_app() -> Any:
         # Also set desired mode to idle so supervisor doesn't restart
         runs_dir = get_runs_dir()
         try:
+            from dataclasses import replace
             from ghtrader.trading.strategy_control import read_strategy_desired, write_strategy_desired
 
             existing = read_strategy_desired(runs_dir=runs_dir, profile=prof)
             if existing and existing.mode != "idle":
-                existing.mode = "idle"  # type: ignore[assignment]
-                write_strategy_desired(runs_dir=runs_dir, profile=prof, desired=existing)
+                write_strategy_desired(runs_dir=runs_dir, profile=prof, desired=replace(existing, mode="idle"))
         except Exception:
             pass
 
@@ -2198,7 +2518,7 @@ def create_app() -> Any:
         return {"ok": True, "runs": out}
 
     @app.get("/api/trading/console/status", response_class=JSONResponse)
-    def api_trading_console_status(request: Request, account_profile: str = "default") -> dict[str, Any]:
+    def api_trading_console_status(request: Request, account_profile: str = "default", var: str = "") -> dict[str, Any]:
         """
         Unified Trading Console status (Gateway-first):
         - gateway: runs/gateway/account=<profile>/...
@@ -2207,6 +2527,7 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
+        var_filter = _normalize_variety_for_api(var) if str(var or "").strip() else ""
         runs_dir = get_runs_dir()
         try:
             from ghtrader.tq.runtime import canonical_account_profile
@@ -2288,16 +2609,106 @@ def create_app() -> Any:
         except Exception:
             pass
 
-        return {
+        if var_filter:
+            # Gateway desired/effective symbols and snapshots filtered for current variety view.
+            gw_desired = gw.get("desired") if isinstance(gw.get("desired"), dict) else None
+            if isinstance(gw_desired, dict):
+                gw_desired2 = dict(gw_desired)
+                inner = gw_desired2.get("desired") if isinstance(gw_desired2.get("desired"), dict) else None
+                if isinstance(inner, dict):
+                    inner2 = dict(inner)
+                    if isinstance(inner2.get("symbols"), list):
+                        inner2["symbols"] = [s for s in inner2.get("symbols") or [] if _symbol_matches_variety(str(s), var_filter)]
+                    gw_desired2["desired"] = inner2
+                elif isinstance(gw_desired2.get("symbols"), list):
+                    gw_desired2["symbols"] = [s for s in gw_desired2.get("symbols") or [] if _symbol_matches_variety(str(s), var_filter)]
+                gw["desired"] = gw_desired2
+
+            gw_state = gw.get("state") if isinstance(gw.get("state"), dict) else None
+            if isinstance(gw_state, dict):
+                gw_state2 = dict(gw_state)
+                eff = gw_state2.get("effective") if isinstance(gw_state2.get("effective"), dict) else None
+                if isinstance(eff, dict):
+                    eff2 = dict(eff)
+                    if isinstance(eff2.get("symbols"), list):
+                        eff2["symbols"] = [s for s in eff2.get("symbols") or [] if _symbol_matches_variety(str(s), var_filter)]
+                    gw_state2["effective"] = eff2
+                snap = gw_state2.get("last_snapshot") if isinstance(gw_state2.get("last_snapshot"), dict) else None
+                if isinstance(snap, dict):
+                    snap2 = dict(snap)
+                    pos = snap2.get("positions")
+                    if isinstance(pos, dict):
+                        snap2["positions"] = {k: v for k, v in pos.items() if _symbol_matches_variety(str(k), var_filter)}
+                    orders_alive = snap2.get("orders_alive")
+                    if isinstance(orders_alive, list):
+                        snap2["orders_alive"] = [
+                            o
+                            for o in orders_alive
+                            if isinstance(o, dict) and _symbol_matches_variety(str(o.get("symbol") or ""), var_filter)
+                        ]
+                    gw_state2["last_snapshot"] = snap2
+                gw["state"] = gw_state2
+
+            st_desired = st.get("desired") if isinstance(st.get("desired"), dict) else None
+            if isinstance(st_desired, dict):
+                st_desired2 = dict(st_desired)
+                inner = st_desired2.get("desired") if isinstance(st_desired2.get("desired"), dict) else None
+                if isinstance(inner, dict):
+                    inner2 = dict(inner)
+                    if isinstance(inner2.get("symbols"), list):
+                        inner2["symbols"] = [s for s in inner2.get("symbols") or [] if _symbol_matches_variety(str(s), var_filter)]
+                    st_desired2["desired"] = inner2
+                elif isinstance(st_desired2.get("symbols"), list):
+                    st_desired2["symbols"] = [s for s in st_desired2.get("symbols") or [] if _symbol_matches_variety(str(s), var_filter)]
+                st["desired"] = st_desired2
+
+            st_state = st.get("state") if isinstance(st.get("state"), dict) else None
+            if isinstance(st_state, dict):
+                st_state2 = dict(st_state)
+                last_targets = st_state2.get("last_targets")
+                if isinstance(last_targets, dict):
+                    st_state2["last_targets"] = {
+                        k: v for k, v in last_targets.items() if _symbol_matches_variety(str(k), var_filter)
+                    }
+                events = st_state2.get("recent_events")
+                if isinstance(events, list):
+                    filtered_events: list[Any] = []
+                    for e in events:
+                        if not isinstance(e, dict):
+                            continue
+                        e2 = dict(e)
+                        targets = e2.get("targets")
+                        if isinstance(targets, dict):
+                            targets2 = {k: v for k, v in targets.items() if _symbol_matches_variety(str(k), var_filter)}
+                            if targets2:
+                                e2["targets"] = targets2
+                                filtered_events.append(e2)
+                                continue
+                        sym = str(e2.get("symbol") or "")
+                        if sym and not _symbol_matches_variety(sym, var_filter):
+                            continue
+                        filtered_events.append(e2)
+                    st_state2["recent_events"] = filtered_events
+                st["state"] = st_state2
+
+        payload = {
             "ok": True,
             "account_profile": prof,
             "live_enabled": bool(live_enabled),
+            "state": ("warn" if (gw_stale or st_stale) else "ok"),
+            "text": ("state stale" if (gw_stale or st_stale) else "healthy"),
+            "error": "",
+            "stale": bool(gw_stale or st_stale),
+            "updated_at": _now_iso(),
             "gateway": {**gw, "component_status": gw_status, "state_age_sec": gw_age, "stale": gw_stale},
             "strategy": {**st, "stale": st_stale},
             "gateway_job": gateway_job,
             "strategy_job": strategy_job,
             "generated_at": _now_iso(),
         }
+        if var_filter:
+            payload["var"] = var_filter
+        return payload
 
     app.include_router(
         build_models_router(

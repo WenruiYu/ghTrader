@@ -23,13 +23,13 @@ def build_models_router(*, models_inventory_handler: Handler, models_benchmarks_
 
     @router.get("/api/models/inventory", response_class=JSONResponse)
     async def api_models_inventory(
-        request: Request, include_temp: bool = False, max_rows: int = 500
+        request: Request, include_temp: bool = False, max_rows: int = 500, var: str = ""
     ) -> dict[str, Any]:
         _ = (include_temp, max_rows)
-        return await _invoke(models_inventory_handler, request)
+        return await _invoke(models_inventory_handler, request, var)
 
     @router.get("/api/models/benchmarks", response_class=JSONResponse)
-    async def api_models_benchmarks(request: Request, limit: int = 20) -> dict[str, Any]:
-        return await _invoke(models_benchmarks_handler, request, limit)
+    async def api_models_benchmarks(request: Request, limit: int = 20, var: str = "") -> dict[str, Any]:
+        return await _invoke(models_benchmarks_handler, request, limit, var)
 
     return router

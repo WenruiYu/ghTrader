@@ -18,11 +18,20 @@ def test_l5_mask_df_detects_rows() -> None:
     assert mask.tolist() == [False, True, False]
 
 
-def test_get_l5_start_date_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GHTRADER_L5_START_DATE", "2019-03-11")
+def test_get_l5_start_date_env_per_var_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GHTRADER_L5_START_DATE", "2019-01-01")
+    monkeypatch.setenv("GHTRADER_L5_START_DATE_CU", "2019-03-11")
     from ghtrader.config import get_l5_start_date
 
-    assert get_l5_start_date() == date(2019, 3, 11)
+    assert get_l5_start_date(variety="cu") == date(2019, 3, 11)
+
+
+def test_get_l5_start_date_env_global_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GHTRADER_L5_START_DATE", "2019-04-01")
+    monkeypatch.delenv("GHTRADER_L5_START_DATE_AU", raising=False)
+    from ghtrader.config import get_l5_start_date
+
+    assert get_l5_start_date(variety="au") == date(2019, 4, 1)
 
 
 class TestL5Constants:

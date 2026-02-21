@@ -29,6 +29,7 @@ class JobRecord:
     error: str | None = None
     waiting_locks: list[str] | None = None
     held_locks: list[str] | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class JobStore:
@@ -67,7 +68,8 @@ class JobStore:
                   finished_at TEXT,
                   error TEXT,
                   waiting_locks_json TEXT,
-                  held_locks_json TEXT
+                  held_locks_json TEXT,
+                  metadata_json TEXT
                 )
                 """
             )
@@ -79,6 +81,7 @@ class JobStore:
                 "ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'terminal'",
                 "ALTER TABLE jobs ADD COLUMN waiting_locks_json TEXT",
                 "ALTER TABLE jobs ADD COLUMN held_locks_json TEXT",
+                "ALTER TABLE jobs ADD COLUMN metadata_json TEXT",
             ]:
                 try:
                     con.execute(stmt)
@@ -95,6 +98,7 @@ class JobStore:
         cwd: Path,
         source: str = "terminal",
         log_path: Path | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> JobRecord:
         now = _now_iso()
         rec = JobRecord(
@@ -107,14 +111,15 @@ class JobStore:
             command=command,
             cwd=str(cwd),
             log_path=str(log_path) if log_path is not None else None,
+            metadata=(dict(metadata) if isinstance(metadata, dict) else None),
         )
         with self._connect() as con:
             con.execute(
                 """
                 INSERT INTO jobs
-                  (id, created_at, updated_at, status, title, source, command_json, cwd, log_path)
+                  (id, created_at, updated_at, status, title, source, command_json, cwd, log_path, metadata_json)
                 VALUES
-                  (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rec.id,
@@ -126,6 +131,7 @@ class JobStore:
                     json.dumps(rec.command),
                     rec.cwd,
                     rec.log_path,
+                    json.dumps(rec.metadata) if rec.metadata is not None else None,
                 ),
             )
             con.commit()
@@ -148,6 +154,7 @@ class JobStore:
         cwd: Path | None = None,
         waiting_locks: list[str] | None = None,
         held_locks: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         fields: dict[str, Any] = {"updated_at": _now_iso()}
         if status is not None:
@@ -176,6 +183,8 @@ class JobStore:
             fields["waiting_locks_json"] = json.dumps(waiting_locks)
         if held_locks is not None:
             fields["held_locks_json"] = json.dumps(held_locks)
+        if metadata is not None:
+            fields["metadata_json"] = json.dumps(metadata)
 
         assignments = ", ".join([f"{k}=?" for k in fields.keys()])
         values = list(fields.values()) + [job_id]
@@ -310,6 +319,7 @@ class JobStore:
         cmd = json.loads(row["command_json"])
         waiting = row["waiting_locks_json"]
         held = row["held_locks_json"]
+        metadata_raw = row["metadata_json"] if "metadata_json" in row.keys() else None
         return JobRecord(
             id=row["id"],
             created_at=row["created_at"],
@@ -327,5 +337,6 @@ class JobStore:
             error=row["error"],
             waiting_locks=json.loads(waiting) if waiting else None,
             held_locks=json.loads(held) if held else None,
+            metadata=(json.loads(metadata_raw) if metadata_raw else None),
         )
 

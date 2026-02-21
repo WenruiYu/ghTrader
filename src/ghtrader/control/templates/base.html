@@ -23,20 +23,66 @@
       
       <nav class="nav">
         {% set path = request.url.path %}
-        <a href="/{{ token_qs }}" class="{% if path == '/' %}active{% endif %}">Dashboard</a>
-        <a href="/jobs{{ token_qs }}" class="{% if path.startswith('/jobs') %}active{% endif %}">
+        {% set parts = path.split('/') %}
+        {% set allowed_vars = allowed_varieties if allowed_varieties is defined else ["cu", "au", "ag"] %}
+        {% set nav_var = variety if variety is defined else ((parts[2] if parts|length > 2 and parts[1] == "v" and parts[2] in allowed_vars else "cu")) %}
+        {% set nav_section = parts[3] if parts|length > 3 and parts[1] == "v" else "" %}
+        {% set nav_prefix = "/v/" ~ nav_var %}
+        {% set switch_section = nav_section if nav_section in ["dashboard", "jobs", "data", "models", "trading"] else "dashboard" %}
+        {% set qsep = "&" if token_qs else "?" %}
+        <a href="{{ nav_prefix }}/dashboard{{ token_qs }}" class="{% if nav_section == 'dashboard' or path == '/' %}active{% endif %}">Dashboard</a>
+        <a href="{{ nav_prefix }}/jobs{{ token_qs }}" class="{% if nav_section == 'jobs' or path.startswith('/jobs') %}active{% endif %}">
           Jobs
           {% if running_count is defined and running_count > 0 %}
             <span class="nav-badge">{{ running_count }}</span>
           {% endif %}
         </a>
-        <a href="/data{{ token_qs }}" class="{% if path.startswith('/data') or path.startswith('/ops') %}active{% endif %}">Data</a>
-        <a href="/models{{ token_qs }}" class="{% if path.startswith('/models') %}active{% endif %}">Models</a>
-        <a href="/trading{{ token_qs }}" class="{% if path.startswith('/trading') %}active{% endif %}">Trading</a>
-        <a href="/explorer{{ token_qs }}" class="{% if path.startswith('/explorer') %}active{% endif %}">SQL</a>
-        <a href="/system{{ token_qs }}" class="{% if path.startswith('/system') %}active{% endif %}">System</a>
+        <a href="{{ nav_prefix }}/data{{ token_qs }}" class="{% if nav_section == 'data' or path.startswith('/data') or path.startswith('/ops') %}active{% endif %}">Data</a>
+        <a href="{{ nav_prefix }}/models{{ token_qs }}" class="{% if nav_section == 'models' or path.startswith('/models') %}active{% endif %}">Models</a>
+        <a href="{{ nav_prefix }}/trading{{ token_qs }}" class="{% if nav_section == 'trading' or path.startswith('/trading') %}active{% endif %}">Trading</a>
+        <a href="/explorer{{ token_qs }}{% if token_qs %}&{% else %}?{% endif %}var={{ nav_var }}" class="{% if path.startswith('/explorer') %}active{% endif %}">SQL</a>
+        <a href="/system{{ token_qs }}{% if token_qs %}&{% else %}?{% endif %}var={{ nav_var }}" class="{% if path.startswith('/system') %}active{% endif %}">System</a>
+      </nav>
+      <nav class="var-nav" aria-label="Variety switch">
+        {% for v in allowed_vars %}
+          {% if path.startswith('/explorer') %}
+            {% set switch_href = "/explorer" ~ token_qs ~ qsep ~ "var=" ~ v %}
+          {% elif path.startswith('/system') %}
+            {% set switch_href = "/system" ~ token_qs ~ qsep ~ "var=" ~ v %}
+          {% else %}
+            {% set switch_href = "/v/" ~ v ~ "/" ~ switch_section ~ token_qs %}
+          {% endif %}
+          <a href="{{ switch_href }}" class="{% if v == nav_var %}active{% endif %}">{{ v|upper }}</a>
+        {% endfor %}
       </nav>
     </header>
+
+    {% set pc = page_context if page_context is defined and page_context is mapping else {} %}
+    {% if pc %}
+      <div class="workspace-strip">
+        <div class="workspace-strip-main">
+          <span class="pill">{{ pc.get("workspace_label") or ((variety or "cu")|upper ~ " workspace") }}</span>
+          <span class="workspace-strip-title">{{ pc.get("page_title") or (title or "") }}</span>
+        </div>
+        {% set crumbs = pc.get("breadcrumbs") if pc.get("breadcrumbs") is sequence else [] %}
+        {% if crumbs %}
+          <nav class="breadcrumbs" aria-label="Breadcrumb">
+            {% for crumb in crumbs %}
+              {% set crumb_href = crumb.get("href") if crumb is mapping else "" %}
+              {% set crumb_label = crumb.get("label") if crumb is mapping else "" %}
+              {% if crumb_label %}
+                {% if crumb_href %}
+                  <a href="{{ crumb_href }}">{{ crumb_label }}</a>
+                {% else %}
+                  <span class="current">{{ crumb_label }}</span>
+                {% endif %}
+                {% if not loop.last %}<span class="sep">/</span>{% endif %}
+              {% endif %}
+            {% endfor %}
+          </nav>
+        {% endif %}
+      </div>
+    {% endif %}
 
     <main class="container">
       {% block alerts %}{% endblock %}
@@ -91,6 +137,48 @@
           if (t) clearTimeout(t);
           t = setTimeout(() => fn.apply(this, args), delayMs || 0);
         };
+      };
+
+      window.ghTrader.setButtonBusy = function(button, busy, opts) {
+        if (!button) return;
+        const options = opts || {};
+        if (busy) {
+          if (!button.dataset.idleText) {
+            button.dataset.idleText = button.textContent || "";
+          }
+          button.disabled = true;
+          button.setAttribute("aria-busy", "true");
+          if (options.loadingText) button.textContent = options.loadingText;
+        } else {
+          button.disabled = false;
+          button.removeAttribute("aria-busy");
+          if (button.dataset.idleText) button.textContent = button.dataset.idleText;
+        }
+      };
+
+      window.ghTrader.withButtonBusy = async function(button, fn, opts) {
+        window.ghTrader.setButtonBusy(button, true, opts);
+        try {
+          return await fn();
+        } finally {
+          window.ghTrader.setButtonBusy(button, false, opts);
+        }
+      };
+
+      window.ghTrader.retry = async function(task, retries, delayMs) {
+        const maxRetries = Number.isFinite(Number(retries)) ? Number(retries) : 2;
+        const sleepMs = Number.isFinite(Number(delayMs)) ? Number(delayMs) : 250;
+        let lastErr = null;
+        for (let i = 0; i <= maxRetries; i++) {
+          try {
+            return await task();
+          } catch (e) {
+            lastErr = e;
+            if (i === maxRetries) break;
+            await new Promise((r) => setTimeout(r, sleepMs));
+          }
+        }
+        throw lastErr || new Error("retry failed");
       };
 
       // Initialize tabbed layouts using `.tab-nav-item[data-tab]` + `#tab-<id>` convention.

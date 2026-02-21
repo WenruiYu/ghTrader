@@ -218,6 +218,7 @@ ghTrader implementation is phased to prioritize data quality and research reprod
 - Must write ingest manifests.
 - **Writes directly to `ghtrader_ticks_main_l5_v2`** (no raw ticks persisted).
 - **Optimization**: Support parallel day processing and batched ILP writes for 5x throughput.
+- **Connection policy**: Reuse one TqSdk API session per download worker thread (instead of per-day reconnect), with bounded reconnect on real transport faults and timeout-sensitive reset throttling.
 
 #### 5.1.1 Symbol types and depth limitations (observed)
 
@@ -335,7 +336,10 @@ Phase-0 focuses on **main_l5 correctness only**:
   - `5.2.7`: intra-day gap ledger/statistics
 - **Main_l5 validation (Phase-0)**:
   - Validate coverage against **actual trading sessions** (night sessions + holidays) using cached `trading_time` from TqSdk.
+  - Ingest/validate session semantics must be aligned: `main_l5` ingest must trim rows to the target trading day and target session windows before QuestDB write, so validation is not asked to diagnose cross-day spillover artifacts.
   - **Optimization**: Support incremental validation (check only new days) and parallel execution.
+  - Validation must hold the same symbol lock namespace as `main_l5` (`main_l5:symbol=...`) to avoid reading rebuild in-flight states.
+  - Incremental mode is a first-class path: when there are no new days for the active `schedule_hash`, command returns success with explicit no-op status (not an exception).
   - Respect **exchange-level session overrides**:
     - Skip night sessions during known suspension windows (e.g., SHFE night trading suspended from 2020-02-03 through 2020-05-06) in addition to holiday-gap skips.
     - Handle **one-off delayed night opens** (e.g., SHFE 2019-12-25 delay to 22:30, applied to the 2019-12-26 trading day) by shifting the expected night-session start.
@@ -343,24 +347,51 @@ Phase-0 focuses on **main_l5 correctness only**:
     - If `seconds_with_two_plus / seconds_with_ticks >= strict_ratio`, treat day as **fixed 0.5s cadence** and enforce per-second frequency (2 ticks/sec, boundary seconds tolerant).
     - Otherwise treat as **event-driven** and only flag gaps above a threshold.
   - **Gap threshold**: gaps shorter than `gap_threshold_s` are ignored to avoid false positives from natural sparsity.
+    - Gap threshold supports per-var/per-session overrides (day/night) on top of a global default to reduce false positives from different microstructure regimes.
   - **Detect + report only** (no auto-repair): missing segments (>= threshold), missing half-seconds (strict days), and summary counts.
+  - Missing-half-second policy is two-level:
+    - **info-level** threshold for observability/warning only;
+    - **blocking-level** threshold for hard failure (`ok=false`).
+    - This replaces the zero-tolerance-only gate for strict-cadence half-second misses.
   - **Best-effort source attribution**: mark gaps as TqSdk-source when provider returns no data; otherwise `unknown`.
   - Persist to QuestDB:
     - Summary table: `ghtrader_main_l5_validate_summary_v2` (symbol + trading_day + cadence stats + gap counts)
     - Gap detail table: `ghtrader_main_l5_validate_gaps_v2` (per-gap rows; capped per day)
+  - Validation persistence is fail-fast: if summary/gap/tick-gap persistence fails, command exits non-zero with actionable error (no warning-only swallow).
+  - Validation preflight is fail-fast: table ensure/readiness errors must fail before long day-by-day scans.
+  - Incremental watermarks and dashboard summary reads must be scoped to the active `schedule_hash` to avoid mixing old and new schedule states.
+  - Validation gap-row cleanup uses a fixed **replace_table** strategy (keep-rows copy, drop original, rename temp), with **no runtime fallback branch switching**.
+  - Report artifact should be compact by default (sampled/truncated issue/event details); full gap details are served from QuestDB gap tables/API.
+  - `missing_seconds_ratio` uses strict in-session denominator (`expected_seconds_strict`) to match missing-seconds counting semantics.
   - Write a validation report under `runs/control/reports/main_l5_validate/` and surface a summary in `/data`.
 #### 5.2.3 Update semantics (Phase-0, safe + idempotent)
 
 - **main_schedule**:
   - If the computed schedule hash and latest trading day match what is already stored for `(exchange, variety)`, the build is a **no-op**.
   - Otherwise, rebuild by clearing the existing schedule for that `(exchange, variety)` and writing the new schedule.
+  - Row-scoped cleanup uses a fixed **replace_table** strategy (keep-rows copy, drop original, rename temp), with **no runtime fallback branch switching**.
+  - **Health gate** (required): command success must imply persisted schedule health:
+    - exactly one `schedule_hash` for `(exchange, variety)`,
+    - row count matches expected trading days,
+    - first/last day and per-day main contract mapping match the built schedule.
+  - If health checks fail, command must return non-zero and surface actionable diagnostics.
 - **main_l5**:
   - Default behavior is **full rebuild** (clear then re-ingest).
   - Optional **incremental update** mode may backfill only missing trading days **only if** the schedule hash matches the stored rows.
   - If the stored schedule hash differs or multiple hashes exist for the same derived symbol, a full rebuild is required.
+  - Row-scoped cleanup uses a fixed **replace_table** strategy (keep-rows copy, drop original, rename temp), with **no runtime fallback branch switching**.
+  - **Health gate** (required): command success must imply dataset health:
+    - post-run coverage must include all schedule trading days in the effective schedule window,
+    - no mixed `schedule_hash` state for `(symbol, ticks_kind='main_l5', dataset_version='v2')`.
+  - QuestDB ILP ingest must be **self-healing** for transport faults: if a persistent sender becomes closed/broken, drop and recreate sender, retry bounded times, and treat flush failures as write failures (no silent swallow).
+  - If health checks fail, command must return non-zero and include missing-day/hash diagnostics.
 - **Idempotence**:
   - QuestDB tables use DEDUP UPSERT KEYS with `row_hash` so re-ingest does not create duplicates.
   - Update runs should emit a lightweight report under `runs/control/reports/` with expected days vs present days, plus a coverage watermark (last trading day + last tick timestamp).
+- **Stuck/cancelled run recovery**:
+  - Lock acquisition must not block forever on orphaned/stuck owners.
+  - On lock wait timeout, CLI may preempt conflicting lock owners (SIGTERM → SIGKILL fallback), mark conflicting jobs as cancelled/failed, release locks, and retry acquire.
+  - This behavior must be env-configurable and auditable in logs.
 
 
 #### 5.2.4 Database / query layer (QuestDB-only)
@@ -475,6 +506,7 @@ Segment metadata contract (required for correctness):
 - Every derived `main_l5` tick row must include:
   - `underlying_contract` (string): the specific contract used for that trading day (e.g. `SHFE.cu2602`)
   - `segment_id` (int): schedule segment id for that trading day
+  - `trading_day` must be assigned from each tick timestamp (night-session aware) and rows outside the target trading-day/session window must be dropped before ingestion.
 - Derived features and labels must **propagate** `underlying_contract` and `segment_id` so downstream datasets can enforce no roll-boundary leakage.
 
 Sequence semantics (critical for ML correctness):
@@ -510,8 +542,12 @@ Coverage constraints:
 - Days outside the L5-available era are excluded from `main_l5`.
 - **Manual L5 start (Phase‑0)**:
   - Operator runs `ghtrader data l5-start --exchange SHFE --var cu` to probe TqSdk L5 availability and write a report under `runs/control/reports/l5_start/`.
-  - Operator **sets `GHTRADER_L5_START_DATE=YYYY-MM-DD` in `.env`** (global) based on the report.
-  - `ghtrader main-schedule` **always reads `GHTRADER_L5_START_DATE`** as its start date and **builds through the latest trading day** (no CLI/UI date inputs).
+  - Operator sets **per-var env keys** in `.env` based on probe reports:
+    - `GHTRADER_L5_START_DATE_CU=YYYY-MM-DD`
+    - `GHTRADER_L5_START_DATE_AU=YYYY-MM-DD`
+    - `GHTRADER_L5_START_DATE_AG=YYYY-MM-DD`
+  - `ghtrader main-schedule --var <var>` must read the corresponding per-var key as start date and build through latest trading day (no CLI/UI date inputs).
+  - Legacy `GHTRADER_L5_START_DATE` may be accepted only as a temporary compatibility fallback when the per-var key is unset.
   - When the env value changes, schedule and `main_l5` must be rebuilt to reflect the new range.
 - **Schedule alignment (Phase-0)**:
   - After `main_l5` builds, align `main_schedule` start to the **actual first L5 trading day** derived from the earliest tick timestamp (night-session aware).
@@ -1070,38 +1106,49 @@ Requirements:
   - Operator accesses via SSH port-forward: `ssh -L 8000:127.0.0.1:8000 ops@server`.
   - Optional shared token (defense-in-depth) may be supported.
 - **Information architecture (role-based pages)**:
-  - The dashboard provides a **command center** home page and **role-focused pages** for major workflows:
-    - **Dashboard** (`/`): Command center with KPIs, pipeline status, quick actions
-    - **Jobs** (`/jobs`): Job listing and management
-    - **Data** (`/data`): Main schedule + main_l5 build
-    - **Models** (`/models`): Model inventory, training, benchmarks
-    - **Trading** (`/trading`): Trading console, positions, run history
-    - **Ops** (`/ops`, legacy): redirects to `/data` for backward compatibility
+  - The dashboard is **variety-centric** for fixed SHFE varieties: `cu`, `au`, `ag`.
+  - Canonical workspace routes are:
+    - `/v/{var}/dashboard`
+    - `/v/{var}/jobs`
+    - `/v/{var}/data`
+    - `/v/{var}/models`
+    - `/v/{var}/trading`
+  - Shared utility pages remain:
     - **SQL** (`/explorer`): QuestDB SQL explorer (read-only)
     - **System** (`/system`): CPU/memory/disk/GPU monitoring
+  - Legacy routes remain for compatibility and must redirect to canonical variety pages:
+    - `/`, `/jobs`, `/data`, `/models`, `/trading`, `/ops*` -> `/v/cu/...` counterpart (default variety `cu`)
   - Each page uses **tabbed layouts** to organize related functionality without excessive scrolling.
   - Navigation includes:
     - Status indicators (QuestDB, GPU) in the topbar
     - Running jobs badge on the Jobs nav item
     - Toast notifications for async feedback
+  - In any `/v/{var}/...` page, all default operations and displayed summaries must be scoped to that `var`.
+    - No silent hardcoded fallback to `cu` is allowed once variety context is present.
 - **Page-specific requirements**:
-  - **Dashboard home** (`/`):
+  - **Dashboard home** (`/v/{var}/dashboard`):
     - System status bar (QuestDB, GPU, CPU, Memory)
     - KPI grid (running jobs, data symbols, models, trading status)
     - Pipeline status visualization (Ingest → Sync → Schedule → main_l5 → Build → Train)
     - Quick action buttons for common workflows
     - Running and recent jobs tables
-  - **Data hub** (`/data`):
+  - **Jobs** (`/v/{var}/jobs`):
+    - Job listing and management with default filtering scoped to current variety jobs.
+    - Start forms in this page must prefill/derive `var` and `KQ.m@SHFE.{var}` from route context.
+  - **Data hub** (`/v/{var}/data`):
     - Single primary workflow: **Main L5 pipeline** (QuestDB-only)
       - Step 1: **Build Schedule** from `KQ.m@...` mapping
       - Step 2: **Download L5 per trading day** for the scheduled underlying contract
       - Step 3: **Build main_l5** into `ghtrader_ticks_main_l5_v2`
     - The UI should expose only these steps in Phase-0.
-  - **Models** (`/models`):
+    - Coverage/validation summaries on this page must query only current variety context.
+  - **Models** (`/v/{var}/models`):
     - Tab 1: Model inventory (list trained artifacts with search/filter)
     - Tab 2: Training (train form + sweep form + active training jobs)
     - Tab 3: Benchmarks (benchmark/compare/backtest forms, results table)
-  - **Trading** (`/trading`):
+    - Default symbol fields must be variety-derived (e.g., `KQ.m@SHFE.{var}`).
+    - Inventory/benchmark listings should support variety-scoped views by default.
+  - **Trading** (`/v/{var}/trading`):
     - Tab 1: **Auto Monitor** — real-time consolidated monitoring dashboard:
       - Gateway/strategy health indicators + mode badges
       - Account KPIs (balance, equity, unrealized PnL)
@@ -1148,7 +1195,7 @@ Requirements:
       - `POST /api/gateway/stop`: cancel running gateway job for selected profile
       - `POST /api/strategy/start`: start strategy job for selected profile (requires symbols + model in desired)
       - `POST /api/strategy/stop`: cancel running strategy job for selected profile
-      - `GET /api/trading/console/status`: enriched with `gateway_job`, `strategy_job` (active job info), and `stale` flags
+      - `GET /api/trading/console/status`: enriched with `gateway_job`, `strategy_job` (active job info), and `stale` flags; supports variety-scoped views for positions/orders/signals
     - Tab 3: **Account Config** — broker account management:
       - Profiles table (profile, broker, masked account, configured status, gateway/strategy status, last verify)
       - Add/edit account form (profile, broker ID, account ID, password)
@@ -1156,8 +1203,8 @@ Requirements:
       - Remove action (with confirmation)
       - Broker ID datalist (from Shinny cache or fallback)
   - **Ops** (`/ops`) — **CONSOLIDATED INTO DATA HUB**:
-    - The `/ops` page has been merged into `/data` (Data Hub) to provide a unified workflow.
-    - All `/ops/*` routes redirect to `/data` with appropriate tab anchors for backward compatibility.
+    - The `/ops` page has been merged into variety Data Hub pages (`/v/{var}/data`) to provide a unified workflow.
+    - All `/ops/*` routes redirect to `/v/cu/data` with appropriate tab anchors for backward compatibility.
     - Compatibility routes are redirect/proxy only; they are not a place to keep deferred business logic.
     - Former Ops tabs are now available in Data Hub:
       - Pipeline → Data Hub unified 8-step workflow (Steps 0-7)
@@ -1165,7 +1212,7 @@ Requirements:
       - Schedule & Build → Data Hub Build tab
       - Integrity → Data Hub Integrity tab
       - Locks → Data Hub Locks tab
-  - `/data` is the canonical entrypoint for data operations and the single source-of-truth UI.
+  - `/v/{var}/data` is the canonical entrypoint for variety-scoped data operations and the source-of-truth UI within that variety context.
 - **Job execution model**:
   - Long-running operations must run as **subprocess jobs** (not in-process), so they are cancellable and resilient to UI restarts.
   - Job history must **persist across dashboard restarts**.
@@ -1237,6 +1284,7 @@ Long-running jobs (Build Schedule, main_l5) must provide **real-time progress vi
 
 Requirements:
 - **Progress API**: `/api/jobs/{id}/progress` returns structured progress data including:
+  - Current runtime state (`queued`/`running`/`succeeded`/`failed`/`cancelled`/`error`) plus progress freshness (`stale`, `updated_age_s`)
   - Current phase and step (e.g., "schedule" → "backfill")
   - Step index and total steps for progress bar
   - Current item being processed (e.g., symbol, trading day)
@@ -1246,6 +1294,9 @@ Requirements:
   - Error message if job failed
 - **Job logs (dashboard)**: every line in `runs/control/logs/job-*.log` must include a timestamp prefix, avoid ANSI/color noise, and include event details (key=value) when available.
 - **Progress File**: Jobs write progress to `runs/control/progress/job-{id}.progress.json` atomically
+- **Progress source policy**:
+  - `main-schedule` and `main-l5` must actively write progress state during execution (not only at start/end),
+  - progress and logs must carry coherent state transitions so operators can read both “current state” and “current progress” from either surface.
 - **Job Detail UI**: Job detail page displays:
   - Phase/step with progress indices
   - Current item (if applicable)
@@ -1292,6 +1343,67 @@ Phase‑1/2 deferred.
 - Define **SLO dashboards** (data freshness, job latency, QuestDB saturation, drift alerts).
 - Add **incident runbooks** for data corruption, QuestDB outages, and model regressions.
 - Enforce **audit retention** for job logs, trading commands, and safety actions.
+
+#### 5.10.5 UI/UX system contract (design-system first)
+
+To keep the control plane maintainable while continuing rapid feature delivery, ghTrader must enforce a UI contract shared by templates, CSS, and API payloads.
+
+State semantics (all primary pages):
+- Every async surface must map into a unified state model:
+  - `loading`: request in flight (skeleton/spinner + disabled destructive actions)
+  - `ok`: data/action succeeded
+  - `warn`: degraded but usable (partial data, stale snapshot, soft validation issues)
+  - `error`: failed and requires operator attention
+  - `empty`: query succeeded but no records
+  - `stale`: cached/aged data beyond freshness threshold
+- Status rendering must use both icon/color and text (never color-only signaling).
+- Error surfaces must include: concise message, likely cause, and next action (retry/open detail/open logs).
+
+Layout and interaction hierarchy:
+- Top-level page skeleton is standardized:
+  1) workspace context row (current variety + page context),
+  2) page header (title + primary actions),
+  3) state/alert strip,
+  4) task content panels.
+- Reusable components must be CSS-class/macro driven, not per-template inline styles:
+  - buttons, pills, status badges, alert banners, empty states, card headers, table wrappers, progress indicators.
+- Forms must provide pre-submit validation and inline hints; invalid submissions should be blocked before POST where feasible.
+- Long-running actions must show explicit processing state and prevent double-submit.
+
+API payload contract (UI-facing summary/status endpoints):
+- Dashboard/UI status endpoints should converge on common fields where applicable:
+  - `state`, `text`, `error`, `updated_at`, `stale` (+ domain-specific fields).
+- Frontend should not infer critical state solely by string parsing logs/titles when structured fields are available.
+
+#### 5.10.6 Cross-page workflow continuity
+
+The variety workspace must support low-friction operator flows without context loss.
+
+Required workflow continuity:
+- Primary data workflow: `Dashboard -> Data -> Jobs -> Data/Models` must preserve current `var`.
+- Trading workflow: `Trading Manual Test -> Jobs -> Trading` must preserve `var` + account profile context.
+- Job detail pages must provide context-aware return paths to originating workspace section.
+
+Navigation and discoverability:
+- Every page must expose current workspace context (`var`) prominently.
+- Breadcrumb/page-context hints should exist for deep pages (job detail, explorer/system utility pages).
+- Pipeline steps shown on Dashboard/Data must be actionable (jump to relevant section/form/report).
+
+List usability and filtering:
+- Large operational tables (Jobs, Models inventory) should support at minimum:
+  - text filter, status/kind filters, and bounded pagination or equivalent chunked rendering.
+- Filter state persistence is recommended for operator efficiency (session/local best-effort).
+
+#### 5.10.7 Accessibility and responsive minimums
+
+- Keyboard-first operation:
+  - All actionable controls reachable by Tab/Shift+Tab.
+  - Tabbed interfaces operable without mouse.
+- Visible focus indicators are mandatory on interactive controls.
+- Color contrast should meet WCAG AA baseline for body text and status labels.
+- Responsive behavior:
+  - Core workflows must remain operable at narrow widths (single-column fallback for multi-pane layouts).
+  - Critical actions must not be hidden behind hover-only affordances.
 
 ### 5.11 Trading Control Plane & Dashboard [Implemented]
 

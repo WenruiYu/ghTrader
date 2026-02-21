@@ -20,6 +20,7 @@ dependencies = [
   "torch>=2.2",
   "pyzmq>=25.0",
   "redis>=5.0",
+  "websockets>=14,<16",
   "hmmlearn>=0.3.0",
 ]
 

@@ -1,7 +1,8 @@
 {% extends "base.html" %}
 {% block content %}
+  <input type="hidden" id="currentVariety" value="{{ variety }}" />
   <div class="section-header">
-    <h2>Trading Console</h2>
+    <h2>Trading Console · {{ variety|upper }}</h2>
     <div class="section-header-actions">
       <button class="btn btn-sm btn-secondary" id="refreshTrading">Refresh</button>
     </div>
@@ -138,7 +139,7 @@
         <!-- Recent Orders -->
         <div class="card">
           <h3 class="mb-2">Recent Orders (alive)</h3>
-          <div class="tableWrap" style="max-height:180px; overflow:auto;">
+          <div class="tableWrap table-scroll-sm">
             <table class="table table-compact">
               <thead>
                 <tr>
@@ -161,7 +162,7 @@
         <!-- Recent Signals -->
         <div class="card">
           <h3 class="mb-2">Recent Signals / Targets</h3>
-          <div class="tableWrap" style="max-height:220px; overflow:auto;">
+          <div class="tableWrap table-scroll-md">
             <table class="table table-compact">
               <thead>
                 <tr>
@@ -217,7 +218,7 @@
         Strategy Run History
         <span class="badge" id="runCountBadge">--</span>
       </h3>
-      <div class="tableWrap" style="max-height:280px; overflow:auto;">
+      <div class="tableWrap table-scroll-lg">
         <table class="table table-compact">
           <thead>
             <tr>
@@ -237,26 +238,26 @@
     </div>
 
     <!-- Raw API Response (collapsible) -->
-    <details class="card" style="margin-top:12px;">
-      <summary style="cursor:pointer; font-weight:600; user-select:none;">
+    <details class="card mt-3">
+      <summary class="summary-plain">
         Raw API Response
-        <span class="muted text-sm" style="margin-left:8px;">(click to expand)</span>
+        <span class="muted text-sm summary-hint">(click to expand)</span>
       </summary>
-      <pre class="mono text-xs" id="monitorRawResponse" style="white-space:pre-wrap; max-height:400px; overflow:auto; margin-top:8px; padding:8px; background:var(--bg-secondary); border-radius:4px;">--</pre>
+      <pre class="mono text-xs raw-json" id="monitorRawResponse">--</pre>
     </details>
   </div>
 
   <!-- Tab: Manual Test -->
   <div class="tab-content" id="tab-test">
     <!-- Quick Start Panel -->
-    <div class="card" style="border: 2px solid var(--accent); margin-bottom:16px;">
+    <div class="card panel-accent">
       <h3 class="mb-2">Quick Start</h3>
       <div class="muted text-sm mb-2">
         Start/stop trading processes with minimal configuration. For advanced settings, expand the sections below.
       </div>
 
       <!-- Process Status Strip -->
-      <div class="grid4 mb-3" style="gap:12px;">
+      <div class="grid4 mb-3">
         <div class="metric-card">
           <div class="metric-content">
             <div class="metric-label">Gateway Status</div>
@@ -286,7 +287,7 @@
       </div>
 
       <!-- Stale Warning -->
-      <div id="qsStaleWarning" class="muted text-sm mb-2" style="display:none; padding:8px; background:var(--warn-bg); border-radius:4px; color:var(--warn-text);">
+      <div id="qsStaleWarning" class="muted text-sm mb-2 banner-inline-warn" hidden>
         <strong>Warning:</strong> Gateway state is stale (>30s). The process may have stopped. Consider restarting.
       </div>
 
@@ -294,7 +295,7 @@
       <div class="grid3 mb-3">
         <div>
           <label>Mode</label>
-          <select id="qsMode" style="width:100%;">
+          <select id="qsMode">
             <option value="sim" selected>sim (simulated)</option>
             <option value="live_monitor">live_monitor (read-only)</option>
             <option value="live_trade">live_trade (real orders)</option>
@@ -302,32 +303,32 @@
         </div>
         <div>
           <label>Symbols (comma-separated)</label>
-          <input id="qsSymbols" placeholder="SHFE.cu2602" style="width:100%;"/>
+          <input id="qsSymbols" placeholder="SHFE.{{ variety }}2602"/>
         </div>
-        <div id="qsConfirmLiveWrap" style="display:none;">
+        <div id="qsConfirmLiveWrap" hidden>
           <label>Confirm live (required)</label>
-          <input id="qsConfirmLive" placeholder="I_UNDERSTAND" style="width:100%;"/>
+          <input id="qsConfirmLive" placeholder="I_UNDERSTAND"/>
         </div>
       </div>
 
       <!-- Start/Stop Buttons -->
-      <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
-        <button type="button" class="btn" style="background:#28a745; color:#fff;" id="qsStartGateway">Start Gateway</button>
+      <div class="btn-group">
+        <button type="button" class="btn btn-success" id="qsStartGateway">Start Gateway</button>
         <button type="button" class="btn btn-secondary" id="qsStopGateway">Stop Gateway</button>
-        <span style="border-left:1px solid var(--border); height:24px;"></span>
-        <button type="button" class="btn" style="background:#17a2b8; color:#fff;" id="qsStartStrategy">Start Strategy</button>
+        <span class="btn-divider"></span>
+        <button type="button" class="btn btn-info" id="qsStartStrategy">Start Strategy</button>
         <button type="button" class="btn btn-secondary" id="qsStopStrategy">Stop Strategy</button>
-        <span class="muted text-sm" id="qsActionStatus" style="margin-left:auto;">Ready</span>
+        <span class="muted text-sm status-right" id="qsActionStatus">Ready</span>
       </div>
 
       <!-- Prerequisites Hint -->
-      <div id="qsPrereqHint" class="muted text-xs" style="margin-top:8px; display:none;">
-        <span style="color:var(--warn-text);">Note:</span> <span id="qsPrereqText"></span>
+      <div id="qsPrereqHint" class="muted text-xs mt-3" hidden>
+        <span class="text-warn">Note:</span> <span id="qsPrereqText"></span>
       </div>
     </div>
 
     <!-- Quick Order Panel -->
-    <div class="card" style="border: 2px solid var(--accent); margin-bottom:16px;">
+    <div class="card panel-accent">
       <h3 class="mb-2">Quick Order (Manual Test)</h3>
       <div class="muted text-sm mb-2">
         Execute one-lot orders manually for testing. Requires gateway in <strong>sim</strong> or <strong>live_trade</strong> mode with symbols configured.
@@ -335,41 +336,41 @@
       <div class="grid4 mb-2">
         <div>
           <label>Symbol</label>
-          <select id="manualOrderSymbol" style="width:100%;">
+          <select id="manualOrderSymbol">
             <option value="">-- select --</option>
           </select>
         </div>
         <div>
           <label>Size (lots)</label>
-          <input id="manualOrderSize" type="number" min="1" max="10" value="1" style="width:100%;"/>
+          <input id="manualOrderSize" type="number" min="1" max="10" value="1"/>
         </div>
         <div>
           <label>Current Position</label>
-          <div class="metric-value mono" id="manualCurrentPos" style="font-size:1.2rem; padding:4px 0;">0</div>
+          <div class="metric-value mono metric-value-lg" id="manualCurrentPos">0</div>
         </div>
         <div>
           <label>Gateway Mode</label>
-          <div class="metric-value mono" id="manualGatewayMode" style="font-size:1rem; padding:4px 0;">--</div>
+          <div class="metric-value mono metric-value-md" id="manualGatewayMode">--</div>
         </div>
       </div>
-      <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
-        <button type="button" class="btn" style="background:#28a745; color:#fff;" id="manualOpenLong">Open Long (+1)</button>
-        <button type="button" class="btn" style="background:#dc3545; color:#fff;" id="manualOpenShort">Open Short (-1)</button>
+      <div class="btn-group">
+        <button type="button" class="btn btn-success" id="manualOpenLong">Open Long (+1)</button>
+        <button type="button" class="btn btn-danger" id="manualOpenShort">Open Short (-1)</button>
         <button type="button" class="btn btn-secondary" id="manualCloseAll">Close Position (0)</button>
-        <span class="muted text-sm" id="manualOrderStatus" style="margin-left:auto;">Ready</span>
+        <span class="muted text-sm status-right" id="manualOrderStatus">Ready</span>
       </div>
     </div>
 
     <!-- Advanced Settings (collapsible) -->
-    <details class="card" style="margin-bottom:16px;">
-      <summary style="cursor:pointer; font-weight:600; user-select:none;">
+    <details class="card mb-4">
+      <summary class="summary-plain">
         Advanced Settings
-        <span class="muted text-sm" style="margin-left:8px;">(Gateway + Strategy configuration)</span>
+        <span class="muted text-sm summary-hint">(Gateway + Strategy configuration)</span>
       </summary>
 
-      <div style="margin-top:16px;">
+      <div class="mt-4">
         <!-- AccountGateway -->
-        <div class="card" style="margin-bottom:12px;">
+        <div class="card mb-3">
           <h4 class="mb-2">AccountGateway (OMS/EMS)</h4>
           <div class="muted text-sm mb-2">
             Gateway state is persisted under <span class="mono">runs/gateway/account=&lt;profile&gt;/</span>.
@@ -396,7 +397,7 @@
             </div>
           </div>
 
-          <div style="display:flex; justify-content:flex-end;">
+          <div class="form-actions-right">
             <button type="button" class="btn btn-sm btn-secondary" id="gatewayRefreshBtn">Refresh</button>
           </div>
 
@@ -431,7 +432,7 @@
             <div class="grid2">
               <div>
                 <label>Symbols (comma-separated)</label>
-                <input id="gatewaySymbols" placeholder="SHFE.cu2602,SHFE.au2602"/>
+                <input id="gatewaySymbols" placeholder="SHFE.{{ variety }}2602"/>
               </div>
               <div>
                 <label>Confirm live (required for live_trade)</label>
@@ -452,7 +453,7 @@
                   <option value="false">false</option>
                 </select>
               </div>
-              <div style="display:flex; align-items:flex-end; gap:8px;">
+              <div class="form-actions">
                 <button type="submit" class="btn btn-primary">Apply desired</button>
               </div>
             </div>
@@ -460,25 +461,25 @@
         </div>
 
         <!-- Manual Interventions -->
-        <div class="card" style="margin-bottom:12px; background: var(--warn-bg); border-color: var(--warn-border);">
+        <div class="card panel-warning mb-3">
           <h4 class="mb-2">Manual interventions (logged)</h4>
           <div class="muted text-sm mb-2">
             These append commands to <span class="mono">commands.jsonl</span>. Use only when necessary.
           </div>
-          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <div class="btn-group">
             <button type="button" class="btn btn-secondary btn-sm" id="gatewayCmdCancelAll">Cancel all orders</button>
             <button type="button" class="btn btn-secondary btn-sm" id="gatewayCmdFlatten">Flatten positions</button>
             <button type="button" class="btn btn-danger btn-sm" id="gatewayCmdDisarm">Disarm live (switch to live_monitor)</button>
           </div>
         </div>
 
-        <div class="card" style="margin-bottom:12px;">
+        <div class="card mb-3">
           <h5 class="mb-2">Gateway Raw Status</h5>
-          <pre class="mono text-xs" id="gatewayRaw" style="white-space:pre-wrap; max-height:150px; overflow:auto;">--</pre>
+          <pre class="mono text-xs raw-json-sm" id="gatewayRaw">--</pre>
         </div>
 
         <!-- StrategyRunner -->
-        <div class="card" style="margin-bottom:12px;">
+        <div class="card mb-3">
           <h4 class="mb-2">StrategyRunner (AI)</h4>
           <div class="muted text-sm mb-2">
             Strategy state is persisted under <span class="mono">runs/strategy/account=&lt;profile&gt;/</span>.
@@ -505,7 +506,7 @@
             </div>
           </div>
 
-          <div style="display:flex; justify-content:flex-end;">
+          <div class="form-actions-right">
             <button type="button" class="btn btn-sm btn-secondary" id="strategyRefreshBtn">Refresh</button>
           </div>
 
@@ -521,7 +522,7 @@
               </div>
               <div>
                 <label>Symbols (comma-separated)</label>
-                <input id="strategySymbols" placeholder="SHFE.cu2602,SHFE.au2602"/>
+                <input id="strategySymbols" placeholder="SHFE.{{ variety }}2602"/>
               </div>
             </div>
             <div class="grid3">
@@ -540,9 +541,9 @@
             <button type="submit" class="btn btn-primary">Apply desired</button>
           </form>
 
-          <div style="margin-top:12px;">
+          <div class="mt-3">
             <h5 class="mb-2">Strategy Raw Status</h5>
-            <pre class="mono text-xs" id="strategyRaw" style="white-space:pre-wrap; max-height:150px; overflow:auto;">--</pre>
+            <pre class="mono text-xs raw-json-sm" id="strategyRaw">--</pre>
           </div>
         </div>
 
@@ -566,7 +567,7 @@
         Add/edit accounts here; the table only displays non-secret info.
       </div>
 
-      <form class="form" id="accountUpsertForm" style="margin-bottom:12px;">
+      <form class="form mb-3" id="accountUpsertForm">
         <h4 class="mb-2">Add / Edit Account</h4>
         <div class="grid3">
           <div>
@@ -588,7 +589,7 @@
             <label>Password</label>
             <input id="accountFormPassword" type="password" autocomplete="new-password" />
           </div>
-          <div style="display:flex; gap:8px; align-items:flex-end;">
+          <div class="form-actions">
             <button type="submit" class="btn btn-primary">Save</button>
             <button type="button" class="btn btn-secondary" id="accountFormClear">Clear</button>
           </div>

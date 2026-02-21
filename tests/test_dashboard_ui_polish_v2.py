@@ -43,6 +43,9 @@ def test_api_ui_status_shape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     assert r.status_code == 200
     data = r.json()
     assert data["ok"] is True
+    assert data["state"] in {"ok", "warn", "error"}
+    assert isinstance(data["text"], str)
+    assert isinstance(data["updated_at"], str)
     assert isinstance(data["questdb_ok"], bool)
     assert isinstance(data["gpu_status"], str)
     assert isinstance(data["running_count"], int)
@@ -56,11 +59,28 @@ def test_api_dashboard_summary_shape(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert r.status_code == 200
     data = r.json()
     assert data["ok"] is True
+    assert data["state"] in {"ok", "warn", "error"}
+    assert isinstance(data["text"], str)
+    assert isinstance(data["updated_at"], str)
     assert "pipeline" in data
     assert isinstance(data["data_symbols_v2"], int)
     assert isinstance(data["model_count"], int)
     assert data["data_status"] == "offline"
     assert data["pipeline"]["main_l5"]["state"] != "deferred"
+    assert data["pipeline"]["validation"]["state"] in {"ok", "warn", "error", "unknown"}
+    assert "guardrails" in data
+    assert data["guardrails"]["health_gate_state"] in {"ok", "warn"}
+    assert isinstance(data["guardrails"]["lock_force_cancel_on_timeout"], bool)
+    assert isinstance(data["guardrails"]["lock_wait_timeout_s"], float)
+
+
+def test_dashboard_page_renders_guardrails_panel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    client = _make_client(tmp_path, monkeypatch)
+
+    r = client.get("/v/cu/dashboard")
+    assert r.status_code == 200
+    assert "Pipeline Guardrails" in r.text
+    assert "Health gate" in r.text
 
 
 def test_api_models_inventory_scans_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

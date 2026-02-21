@@ -1,0 +1,43 @@
+{% macro status_indicator(text, state="unknown", dot=true, id="") -%}
+  {% set cls = "status-indicator" %}
+  {% if state == "ok" %}
+    {% set cls = cls ~ " status-indicator-ok" %}
+  {% elif state == "warn" %}
+    {% set cls = cls ~ " status-indicator-warn" %}
+  {% elif state == "error" %}
+    {% set cls = cls ~ " status-indicator-error" %}
+  {% endif %}
+  <span class="{{ cls }}"{% if id %} id="{{ id }}"{% endif %}>
+    {% if dot %}
+      <span class="status-dot {% if state == 'ok' %}status-dot-ok{% elif state == 'warn' %}status-dot-warn{% elif state == 'error' %}status-dot-error{% else %}status-dot-unknown{% endif %}"></span>
+    {% endif %}
+    <span>{{ text }}</span>
+  </span>
+{%- endmacro %}
+
+{% macro alert_banner(title, text, level="info") -%}
+  <div class="alert-banner {% if level == 'error' %}alert-error{% elif level == 'warn' %}alert-warn{% elif level == 'success' %}alert-success{% else %}alert-info{% endif %}">
+    <div class="alert-banner-content">
+      <div class="alert-banner-title">{{ title }}</div>
+      <div>{{ text }}</div>
+    </div>
+  </div>
+{%- endmacro %}
+
+{% macro empty_state(title, text) -%}
+  <div class="empty-state">
+    <div class="empty-state-title">{{ title }}</div>
+    <div class="empty-state-text">{{ text }}</div>
+  </div>
+{%- endmacro %}
+
+{% macro card_title(title, subtitle="") -%}
+  <div class="card-title">
+    <span>{{ title }}</span>
+    {% if subtitle %}<small>{{ subtitle }}</small>{% endif %}
+  </div>
+{%- endmacro %}
+
+{% macro action_link(href, label, variant="secondary", size="sm") -%}
+  <a class="btn btn-{{ variant }} btn-{{ size }}" href="{{ href }}">{{ label }}</a>
+{%- endmacro %}

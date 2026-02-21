@@ -14,7 +14,7 @@
       <span class="pill" id="gpuStatusPill">GPU: …</span>
       <span class="pill" id="dirStatusPill">Dir sizes: …</span>
     </div>
-    <div class="muted" style="margin-top:8px;">
+    <div class="muted mt-3">
       Note: filesystem totals show overall disk capacity; directory sizes are computed lazily and cached.
     </div>
   </div>
@@ -30,7 +30,7 @@
     </div>
     <div class="card">
       <div class="kpiLabel">Load avg (1/5/15)</div>
-      <div class="kpiValue mono" style="font-size:20px; font-weight:800;" id="loadAvg">…</div>
+      <div class="kpiValue kpiValue-mono-lg mono" id="loadAvg">…</div>
     </div>
   </div>
 
@@ -53,11 +53,11 @@
       <div class="muted text-sm" id="qdbError"></div>
     </div>
   </div>
-  <div class="muted text-sm" style="margin-top:6px;">
+  <div class="muted text-sm mt-3">
     PG limit env/config:
     <span class="pill mono" id="qdbPgLimitPill">…</span>
   </div>
-  <div class="muted text-sm" style="margin-top:6px;">
+  <div class="muted text-sm mt-3">
     Source: QuestDB Prometheus endpoint (/metrics).
   </div>
 

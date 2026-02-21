@@ -1,45 +1,77 @@
 {% extends "base.html" %}
 {% block content %}
-  {% set running_jobs = jobs | selectattr("status", "equalto", "running") | list %}
-  {% set queued_jobs = jobs | selectattr("status", "equalto", "queued") | list %}
-  {% set failed_jobs = jobs | selectattr("status", "equalto", "failed") | list %}
-  {% set succeeded_jobs = jobs | selectattr("status", "equalto", "succeeded") | list %}
+  {% set derived_symbol = "KQ.m@SHFE." ~ variety %}
+  {% set scope_all_qs = token_qs ~ ("&" if token_qs else "?") ~ "scope=all" %}
+  {% set counts = jobs_status_counts if jobs_status_counts is mapping else {} %}
+  {% set running_jobs_count = counts.get("running", 0) %}
+  {% set queued_jobs_count = counts.get("queued", 0) %}
+  {% set failed_jobs_count = counts.get("failed", 0) %}
+  {% set succeeded_jobs_count = counts.get("succeeded", 0) %}
+  {% set pg = jobs_pagination if jobs_pagination is mapping else {} %}
+  {% set pg_page = pg.get("page", 1) %}
+  {% set pg_total_pages = pg.get("total_pages", 1) %}
+  {% set pg_total = pg.get("total", jobs|length) %}
+  {% set pg_per_page = pg.get("per_page", 50) %}
+  {% set jobs_base_qs = token_qs ~ ("&" if token_qs else "?") ~ "scope=" ~ jobs_scope ~ "&per_page=" ~ pg_per_page %}
 
   <div class="page page--ops page--jobs">
     <div class="page-head">
       <div>
         <div class="page-subtitle">Ops Console</div>
-        <h2 class="page-title">Jobs</h2>
+        <h2 class="page-title">Jobs · {{ variety|upper }}</h2>
         <div class="muted text-sm">Subprocess jobs with streamed logs under <span class="mono">runs/control/logs/</span></div>
       </div>
       <div class="page-meta">
-        <span class="pill pill-running">running {{ running_jobs | length }}</span>
-        <span class="pill pill-queued">queued {{ queued_jobs | length }}</span>
-        <span class="pill pill-failed">failed {{ failed_jobs | length }}</span>
-        <a class="btn btn-secondary btn-sm" href="/jobs{{ token_qs }}">Refresh</a>
+        <span class="status-indicator {% if guardrails.health_gate_state == 'ok' %}status-indicator-ok{% else %}status-indicator-warn{% endif %}">
+          <span class="status-dot {% if guardrails.health_gate_state == 'ok' %}status-dot-ok{% else %}status-dot-warn{% endif %}"></span>
+          Health gate {{ guardrails.health_gate_label }}
+        </span>
+        <span class="pill pill-running">running {{ running_jobs_count }}</span>
+        <span class="pill pill-queued">queued {{ queued_jobs_count }}</span>
+        <span class="pill pill-failed">failed {{ failed_jobs_count }}</span>
+        <a class="btn btn-secondary btn-sm {% if jobs_scope != 'all' %}active{% endif %}" href="{{ variety_path_prefix }}/jobs{{ token_qs }}">Current variety</a>
+        <a class="btn btn-secondary btn-sm {% if jobs_scope == 'all' %}active{% endif %}" href="{{ variety_path_prefix }}/jobs{{ scope_all_qs }}">All jobs</a>
+        <a class="btn btn-secondary btn-sm" href="{{ variety_path_prefix }}/jobs{{ token_qs }}">Refresh</a>
       </div>
     </div>
 
     <div class="kpi-grid">
       <div class="kpi-card">
         <div class="kpiLabel">Running</div>
-        <div class="kpiValue">{{ running_jobs | length }}</div>
+        <div class="kpiValue">{{ running_jobs_count }}</div>
         <div class="kpiSubtext">Active processes</div>
       </div>
       <div class="kpi-card">
         <div class="kpiLabel">Queued</div>
-        <div class="kpiValue">{{ queued_jobs | length }}</div>
+        <div class="kpiValue">{{ queued_jobs_count }}</div>
         <div class="kpiSubtext">Waiting for locks</div>
       </div>
       <div class="kpi-card">
         <div class="kpiLabel">Succeeded</div>
-        <div class="kpiValue">{{ succeeded_jobs | length }}</div>
+        <div class="kpiValue">{{ succeeded_jobs_count }}</div>
         <div class="kpiSubtext">Recent completions</div>
       </div>
       <div class="kpi-card">
         <div class="kpiLabel">Failed</div>
-        <div class="kpiValue">{{ failed_jobs | length }}</div>
+        <div class="kpiValue">{{ failed_jobs_count }}</div>
         <div class="kpiSubtext">Needs attention</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span>Pipeline defaults</span>
+        <small>Applied to dashboard-started jobs</small>
+      </div>
+      <div class="kv-list">
+        <div class="kv-k">main-schedule health gate</div>
+        <div class="kv-v">{{ "on" if guardrails.enforce_health_schedule else "off" }}</div>
+        <div class="kv-k">main_l5 health gate</div>
+        <div class="kv-v">{{ "on" if guardrails.enforce_health_main_l5 else "off" }}</div>
+        <div class="kv-k">Lock auto-recovery</div>
+        <div class="kv-v">{{ "on" if guardrails.lock_force_cancel_on_timeout else "off" }}</div>
+        <div class="kv-k">Lock wait timeout</div>
+        <div class="kv-v">{{ "%.1f"|format(guardrails.lock_wait_timeout_s) }}s</div>
       </div>
     </div>
 
@@ -50,6 +82,7 @@
           <small>Phase-0: schedule + main_l5</small>
         </div>
         <form class="form" method="post" action="/jobs/start{{ token_qs }}" id="startJobForm">
+          <input type="hidden" name="variety" value="{{ variety }}"/>
           <label>Job type</label>
           <select name="job_type" id="jobType">
             <option value="main_schedule">main-schedule (Phase-0)</option>
@@ -62,7 +95,7 @@
           <div class="grid2">
             <div>
               <label>Symbol / Variety</label>
-              <input name="symbol_or_var" id="symbolOrVar" placeholder="e.g. SHFE.cu2602 or cu"/>
+              <input name="symbol_or_var" id="symbolOrVar" placeholder="e.g. SHFE.{{ variety }}2602 or {{ variety }}" value="{{ variety }}"/>
             </div>
             <div>
               <label>Data dir</label>
@@ -100,7 +133,10 @@
               <input value="{{ latest_trading_day or '' }}" readonly/>
             </div>
           </div>
-          <div class="hint">Uses <span class="mono">GHTRADER_L5_START_DATE</span> and latest trading day.</div>
+          <div class="hint">Uses <span class="mono">{{ l5_start_env_key or l5_start_env_expected_key or "GHTRADER_L5_START_DATE" }}</span> and latest trading day.</div>
+          {% if l5_start_note %}
+            <div class="hint">{{ l5_start_note }}</div>
+          {% endif %}
           </details>
 
           <details id="groupMainL5">
@@ -108,7 +144,7 @@
             <div class="grid2">
               <div>
                 <label>Derived symbol</label>
-                <input name="derived_symbol" value="KQ.m@SHFE.cu"/>
+                <input name="derived_symbol" value="{{ derived_symbol }}"/>
               </div>
               <div>
                 <label>Overwrite</label>
@@ -142,9 +178,9 @@
             <li>2) Build main_l5</li>
             <li>3) Validate in SQL Explorer</li>
           </ul>
-          <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <a class="btn btn-secondary btn-sm" href="/data{{ token_qs }}">Open Data Hub</a>
-            <a class="btn btn-secondary btn-sm" href="/explorer{{ token_qs }}">SQL Explorer</a>
+          <div class="btn-group">
+            <a class="btn btn-secondary btn-sm" href="{{ variety_path_prefix }}/data{{ token_qs }}">Open Data Hub</a>
+            <a class="btn btn-secondary btn-sm" href="/explorer{{ token_qs }}{% if token_qs %}&{% else %}?{% endif %}var={{ variety }}">SQL Explorer</a>
           </div>
         </div>
       </div>
@@ -163,7 +199,33 @@
           <option value="failed">failed</option>
           <option value="cancelled">cancelled</option>
         </select>
+        <label for="kindFilter">Kind</label>
+        <select id="kindFilter">
+          <option value="" selected>(any)</option>
+          <option value="main_schedule">main_schedule</option>
+          <option value="main_l5">main_l5</option>
+          <option value="build">build</option>
+          <option value="train">train</option>
+          <option value="benchmark">benchmark</option>
+        </select>
         <button type="button" class="btn btn-secondary btn-sm" id="clearFilters">Clear</button>
+      </div>
+      <div class="inlineControls mt-3">
+        <span class="muted text-sm">Page {{ pg_page }}/{{ pg_total_pages }} · {{ pg_total }} jobs</span>
+        {% if pg.get("has_prev") %}
+          <a class="btn btn-secondary btn-sm" href="{{ variety_path_prefix }}/jobs{{ jobs_base_qs }}&page={{ pg.get('prev_page', 1) }}">Prev</a>
+        {% else %}
+          <span class="btn btn-secondary btn-sm" aria-disabled="true">Prev</span>
+        {% endif %}
+        {% if pg.get("has_next") %}
+          <a class="btn btn-secondary btn-sm" href="{{ variety_path_prefix }}/jobs{{ jobs_base_qs }}&page={{ pg.get('next_page', pg_page) }}">Next</a>
+        {% else %}
+          <span class="btn btn-secondary btn-sm" aria-disabled="true">Next</span>
+        {% endif %}
+        <span class="muted text-xs">Rows</span>
+        <a class="btn btn-secondary btn-sm {% if pg_per_page == 50 %}active{% endif %}" href="{{ variety_path_prefix }}/jobs{{ token_qs }}{% if token_qs %}&{% else %}?{% endif %}scope={{ jobs_scope }}&per_page=50&page=1">50</a>
+        <a class="btn btn-secondary btn-sm {% if pg_per_page == 100 %}active{% endif %}" href="{{ variety_path_prefix }}/jobs{{ token_qs }}{% if token_qs %}&{% else %}?{% endif %}scope={{ jobs_scope }}&per_page=100&page=1">100</a>
+        <a class="btn btn-secondary btn-sm {% if pg_per_page == 200 %}active{% endif %}" href="{{ variety_path_prefix }}/jobs{{ token_qs }}{% if token_qs %}&{% else %}?{% endif %}scope={{ jobs_scope }}&per_page=200&page=1">200</a>
       </div>
     </div>
 
@@ -179,18 +241,40 @@
         </thead>
         <tbody>
           {% for j in jobs %}
-          <tr data-status="{{ j.status }}">
-            <td class="mono"><a class="mono" href="/jobs/{{ j.id }}{{ token_qs }}">{{ j.id }}</a></td>
+          {% set meta = j.metadata if j.metadata is mapping else {} %}
+          {% set job_kind = (meta.get("kind") or "") | lower %}
+          {% if not job_kind %}
+            {% set jt = (j.title or "") | lower %}
+            {% if "main-schedule" in jt %}
+              {% set job_kind = "main_schedule" %}
+            {% elif "main-l5" in jt %}
+              {% set job_kind = "main_l5" %}
+            {% elif jt[:6] == "build " %}
+              {% set job_kind = "build" %}
+            {% elif jt[:6] == "train " %}
+              {% set job_kind = "train" %}
+            {% elif jt[:10] == "benchmark " %}
+              {% set job_kind = "benchmark" %}
+            {% endif %}
+          {% endif %}
+          {% set meta_symbol = meta.get("symbol") or ((meta.get("symbols") or []) | join(",")) %}
+          <tr data-status="{{ j.status }}" data-kind="{{ job_kind }}">
+            <td class="mono"><a class="mono" href="/jobs/{{ j.id }}{{ token_qs }}{% if token_qs %}&{% else %}?{% endif %}var={{ variety }}">{{ j.id }}</a></td>
             <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
             <td class="mono">{{ j.source or "" }}</td>
-            <td class="cell-wrap">{{ j.title }}</td>
+            <td class="cell-wrap">
+              <div>{{ j.title }}</div>
+              <div class="muted text-xs mono">
+                kind={{ job_kind or "--" }} · var={{ meta.get("variety") or "--" }} · symbol={{ meta_symbol or "--" }}
+              </div>
+            </td>
             <td class="mono cell-wrap">
               {% if j.held_locks %}
                 <div class="muted">held</div>
                 {% for k in j.held_locks %}<div>{{ k }}</div>{% endfor %}
               {% endif %}
               {% if j.waiting_locks %}
-                <div class="muted" style="margin-top:6px;">waiting</div>
+                <div class="muted mt-3">waiting</div>
                 {% for k in j.waiting_locks %}<div>{{ k }}</div>{% endfor %}
               {% endif %}
             </td>
@@ -199,7 +283,7 @@
             <td class="mono">{{ j.created_at }}</td>
             <td class="mono">{{ j.started_at or "" }}</td>
             <td class="mono">{{ j.finished_at or "" }}</td>
-            <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
+            <td><a href="/jobs/{{ j.id }}{{ token_qs }}{% if token_qs %}&{% else %}?{% endif %}var={{ variety }}">View</a></td>
           </tr>
           {% endfor %}
         </tbody>
@@ -236,9 +320,10 @@
 
         if (!symbolOrVar) return;
         if (t === "main_schedule" || t === "main_l5") {
-          symbolOrVar.placeholder = "e.g. cu";
+          symbolOrVar.placeholder = "e.g. {{ variety }}";
+          if (!symbolOrVar.value || symbolOrVar.value.includes("SHFE.")) symbolOrVar.value = "{{ variety }}";
         } else {
-          symbolOrVar.placeholder = "e.g. SHFE.cu2602";
+          symbolOrVar.placeholder = "e.g. SHFE.{{ variety }}2602";
         }
       }
       if (jobType) jobType.addEventListener("change", syncFormByType);
@@ -246,34 +331,62 @@
 
       const filter = document.getElementById("jobsFilter");
       const status = document.getElementById("statusFilter");
+      const kind = document.getElementById("kindFilter");
       const clearBtn = document.getElementById("clearFilters");
       const table = document.getElementById("jobsTable");
       const tableWrap = document.getElementById("jobsTableWrap");
       const scrollTop = document.getElementById("jobsTableScrollTop");
       const scrollTopInner = document.getElementById("jobsTableScrollTopInner");
 
+      const filterStorageKey = "ghtrader_jobs_filters_{{ variety }}";
+
       function applyFilter() {
         if (!table) return;
         const q = (filter && filter.value ? filter.value : "").trim().toLowerCase();
         const s = (status && status.value ? status.value : "").trim().toLowerCase();
+        const k = (kind && kind.value ? kind.value : "").trim().toLowerCase();
         const rows = table.querySelectorAll("tbody tr");
         for (const tr of rows) {
           const t = (tr.textContent || "").toLowerCase();
           const st = (tr.getAttribute("data-status") || "").toLowerCase();
+          const kd = (tr.getAttribute("data-kind") || "").toLowerCase();
           const okQ = !q || t.includes(q);
           const okS = !s || st === s;
-          tr.style.display = (okQ && okS) ? "" : "none";
+          const okK = !k || kd === k;
+          tr.style.display = (okQ && okS && okK) ? "" : "none";
         }
+        try {
+          localStorage.setItem(
+            filterStorageKey,
+            JSON.stringify({
+              q: filter ? filter.value : "",
+              status: status ? status.value : "",
+              kind: kind ? kind.value : "",
+            })
+          );
+        } catch (_) {}
       }
       if (filter) filter.addEventListener("input", applyFilter);
       if (status) status.addEventListener("change", applyFilter);
+      if (kind) kind.addEventListener("change", applyFilter);
       if (clearBtn) {
         clearBtn.addEventListener("click", () => {
           if (filter) filter.value = "";
           if (status) status.value = "";
+          if (kind) kind.value = "";
           applyFilter();
         });
       }
+
+      try {
+        const saved = JSON.parse(localStorage.getItem(filterStorageKey) || "{}");
+        if (saved && typeof saved === "object") {
+          if (filter && typeof saved.q === "string") filter.value = saved.q;
+          if (status && typeof saved.status === "string") status.value = saved.status;
+          if (kind && typeof saved.kind === "string") kind.value = saved.kind;
+        }
+      } catch (_) {}
+      applyFilter();
 
       function syncScrollWidths() {
         if (!tableWrap || !scrollTopInner) return;

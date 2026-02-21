@@ -22,6 +22,24 @@ def test_explorer_page_exists(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     assert "SQL Explorer" in r.text
 
 
+def test_explorer_page_preserves_var_context_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+
+    mod = importlib.import_module("ghtrader.control.app")
+    importlib.reload(mod)
+    client = TestClient(mod.app)
+
+    r = client.get("/explorer?var=au")
+    assert r.status_code == 200
+    assert '/explorer?var=au' in r.text
+    assert "KQ.m@SHFE.au" in r.text
+    # Variety switch stays in explorer utility page.
+    assert '/explorer?var=cu' in r.text
+    assert '/explorer?var=ag' in r.text
+
+
 def test_system_page_handles_missing_artifacts_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runs_dir = tmp_path / "runs"
     data_dir = tmp_path / "data"
@@ -41,6 +59,29 @@ def test_system_page_handles_missing_artifacts_dir(tmp_path: Path, monkeypatch: 
     r = client.get("/system")
     assert r.status_code == 200
     assert f"{artifacts_dir} (missing)" in r.text
+
+
+def test_system_page_var_switch_stays_on_system(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runs_dir = tmp_path / "runs"
+    data_dir = tmp_path / "data"
+    artifacts_dir = tmp_path / "artifacts"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(runs_dir))
+    monkeypatch.setenv("GHTRADER_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(artifacts_dir))
+
+    mod = importlib.import_module("ghtrader.control.app")
+    importlib.reload(mod)
+    client = TestClient(mod.app)
+
+    r = client.get("/system?var=ag")
+    assert r.status_code == 200
+    assert '/system?var=cu' in r.text
+    assert '/system?var=au' in r.text
+    assert '/system?var=ag' in r.text
 
 
 def test_api_system_snapshot_shape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

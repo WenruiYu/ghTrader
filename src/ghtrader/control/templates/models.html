@@ -1,7 +1,8 @@
 {% extends "base.html" %}
 {% block content %}
+  {% set derived_symbol = "KQ.m@SHFE." ~ variety %}
   <div class="section-header">
-    <h2>Models</h2>
+    <h2>Models · {{ variety|upper }}</h2>
     <div class="section-header-actions">
       <button class="btn btn-sm btn-secondary" id="refreshModels">Refresh</button>
     </div>
@@ -37,7 +38,7 @@
       </div>
       <div class="kpi-card">
         <div class="kpiLabel">Last Trained</div>
-        <div class="kpiValue mono" style="font-size:18px;" id="kpiLastTrained">--</div>
+        <div class="kpiValue kpiValue-sm mono" id="kpiLastTrained">--</div>
         <div class="kpiSubtext" id="kpiLastTrainedModel">--</div>
       </div>
     </div>
@@ -46,8 +47,8 @@
       <div class="section-header mb-2">
         <h3 class="mb-0">Model Artifacts</h3>
         <div class="flex gap-2">
-          <input type="text" id="modelSearch" placeholder="Search models..." style="width:200px; padding:6px 10px; margin:0;"/>
-          <select id="modelTypeFilter" style="width:auto; padding:6px 10px; margin:0;">
+          <input type="text" id="modelSearch" class="control-search" placeholder="Search models..."/>
+          <select id="modelTypeFilter" class="control-compact">
             <option value="all">All types</option>
             <option value="xgboost">xgboost</option>
             <option value="lightgbm">lightgbm</option>
@@ -104,7 +105,7 @@
             </div>
             <div>
               <label>Symbol</label>
-              <input name="symbol" placeholder="KQ.m@SHFE.cu" value="KQ.m@SHFE.cu"/>
+              <input name="symbol" placeholder="{{ derived_symbol }}" value="{{ derived_symbol }}"/>
             </div>
             <div>
               <label>Horizon</label>
@@ -165,7 +166,7 @@
           <h3 class="mb-2">Hyperparameter Sweep</h3>
           <form class="form" method="post" action="/models/model/sweep{{ token_qs }}">
             <div class="grid2">
-              <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu" value="KQ.m@SHFE.cu"/></div>
+              <div><label>Symbol</label><input name="symbol" placeholder="{{ derived_symbol }}" value="{{ derived_symbol }}"/></div>
               <div><label>Model</label><input name="model" value="deeplob"/></div>
             </div>
             <div class="grid3">
@@ -204,7 +205,7 @@
                   <option value="tcn">tcn</option>
                 </select>
               </div>
-              <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu" value="KQ.m@SHFE.cu"/></div>
+              <div><label>Symbol</label><input name="symbol" placeholder="{{ derived_symbol }}" value="{{ derived_symbol }}"/></div>
               <div>
                 <label>Horizon</label>
                 <select name="horizon">
@@ -227,7 +228,7 @@
           <h3 class="mb-2">Compare Models</h3>
           <form class="form" method="post" action="/models/eval/compare{{ token_qs }}">
             <div class="grid2">
-              <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu" value="KQ.m@SHFE.cu"/></div>
+              <div><label>Symbol</label><input name="symbol" placeholder="{{ derived_symbol }}" value="{{ derived_symbol }}"/></div>
               <div><label>Models (comma-separated)</label><input name="models" value="logistic,xgboost,deeplob"/></div>
             </div>
             <div class="grid3">
@@ -269,7 +270,7 @@
           <form class="form" method="post" action="/models/eval/backtest{{ token_qs }}">
             <div class="grid2">
               <div><label>Model</label><input name="model" value="xgboost"/></div>
-              <div><label>Symbol</label><input name="symbol" placeholder="KQ.m@SHFE.cu"/></div>
+              <div><label>Symbol</label><input name="symbol" placeholder="{{ derived_symbol }}" value="{{ derived_symbol }}"/></div>
             </div>
             <div class="grid2">
               <div><label>Start date</label><input name="start_date" type="date"/></div>
@@ -289,7 +290,7 @@
           <div class="muted text-sm mb-2">No real orders are sent. For research/validation only.</div>
           <form class="form" method="post" action="/models/eval/paper{{ token_qs }}">
             <div><label>Model</label><input name="model" value="xgboost"/></div>
-            <div><label>Symbols (comma-separated)</label><input name="symbols" placeholder="KQ.m@SHFE.cu"/></div>
+            <div><label>Symbols (comma-separated)</label><input name="symbols" placeholder="{{ derived_symbol }}" value="{{ derived_symbol }}"/></div>
             <div><label>Artifacts dir</label><input name="artifacts_dir" value="artifacts"/></div>
             <button type="submit">Run Paper</button>
           </form>
@@ -298,7 +299,7 @@
         <div class="card">
           <h3 class="mb-2">Daily Train</h3>
           <form class="form" method="post" action="/models/eval/daily_train{{ token_qs }}">
-            <div><label>Symbols (comma-separated)</label><input name="symbols" placeholder="KQ.m@SHFE.cu"/></div>
+            <div><label>Symbols (comma-separated)</label><input name="symbols" placeholder="{{ derived_symbol }}" value="{{ derived_symbol }}"/></div>
             <div class="grid3">
               <div><label>Model</label><input name="model" value="deeplob"/></div>
               <div><label>Horizon</label><input name="horizon" value="50"/></div>
@@ -326,7 +327,7 @@
 
   async function loadModels() {
     try {
-      const resp = await window.ghTrader.fetchApi("/api/models/inventory");
+      const resp = await window.ghTrader.fetchApi("/api/models/inventory?var={{ variety }}");
       if (!resp.ok) {
         const data = await resp.json().catch(() => ({}));
         throw new Error(data.detail || "Failed to load models");
@@ -409,9 +410,11 @@
       const resp = await window.ghTrader.fetchApi("/api/jobs?limit=50");
       if (!resp.ok) return;
       const data = await resp.json();
+      const marker = ".{{ variety }}";
       const jobs = (data.jobs || []).filter(j => 
         j.status === "running" && 
-        (j.title || "").toLowerCase().includes("train")
+        (j.title || "").toLowerCase().includes("train") &&
+        (j.title || "").toLowerCase().includes(marker)
       );
       
       const container = document.getElementById("trainingJobsList");
@@ -421,12 +424,12 @@
       }
       
       container.innerHTML = jobs.map(j => [
-        '<div class="metric-card" style="margin-bottom:8px;">',
+        '<div class="metric-card mb-2">',
         '<div class="metric-content">',
         '<div class="metric-label">' + j.title + '</div>',
         '<div class="metric-value text-sm"><span class="pill pill-running">running</span></div>',
         '</div>',
-        '<a href="/jobs/' + j.id + '{{ token_qs }}" class="btn-sm btn-secondary">View</a>',
+        '<a href="/jobs/' + j.id + '{{ token_qs }}{% if token_qs %}&{% else %}?{% endif %}var={{ variety }}" class="btn-sm btn-secondary">View</a>',
         '</div>'
       ].join("")).join("");
     } catch (e) {
@@ -436,7 +439,7 @@
 
   async function loadBenchmarkResults() {
     try {
-      const resp = await window.ghTrader.fetchApi("/api/models/benchmarks?limit=10");
+      const resp = await window.ghTrader.fetchApi("/api/models/benchmarks?limit=10&var={{ variety }}");
       if (!resp.ok) return;
       const data = await resp.json();
       if (data && data.ok === false) return;
@@ -471,7 +474,7 @@
   }
 
   function extractFromTitle(title, field) {
-    // Parse "benchmark xgboost KQ.m@SHFE.cu" format
+    // Parse "benchmark xgboost KQ.m@SHFE.<var>" format
     const parts = (title || "").split(" ");
     if (field === "model" && parts.length > 1) return parts[1];
     if (field === "symbol" && parts.length > 2) return parts[2];

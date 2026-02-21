@@ -120,16 +120,30 @@ Then open `http://127.0.0.1:8000` locally.
 
 ### Dashboard pages
 
-| Page | URL | Description |
-|------|-----|-------------|
-| **Dashboard** | `/` | Command center with KPIs, pipeline status, quick actions |
-| **Jobs** | `/jobs` | Job listing, status, logs, cancellation |
-| **Data** | `/data` | Data coverage, contract explorer, DB sync |
-| **Models** | `/models` | Model inventory, training forms, benchmarks |
-| **Trading** | `/trading` | Trading console, positions, run history |
-| **Ops** | `/ops` | Pipeline operations, ingest, schedule/build, integrity, locks |
+The control plane is variety-centric with fixed SHFE varieties: `cu`, `au`, `ag`.
+
+| Page | Canonical URL | Description |
+|------|---------------|-------------|
+| **Dashboard** | `/v/{var}/dashboard` | Command center with KPIs, pipeline status, quick actions |
+| **Jobs** | `/v/{var}/jobs` | Variety-scoped jobs and management |
+| **Data** | `/v/{var}/data` | Main schedule + main_l5 build/validation for current variety |
+| **Models** | `/v/{var}/models` | Variety-scoped model inventory, training, benchmarks |
+| **Trading** | `/v/{var}/trading` | Trading console filtered to current variety context |
 | **SQL** | `/explorer` | QuestDB SQL explorer (read-only; canonical ticks) |
 | **System** | `/system` | CPU, memory, disk, GPU monitoring |
+
+Legacy routes remain for compatibility and redirect to default variety `cu`:
+`/`, `/jobs`, `/data`, `/models`, `/trading`, `/ops*` -> `/v/cu/...`
+
+Examples:
+
+```bash
+# Copper workspace
+http://127.0.0.1:8000/v/cu/dashboard
+
+# Gold workspace
+http://127.0.0.1:8000/v/au/data
+```
 
 ### Key features
 
@@ -231,9 +245,13 @@ Common flows:
 # Probe L5 start (manual) and copy the env line
 ghtrader data l5-start --exchange SHFE --var cu
 # Then set in .env:
-#   GHTRADER_L5_START_DATE=YYYY-MM-DD
+#   GHTRADER_L5_START_DATE_CU=YYYY-MM-DD
+# Repeat for AU/AG:
+#   ghtrader data l5-start --exchange SHFE --var au
+#   ghtrader data l5-start --exchange SHFE --var ag
 
-# Build main schedule from TqSdk KQ.m@ mapping (uses env start → latest trading day)
+# Build main schedule from TqSdk KQ.m@ mapping
+# (uses per-var env start key -> latest trading day)
 ghtrader main-schedule --var cu
 
 # Build derived main_l5 ticks for the continuous alias (writes to QuestDB)
@@ -242,6 +260,11 @@ ghtrader main-l5 --var cu --symbol KQ.m@SHFE.cu
 # (Optional) Build features + labels from main_l5
 ghtrader build --symbol KQ.m@SHFE.cu --ticks-kind main_l5
 ```
+
+Pipeline robustness defaults (recommended in `.env`):
+- `GHTRADER_PIPELINE_ENFORCE_HEALTH=true` (step success implies persisted state is healthy)
+- `GHTRADER_LOCK_WAIT_TIMEOUT_S=120` + `GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT=true` (recover from stuck lock owners)
+- Optionally tune `GHTRADER_MAIN_L5_TOTAL_WORKERS` / `GHTRADER_MAIN_L5_SEGMENT_WORKERS` to cap ingest fan-out
 
 ## Data maintenance (Update)
 

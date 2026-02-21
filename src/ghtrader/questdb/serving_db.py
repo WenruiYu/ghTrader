@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
+import time
 from typing import Literal
 
 import pandas as pd
@@ -32,6 +33,26 @@ def _env_int(key: str, default: int) -> int:
 
 def _env_bool(key: str, default: bool) -> bool:
     return env_bool(key, default)
+
+
+def _is_recoverable_sender_error(exc: Exception) -> bool:
+    msg = str(exc or "").strip().lower()
+    if not msg:
+        return False
+    patterns = (
+        "sender is closed",
+        "can't be called: sender is closed",
+        "broken pipe",
+        "connection reset",
+        "connection aborted",
+        "transport endpoint is not connected",
+        "socket is closed",
+    )
+    if any(p in msg for p in patterns):
+        return True
+    name = type(exc).__name__.lower()
+    # QuestDB client may wrap transport issues into IngressError.
+    return "ingresserror" in name and ("closed" in msg or "connection" in msg or "socket" in msg)
 
 
 @dataclass(frozen=True)
@@ -116,6 +137,11 @@ class QuestDBBackend(ServingDBBackend):
         if sender is not None:
             return sender
         sender = self._sender_context()
+        # QuestDB Sender objects created outside a context manager must be
+        # explicitly established before dataframe()/flush() calls.
+        establish = getattr(sender, "establish", None)
+        if callable(establish):
+            establish()
         tl.sender = sender
         return sender
 
@@ -129,10 +155,7 @@ class QuestDBBackend(ServingDBBackend):
 
         if total_rows <= batch_rows:
             sender.dataframe(df, table_name=table, at="ts")
-            try:
-                sender.flush()
-            except Exception:
-                pass
+            sender.flush()
             return
 
         batch_idx = 0
@@ -141,14 +164,8 @@ class QuestDBBackend(ServingDBBackend):
             sender.dataframe(df.iloc[start:stop], table_name=table, at="ts")
             batch_idx += 1
             if batch_idx % flush_every_batches == 0:
-                try:
-                    sender.flush()
-                except Exception:
-                    pass
-        try:
-            sender.flush()
-        except Exception:
-            pass
+                sender.flush()
+        sender.flush()
 
     def ensure_table(self, *, table: str, include_segment_metadata: bool) -> None:
         # Best-effort DDL via PGWire. ILP can auto-create but may not create WAL/partitioning settings.
@@ -228,29 +245,44 @@ class QuestDBBackend(ServingDBBackend):
                     pass
 
         persistent_sender = _env_bool("GHTRADER_QDB_ILP_PERSISTENT_SENDER", True)
-        try:
-            if persistent_sender:
-                sender = self._get_thread_sender()
-                self._ingest_with_sender(sender=sender, table=table, df=df2)
-            else:
-                with self._sender_context() as sender:
-                    self._ingest_with_sender(sender=sender, table=table, df=df2)
-        except Exception:
-            # Drop poisoned sender so the next write reconnects cleanly.
-            if persistent_sender:
-                self._drop_thread_sender()
-            raise
-        else:
+        retry_max = max(0, int(_env_int("GHTRADER_QDB_ILP_RETRY_MAX", 1 if persistent_sender else 0)))
+        for attempt in range(retry_max + 1):
             try:
-                log.debug(
-                    "serving_db.questdb_ingest",
+                if persistent_sender:
+                    sender = self._get_thread_sender()
+                    self._ingest_with_sender(sender=sender, table=table, df=df2)
+                else:
+                    with self._sender_context() as sender:
+                        self._ingest_with_sender(sender=sender, table=table, df=df2)
+                break
+            except Exception as e:
+                if persistent_sender:
+                    # Drop poisoned sender so the next write reconnects cleanly.
+                    self._drop_thread_sender()
+                recoverable = bool(persistent_sender and _is_recoverable_sender_error(e))
+                if (not recoverable) or attempt >= retry_max:
+                    raise
+                wait_s = min(2.0, 0.1 * (2**attempt))
+                log.warning(
+                    "serving_db.questdb_sender_retry",
                     table=str(table),
-                    rows=int(len(df2)),
-                    ilp_batch_rows=int(_env_int("GHTRADER_QDB_ILP_BATCH_ROWS", 200_000)),
-                    persistent_sender=bool(persistent_sender),
+                    attempt=int(attempt + 1),
+                    max_attempts=int(retry_max + 1),
+                    wait_s=float(wait_s),
+                    error=str(e),
                 )
-            except Exception:
-                pass
+                if wait_s > 0:
+                    time.sleep(float(wait_s))
+        try:
+            log.debug(
+                "serving_db.questdb_ingest",
+                table=str(table),
+                rows=int(len(df2)),
+                ilp_batch_rows=int(_env_int("GHTRADER_QDB_ILP_BATCH_ROWS", 200_000)),
+                persistent_sender=bool(persistent_sender),
+            )
+        except Exception:
+            pass
 
 
 def make_serving_backend(config: ServingDBConfig) -> ServingDBBackend:

@@ -5,6 +5,13 @@
   const tabs = window.ghTrader.initTabs({ updateHash: true });
   const token = window.ghTrader && window.ghTrader.token ? String(window.ghTrader.token) : "";
   const tokenQs = token ? ("?token=" + encodeURIComponent(token)) : "";
+  const currentVariety = (function () {
+    const el = document.getElementById("currentVariety");
+    const v = String(el && el.value ? el.value : "").trim().toLowerCase();
+    return v || "cu";
+  })();
+  const derivedMainSymbol = "KQ.m@SHFE." + currentVariety;
+  const varQs = (tokenQs ? "&" : "?") + "var=" + encodeURIComponent(currentVariety);
 
   // Account profiles
   let accountsByProfile = {};
@@ -28,6 +35,8 @@
     const posEl = document.getElementById("manualCurrentPos");
     const modeEl = document.getElementById("manualGatewayMode");
     const statusEl = document.getElementById("manualOrderStatus");
+    const ordersEnabled = (lastGatewayMode === "sim" || lastGatewayMode === "live_trade");
+    const selectedSym = symSelect ? String(symSelect.value || "") : "";
 
     // Update symbol dropdown
     if (symSelect) {
@@ -54,13 +63,11 @@
     // Update gateway mode
     if (modeEl) {
       modeEl.textContent = lastGatewayMode || "idle";
-      const ordersEnabled = (lastGatewayMode === "sim" || lastGatewayMode === "live_trade");
       modeEl.style.color = ordersEnabled ? "#28a745" : "#6c757d";
     }
 
     // Update status
     if (statusEl) {
-      const ordersEnabled = (lastGatewayMode === "sim" || lastGatewayMode === "live_trade");
       if (!ordersEnabled) {
         statusEl.textContent = "Orders disabled (mode: " + lastGatewayMode + ")";
       } else if (lastGatewaySymbols.length === 0) {
@@ -69,6 +76,11 @@
         statusEl.textContent = "Ready";
       }
     }
+
+    const canOrder = ordersEnabled && !!selectedSym;
+    if (manualOpenLongBtn) manualOpenLongBtn.disabled = !canOrder;
+    if (manualOpenShortBtn) manualOpenShortBtn.disabled = !canOrder;
+    if (manualCloseAllBtn) manualCloseAllBtn.disabled = !canOrder;
   }
 
   // Selectors
@@ -121,6 +133,14 @@
   const strategyArtifactsDirEl = document.getElementById("strategyArtifactsDir");
   const strategyPollIntervalEl = document.getElementById("strategyPollIntervalSec");
 
+  function ensureVarietyScopedSymbolDefaults() {
+    const defaultSym = pickVarietySymbol([]) || derivedMainSymbol;
+    const qsSymbolsEl = document.getElementById("qsSymbols");
+    if (qsSymbolsEl && !String(qsSymbolsEl.value || "").trim()) qsSymbolsEl.value = defaultSym;
+    if (gatewaySymbolsEl && !String(gatewaySymbolsEl.value || "").trim()) gatewaySymbolsEl.value = defaultSym;
+    if (strategySymbolsEl && !String(strategySymbolsEl.value || "").trim()) strategySymbolsEl.value = defaultSym;
+  }
+
   function esc(s) {
     return String(s || "")
       .replace(/&/g, "&amp;")
@@ -151,6 +171,25 @@
       .split(",")
       .map((x) => String(x || "").trim())
       .filter((x) => x);
+  }
+
+  function symbolMatchesVariety(symbol) {
+    const s = String(symbol || "").trim().toLowerCase();
+    if (!s) return false;
+    if (s.includes("@shfe." + currentVariety)) return true;
+    if (s.includes("shfe." + currentVariety)) return true;
+    if (s.includes("." + currentVariety)) return true;
+    return false;
+  }
+
+  function filterSymbolsForVariety(symbols) {
+    const arr = Array.isArray(symbols) ? symbols : [];
+    return arr.filter((s) => symbolMatchesVariety(s));
+  }
+
+  function pickVarietySymbol(symbols) {
+    const filtered = filterSymbolsForVariety(symbols);
+    return filtered.length ? filtered[0] : ("SHFE." + currentVariety);
   }
 
   function setText(el, txt) {
@@ -395,7 +434,11 @@
 
   async function loadConsoleStatus() {
     try {
-      const u = "/api/trading/console/status?account_profile=" + encodeURIComponent(selectedAccountProfile);
+      const u =
+        "/api/trading/console/status?account_profile=" +
+        encodeURIComponent(selectedAccountProfile) +
+        "&var=" +
+        encodeURIComponent(currentVariety);
       const resp = await window.ghTrader.fetchApi(u);
       if (!resp.ok) return;
       const data = await resp.json();
@@ -481,11 +524,11 @@
         lines.push('<div class="grid2">');
         lines.push('<div class="text-sm"><span class="muted">Gateway:</span> ' + esc(String(gw.component_status || gw.status || "--")) + '</div>');
         lines.push('<div class="text-sm"><span class="muted">Gateway mode:</span> ' + esc(String(gwMode || "--")) + '</div>');
-        lines.push('<div class="text-sm"><span class="muted">Gateway job:</span> ' + (gw.active_job_id ? ('<a href="/jobs/' + esc(gw.active_job_id) + tokenQs + '">' + esc(gw.active_job_id) + '</a>') : "--") + '</div>');
+        lines.push('<div class="text-sm"><span class="muted">Gateway job:</span> ' + (gw.active_job_id ? ('<a href="/jobs/' + esc(gw.active_job_id) + tokenQs + varQs + '">' + esc(gw.active_job_id) + '</a>') : "--") + '</div>');
         lines.push('<div class="text-sm"><span class="muted">Gateway error:</span> ' + esc(String(gw.error || "")) + '</div>');
 
         lines.push('<div class="text-sm"><span class="muted">Strategy:</span> ' + esc(String(st.status || "--")) + '</div>');
-        lines.push('<div class="text-sm"><span class="muted">Strategy job:</span> ' + (st.active_job_id ? ('<a href="/jobs/' + esc(st.active_job_id) + tokenQs + '">' + esc(st.active_job_id) + '</a>') : "--") + '</div>');
+        lines.push('<div class="text-sm"><span class="muted">Strategy job:</span> ' + (st.active_job_id ? ('<a href="/jobs/' + esc(st.active_job_id) + tokenQs + varQs + '">' + esc(st.active_job_id) + '</a>') : "--") + '</div>');
         const lastTargets = (st.state && st.state.last_targets) ? st.state.last_targets : null;
         lines.push('<div class="text-sm"><span class="muted">Last targets:</span> ' + esc(lastTargets ? JSON.stringify(lastTargets) : "--") + '</div>');
         lines.push("</div>");
@@ -497,7 +540,7 @@
       const posTbody = document.getElementById("positionsTbody");
       const pos = (gwLastSnap && gwLastSnap.positions) ? gwLastSnap.positions : null;
       if (posTbody) {
-        const keys = pos && typeof pos === "object" ? Object.keys(pos) : [];
+        const keys = pos && typeof pos === "object" ? Object.keys(pos).filter((sym) => symbolMatchesVariety(sym)) : [];
         const rows = [];
         if (keys.length > 0) {
           keys.forEach((sym) => {
@@ -548,18 +591,20 @@
       if (monitorGatewayMode) monitorGatewayMode.textContent = String(mode || "idle");
       if (monitorGatewaySymbols) {
         const effectiveSymbols = (gwState && gwState.effective && gwState.effective.symbols) ? gwState.effective.symbols : [];
-        monitorGatewaySymbols.textContent = Array.isArray(effectiveSymbols) && effectiveSymbols.length ? effectiveSymbols.join(", ") : "--";
+        const varSymbols = filterSymbolsForVariety(effectiveSymbols);
+        monitorGatewaySymbols.textContent = varSymbols.length ? varSymbols.join(", ") : "--";
       }
 
       // Update Quick Order panel state from console status (for cross-tab freshness)
       const gwEffective = (gwState && gwState.effective) ? gwState.effective : {};
       lastGatewayMode = String(gwEffective.mode || mode || "idle");
-      lastGatewaySymbols = Array.isArray(gwEffective.symbols) ? gwEffective.symbols : [];
+      lastGatewaySymbols = filterSymbolsForVariety(gwEffective.symbols);
 
       // Extract positions from gateway snapshot
       if (pos && typeof pos === "object") {
         lastPositions = {};
         for (const sym of Object.keys(pos)) {
+          if (!symbolMatchesVariety(sym)) continue;
           const p = pos[sym] || {};
           const vlong = Number(p.volume_long || 0);
           const vshort = Number(p.volume_short || 0);
@@ -628,20 +673,21 @@
 
       // Stale warning
       if (qsStaleWarning) {
-        qsStaleWarning.style.display = (gwStale || stStale) ? "block" : "none";
+        qsStaleWarning.hidden = !(gwStale || stStale);
       }
 
       // Sync Quick Start symbols from gateway
       const qsSymbolsEl = document.getElementById("qsSymbols");
-      if (qsSymbolsEl && !qsSymbolsEl.value && lastGatewaySymbols.length > 0) {
-        qsSymbolsEl.value = lastGatewaySymbols.join(",");
+      if (qsSymbolsEl && !qsSymbolsEl.value) {
+        if (lastGatewaySymbols.length > 0) qsSymbolsEl.value = lastGatewaySymbols.join(",");
+        else qsSymbolsEl.value = pickVarietySymbol([]);
       }
 
       // Show/hide confirm_live field based on mode
       const qsModeEl = document.getElementById("qsMode");
       const qsConfirmLiveWrap = document.getElementById("qsConfirmLiveWrap");
       if (qsModeEl && qsConfirmLiveWrap) {
-        qsConfirmLiveWrap.style.display = (qsModeEl.value === "live_trade") ? "block" : "none";
+        qsConfirmLiveWrap.hidden = qsModeEl.value !== "live_trade";
       }
 
       // Monitor tab: Strategy health summary (reuse st from Quick Start section above)
@@ -655,7 +701,8 @@
       if (monitorStrategyTarget) {
         const lastTgts = stState2.last_targets;
         if (lastTgts && typeof lastTgts === "object" && Object.keys(lastTgts).length > 0) {
-          monitorStrategyTarget.textContent = Object.entries(lastTgts).map(([k, v]) => k + ":" + v).join(", ");
+          const filtered = Object.entries(lastTgts).filter(([k]) => symbolMatchesVariety(k));
+          monitorStrategyTarget.textContent = filtered.length ? filtered.map(([k, v]) => k + ":" + v).join(", ") : "--";
         } else {
           monitorStrategyTarget.textContent = "--";
         }
@@ -675,15 +722,20 @@
           let sig = "--";
           let conf = "--";
           if (e.type === "signals_disabled") {
+            if (sym && sym !== "--" && !symbolMatchesVariety(sym)) continue;
             sig = "disabled";
             conf = String(e.reason || "");
           } else {
             // StrategyRunner target_change uses {targets:{...}}
             if (e.targets && typeof e.targets === "object") {
-              const keys = Object.keys(e.targets);
+              const keys = Object.keys(e.targets).filter((k) => symbolMatchesVariety(k));
+              if (!keys.length) continue;
               sym = keys.length ? keys[0] : "--";
-              sig = "targets " + JSON.stringify(e.targets);
+              const filteredTargets = {};
+              for (const k of keys) filteredTargets[k] = e.targets[k];
+              sig = "targets " + JSON.stringify(filteredTargets);
             } else {
+              if (!symbolMatchesVariety(sym)) continue;
               sig = "target_change";
             }
           }
@@ -705,6 +757,7 @@
         const ordersAlive = (gwLastSnap && Array.isArray(gwLastSnap.orders_alive)) ? gwLastSnap.orders_alive : [];
         const rows = [];
         for (const o of ordersAlive.slice(0, 30)) {
+          if (!symbolMatchesVariety(o && o.symbol)) continue;
           rows.push([
             "<tr>",
             '<td class="mono text-xs">--</td>',
@@ -755,7 +808,10 @@
       if (gatewayModeEl) gatewayModeEl.value = String(desired.mode || (st.effective && st.effective.mode) || "idle");
       if (gatewayExecutorEl) gatewayExecutorEl.value = String(desired.executor || (st.effective && st.effective.executor) || "targetpos");
       if (gatewaySimAccountEl) gatewaySimAccountEl.value = String(desired.sim_account || "tqsim");
-      if (gatewaySymbolsEl) gatewaySymbolsEl.value = Array.isArray(desired.symbols) ? desired.symbols.join(",") : String(desired.symbols || "");
+      if (gatewaySymbolsEl) {
+        const desiredSymbols = Array.isArray(desired.symbols) ? filterSymbolsForVariety(desired.symbols) : parseCsvSymbols(desired.symbols || "");
+        gatewaySymbolsEl.value = desiredSymbols.length ? desiredSymbols.join(",") : pickVarietySymbol([]);
+      }
       if (gatewayConfirmLiveEl) gatewayConfirmLiveEl.value = String(desired.confirm_live || "");
 
       if (gatewayMaxAbsPosEl) gatewayMaxAbsPosEl.value = String(desired.max_abs_position || 1);
@@ -769,13 +825,14 @@
       // Update Quick Order panel state
       const eff = (st.effective && typeof st.effective === "object") ? st.effective : {};
       lastGatewayMode = String(eff.mode || desired.mode || "idle");
-      lastGatewaySymbols = Array.isArray(eff.symbols) ? eff.symbols : (Array.isArray(desired.symbols) ? desired.symbols : []);
+      lastGatewaySymbols = filterSymbolsForVariety(Array.isArray(eff.symbols) ? eff.symbols : desired.symbols);
 
       // Extract positions from last_snapshot
       const snap = (st.last_snapshot && typeof st.last_snapshot === "object") ? st.last_snapshot : {};
       const posObj = (snap.positions && typeof snap.positions === "object") ? snap.positions : {};
       lastPositions = {};
       for (const sym of Object.keys(posObj)) {
+        if (!symbolMatchesVariety(sym)) continue;
         const p = posObj[sym] || {};
         const vlong = Number(p.volume_long || 0);
         const vshort = Number(p.volume_short || 0);
@@ -817,7 +874,10 @@
       const desired = (desiredWrap.desired && typeof desiredWrap.desired === "object") ? desiredWrap.desired : desiredWrap;
 
       if (strategyModeEl) strategyModeEl.value = String(desired.mode || "idle");
-      if (strategySymbolsEl) strategySymbolsEl.value = Array.isArray(desired.symbols) ? desired.symbols.join(",") : String(desired.symbols || "");
+      if (strategySymbolsEl) {
+        const desiredSymbols = Array.isArray(desired.symbols) ? filterSymbolsForVariety(desired.symbols) : parseCsvSymbols(desired.symbols || "");
+        strategySymbolsEl.value = desiredSymbols.length ? desiredSymbols.join(",") : pickVarietySymbol([]);
+      }
       if (strategyModelEl) strategyModelEl.value = String(desired.model_name || "xgboost");
       if (strategyHorizonEl) strategyHorizonEl.value = String(desired.horizon || 50);
       if (strategyThresholdUpEl) strategyThresholdUpEl.value = String(desired.threshold_up || 0.6);
@@ -852,7 +912,30 @@
         return "";
       }
 
-      const running = jobs.filter((j) => j && j.status === "running" && jobKind(j));
+      function jobMatchesVariety(j) {
+        const meta = (j && typeof j.metadata === "object") ? j.metadata : null;
+        if (meta) {
+          const mv = String(meta.variety || "").trim().toLowerCase();
+          if (mv) return mv === currentVariety;
+          const ms = String(meta.symbol || "").trim();
+          if (ms) return symbolMatchesVariety(ms);
+          const mss = Array.isArray(meta.symbols) ? meta.symbols : [];
+          if (mss.length) return mss.some((s) => symbolMatchesVariety(s));
+        }
+
+        const title = String((j && j.title) || "").toLowerCase();
+        const argv = Array.isArray(j && j.command) ? j.command.map((x) => String(x || "").toLowerCase()) : [];
+        if (title.includes("@" + "shfe." + currentVariety) || title.includes("shfe." + currentVariety)) return true;
+        if (title.includes("." + currentVariety) || title.includes(" " + currentVariety + " ")) return true;
+        for (let i = 0; i < argv.length; i++) {
+          const tok = argv[i];
+          if (tok === "--var" && i + 1 < argv.length && argv[i + 1] === currentVariety) return true;
+          if (tok.includes("@shfe." + currentVariety) || tok.includes("shfe." + currentVariety) || tok.includes("." + currentVariety)) return true;
+        }
+        return false;
+      }
+
+      const running = jobs.filter((j) => j && j.status === "running" && jobKind(j) && jobMatchesVariety(j));
       if (!running.length) {
         container.innerHTML = '<div class="muted">No gateway/strategy jobs running</div>';
         return;
@@ -869,7 +952,7 @@
           '<div class="metric-value text-sm"><span class="' + pill + '">' + esc(label) + "</span></div>",
           "</div>",
           '<div style="display:flex; gap:6px;">',
-          '<a href="/jobs/' + esc(j.id) + tokenQs + '" class="btn-sm btn-secondary">View</a>',
+          '<a href="/jobs/' + esc(j.id) + tokenQs + varQs + '" class="btn-sm btn-secondary">View</a>',
           '<button type="button" class="btn-sm btn-secondary" data-action="cancel-job" data-job-id="' + esc(j.id) + '">Stop</button>',
           "</div>",
           "</div>",
@@ -906,7 +989,12 @@
       if (!resp.ok) return;
       const data = await resp.json();
       if (!data || data.ok === false) return;
-      const runs = Array.isArray(data.runs) ? data.runs : [];
+      const runsRaw = Array.isArray(data.runs) ? data.runs : [];
+      const runs = runsRaw.filter((r) => {
+        const syms = Array.isArray(r && r.symbols) ? r.symbols : parseCsvSymbols((r && r.symbols) || "");
+        if (!syms.length) return false;
+        return syms.some((s) => symbolMatchesVariety(s));
+      });
       const badge = document.getElementById("runCountBadge");
       if (badge) badge.textContent = runs.length ? runs.length : "--";
       if (!runs.length) {
@@ -944,7 +1032,7 @@
         mode: gatewayModeEl ? String(gatewayModeEl.value || "idle") : "idle",
         executor: gatewayExecutorEl ? String(gatewayExecutorEl.value || "targetpos") : "targetpos",
         sim_account: gatewaySimAccountEl ? String(gatewaySimAccountEl.value || "tqsim") : "tqsim",
-        symbols: parseCsvSymbols(gatewaySymbolsEl ? gatewaySymbolsEl.value : ""),
+        symbols: filterSymbolsForVariety(parseCsvSymbols(gatewaySymbolsEl ? gatewaySymbolsEl.value : "")),
         confirm_live: gatewayConfirmLiveEl ? String(gatewayConfirmLiveEl.value || "").trim() : "",
         max_abs_position: gatewayMaxAbsPosEl ? Number(gatewayMaxAbsPosEl.value || 0) : 0,
         max_order_size: gatewayMaxOrderSizeEl ? Number(gatewayMaxOrderSizeEl.value || 1) : 1,
@@ -1064,21 +1152,23 @@
   if (qsModeEl) {
     qsModeEl.addEventListener("change", () => {
       if (qsConfirmLiveWrap) {
-        qsConfirmLiveWrap.style.display = (qsModeEl.value === "live_trade") ? "block" : "none";
+        qsConfirmLiveWrap.hidden = qsModeEl.value !== "live_trade";
       }
       updateQsPrerequisites();
     });
   }
 
   function updateQsPrerequisites() {
-    if (!qsPrereqHint || !qsPrereqText) return;
     const mode = qsModeEl ? qsModeEl.value : "sim";
-    const symbols = parseCsvSymbols(qsSymbolsEl ? qsSymbolsEl.value : "");
+    const symbolsRaw = parseCsvSymbols(qsSymbolsEl ? qsSymbolsEl.value : "");
+    const symbols = filterSymbolsForVariety(symbolsRaw);
     const confirmLive = qsConfirmLiveEl ? qsConfirmLiveEl.value.trim() : "";
 
     const issues = [];
-    if (symbols.length === 0) {
+    if (symbolsRaw.length === 0) {
       issues.push("Symbols required");
+    } else if (symbols.length === 0) {
+      issues.push("Symbols must match current variety: " + currentVariety.toUpperCase());
     }
     if (mode === "live_trade") {
       if (!liveEnabled) {
@@ -1089,27 +1179,36 @@
       }
     }
 
-    if (issues.length > 0) {
-      qsPrereqHint.style.display = "block";
-      qsPrereqText.textContent = issues.join("; ");
-    } else {
-      qsPrereqHint.style.display = "none";
-    }
+    if (qsPrereqHint) qsPrereqHint.hidden = issues.length === 0;
+    if (qsPrereqText) qsPrereqText.textContent = issues.join("; ");
+
+    const strategyIssues = [];
+    if (symbolsRaw.length === 0) strategyIssues.push("Symbols required");
+    else if (symbols.length === 0) strategyIssues.push("Symbols must match current variety");
+
+    if (qsStartGatewayBtn) qsStartGatewayBtn.disabled = issues.length > 0;
+    if (qsStartStrategyBtn) qsStartStrategyBtn.disabled = strategyIssues.length > 0;
   }
 
   // Update prerequisites on input changes
   if (qsSymbolsEl) qsSymbolsEl.addEventListener("input", updateQsPrerequisites);
   if (qsConfirmLiveEl) qsConfirmLiveEl.addEventListener("input", updateQsPrerequisites);
+  updateQsPrerequisites();
 
   // Start Gateway
   if (qsStartGatewayBtn) {
     qsStartGatewayBtn.addEventListener("click", async () => {
       const mode = qsModeEl ? qsModeEl.value : "sim";
-      const symbols = parseCsvSymbols(qsSymbolsEl ? qsSymbolsEl.value : "");
+      const symbolsRaw = parseCsvSymbols(qsSymbolsEl ? qsSymbolsEl.value : "");
+      const symbols = filterSymbolsForVariety(symbolsRaw);
       const confirmLive = qsConfirmLiveEl ? qsConfirmLiveEl.value.trim() : "";
 
-      if (symbols.length === 0) {
+      if (symbolsRaw.length === 0) {
         window.ghTrader.toast("Symbols required", "error");
+        return;
+      }
+      if (symbols.length === 0) {
+        window.ghTrader.toast("Symbols must match current variety: " + currentVariety.toUpperCase(), "error");
         return;
       }
       if (mode === "live_trade" && !liveEnabled) {
@@ -1123,24 +1222,30 @@
 
       if (qsActionStatusEl) qsActionStatusEl.textContent = "Starting gateway...";
       try {
-        const out = await window.ghTrader.postJson("/api/gateway/start", {
-          account_profile: selectedAccountProfile,
-          desired: {
-            mode: mode,
-            symbols: symbols,
-            confirm_live: confirmLive,
-            max_abs_position: 1,
-            max_order_size: 1,
-            max_ops_per_sec: 10,
+        await window.ghTrader.withButtonBusy(
+          qsStartGatewayBtn,
+          async () => {
+            const out = await window.ghTrader.postJson("/api/gateway/start", {
+              account_profile: selectedAccountProfile,
+              desired: {
+                mode: mode,
+                symbols: symbols,
+                confirm_live: confirmLive,
+                max_abs_position: 1,
+                max_order_size: 1,
+                max_ops_per_sec: 10,
+              },
+            });
+            if (out.ok) {
+              window.ghTrader.toast("Gateway started (job: " + (out.job_id || "") + ")", "success");
+              if (qsActionStatusEl) qsActionStatusEl.textContent = "Gateway started";
+            } else {
+              window.ghTrader.toast(out.message || out.error || "Failed to start gateway", "error");
+              if (qsActionStatusEl) qsActionStatusEl.textContent = out.message || out.error || "Failed";
+            }
           },
-        });
-        if (out.ok) {
-          window.ghTrader.toast("Gateway started (job: " + (out.job_id || "") + ")", "success");
-          if (qsActionStatusEl) qsActionStatusEl.textContent = "Gateway started";
-        } else {
-          window.ghTrader.toast(out.message || out.error || "Failed to start gateway", "error");
-          if (qsActionStatusEl) qsActionStatusEl.textContent = out.message || out.error || "Failed";
-        }
+          { loadingText: "Starting..." }
+        );
         await refreshAll();
       } catch (e) {
         window.ghTrader.toast("Failed: " + (e.message || e), "error");
@@ -1154,16 +1259,26 @@
     qsStopGatewayBtn.addEventListener("click", async () => {
       if (qsActionStatusEl) qsActionStatusEl.textContent = "Stopping gateway...";
       try {
-        const out = await window.ghTrader.postJson("/api/gateway/stop", {
-          account_profile: selectedAccountProfile,
-        });
-        if (out.ok) {
-          window.ghTrader.toast("Gateway stop signal sent", "success");
-          if (qsActionStatusEl) qsActionStatusEl.textContent = "Gateway stopped";
-        } else {
-          window.ghTrader.toast(out.message || out.error || "Failed to stop gateway", "error");
-          if (qsActionStatusEl) qsActionStatusEl.textContent = out.message || out.error || "Failed";
-        }
+        await window.ghTrader.withButtonBusy(
+          qsStopGatewayBtn,
+          async () => {
+            const out = await window.ghTrader.postJson("/api/gateway/stop", {
+              account_profile: selectedAccountProfile,
+            });
+            if (out.ok) {
+              window.ghTrader.toast("Gateway stop signal sent", "success");
+              if (qsActionStatusEl) qsActionStatusEl.textContent = "Gateway stopped";
+            } else if (out.error === "not_running") {
+              // Stop is effectively idempotent for operators.
+              window.ghTrader.toast("Gateway already not running for this profile", "info");
+              if (qsActionStatusEl) qsActionStatusEl.textContent = "Gateway already stopped";
+            } else {
+              window.ghTrader.toast(out.message || out.error || "Failed to stop gateway", "error");
+              if (qsActionStatusEl) qsActionStatusEl.textContent = out.message || out.error || "Failed";
+            }
+          },
+          { loadingText: "Stopping..." }
+        );
         await refreshAll();
       } catch (e) {
         window.ghTrader.toast("Failed: " + (e.message || e), "error");
@@ -1175,33 +1290,44 @@
   // Start Strategy
   if (qsStartStrategyBtn) {
     qsStartStrategyBtn.addEventListener("click", async () => {
-      const symbols = parseCsvSymbols(qsSymbolsEl ? qsSymbolsEl.value : "");
-      if (symbols.length === 0) {
+      const symbolsRaw = parseCsvSymbols(qsSymbolsEl ? qsSymbolsEl.value : "");
+      const symbols = filterSymbolsForVariety(symbolsRaw);
+      if (symbolsRaw.length === 0) {
         window.ghTrader.toast("Symbols required", "error");
+        return;
+      }
+      if (symbols.length === 0) {
+        window.ghTrader.toast("Symbols must match current variety: " + currentVariety.toUpperCase(), "error");
         return;
       }
 
       if (qsActionStatusEl) qsActionStatusEl.textContent = "Starting strategy...";
       try {
-        const out = await window.ghTrader.postJson("/api/strategy/start", {
-          account_profile: selectedAccountProfile,
-          desired: {
-            mode: "run",
-            symbols: symbols,
-            model_name: "xgboost",
-            horizon: 50,
-            threshold_up: 0.6,
-            threshold_down: 0.6,
-            position_size: 1,
+        await window.ghTrader.withButtonBusy(
+          qsStartStrategyBtn,
+          async () => {
+            const out = await window.ghTrader.postJson("/api/strategy/start", {
+              account_profile: selectedAccountProfile,
+              desired: {
+                mode: "run",
+                symbols: symbols,
+                model_name: "xgboost",
+                horizon: 50,
+                threshold_up: 0.6,
+                threshold_down: 0.6,
+                position_size: 1,
+              },
+            });
+            if (out.ok) {
+              window.ghTrader.toast("Strategy started (job: " + (out.job_id || "") + ")", "success");
+              if (qsActionStatusEl) qsActionStatusEl.textContent = "Strategy started";
+            } else {
+              window.ghTrader.toast(out.message || out.error || "Failed to start strategy", "error");
+              if (qsActionStatusEl) qsActionStatusEl.textContent = out.message || out.error || "Failed";
+            }
           },
-        });
-        if (out.ok) {
-          window.ghTrader.toast("Strategy started (job: " + (out.job_id || "") + ")", "success");
-          if (qsActionStatusEl) qsActionStatusEl.textContent = "Strategy started";
-        } else {
-          window.ghTrader.toast(out.message || out.error || "Failed to start strategy", "error");
-          if (qsActionStatusEl) qsActionStatusEl.textContent = out.message || out.error || "Failed";
-        }
+          { loadingText: "Starting..." }
+        );
         await refreshAll();
       } catch (e) {
         window.ghTrader.toast("Failed: " + (e.message || e), "error");
@@ -1215,16 +1341,26 @@
     qsStopStrategyBtn.addEventListener("click", async () => {
       if (qsActionStatusEl) qsActionStatusEl.textContent = "Stopping strategy...";
       try {
-        const out = await window.ghTrader.postJson("/api/strategy/stop", {
-          account_profile: selectedAccountProfile,
-        });
-        if (out.ok) {
-          window.ghTrader.toast("Strategy stop signal sent", "success");
-          if (qsActionStatusEl) qsActionStatusEl.textContent = "Strategy stopped";
-        } else {
-          window.ghTrader.toast(out.message || out.error || "Failed to stop strategy", "error");
-          if (qsActionStatusEl) qsActionStatusEl.textContent = out.message || out.error || "Failed";
-        }
+        await window.ghTrader.withButtonBusy(
+          qsStopStrategyBtn,
+          async () => {
+            const out = await window.ghTrader.postJson("/api/strategy/stop", {
+              account_profile: selectedAccountProfile,
+            });
+            if (out.ok) {
+              window.ghTrader.toast("Strategy stop signal sent", "success");
+              if (qsActionStatusEl) qsActionStatusEl.textContent = "Strategy stopped";
+            } else if (out.error === "not_running") {
+              // Stop is effectively idempotent for operators.
+              window.ghTrader.toast("Strategy already not running for this profile", "info");
+              if (qsActionStatusEl) qsActionStatusEl.textContent = "Strategy already stopped";
+            } else {
+              window.ghTrader.toast(out.message || out.error || "Failed to stop strategy", "error");
+              if (qsActionStatusEl) qsActionStatusEl.textContent = out.message || out.error || "Failed";
+            }
+          },
+          { loadingText: "Stopping..." }
+        );
         await refreshAll();
       } catch (e) {
         window.ghTrader.toast("Failed: " + (e.message || e), "error");
@@ -1239,7 +1375,7 @@
       ev.preventDefault();
       const desired = {
         mode: strategyModeEl ? String(strategyModeEl.value || "idle") : "idle",
-        symbols: parseCsvSymbols(strategySymbolsEl ? strategySymbolsEl.value : ""),
+        symbols: filterSymbolsForVariety(parseCsvSymbols(strategySymbolsEl ? strategySymbolsEl.value : "")),
         model_name: strategyModelEl ? String(strategyModelEl.value || "xgboost") : "xgboost",
         horizon: strategyHorizonEl ? Number(strategyHorizonEl.value || 50) : 50,
         threshold_up: strategyThresholdUpEl ? Number(strategyThresholdUpEl.value || 0.6) : 0.6,
@@ -1289,6 +1425,7 @@
   }
 
   // Initial load
+  ensureVarietyScopedSymbolDefaults();
   loadBrokers();
   loadAccounts();
   refreshAll();

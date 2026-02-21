@@ -21,6 +21,7 @@ from ghtrader.questdb.client import make_questdb_query_config_from_env
 from ghtrader.questdb.main_l5_validate import (
     MainL5ValidateGapRow,
     MainL5ValidateSummaryRow,
+    assert_main_l5_validate_tables_ready,
     clear_main_l5_validate_gap_rows,
     ensure_main_l5_tick_gaps_table,
     ensure_main_l5_validate_gaps_table,
@@ -40,6 +41,25 @@ from ghtrader.tq.runtime import create_tq_data_api, trading_day_from_ts_ns
 from ghtrader.util.json_io import read_json, write_json_atomic
 
 log = structlog.get_logger()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(os.environ.get(name, "1" if default else "0") or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _env_float(name: str) -> float | None:
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except Exception:
+        return None
 
 
 def _symbol_slug(symbol: str) -> str:
@@ -287,17 +307,127 @@ def validate_main_l5(
 
     cfg = make_questdb_query_config_from_env()
 
-    if incremental and start_day is None:
-        last_val = get_last_validated_day(cfg=cfg, symbol=ds)
-        if last_val:
-            start_day = last_val + timedelta(days=1)
-            log.info("main_l5_validate.incremental", last_validated=last_val.isoformat(), new_start=start_day.isoformat())
+    def _write_noop_report(
+        *,
+        reason: str,
+        schedule_hash: str,
+        schedule_start: date | None,
+        schedule_end: date | None,
+        last_validated_day: date | None,
+    ) -> tuple[dict[str, Any], Path | None]:
+        report = {
+            "ok": True,
+            "state": "noop",
+            "reason": str(reason or "up_to_date"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "exchange": ex,
+            "variety": var,
+            "derived_symbol": ds,
+            "schedule_hash": str(schedule_hash or ""),
+            "schedule_start": (schedule_start.isoformat() if schedule_start else None),
+            "schedule_end": (schedule_end.isoformat() if schedule_end else None),
+            "last_validated_day": (last_validated_day.isoformat() if last_validated_day else None),
+            "checked_days": 0,
+            "missing_days": 0,
+            "missing_days_sample": [],
+            "missing_segments_total": 0,
+            "missing_seconds_total": 0,
+            "missing_half_seconds_total": 0,
+            "boundary_missing_seconds_total": 0,
+            "ticks_outside_sessions_seconds_total": 0,
+            "max_gap_s": 0,
+            "days_with_issues": 0,
+            "issues_total": 0,
+            "issues_truncated": False,
+            "report_max_days": 0,
+            "gap_threshold_s": float(gap_threshold_s or 0.0) if gap_threshold_s is not None else None,
+            "gap_threshold_s_by_session": {},
+            "cadence_mode": "hybrid",
+            "seconds_with_ticks_total": 0,
+            "seconds_with_one_tick_total": 0,
+            "seconds_with_two_plus_total": 0,
+            "expected_seconds_total": 0,
+            "expected_seconds_strict_total": 0,
+            "expected_seconds_strict_fixed_total": 0,
+            "missing_seconds_ratio": 0.0,
+            "gap_buckets_total": {"2_5": 0, "6_15": 0, "16_30": 0, "gt_30": 0},
+            "gap_buckets_by_session_total": {},
+            "gap_count_gt_30s": 0,
+            "total_segments": 0,
+            "two_plus_ratio": 0.0,
+            "strict_ratio": float(strict_ratio or 0.0) if strict_ratio is not None else None,
+            "missing_half_seconds_ratio": 0.0,
+            "missing_half_seconds_info_ratio": None,
+            "missing_half_seconds_block_ratio": None,
+            "missing_half_seconds_state": "ok",
+            "timeliness": {"p95_lag_s": None, "max_lag_s": None, "days_with_lag": 0},
+            "sessions": {"count": 0, "source": "cache", "raw_trading_time": None},
+            "holiday_night_skipped_days": 0,
+            "holiday_night_skipped_sample": [],
+            "exchange_events_used": [],
+            "exchange_events_used_total": 0,
+            "exchange_events_used_truncated": False,
+            "event_override_days": 0,
+            "event_override_days_sample": [],
+            "tqsdk_check": {
+                "enabled": bool(tqsdk_check) if tqsdk_check is not None else None,
+                "error": None,
+                "max_days": 0,
+                "max_segments": 0,
+                "checked_days": 0,
+                "checked_segments": 0,
+                "provider_missing_segments": 0,
+                "provider_has_data_segments": 0,
+                "errors": 0,
+            },
+            "manifest": {"path": None, "run_id": None, "created_at": None},
+            "persist": {
+                "summary_rows_upserted": 0,
+                "gap_rows_deleted": 0,
+                "gap_rows_inserted": 0,
+                "tick_gap_rows_upserted": 0,
+            },
+            "issues": [],
+        }
+        out_path = _write_report(runs_dir=Path(runs_dir), report=report, exchange=ex, variety=var, derived_symbol=ds)
+        return report, out_path
 
     schedule = fetch_schedule(cfg=cfg, exchange=ex, variety=var, start_day=start_day, end_day=end_day, connect_timeout_s=2)
     if schedule.empty:
         raise FileNotFoundError(f"No schedule rows found for {ex}.{var} (build main-schedule first).")
 
     schedule = schedule.dropna(subset=["trading_day", "main_contract"]).sort_values("trading_day").reset_index(drop=True)
+    raw_hashes = schedule["schedule_hash"].tolist() if "schedule_hash" in schedule.columns else []
+    schedule_hashes = sorted({str(h).strip() for h in raw_hashes if str(h).strip()})
+    if len(schedule_hashes) > 1:
+        raise RuntimeError(f"main_l5_validate mixed schedule_hash in schedule source: {schedule_hashes}")
+    schedule_hash = str(schedule_hashes[0]) if schedule_hashes else ""
+
+    if incremental and start_day is None:
+        last_val = get_last_validated_day(cfg=cfg, symbol=ds, schedule_hash=(schedule_hash or None))
+        if last_val:
+            schedule = schedule[schedule["trading_day"] > last_val].reset_index(drop=True)
+            log.info(
+                "main_l5_validate.incremental",
+                last_validated=last_val.isoformat(),
+                schedule_hash=(schedule_hash or None),
+                remaining_days=int(len(schedule)),
+            )
+            if schedule.empty:
+                log.info(
+                    "main_l5_validate.noop",
+                    reason="up_to_date",
+                    last_validated=last_val.isoformat(),
+                    schedule_hash=(schedule_hash or None),
+                )
+                return _write_noop_report(
+                    reason="up_to_date",
+                    schedule_hash=schedule_hash,
+                    schedule_start=None,
+                    schedule_end=last_val,
+                    last_validated_day=last_val,
+                )
+
     schedule_days = [d for d in schedule["trading_day"].tolist() if isinstance(d, date)]
     schedule_start = min(schedule_days) if schedule_days else None
     schedule_end = max(schedule_days) if schedule_days else None
@@ -337,12 +467,20 @@ def validate_main_l5(
             schedule_start = min(schedule_days)
             schedule_end = max(schedule_days)
         else:
+            if incremental:
+                log.info(
+                    "main_l5_validate.noop",
+                    reason="up_to_date_after_alignment",
+                    schedule_hash=(schedule_hash or None),
+                )
+                return _write_noop_report(
+                    reason="up_to_date_after_alignment",
+                    schedule_hash=schedule_hash,
+                    schedule_start=aligned_start,
+                    schedule_end=None,
+                    last_validated_day=None,
+                )
             raise ValueError("No schedule days available after alignment")
-    schedule_hash = ""
-    try:
-        schedule_hash = str(schedule["schedule_hash"].dropna().astype(str).iloc[0])
-    except Exception:
-        schedule_hash = ""
 
     sessions_payload = read_trading_sessions_cache(data_dir=data_dir, exchange=ex, variety=var) or {}
     sessions = sessions_payload.get("sessions") if isinstance(sessions_payload, dict) else None
@@ -377,9 +515,13 @@ def validate_main_l5(
     exchange_events = load_exchange_events(data_dir=Path(data_dir), exchange=ex, variety=var)
     event_override_days: set[date] = set()
 
-    ensure_main_l5_validate_summary_table(cfg=cfg)
-    ensure_main_l5_validate_gaps_table(cfg=cfg)
-    ensure_main_l5_tick_gaps_table(cfg=cfg)
+    ensure_main_l5_validate_summary_table(cfg=cfg, fail_fast=True)
+    ensure_main_l5_validate_gaps_table(cfg=cfg, fail_fast=True)
+    ensure_main_l5_tick_gaps_table(cfg=cfg, fail_fast=True)
+    try:
+        assert_main_l5_validate_tables_ready(cfg=cfg)
+    except Exception as e:
+        raise RuntimeError(f"main_l5_validate preflight failed: {e}") from e
 
     if tqsdk_check is None:
         raw = str(os.environ.get("GHTRADER_L5_VALIDATE_TQ_CHECK", "1") or "1").strip().lower()
@@ -403,22 +545,67 @@ def validate_main_l5(
         report_max_days = int(os.environ.get("GHTRADER_L5_VALIDATE_REPORT_MAX_DAYS", "200") or "200")
     except Exception:
         report_max_days = 200
+    report_include_segments = _env_bool("GHTRADER_L5_VALIDATE_REPORT_INCLUDE_SEGMENTS", False)
+    try:
+        report_segments_sample = int(os.environ.get("GHTRADER_L5_VALIDATE_REPORT_SEGMENTS_SAMPLE", "5") or "5")
+    except Exception:
+        report_segments_sample = 5
+    try:
+        report_max_events = int(os.environ.get("GHTRADER_L5_VALIDATE_REPORT_MAX_EVENTS", "200") or "200")
+    except Exception:
+        report_max_events = 200
+    gap_threshold_s_by_session: dict[str, float] = {}
     if gap_threshold_s is None:
-        try:
-            gap_threshold_s = float(os.environ.get("GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S", "5") or "5")
-        except Exception:
+        var_key = re.sub(r"[^A-Za-z0-9]+", "_", var).strip("_").upper()
+        candidates = []
+        if var_key:
+            candidates.append(f"GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S_{var_key}")
+        candidates.append("GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S")
+        for key in candidates:
+            val = _env_float(key)
+            if val is not None:
+                gap_threshold_s = float(val)
+                break
+        if gap_threshold_s is None:
             gap_threshold_s = 5.0
+
+        for sess in ("day", "night"):
+            sess_key = sess.upper()
+            sess_candidates = []
+            if var_key:
+                sess_candidates.append(f"GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S_{var_key}_{sess_key}")
+            sess_candidates.append(f"GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S_{sess_key}")
+            for key in sess_candidates:
+                sval = _env_float(key)
+                if sval is not None:
+                    gap_threshold_s_by_session[sess] = float(sval)
+                    break
     if strict_ratio is None:
         try:
             strict_ratio = float(os.environ.get("GHTRADER_L5_VALIDATE_STRICT_RATIO", "0.8") or "0.8")
         except Exception:
             strict_ratio = 0.8
+    half_info_ratio = _env_float("GHTRADER_L5_VALIDATE_MISSING_HALF_INFO_RATIO")
+    half_block_ratio = _env_float("GHTRADER_L5_VALIDATE_MISSING_HALF_BLOCK_RATIO")
+    if half_info_ratio is None:
+        half_info_ratio = 0.02
+    if half_block_ratio is None:
+        half_block_ratio = 0.10
     tqsdk_check_max_days = max(0, int(tqsdk_check_max_days))
     tqsdk_check_max_segments = max(0, int(tqsdk_check_max_segments))
     max_segments_per_day = max(10, int(max_segments_per_day))
     report_max_days = max(1, int(report_max_days))
+    report_segments_sample = max(0, int(report_segments_sample))
+    report_max_events = max(1, int(report_max_events))
     gap_threshold_s = max(0.5, float(gap_threshold_s))
+    for sess_key, sval in list(gap_threshold_s_by_session.items()):
+        try:
+            gap_threshold_s_by_session[sess_key] = max(0.5, float(sval))
+        except Exception:
+            gap_threshold_s_by_session.pop(sess_key, None)
     strict_ratio = max(0.0, min(1.0, float(strict_ratio)))
+    half_info_ratio = max(0.0, min(1.0, float(half_info_ratio)))
+    half_block_ratio = max(float(half_info_ratio), min(1.0, float(half_block_ratio)))
 
     try:
         progress_every_s = float(os.environ.get("GHTRADER_PROGRESS_EVERY_S", "15") or "15")
@@ -466,7 +653,10 @@ def validate_main_l5(
         days_total=int(len(schedule_days)),
         tqsdk_check=bool(tqsdk_check),
         gap_threshold_s=float(gap_threshold_s),
+        gap_threshold_s_by_session=gap_threshold_s_by_session,
         strict_ratio=float(strict_ratio),
+        missing_half_info_ratio=float(half_info_ratio),
+        missing_half_block_ratio=float(half_block_ratio),
     )
 
     day_stats: dict[date, dict[str, int]] = {}
@@ -489,6 +679,7 @@ def validate_main_l5(
     seconds_with_two_plus_total = 0
     expected_seconds_total = 0
     expected_seconds_strict_total = 0
+    expected_seconds_strict_fixed_total = 0
     total_segments_total = 0
 
     summary_rows: list[MainL5ValidateSummaryRow] = []
@@ -557,6 +748,7 @@ def validate_main_l5(
             sec_counts=sec_counts,
             day_cadence=day_cadence,
             gap_threshold_s=float(gap_threshold_s),
+            gap_threshold_s_by_session=gap_threshold_s_by_session,
             gap_bucket_defs=gap_bucket_defs,
             max_segments_per_day=max_segments_per_day,
             sec_to_iso=_sec_to_iso,
@@ -667,6 +859,8 @@ def validate_main_l5(
         max_gap_s = max(max_gap_s, int(max_gap_day))
         expected_seconds_total += int(expected_seconds)
         expected_seconds_strict_total += int(expected_seconds_strict)
+        if day_cadence == "fixed_0p5s":
+            expected_seconds_strict_fixed_total += int(expected_seconds_strict)
         total_segments_day = int(summary_row.total_segments)
         total_segments_total += int(total_segments_day)
         summary_rows.append(summary_row)
@@ -683,33 +877,40 @@ def validate_main_l5(
             )
             last_progress_ts = time.time()
 
+    persisted_summary_rows = 0
+    persisted_gap_rows_deleted = 0
+    persisted_gap_rows_inserted = 0
+    persisted_tick_gap_rows = 0
     try:
-        upsert_main_l5_validate_summary_rows(cfg=cfg, rows=summary_rows)
-    except Exception as e:
-        log.warning("main_l5_validate.summary_persist_failed", error=str(e))
-    try:
-        clear_main_l5_validate_gap_rows(
-            cfg=cfg,
-            symbol=ds,
-            start_day=schedule_start,
-            end_day=schedule_end,
-        )
-    except Exception as e:
-        log.warning("main_l5_validate.gaps_clear_failed", error=str(e))
-    try:
-        insert_main_l5_validate_gap_rows(cfg=cfg, rows=gap_rows)
-    except Exception as e:
-        log.warning("main_l5_validate.gaps_persist_failed", error=str(e))
-    try:
-        upsert_main_l5_tick_gaps_from_validate_summary(cfg=cfg, summary_rows=summary_rows)
-    except Exception as e:
-        log.warning("main_l5_validate.tick_gaps_persist_failed", error=str(e))
-
-    if tqsdk_api is not None:
         try:
-            tqsdk_api.close()
-        except Exception:
-            pass
+            persisted_summary_rows = int(upsert_main_l5_validate_summary_rows(cfg=cfg, rows=summary_rows))
+        except Exception as e:
+            raise RuntimeError(f"main_l5_validate summary persist failed: {e}") from e
+        try:
+            persisted_gap_rows_deleted = int(
+                clear_main_l5_validate_gap_rows(
+                    cfg=cfg,
+                    symbol=ds,
+                    start_day=schedule_start,
+                    end_day=schedule_end,
+                )
+            )
+        except Exception as e:
+            raise RuntimeError(f"main_l5_validate gaps clear failed: {e}") from e
+        try:
+            persisted_gap_rows_inserted = int(insert_main_l5_validate_gap_rows(cfg=cfg, rows=gap_rows))
+        except Exception as e:
+            raise RuntimeError(f"main_l5_validate gaps persist failed: {e}") from e
+        try:
+            persisted_tick_gap_rows = int(upsert_main_l5_tick_gaps_from_validate_summary(cfg=cfg, summary_rows=summary_rows))
+        except Exception as e:
+            raise RuntimeError(f"main_l5_validate tick_gaps persist failed: {e}") from e
+    finally:
+        if tqsdk_api is not None:
+            try:
+                tqsdk_api.close()
+            except Exception:
+                pass
 
     two_plus_ratio = 0.0
     if seconds_with_ticks_total > 0:
@@ -721,20 +922,58 @@ def validate_main_l5(
         for d in days_all
         if d.get("_has_gap") or d.get("_has_half") or d.get("_has_outside") or d.get("_has_missing_day")
     ]
+    days_with_issues.sort(
+        key=lambda d: (
+            int(d.get("missing_segments_total") or 0),
+            int(d.get("missing_half_seconds") or 0),
+            int(d.get("ticks_outside_sessions_seconds") or 0),
+            int(d.get("max_gap_s") or 0),
+            str(d.get("trading_day") or ""),
+        ),
+        reverse=True,
+    )
     for d in days_with_issues:
         for key in ("_has_gap", "_has_half", "_has_outside", "_has_missing_day"):
             d.pop(key, None)
+
+    missing_half_seconds_ratio = (
+        float(missing_half_seconds_total) / float(expected_seconds_strict_fixed_total)
+        if expected_seconds_strict_fixed_total > 0
+        else 0.0
+    )
+    if missing_half_seconds_total > 0 and expected_seconds_strict_fixed_total <= 0:
+        missing_half_seconds_state = "error"
+    elif missing_half_seconds_ratio >= float(half_block_ratio) and missing_half_seconds_total > 0:
+        missing_half_seconds_state = "error"
+    elif missing_half_seconds_ratio >= float(half_info_ratio) and missing_half_seconds_total > 0:
+        missing_half_seconds_state = "info"
+    else:
+        missing_half_seconds_state = "ok"
 
     ok = bool(
         missing_segments_total == 0
         and ticks_outside_sessions_total == 0
         and len(missing_days) == 0
-        and missing_half_seconds_total == 0
+        and missing_half_seconds_state != "error"
     )
+    state = "error" if not ok else ("warn" if missing_half_seconds_state == "info" else "ok")
     issues_total = int(len(days_with_issues))
     issues_truncated = bool(issues_total > report_max_days)
     if issues_truncated:
         days_with_issues = days_with_issues[:report_max_days]
+    if not report_include_segments:
+        for d in days_with_issues:
+            segs = list(d.get("missing_segments") or [])
+            if segs and report_segments_sample > 0:
+                d["missing_segments_sample"] = segs[:report_segments_sample]
+                d["missing_segments_sampled"] = int(min(report_segments_sample, len(segs)))
+            else:
+                d["missing_segments_sample"] = []
+                d["missing_segments_sampled"] = 0
+            d["missing_segments"] = []
+    exchange_events_total = int(len(exchange_events_used))
+    exchange_events_truncated = bool(exchange_events_total > report_max_events)
+    exchange_events_sample = list(exchange_events_used[:report_max_events])
     lag_p95 = None
     lag_max = None
     if session_end_lags:
@@ -744,6 +983,7 @@ def validate_main_l5(
         lag_p95 = int(sorted_lags[max(0, idx)])
     report = {
         "ok": ok,
+        "state": state,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "exchange": ex,
         "variety": var,
@@ -765,19 +1005,29 @@ def validate_main_l5(
         "issues_truncated": bool(issues_truncated),
         "report_max_days": int(report_max_days),
         "gap_threshold_s": float(gap_threshold_s),
+        "gap_threshold_s_by_session": {k: float(v) for k, v in gap_threshold_s_by_session.items()},
         "cadence_mode": cadence_mode,
         "seconds_with_ticks_total": int(seconds_with_ticks_total),
         "seconds_with_one_tick_total": int(seconds_with_one_tick_total),
         "seconds_with_two_plus_total": int(seconds_with_two_plus_total),
         "expected_seconds_total": int(expected_seconds_total),
         "expected_seconds_strict_total": int(expected_seconds_strict_total),
-        "missing_seconds_ratio": (float(missing_seconds_total) / float(expected_seconds_total) if expected_seconds_total > 0 else 0.0),
+        "expected_seconds_strict_fixed_total": int(expected_seconds_strict_fixed_total),
+        "missing_seconds_ratio": (
+            float(missing_seconds_total) / float(expected_seconds_strict_total)
+            if expected_seconds_strict_total > 0
+            else 0.0
+        ),
         "gap_buckets_total": gap_bucket_totals,
         "gap_buckets_by_session_total": gap_bucket_totals_by_session,
         "gap_count_gt_30s": int(gap_count_gt_30_total),
         "total_segments": int(total_segments_total),
         "two_plus_ratio": float(two_plus_ratio),
         "strict_ratio": float(strict_ratio),
+        "missing_half_seconds_ratio": float(missing_half_seconds_ratio),
+        "missing_half_seconds_info_ratio": float(half_info_ratio),
+        "missing_half_seconds_block_ratio": float(half_block_ratio),
+        "missing_half_seconds_state": str(missing_half_seconds_state),
         "timeliness": {
             "p95_lag_s": lag_p95,
             "max_lag_s": lag_max,
@@ -790,7 +1040,9 @@ def validate_main_l5(
         },
         "holiday_night_skipped_days": int(len(holiday_gap_days)),
         "holiday_night_skipped_sample": [d.isoformat() for d in sorted(holiday_gap_days)[:20]],
-        "exchange_events_used": exchange_events_used,
+        "exchange_events_used": exchange_events_sample,
+        "exchange_events_used_total": exchange_events_total,
+        "exchange_events_used_truncated": bool(exchange_events_truncated),
         "event_override_days": int(len(event_override_days)),
         "event_override_days_sample": [d.isoformat() for d in sorted(event_override_days)[:20]],
         "tqsdk_check": {
@@ -809,8 +1061,28 @@ def validate_main_l5(
             "run_id": (manifest.get("run_id") if isinstance(manifest, dict) else None),
             "created_at": (manifest.get("created_at") if isinstance(manifest, dict) else None),
         },
+        "persist": {
+            "summary_rows_upserted": int(persisted_summary_rows),
+            "gap_rows_deleted": int(persisted_gap_rows_deleted),
+            "gap_rows_inserted": int(persisted_gap_rows_inserted),
+            "tick_gap_rows_upserted": int(persisted_tick_gap_rows),
+        },
+        "report_compaction": {
+            "include_segments": bool(report_include_segments),
+            "segments_sample": int(report_segments_sample),
+            "max_days": int(report_max_days),
+            "max_events": int(report_max_events),
+        },
         "issues": days_with_issues,
     }
+
+    log.info(
+        "main_l5_validate.persist_done",
+        summary_rows_upserted=int(persisted_summary_rows),
+        gap_rows_deleted=int(persisted_gap_rows_deleted),
+        gap_rows_inserted=int(persisted_gap_rows_inserted),
+        tick_gap_rows_upserted=int(persisted_tick_gap_rows),
+    )
 
     log.info(
         "main_l5_validate.done",

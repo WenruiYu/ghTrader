@@ -1,10 +1,12 @@
 {% extends "base.html" %}
 {% block content %}
+  {% set var_query = token_qs ~ ("&" if token_qs else "?") ~ "var=" ~ variety %}
+  {% set default_symbol = "KQ.m@SHFE." ~ variety %}
   <div class="section-header">
     <h2>SQL Explorer</h2>
     <div class="section-header-actions">
       <span class="pill">QuestDB</span>
-      <a class="btn btn-secondary btn-sm" href="/explorer{{ token_qs }}">Refresh</a>
+      <a class="btn btn-secondary btn-sm" href="/explorer{{ var_query }}">Refresh</a>
     </div>
   </div>
 
@@ -15,10 +17,10 @@
     </p>
 
     {% if error %}
-      <pre class="mono" style="white-space:pre-wrap; color:#b00020;">{{ error }}</pre>
+      <pre class="mono raw-json text-danger">{{ error }}</pre>
     {% endif %}
 
-    <form class="form" method="post" action="/explorer{{ token_qs }}">
+    <form class="form" method="post" action="/explorer{{ var_query }}">
       <div class="grid2">
         <div>
           <label>Sample queries</label>
@@ -27,23 +29,23 @@
             <option value="SELECT count() AS n_ticks FROM ghtrader_ticks_main_l5_v2">Count main_l5 rows</option>
             <option value="SELECT symbol, count() AS n_rows FROM ghtrader_ticks_main_l5_v2 GROUP BY symbol ORDER BY n_rows DESC LIMIT 20">Top symbols by rows (main_l5)</option>
             <option value="SELECT symbol, min(cast(trading_day as string)) AS first_day, max(cast(trading_day as string)) AS last_day, count(DISTINCT cast(trading_day as string)) AS n_days FROM ghtrader_ticks_main_l5_v2 GROUP BY symbol ORDER BY n_days DESC LIMIT 20">Coverage bounds by symbol (main_l5)</option>
-            <option value="SELECT ts, symbol, last_price FROM ghtrader_ticks_main_l5_v2 WHERE symbol='KQ.m@SHFE.cu' ORDER BY ts DESC LIMIT 50">Latest ticks for KQ.m@SHFE.cu</option>
+            <option value="SELECT ts, symbol, last_price FROM ghtrader_ticks_main_l5_v2 WHERE symbol='{{ default_symbol }}' ORDER BY ts DESC LIMIT 50">Latest ticks for {{ default_symbol }}</option>
           </select>
         </div>
-        <div class="muted" style="display:flex; align-items:flex-end;">
+        <div class="muted form-actions">
           Paste your own SELECT/WITH queries below.
         </div>
       </div>
       <div>
         <label>Query</label>
-        <textarea name="query" rows="10" class="mono" style="width:100%;" id="queryBox">{{ query or "" }}</textarea>
+        <textarea name="query" rows="10" class="mono" id="queryBox">{{ query or "" }}</textarea>
       </div>
       <div class="grid2">
         <div>
           <label>Max rows</label>
           <input name="limit" type="number" min="1" step="1" value="{{ limit or 200 }}"/>
         </div>
-        <div style="display:flex; align-items:flex-end;">
+        <div class="form-actions-right">
           <button type="submit">Run query</button>
         </div>
       </div>

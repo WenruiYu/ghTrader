@@ -80,13 +80,20 @@ def get_last_validated_day(
     *,
     cfg: Any,
     symbol: str,
+    schedule_hash: str | None = None,
     table: str = "ghtrader_main_l5_validate_summary_v2",
 ) -> date | None:
     """Get the last validated trading day for a symbol from QuestDB."""
-    sql = f"SELECT max(cast(trading_day as string)) FROM {table} WHERE symbol=%s"
+    where = ["symbol=%s"]
+    params: list[Any] = [str(symbol).strip()]
+    sh = str(schedule_hash or "").strip()
+    if sh:
+        where.append("schedule_hash=%s")
+        params.append(sh)
+    sql = f"SELECT max(cast(trading_day as string)) FROM {table} WHERE {' AND '.join(where)}"
     with connect_pg(cfg, connect_timeout_s=2) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, [str(symbol).strip()])
+            cur.execute(sql, params)
             row = cur.fetchone()
             if row and row[0]:
                 try:

@@ -85,6 +85,7 @@ def ensure_main_l5_validate_summary_table(
     cfg: QuestDBQueryConfig,
     table: str = MAIN_L5_VALIDATE_SUMMARY_TABLE,
     connect_timeout_s: int = 2,
+    fail_fast: bool = False,
 ) -> None:
     tbl = str(table).strip() or MAIN_L5_VALIDATE_SUMMARY_TABLE
     ddl = f"""
@@ -165,6 +166,8 @@ def ensure_main_l5_validate_summary_table(
                     pass
     except Exception as e:
         log.warning("questdb_main_l5_validate.summary_ensure_failed", table=tbl, error=str(e))
+        if fail_fast:
+            raise
 
 
 def ensure_main_l5_validate_gaps_table(
@@ -172,6 +175,7 @@ def ensure_main_l5_validate_gaps_table(
     cfg: QuestDBQueryConfig,
     table: str = MAIN_L5_VALIDATE_GAPS_TABLE,
     connect_timeout_s: int = 2,
+    fail_fast: bool = False,
 ) -> None:
     tbl = str(table).strip() or MAIN_L5_VALIDATE_GAPS_TABLE
     ddl = f"""
@@ -218,6 +222,8 @@ def ensure_main_l5_validate_gaps_table(
                     pass
     except Exception as e:
         log.warning("questdb_main_l5_validate.gaps_ensure_failed", table=tbl, error=str(e))
+        if fail_fast:
+            raise
 
 
 def ensure_main_l5_tick_gaps_table(
@@ -225,6 +231,7 @@ def ensure_main_l5_tick_gaps_table(
     cfg: QuestDBQueryConfig,
     table: str = MAIN_L5_TICK_GAPS_TABLE,
     connect_timeout_s: int = 2,
+    fail_fast: bool = False,
 ) -> None:
     tbl = str(table).strip() or MAIN_L5_TICK_GAPS_TABLE
     ddl = f"""
@@ -287,6 +294,35 @@ def ensure_main_l5_tick_gaps_table(
                     pass
     except Exception as e:
         log.warning("questdb_main_l5_validate.tick_gaps_ensure_failed", table=tbl, error=str(e))
+        if fail_fast:
+            raise
+
+
+def _append_schedule_hash_filter(*, where: list[str], params: list[Any], schedule_hash: str | None) -> None:
+    sh = str(schedule_hash or "").strip()
+    if sh:
+        where.append("schedule_hash=%s")
+        params.append(sh)
+
+
+def assert_main_l5_validate_tables_ready(
+    *,
+    cfg: QuestDBQueryConfig,
+    summary_table: str = MAIN_L5_VALIDATE_SUMMARY_TABLE,
+    gaps_table: str = MAIN_L5_VALIDATE_GAPS_TABLE,
+    tick_gaps_table: str = MAIN_L5_TICK_GAPS_TABLE,
+    connect_timeout_s: int = 2,
+) -> None:
+    tables = [
+        str(summary_table).strip() or MAIN_L5_VALIDATE_SUMMARY_TABLE,
+        str(gaps_table).strip() or MAIN_L5_VALIDATE_GAPS_TABLE,
+        str(tick_gaps_table).strip() or MAIN_L5_TICK_GAPS_TABLE,
+    ]
+    with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
+        with conn.cursor() as cur:
+            for tbl in tables:
+                cur.execute(f"SELECT count() FROM {tbl} LIMIT 1")
+                _ = cur.fetchone()
 
 
 def upsert_main_l5_validate_summary_rows(
@@ -339,15 +375,40 @@ def upsert_main_l5_validate_summary_rows(
         )
     if not params:
         return 0
+    columns = [
+        "ts",
+        "symbol",
+        "trading_day",
+        "cadence_mode",
+        "expected_seconds",
+        "expected_seconds_strict",
+        "seconds_with_ticks",
+        "seconds_with_two_plus",
+        "two_plus_ratio",
+        "observed_segments",
+        "total_segments",
+        "missing_day",
+        "missing_segments",
+        "missing_seconds",
+        "missing_seconds_ratio",
+        "gap_bucket_2_5",
+        "gap_bucket_6_15",
+        "gap_bucket_16_30",
+        "gap_bucket_gt_30",
+        "gap_count_gt_30",
+        "missing_half_seconds",
+        "last_tick_ts",
+        "session_end_lag_s",
+        "max_gap_s",
+        "gap_threshold_s",
+        "schedule_hash",
+        "updated_at",
+    ]
+    placeholders = ",".join(["%s"] * int(len(columns)))
     sql = (
         f"INSERT INTO {tbl} "
-        "(ts, symbol, trading_day, cadence_mode, expected_seconds, expected_seconds_strict, "
-        "seconds_with_ticks, seconds_with_two_plus, two_plus_ratio, observed_segments, total_segments, "
-        "missing_day, missing_segments, missing_seconds, missing_seconds_ratio, gap_bucket_2_5, gap_bucket_6_15, "
-        "gap_bucket_16_30, gap_bucket_gt_30, gap_count_gt_30, missing_half_seconds, last_tick_ts, "
-        "session_end_lag_s, max_gap_s, gap_threshold_s, "
-        "schedule_hash, updated_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+        f"({', '.join(columns)}) "
+        f"VALUES ({placeholders})"
     )
     with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
         with conn.cursor() as cur:
@@ -509,13 +570,13 @@ def clear_main_l5_validate_gap_rows(
 ) -> int:
     """
     Delete gap rows for a symbol, optionally limited to trading_day range.
-
-    Falls back to table rebuild if DELETE is not supported.
     """
     tbl = str(table).strip() or MAIN_L5_VALIDATE_GAPS_TABLE
     sym = str(symbol or "").strip()
     if not sym:
         return 0
+    from .row_cleanup import replace_table_delete_where
+
     where = ["symbol=%s"]
     params: list[Any] = [sym]
     if start_day is not None:
@@ -525,35 +586,18 @@ def clear_main_l5_validate_gap_rows(
         where.append("cast(trading_day as string) <= %s")
         params.append(end_day.isoformat())
     where_sql = " AND ".join(where)
-    count_sql = f"SELECT count() FROM {tbl} WHERE {where_sql}"
-    delete_sql = f"DELETE FROM {tbl} WHERE {where_sql}"
-    cols = "ts, symbol, trading_day, session, start_ts, end_ts, duration_s, tqsdk_status, schedule_hash, updated_at"
-    tmp_table = f"{tbl}_clean"
-    with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
-        try:
-            conn.autocommit = True  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        with conn.cursor() as cur:
-            try:
-                cur.execute(count_sql, params)
-                (count,) = cur.fetchone() or (0,)
-            except Exception:
-                count = 0
-            try:
-                cur.execute(delete_sql, params)
-                return int(count)
-            except Exception as e:
-                log.warning("questdb_main_l5_validate.gaps_delete_failed", table=tbl, error=str(e))
-                ensure_main_l5_validate_gaps_table(cfg=cfg, table=tmp_table, connect_timeout_s=connect_timeout_s)
-                insert_sql = (
-                    f"INSERT INTO {tmp_table} ({cols}) "
-                    f"SELECT {cols} FROM {tbl} WHERE NOT ({where_sql})"
-                )
-                cur.execute(insert_sql, params)
-                cur.execute(f"DROP TABLE {tbl}")
-                cur.execute(f"RENAME TABLE {tmp_table} TO {tbl}")
-                return int(count)
+    cols = ["ts", "symbol", "trading_day", "session", "start_ts", "end_ts", "duration_s", "tqsdk_status", "schedule_hash", "updated_at"]
+    return int(
+        replace_table_delete_where(
+            cfg=cfg,
+            table=tbl,
+            columns=cols,
+            delete_where_sql=where_sql,
+            delete_params=params,
+            ensure_table=lambda t: ensure_main_l5_validate_gaps_table(cfg=cfg, table=t, connect_timeout_s=connect_timeout_s),
+            connect_timeout_s=connect_timeout_s,
+        )
+    )
 
 
 def fetch_latest_main_l5_validate_summary(
@@ -561,25 +605,30 @@ def fetch_latest_main_l5_validate_summary(
     cfg: QuestDBQueryConfig,
     symbol: str,
     limit: int = 30,
+    schedule_hash: str | None = None,
     table: str = MAIN_L5_VALIDATE_SUMMARY_TABLE,
     connect_timeout_s: int = 2,
 ) -> list[dict[str, Any]]:
     tbl = str(table).strip() or MAIN_L5_VALIDATE_SUMMARY_TABLE
     sym = str(symbol or "").strip()
     lim = max(1, min(int(limit or 30), 3650))
+    where = ["symbol=%s"]
+    params: list[Any] = [sym]
+    _append_schedule_hash_filter(where=where, params=params, schedule_hash=schedule_hash)
     sql = (
         "SELECT trading_day, cadence_mode, expected_seconds, expected_seconds_strict, seconds_with_ticks, "
         "seconds_with_two_plus, two_plus_ratio, observed_segments, total_segments, missing_day, missing_segments, "
         "missing_seconds, missing_seconds_ratio, gap_bucket_2_5, gap_bucket_6_15, gap_bucket_16_30, "
         "gap_bucket_gt_30, gap_count_gt_30, missing_half_seconds, last_tick_ts, session_end_lag_s, "
         "max_gap_s, gap_threshold_s, schedule_hash, updated_at "
-        f"FROM {tbl} WHERE symbol=%s "
+        f"FROM {tbl} WHERE {' AND '.join(where)} "
         "ORDER BY cast(trading_day as string) DESC LIMIT %s"
     )
+    params.append(lim)
     out: list[dict[str, Any]] = []
     with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, [sym, lim])
+            cur.execute(sql, params)
             for row in cur.fetchall():
                 out.append(
                     {
@@ -618,21 +667,26 @@ def fetch_main_l5_validate_top_gap_days(
     cfg: QuestDBQueryConfig,
     symbol: str,
     limit: int = 10,
+    schedule_hash: str | None = None,
     table: str = MAIN_L5_VALIDATE_SUMMARY_TABLE,
     connect_timeout_s: int = 2,
 ) -> list[dict[str, Any]]:
     tbl = str(table).strip() or MAIN_L5_VALIDATE_SUMMARY_TABLE
     sym = str(symbol or "").strip()
     lim = max(1, min(int(limit or 10), 200))
+    where = ["symbol=%s", "max_gap_s > 0"]
+    params: list[Any] = [sym]
+    _append_schedule_hash_filter(where=where, params=params, schedule_hash=schedule_hash)
     sql = (
         "SELECT trading_day, cadence_mode, missing_segments, missing_half_seconds, max_gap_s, schedule_hash "
-        f"FROM {tbl} WHERE symbol=%s AND max_gap_s > 0 "
+        f"FROM {tbl} WHERE {' AND '.join(where)} "
         "ORDER BY max_gap_s DESC, missing_segments DESC, cast(trading_day as string) DESC LIMIT %s"
     )
+    params.append(lim)
     out: list[dict[str, Any]] = []
     with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, [sym, lim])
+            cur.execute(sql, params)
             for row in cur.fetchall():
                 out.append(
                     {
@@ -652,21 +706,26 @@ def fetch_main_l5_validate_top_lag_days(
     cfg: QuestDBQueryConfig,
     symbol: str,
     limit: int = 10,
+    schedule_hash: str | None = None,
     table: str = MAIN_L5_VALIDATE_SUMMARY_TABLE,
     connect_timeout_s: int = 2,
 ) -> list[dict[str, Any]]:
     tbl = str(table).strip() or MAIN_L5_VALIDATE_SUMMARY_TABLE
     sym = str(symbol or "").strip()
     lim = max(1, min(int(limit or 10), 200))
+    where = ["symbol=%s", "session_end_lag_s IS NOT NULL"]
+    params: list[Any] = [sym]
+    _append_schedule_hash_filter(where=where, params=params, schedule_hash=schedule_hash)
     sql = (
         "SELECT trading_day, session_end_lag_s, last_tick_ts, cadence_mode, max_gap_s, schedule_hash "
-        f"FROM {tbl} WHERE symbol=%s AND session_end_lag_s IS NOT NULL "
+        f"FROM {tbl} WHERE {' AND '.join(where)} "
         "ORDER BY session_end_lag_s DESC, cast(trading_day as string) DESC LIMIT %s"
     )
+    params.append(lim)
     out: list[dict[str, Any]] = []
     with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, [sym, lim])
+            cur.execute(sql, params)
             for row in cur.fetchall():
                 out.append(
                     {
@@ -685,6 +744,7 @@ def list_main_l5_validate_gaps(
     *,
     cfg: QuestDBQueryConfig,
     symbol: str,
+    schedule_hash: str | None = None,
     trading_day: date | None = None,
     start_day: date | None = None,
     end_day: date | None = None,
@@ -698,6 +758,7 @@ def list_main_l5_validate_gaps(
     lim = max(1, min(int(limit or 500), 10000))
     where = ["symbol=%s"]
     params: list[Any] = [sym]
+    _append_schedule_hash_filter(where=where, params=params, schedule_hash=schedule_hash)
     if trading_day is not None:
         where.append("cast(trading_day as string) = %s")
         params.append(trading_day.isoformat())
@@ -739,11 +800,15 @@ def fetch_main_l5_validate_overview(
     *,
     cfg: QuestDBQueryConfig,
     symbol: str,
+    schedule_hash: str | None = None,
     table: str = MAIN_L5_VALIDATE_SUMMARY_TABLE,
     connect_timeout_s: int = 2,
 ) -> dict[str, Any]:
     tbl = str(table).strip() or MAIN_L5_VALIDATE_SUMMARY_TABLE
     sym = str(symbol or "").strip()
+    where = ["symbol=%s"]
+    params: list[Any] = [sym]
+    _append_schedule_hash_filter(where=where, params=params, schedule_hash=schedule_hash)
     sql = (
         "SELECT "
         "count() AS days_total, "
@@ -764,7 +829,7 @@ def fetch_main_l5_validate_overview(
         "max(session_end_lag_s) AS max_lag_s, "
         "max(gap_threshold_s) AS gap_threshold_s, "
         "max(cast(trading_day as string)) AS last_day "
-        f"FROM {tbl} WHERE symbol=%s"
+        f"FROM {tbl} WHERE {' AND '.join(where)}"
     )
     out: dict[str, Any] = {
         "days_total": 0,
@@ -789,7 +854,7 @@ def fetch_main_l5_validate_overview(
     }
     with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, [sym])
+            cur.execute(sql, params)
             row = cur.fetchone()
             if row:
                 out["days_total"] = int(row[0] or 0)
@@ -812,8 +877,8 @@ def fetch_main_l5_validate_overview(
                 out["last_day"] = row[17]
             try:
                 cur.execute(
-                    f"SELECT session_end_lag_s FROM {tbl} WHERE symbol=%s AND session_end_lag_s IS NOT NULL",
-                    [sym],
+                    f"SELECT session_end_lag_s FROM {tbl} WHERE {' AND '.join(where)} AND session_end_lag_s IS NOT NULL",
+                    params,
                 )
                 lags = [int(r[0]) for r in cur.fetchall() if r and r[0] is not None]
                 if lags:

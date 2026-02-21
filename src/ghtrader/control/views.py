@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -18,10 +19,19 @@ from fastapi.templating import Jinja2Templates
 
 from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
 from ghtrader.control import auth
+from ghtrader.control.job_metadata import infer_job_metadata, merge_job_metadata
 from ghtrader.control.jobs import JobSpec, python_module_argv
 from ghtrader.control.ops_compat import canonical_for_legacy
 from ghtrader.control.settings import get_tqsdk_scheduler_state, set_tqsdk_scheduler_max_parallel
 from ghtrader.control.system_info import cpu_mem_info, disk_usage, gpu_info
+from ghtrader.control.variety_context import (
+    allowed_varieties as _allowed_varieties,
+    default_variety as _default_variety,
+    derived_symbol_for_variety as _derived_symbol_for_variety,
+    infer_variety_from_symbol as _infer_variety_from_symbol_ctx,
+    require_supported_variety as _require_supported_variety,
+    symbol_matches_variety as _symbol_matches_variety,
+)
 
 log = structlog.get_logger()
 
@@ -65,6 +75,79 @@ def build_router() -> Any:
 
     def _token_qs(request: Request) -> str:
         return auth.token_query_string(request)
+
+    def _page_variety(variety: str | None) -> str:
+        try:
+            return _require_supported_variety(variety)
+        except Exception as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    def _variety_nav_ctx(
+        variety: str,
+        *,
+        section: str = "",
+        page_title: str = "",
+        breadcrumbs: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        v = _page_variety(variety)
+        section_key = str(section or "").strip().lower()
+        section_title_map = {
+            "dashboard": "Dashboard",
+            "jobs": "Jobs",
+            "data": "Data Hub",
+            "models": "Models",
+            "trading": "Trading",
+            "sql": "SQL Explorer",
+            "system": "System",
+        }
+        current_title = str(page_title or section_title_map.get(section_key) or "Workspace").strip()
+        crumb_list = breadcrumbs or [
+            {"label": "Workspace", "href": f"/v/{v}/dashboard"},
+            {"label": current_title, "href": ""},
+        ]
+        return {
+            "variety": v,
+            "allowed_varieties": list(_allowed_varieties()),
+            "variety_path_prefix": f"/v/{v}",
+            "page_context": {
+                "section": section_key,
+                "page_title": current_title,
+                "workspace_label": f"{v.upper()} workspace",
+                "breadcrumbs": crumb_list,
+            },
+        }
+
+    def _var_page(path_suffix: str, *, variety: str | None = None, token_qs: str = "") -> str:
+        v = str(variety or _default_variety()).strip().lower() or _default_variety()
+        suffix = str(path_suffix or "").strip().lstrip("/")
+        return f"/v/{v}/{suffix}{token_qs}"
+
+    def _form_variety(raw: Any, *, strict: bool = False) -> str:
+        v = str(raw or "").strip().lower()
+        if not v:
+            if strict:
+                raise HTTPException(status_code=400, detail="variety is required")
+            return _default_variety()
+        if strict:
+            try:
+                return _require_supported_variety(v)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e))
+        return v if v in _allowed_varieties() else _default_variety()
+
+    def _request_variety_hint(request: Request) -> str:
+        raw = str(request.query_params.get("var") or "").strip().lower()
+        return raw if raw in _allowed_varieties() else _default_variety()
+
+    def _infer_variety_from_symbol(symbol: str) -> str | None:
+        return _infer_variety_from_symbol_ctx(symbol)
+
+    def _job_redirect_url(request: Request, job_id: str, *, variety: str | None = None) -> str:
+        token_qs = _token_qs(request)
+        if variety:
+            sep = "&" if token_qs else "?"
+            return f"/jobs/{job_id}{token_qs}{sep}var={variety}"
+        return f"/jobs/{job_id}{token_qs}"
 
     def _log_ops_hit(legacy_path: str) -> None:
         try:
@@ -137,15 +220,94 @@ def build_router() -> Any:
             "queued_count": len(queued),
         }
 
-    def _l5_calendar_context(*, data_dir: Path) -> dict[str, str]:
+    def _find_existing_job_by_command(*, request: Request, argv: list[str]) -> Any | None:
+        """
+        Best-effort dedupe for long-running data build jobs.
+        """
+        store = request.app.state.job_store
+        target = [str(x) for x in list(argv)]
+        try:
+            active = store.list_active_jobs() + store.list_unstarted_queued_jobs(limit=2000)
+        except Exception:
+            return None
+        for job in active:
+            cmd = [str(x) for x in (job.command or [])]
+            if cmd == target:
+                return job
+        return None
+
+    def _start_or_reuse_job_by_command(
+        *, request: Request, title: str, argv: list[str], cwd: Path, metadata: dict[str, Any] | None = None
+    ) -> Any:
+        jm = request.app.state.job_manager
+        auto_metadata = infer_job_metadata(argv=argv, title=title)
+        merged_metadata = merge_job_metadata(auto_metadata, metadata)
+        existing = _find_existing_job_by_command(request=request, argv=argv)
+        if existing is not None:
+            if merged_metadata:
+                try:
+                    store = request.app.state.job_store
+                    current_meta = dict(existing.metadata) if isinstance(getattr(existing, "metadata", None), dict) else None
+                    next_meta = merge_job_metadata(current_meta, merged_metadata)
+                    if next_meta and next_meta != current_meta:
+                        store.update_job(existing.id, metadata=next_meta)
+                except Exception:
+                    pass
+            if existing.pid is None and str(existing.status or "").strip().lower() == "queued":
+                try:
+                    started = jm.start_queued_job(existing.id)
+                    if started is not None:
+                        return started
+                except Exception:
+                    pass
+            return existing
+        return jm.start_job(JobSpec(title=title, argv=argv, cwd=cwd, metadata=merged_metadata))
+
+    def _job_matches_variety(job: Any, variety: str) -> bool:
+        v = _page_variety(variety)
+        meta = getattr(job, "metadata", None)
+        if isinstance(meta, dict):
+            mv = str(meta.get("variety") or "").strip().lower()
+            if mv in set(_allowed_varieties()):
+                return mv == v
+            ms = str(meta.get("symbol") or "").strip()
+            if ms:
+                return _symbol_matches_variety(ms, v)
+            mss = meta.get("symbols")
+            if isinstance(mss, list) and mss:
+                return any(_symbol_matches_variety(str(x or ""), v) for x in mss)
+        cmd = [str(x) for x in (job.command or [])]
+        cmd_lc = [x.lower() for x in cmd]
+        for i, token in enumerate(cmd_lc[:-1]):
+            if token == "--var" and cmd_lc[i + 1] == v:
+                return True
+        for token in cmd_lc:
+            if _symbol_matches_variety(token, v):
+                return True
+        title = str(job.title or "").lower()
+        if _symbol_matches_variety(title, v):
+            return True
+        if re.search(rf"(^|\s){re.escape(v)}(\s|$)", title):
+            return True
+        return False
+
+    def _l5_calendar_context(*, data_dir: Path, variety: str) -> dict[str, str]:
         l5_start_date = ""
         l5_start_error = ""
+        l5_start_env_key = ""
+        l5_start_env_expected_key = ""
+        l5_start_note = ""
         latest_trading_day = ""
         latest_trading_error = ""
         try:
-            from ghtrader.config import get_l5_start_date
+            from ghtrader.config import get_l5_start_date_with_source, l5_start_env_key as _l5_start_env_key
 
-            l5_start_date = get_l5_start_date().isoformat()
+            l5_start_env_expected_key = _l5_start_env_key(variety=variety)
+            d, used_key = get_l5_start_date_with_source(variety=variety)
+            l5_start_date = d.isoformat()
+            l5_start_env_key = str(used_key or l5_start_env_expected_key)
+            if l5_start_env_expected_key and l5_start_env_key and l5_start_env_key != l5_start_env_expected_key:
+                l5_start_note = f"{l5_start_env_expected_key} not set; using {l5_start_env_key}"
         except Exception as e:
             l5_start_error = str(e)
         try:
@@ -157,8 +319,135 @@ def build_router() -> Any:
         return {
             "l5_start_date": l5_start_date,
             "l5_start_error": l5_start_error,
+            "l5_start_env_key": l5_start_env_key,
+            "l5_start_env_expected_key": l5_start_env_expected_key,
+            "l5_start_note": l5_start_note,
             "latest_trading_day": latest_trading_day,
             "latest_trading_error": latest_trading_error,
+        }
+
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = str(os.environ.get(name, "1" if default else "0") or "").strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        return bool(default)
+
+    def _env_float(name: str, default: float, *, min_value: float | None = None) -> float:
+        try:
+            val = float(str(os.environ.get(name, default) or default).strip())
+        except Exception:
+            val = float(default)
+        if min_value is not None:
+            val = max(float(min_value), float(val))
+        return float(val)
+
+    def _pipeline_guardrails_context() -> dict[str, Any]:
+        enforce_health_global = _env_bool("GHTRADER_PIPELINE_ENFORCE_HEALTH", True)
+        enforce_health_schedule = _env_bool("GHTRADER_MAIN_SCHEDULE_ENFORCE_HEALTH", enforce_health_global)
+        enforce_health_main_l5 = _env_bool("GHTRADER_MAIN_L5_ENFORCE_HEALTH", enforce_health_global)
+        lock_wait_timeout_s = _env_float("GHTRADER_LOCK_WAIT_TIMEOUT_S", 120.0, min_value=0.0)
+        lock_poll_interval_s = _env_float("GHTRADER_LOCK_POLL_INTERVAL_S", 1.0, min_value=0.1)
+        lock_force_cancel = _env_bool("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", True)
+        lock_preempt_grace_s = _env_float("GHTRADER_LOCK_PREEMPT_GRACE_S", 8.0, min_value=1.0)
+
+        total_workers_raw = str(os.environ.get("GHTRADER_MAIN_L5_TOTAL_WORKERS", "") or "").strip()
+        segment_workers_raw = str(os.environ.get("GHTRADER_MAIN_L5_SEGMENT_WORKERS", "") or "").strip()
+        total_workers = _safe_int(total_workers_raw, 0, min_value=0) if total_workers_raw else 0
+        segment_workers = _safe_int(segment_workers_raw, 0, min_value=0) if segment_workers_raw else 0
+
+        health_gate_strict = bool(enforce_health_schedule and enforce_health_main_l5)
+        worker_mode = "bounded" if (total_workers > 0 or segment_workers > 0) else "auto"
+        return {
+            "enforce_health_global": bool(enforce_health_global),
+            "enforce_health_schedule": bool(enforce_health_schedule),
+            "enforce_health_main_l5": bool(enforce_health_main_l5),
+            "health_gate_state": ("ok" if health_gate_strict else "warn"),
+            "health_gate_label": ("strict" if health_gate_strict else "partial"),
+            "lock_wait_timeout_s": float(lock_wait_timeout_s),
+            "lock_poll_interval_s": float(lock_poll_interval_s),
+            "lock_force_cancel_on_timeout": bool(lock_force_cancel),
+            "lock_preempt_grace_s": float(lock_preempt_grace_s),
+            "lock_recovery_state": ("ok" if lock_force_cancel else "warn"),
+            "main_l5_total_workers": int(total_workers),
+            "main_l5_segment_workers": int(segment_workers),
+            "main_l5_worker_mode": worker_mode,
+        }
+
+    def _pipeline_health_context(
+        *,
+        main_schedule_coverage: dict[str, Any],
+        main_l5_coverage: dict[str, Any],
+        main_l5_validation: dict[str, Any],
+        coverage_error: str,
+        validation_error: str,
+    ) -> dict[str, dict[str, Any]]:
+        schedule_days = _safe_int(main_schedule_coverage.get("n_days"), 0, min_value=0)
+        hashes_raw = main_schedule_coverage.get("schedule_hashes") or []
+        hashes: list[str] = [str(h) for h in hashes_raw if str(h).strip()]
+        hash_count = len(hashes)
+
+        if coverage_error:
+            schedule_state = "error"
+            schedule_text = "coverage query failed"
+        elif schedule_days <= 0:
+            schedule_state = "error"
+            schedule_text = "missing"
+        elif hash_count == 1:
+            schedule_state = "ok"
+            schedule_text = f"{schedule_days}d · hash ok"
+        else:
+            schedule_state = "warn"
+            schedule_text = f"{schedule_days}d · {hash_count} hashes"
+
+        main_days = _safe_int(main_l5_coverage.get("n_days"), 0, min_value=0)
+        if coverage_error:
+            main_l5_state = "error"
+            main_l5_text = "coverage query failed"
+        elif schedule_days <= 0 and main_days <= 0:
+            main_l5_state = "warn"
+            main_l5_text = "wait for schedule"
+        elif main_days <= 0:
+            main_l5_state = "error"
+            main_l5_text = "empty"
+        elif schedule_days > 0:
+            miss = max(0, int(schedule_days - main_days))
+            if miss > 0:
+                main_l5_state = "warn"
+                main_l5_text = f"{main_days}/{schedule_days}d"
+            else:
+                main_l5_state = "ok"
+                main_l5_text = f"{main_days}/{schedule_days}d"
+        else:
+            main_l5_state = "ok"
+            main_l5_text = f"{main_days}d"
+
+        val_status = str(main_l5_validation.get("status") or "").strip().lower()
+        checked_days = _safe_int(main_l5_validation.get("checked_days"), 0, min_value=0)
+        missing_days = _safe_int(main_l5_validation.get("missing_days"), 0, min_value=0)
+        missing_segments = _safe_int(main_l5_validation.get("missing_segments_total"), 0, min_value=0)
+        if validation_error:
+            validation_state = "error"
+            validation_text = "summary unavailable"
+        elif checked_days <= 0:
+            validation_state = "warn"
+            validation_text = "not run"
+        elif val_status == "ok":
+            validation_state = "ok"
+            validation_text = f"{checked_days}d clean"
+        else:
+            validation_state = "warn"
+            validation_text = (
+                f"{missing_days}/{checked_days}d miss · {missing_segments} seg"
+                if checked_days > 0
+                else "warn"
+            )
+
+        return {
+            "schedule": {"state": schedule_state, "text": schedule_text},
+            "main_l5": {"state": main_l5_state, "text": main_l5_text},
+            "validation": {"state": validation_state, "text": validation_text},
         }
 
     def _build_train_job_argv(
@@ -268,11 +557,21 @@ def build_router() -> Any:
         )
 
     @router.get("/")
-    def index(request: Request):
+    def index_redirect(request: Request):
         _require_auth(request)
+        return RedirectResponse(url=_var_page("dashboard", token_qs=_token_qs(request)), status_code=303)
+
+    @router.get("/v/{variety}/dashboard")
+    def index(request: Request, variety: str):
+        _require_auth(request)
+        v = _page_variety(variety)
         summary = _job_summary(request=request, limit=50)
+        jobs_filtered = [j for j in list(summary["jobs"]) if _job_matches_variety(j, v)]
+        running_count = len([j for j in jobs_filtered if str(j.status) == "running"])
+        queued_count = len([j for j in jobs_filtered if str(j.status) == "queued"])
         data_dir = get_data_dir()
-        calendar_ctx = _l5_calendar_context(data_dir=data_dir)
+        calendar_ctx = _l5_calendar_context(data_dir=data_dir, variety=v)
+        guardrails = _pipeline_guardrails_context()
 
         return templates.TemplateResponse(
             request,
@@ -281,20 +580,49 @@ def build_router() -> Any:
                 "request": request,
                 "title": "ghTrader Dashboard",
                 "token_qs": _token_qs(request),
-                "jobs": summary["jobs"],
-                "running_count": summary["running_count"],
-                "queued_count": summary["queued_count"],
-                "recent_count": len(summary["jobs"]),
+                "jobs": jobs_filtered,
+                "running_count": running_count,
+                "queued_count": queued_count,
+                "recent_count": len(jobs_filtered),
+                "guardrails": guardrails,
                 **calendar_ctx,
+                **_variety_nav_ctx(v, section="dashboard", page_title="Dashboard"),
             },
         )
 
     @router.get("/jobs")
-    def jobs(request: Request):
+    def jobs_redirect(request: Request):
         _require_auth(request)
+        return RedirectResponse(url=_var_page("jobs", token_qs=_token_qs(request)), status_code=303)
+
+    @router.get("/v/{variety}/jobs")
+    def jobs(request: Request, variety: str):
+        _require_auth(request)
+        v = _page_variety(variety)
         summary = _job_summary(request=request, limit=200)
+        jobs_scope = str(request.query_params.get("scope") or "var").strip().lower()
+        page = _safe_int(request.query_params.get("page"), 1, min_value=1)
+        per_page = _safe_int(request.query_params.get("per_page"), 50, min_value=20, max_value=200)
+        show_all = jobs_scope == "all"
+        jobs_all = list(summary["jobs"])
+        jobs_filtered_all = jobs_all if show_all else [j for j in jobs_all if _job_matches_variety(j, v)]
+        running_count = len([j for j in jobs_filtered_all if str(j.status) == "running"])
+        status_counts = {
+            "running": len([j for j in jobs_filtered_all if str(j.status) == "running"]),
+            "queued": len([j for j in jobs_filtered_all if str(j.status) == "queued"]),
+            "succeeded": len([j for j in jobs_filtered_all if str(j.status) == "succeeded"]),
+            "failed": len([j for j in jobs_filtered_all if str(j.status) == "failed"]),
+            "cancelled": len([j for j in jobs_filtered_all if str(j.status) == "cancelled"]),
+        }
+        total_jobs = len(jobs_filtered_all)
+        total_pages = max(1, (total_jobs + per_page - 1) // per_page)
+        if page > total_pages:
+            page = total_pages
+        offset = (page - 1) * per_page
+        jobs_filtered = jobs_filtered_all[offset : offset + per_page]
         data_dir = get_data_dir()
-        calendar_ctx = _l5_calendar_context(data_dir=data_dir)
+        calendar_ctx = _l5_calendar_context(data_dir=data_dir, variety=v)
+        guardrails = _pipeline_guardrails_context()
         return templates.TemplateResponse(
             request,
             "jobs.html",
@@ -302,9 +630,23 @@ def build_router() -> Any:
                 "request": request,
                 "title": "Jobs",
                 "token_qs": _token_qs(request),
-                "jobs": summary["jobs"],
-                "running_count": summary["running_count"],
+                "jobs": jobs_filtered,
+                "running_count": running_count,
+                "jobs_status_counts": status_counts,
+                "jobs_scope": "all" if show_all else "var",
+                "jobs_pagination": {
+                    "page": page,
+                    "per_page": per_page,
+                    "total": total_jobs,
+                    "total_pages": total_pages,
+                    "has_prev": page > 1,
+                    "has_next": page < total_pages,
+                    "prev_page": max(1, page - 1),
+                    "next_page": min(total_pages, page + 1),
+                },
+                "guardrails": guardrails,
                 **calendar_ctx,
+                **_variety_nav_ctx(v, section="jobs", page_title="Jobs"),
             },
         )
 
@@ -313,11 +655,17 @@ def build_router() -> Any:
     # ---------------------------------------------------------------------
 
     @router.get("/models")
-    def models_page(request: Request):
+    def models_redirect(request: Request):
         _require_auth(request)
+        return RedirectResponse(url=_var_page("models", token_qs=_token_qs(request)), status_code=303)
+
+    @router.get("/v/{variety}/models")
+    def models_page(request: Request, variety: str):
+        _require_auth(request)
+        v = _page_variety(variety)
         store = request.app.state.job_store
         jobs = store.list_jobs(limit=50)
-        running = [j for j in jobs if j.status == "running"]
+        running = [j for j in jobs if j.status == "running" and _job_matches_variety(j, v)]
         return templates.TemplateResponse(
             request,
             "models.html",
@@ -326,6 +674,7 @@ def build_router() -> Any:
                 "title": "Models",
                 "token_qs": _token_qs(request),
                 "running_count": len(running),
+                **_variety_nav_ctx(v, section="models", page_title="Models"),
             },
         )
 
@@ -334,11 +683,17 @@ def build_router() -> Any:
     # ---------------------------------------------------------------------
 
     @router.get("/trading")
-    def trading_page(request: Request):
+    def trading_redirect(request: Request):
         _require_auth(request)
+        return RedirectResponse(url=_var_page("trading", token_qs=_token_qs(request)), status_code=303)
+
+    @router.get("/v/{variety}/trading")
+    def trading_page(request: Request, variety: str):
+        _require_auth(request)
+        v = _page_variety(variety)
         store = request.app.state.job_store
         jobs = store.list_jobs(limit=50)
-        running = [j for j in jobs if j.status == "running"]
+        running = [j for j in jobs if j.status == "running" and _job_matches_variety(j, v)]
 
         return templates.TemplateResponse(
             request,
@@ -348,6 +703,7 @@ def build_router() -> Any:
                 "title": "Trading",
                 "token_qs": _token_qs(request),
                 "running_count": len(running),
+                **_variety_nav_ctx(v, section="trading", page_title="Trading"),
             },
         )
 
@@ -360,51 +716,50 @@ def build_router() -> Any:
         """Redirect /ops to /data for backward compatibility (unified workflow in Contracts tab)."""
         _require_auth(request)
         _log_ops_hit("/ops")
-        token_qs = _token_qs(request)
         # Redirect to the unified Data Hub (Contracts tab has the 8-step workflow)
-        return RedirectResponse(url=f"/data{token_qs}#contracts", status_code=303)
+        return RedirectResponse(url=f"{_var_page('data', token_qs=_token_qs(request))}#contracts", status_code=303)
 
     @router.get("/ops/ingest")
     def ops_ingest_redirect(request: Request):
         _require_auth(request)
         _log_ops_hit("/ops/ingest")
-        return RedirectResponse(url=f"/data{_token_qs(request)}#ingest", status_code=303)
+        return RedirectResponse(url=f"{_var_page('data', token_qs=_token_qs(request))}#ingest", status_code=303)
 
     @router.get("/ops/build")
     def ops_build_redirect(request: Request):
         _require_auth(request)
         _log_ops_hit("/ops/build")
-        return RedirectResponse(url=f"/data{_token_qs(request)}#build", status_code=303)
+        return RedirectResponse(url=f"{_var_page('data', token_qs=_token_qs(request))}#build", status_code=303)
 
     @router.get("/ops/model")
     def ops_model_redirect(request: Request):
         _require_auth(request)
         _log_ops_hit("/ops/model")
-        return RedirectResponse(url=f"/models{_token_qs(request)}", status_code=303)
+        return RedirectResponse(url=_var_page("models", token_qs=_token_qs(request)), status_code=303)
 
     @router.get("/ops/eval")
     def ops_eval_redirect(request: Request):
         _require_auth(request)
         _log_ops_hit("/ops/eval")
-        return RedirectResponse(url=f"/models{_token_qs(request)}", status_code=303)
+        return RedirectResponse(url=_var_page("models", token_qs=_token_qs(request)), status_code=303)
 
     @router.get("/ops/trading")
     def ops_trading_redirect(request: Request):
         _require_auth(request)
         _log_ops_hit("/ops/trading")
-        return RedirectResponse(url=f"/trading{_token_qs(request)}", status_code=303)
+        return RedirectResponse(url=_var_page("trading", token_qs=_token_qs(request)), status_code=303)
 
     @router.get("/ops/locks")
     def ops_locks_redirect(request: Request):
         _require_auth(request)
         _log_ops_hit("/ops/locks")
-        return RedirectResponse(url=f"/data{_token_qs(request)}#locks", status_code=303)
+        return RedirectResponse(url=f"{_var_page('data', token_qs=_token_qs(request))}#locks", status_code=303)
 
     @router.get("/ops/integrity")
     def ops_integrity_redirect(request: Request):
         _require_auth(request)
         _log_ops_hit("/ops/integrity")
-        return RedirectResponse(url=f"/data{_token_qs(request)}#integrity", status_code=303)
+        return RedirectResponse(url=f"{_var_page('data', token_qs=_token_qs(request))}#integrity", status_code=303)
 
     @router.get("/ops/integrity/report/{name}")
     def ops_integrity_report_redirect(request: Request, name: str):
@@ -441,6 +796,7 @@ def build_router() -> Any:
     async def data_settings_tqsdk_scheduler(request: Request):
         _require_auth(request)
         form = await request.form()
+        variety = _form_variety(form.get("variety"), strict=False)
         max_parallel = form.get("max_parallel")
         persist_raw = str(form.get("persist") or "1").strip().lower()
         persist = persist_raw not in {"0", "false", "no", "off"}
@@ -450,13 +806,13 @@ def build_router() -> Any:
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        return RedirectResponse(url=f"/data{_token_qs(request)}#ingest", status_code=303)
+        return RedirectResponse(url=f"{_var_page('data', variety=variety, token_qs=_token_qs(request))}#ingest", status_code=303)
 
     @router.post("/data/build/main_schedule")
     async def data_build_main_schedule(request: Request):
         _require_auth(request)
         form = await request.form()
-        var = str(form.get("variety") or "cu").strip()
+        var = _form_variety(form.get("variety"), strict=True)
         data_dir = str(form.get("data_dir") or "data").strip()
         argv = python_module_argv(
             "ghtrader.cli",
@@ -467,16 +823,26 @@ def build_router() -> Any:
             data_dir,
         )
         title = f"main-schedule {var} env->latest"
-        jm = request.app.state.job_manager
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        rec = _start_or_reuse_job_by_command(
+            request=request,
+            title=title,
+            argv=argv,
+            cwd=Path.cwd(),
+            metadata={
+                "kind": "main_schedule",
+                "exchange": "SHFE",
+                "variety": var,
+                "symbol": _derived_symbol_for_variety(var),
+            },
+        )
+        return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=var), status_code=303)
 
     @router.post("/data/build/main_l5")
     async def data_build_main_l5(request: Request):
         _require_auth(request)
         form = await request.form()
-        var = str(form.get("variety") or "cu").strip()
-        derived_symbol = str(form.get("derived_symbol") or f"KQ.m@SHFE.{var}").strip()
+        var = _form_variety(form.get("variety"), strict=True)
+        derived_symbol = str(form.get("derived_symbol") or _derived_symbol_for_variety(var)).strip()
         data_dir = str(form.get("data_dir") or "data").strip()
         update_mode = str(form.get("update_mode") or "0").strip().lower() in {"1", "true", "yes", "on"}
         if not var or not derived_symbol:
@@ -494,9 +860,19 @@ def build_router() -> Any:
         if update_mode:
             argv += ["--update"]
         title = f"main-l5 {var} {derived_symbol}"
-        jm = request.app.state.job_manager
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        rec = _start_or_reuse_job_by_command(
+            request=request,
+            title=title,
+            argv=argv,
+            cwd=Path.cwd(),
+            metadata={
+                "kind": "main_l5",
+                "exchange": "SHFE",
+                "variety": var,
+                "symbol": derived_symbol,
+            },
+        )
+        return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=var), status_code=303)
 
     @router.post("/data/build/build")
     async def data_build_build(request: Request):
@@ -528,7 +904,7 @@ def build_router() -> Any:
         title = f"build {symbol} ticks_kind={ticks_kind} overwrite={overwrite}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(symbol)), status_code=303)
 
     # ---------------------------------------------------------------------
     # Legacy /ops/* POST routes (alias to canonical active handlers)
@@ -605,7 +981,7 @@ def build_router() -> Any:
         )
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(symbol)), status_code=303)
 
     @router.post("/models/model/sweep")
     @router.post("/ops/model/sweep")
@@ -655,7 +1031,7 @@ def build_router() -> Any:
             title += f" {sweep_note}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(symbol)), status_code=303)
 
     @router.post("/models/eval/benchmark")
     @router.post("/ops/eval/benchmark")
@@ -691,7 +1067,7 @@ def build_router() -> Any:
         title = f"benchmark {model} {symbol}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(symbol)), status_code=303)
 
     @router.post("/models/eval/compare")
     @router.post("/ops/eval/compare")
@@ -727,7 +1103,7 @@ def build_router() -> Any:
         title = f"compare {symbol}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(symbol)), status_code=303)
 
     @router.post("/models/eval/backtest")
     @router.post("/ops/eval/backtest")
@@ -766,7 +1142,7 @@ def build_router() -> Any:
         title = f"backtest {model} {symbol}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(symbol)), status_code=303)
 
     @router.post("/models/eval/paper")
     @router.post("/ops/eval/paper")
@@ -787,7 +1163,11 @@ def build_router() -> Any:
         title = f"paper {model}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        first_sym = next((s.strip() for s in symbols.split(",") if s.strip()), "")
+        return RedirectResponse(
+            url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(first_sym)),
+            status_code=303,
+        )
 
     @router.post("/models/eval/daily_train")
     @router.post("/ops/eval/daily_train")
@@ -825,7 +1205,11 @@ def build_router() -> Any:
         title = f"daily-train {model}"
         jm = request.app.state.job_manager
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        first_sym = next((s.strip() for s in symbols.split(",") if s.strip()), "")
+        return RedirectResponse(
+            url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(first_sym)),
+            status_code=303,
+        )
 
     @router.post("/jobs/start")
     async def jobs_start(request: Request):
@@ -835,6 +1219,8 @@ def build_router() -> Any:
         job_type = str(form.get("job_type") or "").strip()
         symbol_or_var = str(form.get("symbol_or_var") or "").strip()
         data_dir = Path(str(form.get("data_dir") or "data"))
+        job_var = _form_variety(form.get("variety"), strict=False)
+        job_metadata: dict[str, Any] | None = None
 
         # Build argv for a known-safe set of job types (no shell).
         if job_type == "build":
@@ -850,6 +1236,7 @@ def build_router() -> Any:
                 str(data_dir),
             )
             title = f"build {symbol}"
+            job_var = _infer_variety_from_symbol(symbol) or job_var
         elif job_type == "train":
             symbol = symbol_or_var
             if not symbol:
@@ -872,6 +1259,7 @@ def build_router() -> Any:
                 horizon,
             )
             title = f"train {model} {symbol}"
+            job_var = _infer_variety_from_symbol(symbol) or job_var
         elif job_type == "benchmark":
             symbol = symbol_or_var
             if not symbol:
@@ -897,8 +1285,12 @@ def build_router() -> Any:
                 horizon,
             )
             title = f"benchmark {model} {symbol}"
+            job_var = _infer_variety_from_symbol(symbol) or job_var
         elif job_type == "main_schedule":
-            var = symbol_or_var or "cu"
+            var_raw = symbol_or_var or str(form.get("variety") or "").strip()
+            if not var_raw:
+                raise HTTPException(status_code=400, detail="symbol_or_var must be a variety for main_schedule")
+            var = _page_variety(var_raw)
             argv = python_module_argv(
                 "ghtrader.cli",
                 "main-schedule",
@@ -908,26 +1300,47 @@ def build_router() -> Any:
                 str(data_dir),
             )
             title = f"main-schedule {var} env->latest"
+            job_var = var
+            job_metadata = {
+                "kind": "main_schedule",
+                "exchange": "SHFE",
+                "variety": var,
+                "symbol": _derived_symbol_for_variety(var),
+            }
         elif job_type == "main_l5":
-            var = symbol_or_var or "cu"
-            derived_symbol = str(form.get("derived_symbol") or "").strip()
+            var_raw = symbol_or_var or str(form.get("variety") or "").strip()
+            if not var_raw:
+                raise HTTPException(status_code=400, detail="symbol_or_var must be a variety for main_l5")
+            var = _page_variety(var_raw)
+            derived_symbol = str(form.get("derived_symbol") or "").strip() or _derived_symbol_for_variety(var)
             update_mode = str(form.get("update_mode") or "0").strip().lower() in {"1", "true", "yes", "on"}
-            argv = python_module_argv("ghtrader.cli", "main-l5", "--var", var)
-            if derived_symbol:
-                argv += ["--symbol", derived_symbol]
+            argv = python_module_argv("ghtrader.cli", "main-l5", "--var", var, "--symbol", derived_symbol)
             if update_mode:
                 argv += ["--update"]
-            title = f"main-l5 {var}"
+            title = f"main-l5 {var} {derived_symbol}"
+            job_var = var
+            job_metadata = {
+                "kind": "main_l5",
+                "exchange": "SHFE",
+                "variety": var,
+                "symbol": derived_symbol,
+            }
         else:
             raise HTTPException(status_code=400, detail=f"Unknown job_type: {job_type}")
 
-        jm = request.app.state.job_manager
-        rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
-        return RedirectResponse(url=f"/jobs/{rec.id}{_token_qs(request)}", status_code=303)
+        if job_type in {"main_schedule", "main_l5"}:
+            rec = _start_or_reuse_job_by_command(
+                request=request, title=title, argv=argv, cwd=Path.cwd(), metadata=job_metadata
+            )
+        else:
+            jm = request.app.state.job_manager
+            rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd(), metadata=job_metadata))
+        return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=job_var), status_code=303)
 
     @router.get("/jobs/{job_id}")
     def job_detail(request: Request, job_id: str):
         _require_auth(request)
+        nav_var = _request_variety_hint(request)
         store = request.app.state.job_store
         jm = request.app.state.job_manager
         job = store.get_job(job_id)
@@ -943,6 +1356,16 @@ def build_router() -> Any:
                 "token_qs": _token_qs(request),
                 "job": job,
                 "log_text": log_text,
+                **_variety_nav_ctx(
+                    nav_var,
+                    section="jobs",
+                    page_title=f"Job {job_id}",
+                    breadcrumbs=[
+                        {"label": "Workspace", "href": f"/v/{nav_var}/dashboard"},
+                        {"label": "Jobs", "href": f"/v/{nav_var}/jobs{_token_qs(request)}"},
+                        {"label": f"Job {job_id}", "href": ""},
+                    ],
+                ),
             },
         )
 
@@ -951,16 +1374,27 @@ def build_router() -> Any:
         _require_auth(request)
         jm = request.app.state.job_manager
         jm.cancel_job(job_id)
-        return RedirectResponse(url=f"/jobs/{job_id}{_token_qs(request)}", status_code=303)
+        nav_var = _request_variety_hint(request)
+        extra_var = f"&var={nav_var}" if _token_qs(request) else f"?var={nav_var}"
+        return RedirectResponse(url=f"/jobs/{job_id}{_token_qs(request)}{extra_var}", status_code=303)
 
     @router.get("/data")
-    def data_page(request: Request):
+    def data_redirect(request: Request):
         _require_auth(request)
+        return RedirectResponse(url=_var_page("data", token_qs=_token_qs(request)), status_code=303)
+
+    @router.get("/v/{variety}/data")
+    def data_page(request: Request, variety: str):
+        _require_auth(request)
+        v = _page_variety(variety)
         summary = _job_summary(request=request, limit=200)
+        jobs_filtered = [j for j in list(summary["jobs"]) if _job_matches_variety(j, v)]
+        running_count = len([j for j in jobs_filtered if str(j.status) == "running"])
+        queued_count = len([j for j in jobs_filtered if str(j.status) == "queued"])
         runs_dir = get_runs_dir()
 
         data_dir = get_data_dir()
-        calendar_ctx = _l5_calendar_context(data_dir=data_dir)
+        calendar_ctx = _l5_calendar_context(data_dir=data_dir, variety=v)
         lv = "v2"
 
 
@@ -978,13 +1412,13 @@ def build_router() -> Any:
         reports = _data_page_cache_get("data_page:audit_reports")
         questdb = _data_page_cache_get("data_page:questdb_status")
 
-        # Coverage watermarks (best-effort, default CU)
+        # Coverage watermarks (best-effort, variety-scoped)
         main_l5_coverage: dict[str, Any] = {}
         main_schedule_coverage: dict[str, Any] = {}
         coverage_error = ""
         main_l5_validation: dict[str, Any] = {}
         validation_error = ""
-        coverage_var = "cu"
+        coverage_var = v
         coverage_symbol = f"KQ.m@SHFE.{coverage_var}"
 
         coverage_payload = _data_page_cache_get(f"data_page:coverage:{coverage_symbol}")
@@ -1077,13 +1511,43 @@ def build_router() -> Any:
                     fetch_main_l5_validate_top_gap_days,
                     fetch_main_l5_validate_top_lag_days,
                 )
+                from ghtrader.questdb.main_schedule import fetch_main_schedule_state
                 from ghtrader.data.main_l5_validation import read_latest_validation_report
 
-                overview = fetch_main_l5_validate_overview(cfg=cfg, symbol=coverage_symbol)
-                latest_rows = fetch_latest_main_l5_validate_summary(cfg=cfg, symbol=coverage_symbol, limit=1)
+                schedule_hash_filter = None
+                try:
+                    sched = fetch_main_schedule_state(cfg=cfg, exchange="SHFE", variety=coverage_var)
+                    hashes_raw = sched.get("schedule_hashes") or set()
+                    hashes = sorted([str(h) for h in hashes_raw if str(h).strip()])
+                    if len(hashes) == 1:
+                        schedule_hash_filter = hashes[0]
+                except Exception:
+                    schedule_hash_filter = None
+
+                overview = fetch_main_l5_validate_overview(
+                    cfg=cfg,
+                    symbol=coverage_symbol,
+                    schedule_hash=schedule_hash_filter,
+                )
+                latest_rows = fetch_latest_main_l5_validate_summary(
+                    cfg=cfg,
+                    symbol=coverage_symbol,
+                    schedule_hash=schedule_hash_filter,
+                    limit=1,
+                )
                 latest = latest_rows[0] if latest_rows else {}
-                top_gap_days = fetch_main_l5_validate_top_gap_days(cfg=cfg, symbol=coverage_symbol, limit=8)
-                top_lag_days = fetch_main_l5_validate_top_lag_days(cfg=cfg, symbol=coverage_symbol, limit=8)
+                top_gap_days = fetch_main_l5_validate_top_gap_days(
+                    cfg=cfg,
+                    symbol=coverage_symbol,
+                    schedule_hash=schedule_hash_filter,
+                    limit=8,
+                )
+                top_lag_days = fetch_main_l5_validate_top_lag_days(
+                    cfg=cfg,
+                    symbol=coverage_symbol,
+                    schedule_hash=schedule_hash_filter,
+                    limit=8,
+                )
                 if overview.get("days_total"):
                     out["main_l5_validation"] = {
                         "status": "ok"
@@ -1116,6 +1580,7 @@ def build_router() -> Any:
                         "cadence_mode": latest.get("cadence_mode"),
                         "two_plus_ratio": latest.get("two_plus_ratio"),
                         "last_run": latest.get("updated_at"),
+                        "schedule_hash": (schedule_hash_filter or latest.get("schedule_hash")),
                         "top_gap_days": top_gap_days,
                         "top_lag_days": top_lag_days,
                     }
@@ -1125,9 +1590,18 @@ def build_router() -> Any:
                     variety=coverage_var,
                     derived_symbol=coverage_symbol,
                 )
-                if rep and rep.get("_path"):
+                if not out["main_l5_validation"] and isinstance(rep, dict):
+                    out["main_l5_validation"] = {
+                        "status": ("ok" if bool(rep.get("ok")) else "warn"),
+                        "last_run": rep.get("created_at"),
+                        "max_gap_s": rep.get("max_gap_s"),
+                        "gap_threshold_s": rep.get("gap_threshold_s"),
+                        "missing_seconds_ratio": rep.get("missing_seconds_ratio"),
+                        "schedule_hash": rep.get("schedule_hash"),
+                    }
+                if isinstance(rep, dict) and rep.get("_path"):
                     out["main_l5_validation"]["report_name"] = Path(str(rep.get("_path"))).name
-                if rep.get("created_at") and not out["main_l5_validation"].get("last_run"):
+                if isinstance(rep, dict) and rep.get("created_at") and not out["main_l5_validation"].get("last_run"):
                     out["main_l5_validation"]["last_run"] = rep.get("created_at")
                     for key in (
                         "max_gap_s",
@@ -1211,6 +1685,14 @@ def build_router() -> Any:
 
         # TqSdk scheduler settings (max parallel heavy jobs)
         tqsdk_scheduler = get_tqsdk_scheduler_state(runs_dir=runs_dir)
+        guardrails = _pipeline_guardrails_context()
+        pipeline_health = _pipeline_health_context(
+            main_schedule_coverage=main_schedule_coverage,
+            main_l5_coverage=main_l5_coverage,
+            main_l5_validation=main_l5_validation,
+            coverage_error=coverage_error,
+            validation_error=validation_error,
+        )
 
         # Coverage lists can get very large; keep /data page load fast by default.
         # The Contracts tab will lazy-load any detailed coverage via API.
@@ -1221,8 +1703,8 @@ def build_router() -> Any:
                 "request": request,
                 "title": "Data Hub",
                 "token_qs": _token_qs(request),
-                "running_count": summary["running_count"],
-                "queued_count": summary["queued_count"],
+                "running_count": running_count,
+                "queued_count": queued_count,
                 "dataset_version": lv,
                 "ticks_v2": [],
                 "main_l5_v2": [],
@@ -1240,12 +1722,16 @@ def build_router() -> Any:
                 "coverage_error": coverage_error,
                 "main_l5_validation": main_l5_validation,
                 "validation_error": validation_error,
+                "guardrails": guardrails,
+                "pipeline_health": pipeline_health,
+                **_variety_nav_ctx(v, section="data", page_title="Data Hub"),
             },
         )
 
     @router.get("/explorer")
     def explorer_page(request: Request):
         _require_auth(request)
+        nav_var = _request_variety_hint(request)
         store = request.app.state.job_store
         jobs = store.list_jobs(limit=50)
         running = [j for j in jobs if j.status == "running"]
@@ -1264,12 +1750,14 @@ def build_router() -> Any:
                 "columns": [],
                 "rows": [],
                 "error": "",
+                **_variety_nav_ctx(nav_var, section="sql", page_title="SQL Explorer"),
             },
         )
 
     @router.post("/explorer")
     async def explorer_run(request: Request):
         _require_auth(request)
+        nav_var = _request_variety_hint(request)
         form = await request.form()
         query = str(form.get("query") or "").strip()
         limit_raw = str(form.get("limit") or "200").strip()
@@ -1308,12 +1796,14 @@ def build_router() -> Any:
                 "columns": columns,
                 "rows": rows,
                 "error": err,
+                **_variety_nav_ctx(nav_var, section="sql", page_title="SQL Explorer"),
             },
         )
 
     @router.get("/system")
     def system_page(request: Request):
         _require_auth(request)
+        nav_var = _request_variety_hint(request)
         store = request.app.state.job_store
         jobs = store.list_jobs(limit=50)
         running = [j for j in jobs if j.status == "running"]
@@ -1336,6 +1826,7 @@ def build_router() -> Any:
                     {"key": "runs", "path": str(runs_dir), "exists": bool(runs_dir.exists())},
                     {"key": "artifacts", "path": str(artifacts_dir), "exists": bool(artifacts_dir.exists())},
                 ],
+                **_variety_nav_ctx(nav_var, section="system", page_title="System"),
             },
         )
 

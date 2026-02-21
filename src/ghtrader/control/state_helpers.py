@@ -5,14 +5,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ghtrader.util.json_io import read_json
+
 
 def read_json_file(path: Path) -> dict[str, Any] | None:
-    try:
-        if not path.exists():
-            return None
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    return read_json(path)
 
 
 def read_redis_json(key: str) -> dict[str, Any] | None:

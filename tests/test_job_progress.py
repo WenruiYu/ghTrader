@@ -220,6 +220,7 @@ class TestProgressAPI:
         data = resp.json()
         assert data["job_id"] == "testjob123"
         assert data["available"] is False
+        assert data["state"] == "queued"
 
     def test_progress_endpoint_with_progress_file(self, test_app_client) -> None:
         """Test progress endpoint when progress file exists."""
@@ -255,6 +256,8 @@ class TestProgressAPI:
         assert data["phase"] == "diagnose"
         assert data["step"] == "schema_validation"
         assert data["job_status"] == "queued"  # Job created with queued status
+        assert data["state"] == "queued"
+        assert "stale" in data
 
     def test_progress_endpoint_job_not_found(self, test_app_client) -> None:
         """Test progress endpoint returns 404 for unknown job."""

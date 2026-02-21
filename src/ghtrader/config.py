@@ -153,18 +153,49 @@ def get_qdb_redis_config() -> dict[str, Any]:
     }
 
 
-def get_l5_start_date() -> date:
+def l5_start_env_key(*, variety: str | None = None) -> str:
+    v = str(variety or "").strip().lower()
+    if not v:
+        return "GHTRADER_L5_START_DATE"
+    v_norm = "".join(ch for ch in v if ch.isalnum())
+    if not v_norm:
+        return "GHTRADER_L5_START_DATE"
+    return f"GHTRADER_L5_START_DATE_{v_norm.upper()}"
+
+
+def get_l5_start_date_with_source(*, variety: str | None = None) -> tuple[date, str]:
     """
-    Return the required global L5 start date from the environment.
+    Resolve L5 start date for a variety.
+
+    Resolution order:
+    1) GHTRADER_L5_START_DATE_<VAR>
+    2) GHTRADER_L5_START_DATE (legacy fallback)
     """
     load_config()
-    raw = str(get_env("GHTRADER_L5_START_DATE", "") or "").strip()
-    if not raw:
-        raise RuntimeError("Required environment variable GHTRADER_L5_START_DATE is not set.")
-    try:
-        return date.fromisoformat(raw[:10])
-    except Exception as e:
-        raise RuntimeError(f"Invalid GHTRADER_L5_START_DATE: {raw}") from e
+    key_var = l5_start_env_key(variety=variety)
+    keys = [key_var] if key_var != "GHTRADER_L5_START_DATE" else []
+    keys.append("GHTRADER_L5_START_DATE")
+
+    for key in keys:
+        raw = str(get_env(key, "") or "").strip()
+        if not raw:
+            continue
+        try:
+            return date.fromisoformat(raw[:10]), key
+        except Exception as e:
+            raise RuntimeError(f"Invalid {key}: {raw}") from e
+
+    if key_var != "GHTRADER_L5_START_DATE":
+        raise RuntimeError(
+            f"Required environment variable {key_var} is not set "
+            f"(and legacy fallback GHTRADER_L5_START_DATE is also missing)."
+        )
+    raise RuntimeError("Required environment variable GHTRADER_L5_START_DATE is not set.")
+
+
+def get_l5_start_date(*, variety: str | None = None) -> date:
+    d, _key = get_l5_start_date_with_source(variety=variety)
+    return d
 
 
 def get_tqsdk_auth() -> Any:

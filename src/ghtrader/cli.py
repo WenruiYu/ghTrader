@@ -22,6 +22,7 @@ import click
 import structlog
 
 from ghtrader.config import get_runs_dir, load_config
+from ghtrader.control.job_metadata import infer_job_metadata, merge_job_metadata
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -119,7 +120,7 @@ def _setup_logging(verbose: bool) -> None:
     env_level = os.environ.get("GHTRADER_LOG_LEVEL", "").strip().lower()
     env_verbose = os.environ.get("GHTRADER_JOB_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
     is_dashboard = os.environ.get("GHTRADER_JOB_SOURCE", "").strip() == "dashboard"
-    force_debug = bool(is_dashboard or env_verbose or env_level in {"debug", "trace"} or env_level == "")
+    force_debug = bool(verbose or env_verbose or env_level in {"debug", "trace"})
     if force_debug:
         level = logging.DEBUG
     elif env_level in {"warning", "warn"}:
@@ -129,7 +130,7 @@ def _setup_logging(verbose: bool) -> None:
     elif env_level == "critical":
         level = logging.CRITICAL
     else:
-        level = logging.DEBUG if verbose else logging.INFO
+        level = logging.INFO
     structlog.configure(
         processors=[
             structlog.stdlib.add_log_level,
@@ -150,6 +151,8 @@ def _setup_logging(verbose: bool) -> None:
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_path))
     logging.basicConfig(format="%(message)s", level=level, handlers=handlers)
+    # Keep noisy transport internals out of job logs unless explicitly needed.
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 
 _heartbeat_thread: threading.Thread | None = None
@@ -214,6 +217,112 @@ def _current_job_id() -> str | None:
     return os.environ.get("GHTRADER_JOB_ID") or None
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(os.environ.get(name, "1" if default else "0") or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _is_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def _terminate_pid_for_lock(pid: int, *, grace_s: float) -> bool:
+    """
+    Best-effort terminate a conflicting lock owner.
+
+    Returns True if process is gone after termination attempts.
+    """
+    owner_pid = int(pid)
+    if owner_pid <= 0:
+        return True
+    if not _is_pid_alive(owner_pid):
+        return True
+
+    term_sent = False
+    try:
+        os.killpg(owner_pid, signal.SIGTERM)
+        term_sent = True
+    except Exception:
+        try:
+            os.kill(owner_pid, signal.SIGTERM)
+            term_sent = True
+        except Exception:
+            term_sent = False
+    if not term_sent:
+        return not _is_pid_alive(owner_pid)
+
+    deadline = time.time() + max(0.2, float(grace_s))
+    while time.time() < deadline:
+        if not _is_pid_alive(owner_pid):
+            return True
+        time.sleep(0.1)
+
+    try:
+        os.killpg(owner_pid, signal.SIGKILL)
+    except Exception:
+        try:
+            os.kill(owner_pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    hard_deadline = time.time() + 2.0
+    while time.time() < hard_deadline:
+        if not _is_pid_alive(owner_pid):
+            return True
+        time.sleep(0.05)
+    return not _is_pid_alive(owner_pid)
+
+
+def _preempt_lock_conflicts(*, conflicts: list[dict[str, Any]], store: Any, locks: Any, current_job_id: str, grace_s: float) -> list[dict[str, Any]]:
+    """
+    Attempt to preempt conflicting lock owners and release their lock rows.
+    """
+    log = structlog.get_logger()
+    out: list[dict[str, Any]] = []
+    seen_jobs: set[str] = set()
+    for c in conflicts:
+        owner_job = str(c.get("job_id") or "").strip()
+        if not owner_job or owner_job == current_job_id or owner_job in seen_jobs:
+            continue
+        seen_jobs.add(owner_job)
+        try:
+            owner_pid = int(c.get("pid") or 0)
+        except Exception:
+            owner_pid = 0
+        terminated = _terminate_pid_for_lock(owner_pid, grace_s=float(grace_s)) if owner_pid > 0 else True
+        finished_at = datetime.now(timezone.utc).isoformat()
+        reason = "lock preempted after timeout"
+        released = 0
+        if terminated:
+            try:
+                store.try_mark_cancelled(job_id=owner_job, finished_at=finished_at, error=reason)
+            except Exception:
+                pass
+            try:
+                released = int(locks.release_all(job_id=owner_job) or 0)
+            except Exception:
+                released = 0
+        else:
+            reason = f"{reason}; pid still alive"
+        row = {
+            "job_id": owner_job,
+            "pid": int(owner_pid),
+            "terminated": bool(terminated),
+            "released": int(released),
+        }
+        out.append(row)
+        log.warning("job.lock_preempted", **row)
+    return out
+
+
 def _acquire_locks(lock_keys: list[str]) -> None:
     """Acquire strict cross-session locks for the current CLI run."""
     job_id = _current_job_id()
@@ -228,9 +337,52 @@ def _acquire_locks(lock_keys: list[str]) -> None:
     locks = LockStore(_jobs_db_path(runs_dir))
 
     store.update_job(job_id, status="queued", waiting_locks=lock_keys, held_locks=[])
-    ok, conflicts = locks.acquire(lock_keys=lock_keys, job_id=job_id, pid=os.getpid(), wait=True)
-    if not ok:
-        raise RuntimeError(f"Failed to acquire locks: {conflicts}")
+    try:
+        poll_interval_s = float(os.environ.get("GHTRADER_LOCK_POLL_INTERVAL_S", "1") or "1")
+    except Exception:
+        poll_interval_s = 1.0
+    poll_interval_s = max(0.1, float(poll_interval_s))
+    try:
+        wait_timeout_s = float(os.environ.get("GHTRADER_LOCK_WAIT_TIMEOUT_S", "120") or "120")
+    except Exception:
+        wait_timeout_s = 120.0
+    wait_timeout_s = float(wait_timeout_s)
+    preempt_on_timeout = _env_bool("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", True)
+    try:
+        preempt_grace_s = float(os.environ.get("GHTRADER_LOCK_PREEMPT_GRACE_S", "8") or "8")
+    except Exception:
+        preempt_grace_s = 8.0
+    preempt_grace_s = max(0.5, float(preempt_grace_s))
+
+    started_at = time.time()
+    last_conflicts: list[dict[str, Any]] = []
+    while True:
+        ok, conflicts = locks.acquire(lock_keys=lock_keys, job_id=job_id, pid=os.getpid(), wait=False)
+        if ok:
+            break
+        last_conflicts = list(conflicts or [])
+        elapsed = float(time.time() - started_at)
+        timed_out = bool(wait_timeout_s > 0 and elapsed >= wait_timeout_s)
+        if timed_out:
+            preempted: list[dict[str, Any]] = []
+            if preempt_on_timeout and last_conflicts:
+                preempted = _preempt_lock_conflicts(
+                    conflicts=last_conflicts,
+                    store=store,
+                    locks=locks,
+                    current_job_id=job_id,
+                    grace_s=preempt_grace_s,
+                )
+                if preempted:
+                    ok2, conflicts2 = locks.acquire(lock_keys=lock_keys, job_id=job_id, pid=os.getpid(), wait=False)
+                    if ok2:
+                        break
+                    last_conflicts = list(conflicts2 or [])
+            raise RuntimeError(
+                f"Failed to acquire locks after {elapsed:.1f}s: "
+                f"conflicts={last_conflicts}, preempted={preempted}"
+            )
+        time.sleep(poll_interval_s)
     store.update_job(job_id, status="running", waiting_locks=[], held_locks=lock_keys)
 
 
@@ -298,6 +450,7 @@ def entrypoint() -> None:
     store = JobStore(db_path)
 
     rec = store.get_job(job_id)
+    inferred_metadata = infer_job_metadata(argv=list(sys.argv), title=(" ".join(sys.argv[1:]).strip() or "ghtrader"))
     if rec is None:
         title = " ".join(sys.argv[1:]).strip() or "ghtrader"
         store.create_job(
@@ -307,12 +460,16 @@ def entrypoint() -> None:
             cwd=Path.cwd(),
             source=source,
             log_path=log_path,
+            metadata=inferred_metadata,
         )
     else:
         if not rec.log_path:
             store.update_job(job_id, log_path=log_path)
         if getattr(rec, "source", "") != source:
             store.update_job(job_id, source=source)
+        merged_metadata = merge_job_metadata((dict(rec.metadata) if isinstance(rec.metadata, dict) else None), inferred_metadata)
+        if merged_metadata and merged_metadata != rec.metadata:
+            store.update_job(job_id, metadata=merged_metadata)
 
     store.update_job(job_id, status="running", pid=os.getpid(), started_at=datetime.now().isoformat(), error="")
 

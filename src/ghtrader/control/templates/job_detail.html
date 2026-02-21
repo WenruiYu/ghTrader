@@ -1,17 +1,23 @@
 {% extends "base.html" %}
 {% block content %}
+  {% set var_query = token_qs ~ ("&" if token_qs else "?") ~ "var=" ~ variety %}
   <div class="section-header">
     <h2 class="mono">Job {{ job.id }}</h2>
     <div class="section-header-actions">
-      <a class="btn btn-secondary btn-sm" href="/jobs{{ token_qs }}">Back</a>
-      <a class="btn btn-secondary btn-sm" href="/jobs/{{ job.id }}{{ token_qs }}">Refresh</a>
+      <a class="btn btn-secondary btn-sm" href="{{ variety_path_prefix }}/jobs{{ token_qs }}">Back</a>
+      <a class="btn btn-secondary btn-sm" href="/jobs/{{ job.id }}{{ var_query }}">Refresh</a>
     </div>
   </div>
 
   <div class="card">
+    {% set job_meta = job.metadata if job.metadata is mapping else {} %}
     <div><b>Status:</b> <span class="pill pill-{{ job.status }}" id="jobStatusPill">{{ job.status }}</span></div>
     <div><b>Title:</b> {{ job.title }}</div>
     <div><b>Source:</b> <span class="mono">{{ job.source or "" }}</span></div>
+    <div><b>Kind:</b> <span class="mono">{{ job_meta.get("kind") or "--" }}</span></div>
+    <div><b>Variety:</b> <span class="mono">{{ job_meta.get("variety") or "--" }}</span></div>
+    <div><b>Symbol:</b> <span class="mono">{{ job_meta.get("symbol") or ((job_meta.get("symbols") or []) | join(",")) or "--" }}</span></div>
+    <div><b>Account profile:</b> <span class="mono">{{ job_meta.get("account_profile") or "--" }}</span></div>
     <div><b>PID:</b> <span class="mono">{{ job.pid or "" }}</span></div>
     <div><b>Exit:</b> <span class="mono">{{ job.exit_code if job.exit_code is not none else "" }}</span></div>
     <div><b>Created:</b> <span class="mono">{{ job.created_at }}</span></div>
@@ -23,47 +29,51 @@
     <div><b>Held locks:</b> <span class="mono">{{ (job.held_locks or []) | join(",") }}</span></div>
 
     {% if job.status in ["queued", "running"] %}
-      <form method="post" action="/jobs/{{ job.id }}/cancel{{ token_qs }}">
+      <form method="post" action="/jobs/{{ job.id }}/cancel{{ var_query }}">
         <button class="btn btn-danger btn-sm" type="submit">Cancel</button>
       </form>
     {% endif %}
   </div>
 
   <h3>Job Progress</h3>
-  <div class="card" id="progressCard" style="display:none;">
-    <div style="margin-bottom:8px;">
-      <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+  <div class="card" id="progressCard" hidden>
+    <div class="job-progress-layout">
+      <div class="job-progress-row">
+        <b>State:</b>
+        <span class="mono" id="progressState">-</span>
+      </div>
+      <div class="job-progress-row">
         <b>Phase:</b>
         <span class="mono" id="progressPhase">-</span>
         <span class="muted text-xs" id="progressPhaseIdx"></span>
       </div>
-      <div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">
+      <div class="job-progress-row">
         <b>Step:</b>
         <span class="mono" id="progressStep">-</span>
         <span class="muted text-xs" id="progressStepIdx"></span>
       </div>
-      <div id="progressItemRow" style="display:none; margin-bottom:4px;">
+      <div id="progressItemRow" class="job-progress-row-inline" hidden>
         <b>Current:</b>
         <span class="mono" id="progressItem">-</span>
         <span class="muted text-xs" id="progressItemIdx"></span>
       </div>
-      <div style="margin-bottom:4px;">
+      <div class="job-progress-row">
         <b>Message:</b>
         <span id="progressMessage">-</span>
       </div>
     </div>
-    <div style="margin-bottom:8px;">
-      <div style="display:flex; align-items:center; gap:12px;">
-        <div style="flex:1;">
-          <div class="progressBar" style="height:12px;">
-            <div id="progressBarFill" style="width:0%; transition:width 0.3s;"></div>
+    <div class="job-progress-layout">
+      <div class="job-progress-stack">
+        <div class="flex-1">
+          <div class="progressBar progressBar-lg">
+            <div id="progressBarFill" class="job-progress-fill"></div>
           </div>
         </div>
-        <span class="mono" id="progressPct" style="min-width:50px; text-align:right;">0%</span>
-        <span class="muted mono" id="progressEta" style="min-width:80px;">-</span>
+        <span class="mono job-progress-pct" id="progressPct">0%</span>
+        <span class="muted mono job-progress-eta" id="progressEta">-</span>
       </div>
     </div>
-    <div id="progressErrorRow" style="display:none; color:var(--danger);">
+    <div id="progressErrorRow" class="job-progress-error" hidden>
       <b>Error:</b> <span class="mono text-xs" id="progressError"></span>
     </div>
   </div>
@@ -86,7 +96,7 @@
       <button type="button" class="btn btn-secondary" id="copyLogPath">Copy log path</button>
       <a class="btn btn-secondary" href="/api/jobs/{{ job.id }}/log/download{{ token_qs }}">Download full log</a>
     </div>
-    <p class="muted" style="margin:10px 0 0;">
+    <p class="muted mt-3">
       Tip: polling pauses when the tab is hidden and stops when the job finishes.
     </p>
   </div>
@@ -114,6 +124,7 @@
       const progressItem = document.getElementById("progressItem");
       const progressItemIdx = document.getElementById("progressItemIdx");
       const progressMessage = document.getElementById("progressMessage");
+      const progressState = document.getElementById("progressState");
       const progressBarFill = document.getElementById("progressBarFill");
       const progressPct = document.getElementById("progressPct");
       const progressEta = document.getElementById("progressEta");
@@ -175,10 +186,14 @@
           if (!resp.ok) return;
           const p = await resp.json();
           if (!p || !p.available) {
-            progressCard.style.display = "none";
+            progressCard.hidden = true;
             return;
           }
-          progressCard.style.display = "block";
+          progressCard.hidden = false;
+          if (progressState) {
+            const st = String(p.state || p.job_status || "").trim();
+            progressState.textContent = st || "-";
+          }
 
           // Phase
           progressPhase.textContent = p.phase || "-";
@@ -198,11 +213,11 @@
 
           // Item (optional)
           if (p.total_items > 0 && p.item) {
-            progressItemRow.style.display = "block";
+            progressItemRow.hidden = false;
             progressItem.textContent = p.item;
             progressItemIdx.textContent = "(" + p.item_idx + "/" + p.total_items + ")";
           } else {
-            progressItemRow.style.display = "none";
+            progressItemRow.hidden = true;
           }
 
           // Message
@@ -219,13 +234,16 @@
           } else {
             progressEta.textContent = "-";
           }
+          if (p.stale && p.updated_age_s !== null && p.updated_age_s !== undefined) {
+            progressEta.textContent += " · stale " + String(p.updated_age_s) + "s";
+          }
 
           // Error
           if (p.error) {
-            progressErrorRow.style.display = "block";
+            progressErrorRow.hidden = false;
             progressError.textContent = p.error;
           } else {
-            progressErrorRow.style.display = "none";
+            progressErrorRow.hidden = true;
           }
         } catch (e) {}
       }

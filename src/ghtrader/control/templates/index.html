@@ -1,10 +1,11 @@
 {% extends "base.html" %}
+{% import "_ui_macros.html" as ui %}
 {% block alerts %}
   <div id="dashboardAlerts"></div>
 {% endblock %}
 {% block content %}
   <div class="section-header">
-    <h2>Dashboard</h2>
+    <h2>Dashboard · {{ variety|upper }}</h2>
     <div class="section-header-actions">
       <button class="btn btn-secondary btn-sm" id="refreshDashboard">Refresh</button>
     </div>
@@ -28,26 +29,34 @@
       <span class="status-dot status-dot-idle"></span>
       <span>Mem: --%</span>
     </div>
+    <div class="status-indicator {% if guardrails.health_gate_state == 'ok' %}status-indicator-ok{% else %}status-indicator-warn{% endif %}" id="statusHealthGateIndicator">
+      <span class="status-dot {% if guardrails.health_gate_state == 'ok' %}status-dot-ok{% else %}status-dot-warn{% endif %}"></span>
+      <span>Health gate: {{ guardrails.health_gate_label }}</span>
+    </div>
+    <div class="status-indicator {% if guardrails.lock_recovery_state == 'ok' %}status-indicator-ok{% else %}status-indicator-warn{% endif %}" id="statusLockRecoveryIndicator">
+      <span class="status-dot {% if guardrails.lock_recovery_state == 'ok' %}status-dot-ok{% else %}status-dot-warn{% endif %}"></span>
+      <span>Lock recovery: {{ "on" if guardrails.lock_force_cancel_on_timeout else "off" }}</span>
+    </div>
   </div>
 
   <!-- KPI Grid -->
   <div class="kpi-grid" id="kpiGrid">
-    <a href="/jobs{{ token_qs }}" class="kpi-card kpi-card-clickable">
+    <a href="{{ variety_path_prefix }}/jobs{{ token_qs }}" class="kpi-card kpi-card-clickable">
       <div class="kpiLabel">Running Jobs</div>
       <div class="kpiValue" id="kpiRunning">{{ running_count }}</div>
       <div class="kpiSubtext"><span id="kpiQueued">{{ queued_count }}</span> queued</div>
     </a>
-    <a href="/data{{ token_qs }}" class="kpi-card kpi-card-clickable">
+    <a href="{{ variety_path_prefix }}/data{{ token_qs }}" class="kpi-card kpi-card-clickable">
       <div class="kpiLabel">Data Symbols</div>
       <div class="kpiValue" id="kpiSymbols">--</div>
       <div class="kpiSubtext" id="kpiDataStatus">Loading...</div>
     </a>
-    <a href="/models{{ token_qs }}" class="kpi-card kpi-card-clickable">
+    <a href="{{ variety_path_prefix }}/models{{ token_qs }}" class="kpi-card kpi-card-clickable">
       <div class="kpiLabel">Trained Models</div>
       <div class="kpiValue" id="kpiModels">--</div>
       <div class="kpiSubtext" id="kpiModelsStatus">Loading...</div>
     </a>
-    <a href="/trading{{ token_qs }}" class="kpi-card kpi-card-clickable">
+    <a href="{{ variety_path_prefix }}/trading{{ token_qs }}" class="kpi-card kpi-card-clickable">
       <div class="kpiLabel">Trading</div>
       <div class="kpiValue" id="kpiTrading">Idle</div>
       <div class="kpiSubtext" id="kpiTradingStatus">No active runs</div>
@@ -79,17 +88,39 @@
         <div class="pipeline-step-status">--</div>
       </div>
       <div class="pipeline-arrow"></div>
-      <div class="pipeline-step" id="stepBuild">
+      <div class="pipeline-step" id="stepValidate">
         <div class="pipeline-step-icon">4</div>
+        <div class="pipeline-step-label">Validate</div>
+        <div class="pipeline-step-status">--</div>
+      </div>
+      <div class="pipeline-arrow"></div>
+      <div class="pipeline-step" id="stepBuild">
+        <div class="pipeline-step-icon">5</div>
         <div class="pipeline-step-label">Features</div>
         <div class="pipeline-step-status">--</div>
       </div>
       <div class="pipeline-arrow"></div>
       <div class="pipeline-step" id="stepTrain">
-        <div class="pipeline-step-icon">5</div>
+        <div class="pipeline-step-icon">6</div>
         <div class="pipeline-step-label">Train</div>
         <div class="pipeline-step-status">--</div>
       </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-header mb-2">
+      <h3 class="mb-0">Pipeline Guardrails</h3>
+      <div class="muted text-sm">Runtime defaults for self-healing and health gates</div>
+    </div>
+    <div class="kv-list">
+      <div class="kv-k">Health gate</div><div class="kv-v" id="guardrailsHealthGate">{{ guardrails.health_gate_label }}</div>
+      <div class="kv-k">main-schedule health</div><div class="kv-v" id="guardrailsScheduleHealth">{{ "on" if guardrails.enforce_health_schedule else "off" }}</div>
+      <div class="kv-k">main_l5 health</div><div class="kv-v" id="guardrailsMainL5Health">{{ "on" if guardrails.enforce_health_main_l5 else "off" }}</div>
+      <div class="kv-k">Lock auto-recovery</div><div class="kv-v" id="guardrailsLockRecovery">{{ "on" if guardrails.lock_force_cancel_on_timeout else "off" }}</div>
+      <div class="kv-k">Lock wait timeout</div><div class="kv-v" id="guardrailsLockTimeout">{{ "%.1f"|format(guardrails.lock_wait_timeout_s) }}s</div>
+      <div class="kv-k">Preempt grace</div><div class="kv-v" id="guardrailsPreemptGrace">{{ "%.1f"|format(guardrails.lock_preempt_grace_s) }}s</div>
+      <div class="kv-k">main_l5 worker mode</div><div class="kv-v" id="guardrailsWorkerMode">{{ guardrails.main_l5_worker_mode }}</div>
     </div>
   </div>
 
@@ -98,26 +129,26 @@
     <h3 class="mb-3">Quick Actions</h3>
     <div class="grid4">
       <form method="post" action="/data/build/main_schedule{{ token_qs }}">
-        <input type="hidden" name="variety" value="cu"/>
+        <input type="hidden" name="variety" value="{{ variety }}"/>
         <input type="hidden" name="data_dir" value="data"/>
         <input type="hidden" name="start_date" value="{{ l5_start_date or '' }}"/>
         <input type="hidden" name="end_date" value="{{ latest_trading_day or '' }}"/>
-        <button type="submit" class="btn btn-secondary" style="width:100%;">Build Schedule (env)</button>
+        <button type="submit" class="btn btn-secondary btn-full">Build Schedule (env)</button>
       </form>
       <form method="post" action="/data/build/main_l5{{ token_qs }}">
-        <input type="hidden" name="variety" value="cu"/>
-        <input type="hidden" name="derived_symbol" value="KQ.m@SHFE.cu"/>
+        <input type="hidden" name="variety" value="{{ variety }}"/>
+        <input type="hidden" name="derived_symbol" value="KQ.m@SHFE.{{ variety }}"/>
         <input type="hidden" name="data_dir" value="data"/>
-        <button type="submit" class="btn btn-secondary" style="width:100%;">Build main_l5 (cu)</button>
+        <button type="submit" class="btn btn-secondary btn-full">Build main_l5 ({{ variety }})</button>
       </form>
       <form method="post" action="/data/build/build{{ token_qs }}">
-        <input type="hidden" name="symbol" value="KQ.m@SHFE.cu"/>
+        <input type="hidden" name="symbol" value="KQ.m@SHFE.{{ variety }}"/>
         <input type="hidden" name="horizons" value="10,50,200"/>
         <input type="hidden" name="threshold_k" value="1"/>
         <input type="hidden" name="ticks_kind" value="main_l5"/>
         <input type="hidden" name="overwrite" value="false"/>
         <input type="hidden" name="data_dir" value="data"/>
-        <button type="submit" class="btn btn-secondary" style="width:100%;">Build Features</button>
+        <button type="submit" class="btn btn-secondary btn-full">Build Features</button>
       </form>
     </div>
   </div>
@@ -127,7 +158,7 @@
     <div class="card">
       <div class="section-header">
         <h3 class="mb-0">Running Jobs</h3>
-        <a href="/jobs{{ token_qs }}" class="text-sm">View all</a>
+        <a href="{{ variety_path_prefix }}/jobs{{ token_qs }}" class="text-sm">View all</a>
       </div>
       {% set running_jobs = jobs | selectattr("status", "equalto", "running") | list %}
       {% if running_jobs and running_jobs|length > 0 %}
@@ -143,19 +174,19 @@
             <tbody>
               {% for j in running_jobs[:5] %}
               <tr>
-                <td class="truncate" style="max-width:200px;" title="{{ j.title }}">{{ j.title }}</td>
+                <td class="truncate max-w-200" title="{{ j.title }}">{{ j.title }}</td>
                 <td class="mono">{{ j.started_at or "" }}</td>
-                <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
+                <td><a href="/jobs/{{ j.id }}{{ token_qs }}{% if token_qs %}&{% else %}?{% endif %}var={{ variety }}">View</a></td>
               </tr>
               {% endfor %}
             </tbody>
           </table>
         </div>
         {% if running_jobs|length > 5 %}
-          <div class="muted text-sm" style="margin-top:8px;">+ {{ running_jobs|length - 5 }} more</div>
+          <div class="muted text-sm mt-3">+ {{ running_jobs|length - 5 }} more</div>
         {% endif %}
       {% else %}
-        <div class="empty-state" style="padding:20px;">
+        <div class="empty-state">
           <div class="empty-state-text">No jobs currently running</div>
         </div>
       {% endif %}
@@ -164,7 +195,7 @@
     <div class="card">
       <div class="section-header">
         <h3 class="mb-0">Recent Jobs</h3>
-        <a href="/jobs{{ token_qs }}" class="text-sm">View all</a>
+        <a href="{{ variety_path_prefix }}/jobs{{ token_qs }}" class="text-sm">View all</a>
       </div>
       {% if jobs and jobs|length > 0 %}
         <div class="tableWrap">
@@ -179,16 +210,16 @@
             <tbody>
               {% for j in jobs[:8] %}
               <tr>
-                <td class="truncate" style="max-width:200px;" title="{{ j.title }}">{{ j.title }}</td>
+                <td class="truncate max-w-200" title="{{ j.title }}">{{ j.title }}</td>
                 <td><span class="pill pill-{{ j.status }}">{{ j.status }}</span></td>
-                <td><a href="/jobs/{{ j.id }}{{ token_qs }}">View</a></td>
+                <td><a href="/jobs/{{ j.id }}{{ token_qs }}{% if token_qs %}&{% else %}?{% endif %}var={{ variety }}">View</a></td>
               </tr>
               {% endfor %}
             </tbody>
           </table>
         </div>
       {% else %}
-        <div class="empty-state" style="padding:20px;">
+        <div class="empty-state">
           <div class="empty-state-text">No recent jobs</div>
         </div>
       {% endif %}
@@ -247,7 +278,7 @@
   
   async function refreshDashboardSummary() {
     try {
-      const resp = await window.ghTrader.fetchApi("/api/dashboard/summary");
+      const resp = await window.ghTrader.fetchApi("/api/dashboard/summary?var={{ variety }}");
       if (!resp.ok) return;
       const data = await resp.json();
       
@@ -296,8 +327,10 @@
       updatePipelineStep("stepSync", data.pipeline?.sync);
       updatePipelineStep("stepSchedule", data.pipeline?.schedule);
       updatePipelineStep("stepMainL5", data.pipeline?.main_l5);
+      updatePipelineStep("stepValidate", data.pipeline?.validation || data.pipeline?.main_l5);
       updatePipelineStep("stepBuild", data.pipeline?.build);
       updatePipelineStep("stepTrain", data.pipeline?.train);
+      renderGuardrails(data.guardrails);
 
       renderDashboardAlerts(data);
       
@@ -319,9 +352,46 @@
     else if (status.state === "error") el.classList.add("pipeline-step-error");
   }
 
+  function renderGuardrails(guardrails) {
+    if (!guardrails || typeof guardrails !== "object") return;
+    const healthState = String(guardrails.health_gate_state || "warn");
+    const healthLabel = String(guardrails.health_gate_label || "partial");
+    const lockRecoveryOn = !!guardrails.lock_force_cancel_on_timeout;
+
+    const healthEl = document.getElementById("statusHealthGateIndicator");
+    if (healthEl) {
+      const dot = healthEl.querySelector(".status-dot");
+      const txt = healthEl.querySelector("span:last-child");
+      if (txt) txt.textContent = "Health gate: " + healthLabel;
+      if (dot) dot.className = "status-dot " + (healthState === "ok" ? "status-dot-ok" : "status-dot-warn");
+      healthEl.className = "status-indicator " + (healthState === "ok" ? "status-indicator-ok" : "status-indicator-warn");
+    }
+
+    const lockEl = document.getElementById("statusLockRecoveryIndicator");
+    if (lockEl) {
+      const dot = lockEl.querySelector(".status-dot");
+      const txt = lockEl.querySelector("span:last-child");
+      if (txt) txt.textContent = "Lock recovery: " + (lockRecoveryOn ? "on" : "off");
+      if (dot) dot.className = "status-dot " + (lockRecoveryOn ? "status-dot-ok" : "status-dot-warn");
+      lockEl.className = "status-indicator " + (lockRecoveryOn ? "status-indicator-ok" : "status-indicator-warn");
+    }
+
+    const setText = (id, value) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = String(value);
+    };
+    setText("guardrailsHealthGate", healthLabel);
+    setText("guardrailsScheduleHealth", guardrails.enforce_health_schedule ? "on" : "off");
+    setText("guardrailsMainL5Health", guardrails.enforce_health_main_l5 ? "on" : "off");
+    setText("guardrailsLockRecovery", lockRecoveryOn ? "on" : "off");
+    setText("guardrailsLockTimeout", (guardrails.lock_wait_timeout_s != null ? Number(guardrails.lock_wait_timeout_s).toFixed(1) + "s" : "--"));
+    setText("guardrailsPreemptGrace", (guardrails.lock_preempt_grace_s != null ? Number(guardrails.lock_preempt_grace_s).toFixed(1) + "s" : "--"));
+    setText("guardrailsWorkerMode", String(guardrails.main_l5_worker_mode || "auto"));
+  }
+
   function _bannerHtml(kind, title, text, ctaHref, ctaText) {
     const klass = kind === "error" ? "alert-error" : (kind === "warn" ? "alert-warn" : "alert-info");
-    const cta = ctaHref ? `<div style="margin-top:6px;"><a class="btn btn-secondary btn-sm" href="${ctaHref}">${ctaText || "Open"}</a></div>` : "";
+    const cta = ctaHref ? `<div class="mt-3"><a class="btn btn-secondary btn-sm" href="${ctaHref}">${ctaText || "Open"}</a></div>` : "";
     return `
       <div class="alert-banner ${klass}">
         <div class="alert-banner-content">
@@ -337,32 +407,43 @@
     const el = document.getElementById("dashboardAlerts");
     if (!el) return;
     const pipe = data.pipeline || {};
+    const guardrails = data.guardrails || {};
     const alerts = [];
     if (data.questdb_ok === false) {
       const hint = "DB-backed pages will be degraded. Start QuestDB with: " +
         "<span class=\"mono\">docker compose -f infra/questdb/docker-compose.yml up -d</span> " +
         "then verify: <span class=\"mono\">ghtrader db questdb-health</span>.";
-      alerts.push(_bannerHtml("error", "QuestDB is offline", hint, `/data${tokenQs}#sync`, "Open DB Sync"));
+      alerts.push(_bannerHtml("error", "QuestDB is offline", hint, `{{ variety_path_prefix }}/data${tokenQs}#sync`, "Open DB Sync"));
     }
     if (pipe.schedule && pipe.schedule.state !== "ok") {
-      alerts.push(_bannerHtml("warn", "Main schedule is missing", "Build the main-contract schedule before running main_l5 / features.", `/data${tokenQs}#build`, "Build Schedule"));
+      alerts.push(_bannerHtml("warn", "Main schedule is missing", "Build the main-contract schedule before running main_l5 / features.", `{{ variety_path_prefix }}/data${tokenQs}#build`, "Build Schedule"));
     }
     if (pipe.main_l5 && pipe.main_l5.state !== "ok") {
-      alerts.push(_bannerHtml("warn", "main_l5 ticks are missing", "Build the derived main_l5 ticks before feature engineering.", `/data${tokenQs}#build`, "Build main_l5"));
+      alerts.push(_bannerHtml("warn", "main_l5 ticks are missing", "Build the derived main_l5 ticks before feature engineering.", `{{ variety_path_prefix }}/data${tokenQs}#build`, "Build main_l5"));
+    }
+    if (pipe.validation && pipe.validation.state !== "ok") {
+      alerts.push(_bannerHtml("warn", "Validation needs attention", "Run or inspect main_l5 validation before moving to model training.", `{{ variety_path_prefix }}/data${tokenQs}#validate`, "Open Validate"));
     }
     if (pipe.build && pipe.build.state !== "ok") {
-      alerts.push(_bannerHtml("warn", "Features / labels are missing", "Build features/labels before training models.", `/data${tokenQs}#build`, "Build Features"));
+      alerts.push(_bannerHtml("warn", "Features / labels are missing", "Build features/labels before training models.", `{{ variety_path_prefix }}/data${tokenQs}#build`, "Build Features"));
+    }
+    if (guardrails.enforce_health_schedule === false || guardrails.enforce_health_main_l5 === false) {
+      alerts.push(_bannerHtml("warn", "Pipeline health gate is partial", "Enable both main-schedule and main_l5 health checks so successful commands imply healthy persisted state.", `{{ variety_path_prefix }}/data${tokenQs}`, "Open Data Guardrails"));
+    }
+    if (guardrails.lock_force_cancel_on_timeout === false) {
+      alerts.push(_bannerHtml("warn", "Stale-lock auto recovery is off", "Queued jobs may remain blocked when prior owners are stuck or cancelled. Enable lock preemption on timeout.", `{{ variety_path_prefix }}/jobs${tokenQs}`, "Open Jobs"));
     }
     el.innerHTML = alerts.join("");
   }
 
   function setupPipelineNavigation() {
     const map = {
-      stepSync: `/data${tokenQs}#contracts`,
-      stepSchedule: `/data${tokenQs}#build`,
-      stepMainL5: `/data${tokenQs}#build`,
-      stepBuild: `/data${tokenQs}#build`,
-      stepTrain: `/models${tokenQs}#train`
+      stepSync: `{{ variety_path_prefix }}/data${tokenQs}#contracts`,
+      stepSchedule: `{{ variety_path_prefix }}/data${tokenQs}#build`,
+      stepMainL5: `{{ variety_path_prefix }}/data${tokenQs}#build`,
+      stepValidate: `{{ variety_path_prefix }}/data${tokenQs}#validate`,
+      stepBuild: `{{ variety_path_prefix }}/data${tokenQs}#build`,
+      stepTrain: `{{ variety_path_prefix }}/models${tokenQs}#train`
     };
     Object.entries(map).forEach(([id, href]) => {
       const el = document.getElementById(id);

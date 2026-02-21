@@ -61,3 +61,69 @@ def test_cli_lock_acquire_updates_job_fields(tmp_path: Path, monkeypatch: pytest
     locks = LockStore(db_path).list_locks()
     assert any(l.key == "build:symbol=KQ.m@SHFE.cu,ticks_kind=main_l5" and l.job_id == "jid123" for l in locks)
 
+
+def test_cli_lock_acquire_timeout_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runs_dir = tmp_path / "runs"
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(runs_dir))
+    monkeypatch.setenv("GHTRADER_LOCK_WAIT_TIMEOUT_S", "0.2")
+    monkeypatch.setenv("GHTRADER_LOCK_POLL_INTERVAL_S", "0.05")
+    monkeypatch.setenv("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", "0")
+
+    from ghtrader.control.db import JobStore
+    from ghtrader.control.locks import LockStore
+
+    db_path = runs_dir / "control" / "jobs.db"
+    store = JobStore(db_path)
+    locks = LockStore(db_path)
+    owner_id = "owner_job"
+    waiter_id = "waiter_job"
+    store.create_job(job_id=owner_id, title="owner", command=["x"], cwd=tmp_path, source="terminal", log_path=None)
+    store.create_job(job_id=waiter_id, title="waiter", command=["y"], cwd=tmp_path, source="terminal", log_path=None)
+    store.update_job(owner_id, status="running", pid=os.getpid())
+    store.update_job(waiter_id, status="running", pid=os.getpid())
+    ok, _ = locks.acquire(lock_keys=["main_l5:symbol=KQ.m@SHFE.au"], job_id=owner_id, pid=os.getpid(), wait=False)
+    assert ok is True
+
+    monkeypatch.setenv("GHTRADER_JOB_ID", waiter_id)
+    monkeypatch.setenv("GHTRADER_JOB_SOURCE", "terminal")
+    from ghtrader.cli import _acquire_locks
+
+    with pytest.raises(RuntimeError, match="Failed to acquire locks"):
+        _acquire_locks(["main_l5:symbol=KQ.m@SHFE.au"])
+
+
+def test_cli_lock_acquire_preempts_conflict_on_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runs_dir = tmp_path / "runs"
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(runs_dir))
+    monkeypatch.setenv("GHTRADER_LOCK_WAIT_TIMEOUT_S", "0.2")
+    monkeypatch.setenv("GHTRADER_LOCK_POLL_INTERVAL_S", "0.05")
+    monkeypatch.setenv("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", "1")
+    monkeypatch.setenv("GHTRADER_LOCK_PREEMPT_GRACE_S", "0.1")
+
+    from ghtrader.control.db import JobStore
+    from ghtrader.control.locks import LockStore
+
+    db_path = runs_dir / "control" / "jobs.db"
+    store = JobStore(db_path)
+    locks = LockStore(db_path)
+    owner_id = "owner_job"
+    waiter_id = "waiter_job"
+    store.create_job(job_id=owner_id, title="owner", command=["x"], cwd=tmp_path, source="terminal", log_path=None)
+    store.create_job(job_id=waiter_id, title="waiter", command=["y"], cwd=tmp_path, source="terminal", log_path=None)
+    store.update_job(owner_id, status="running", pid=os.getpid())
+    store.update_job(waiter_id, status="running", pid=os.getpid())
+    ok, _ = locks.acquire(lock_keys=["main_schedule:var=au"], job_id=owner_id, pid=os.getpid(), wait=False)
+    assert ok is True
+
+    monkeypatch.setenv("GHTRADER_JOB_ID", waiter_id)
+    monkeypatch.setenv("GHTRADER_JOB_SOURCE", "terminal")
+    import ghtrader.cli as cli
+
+    monkeypatch.setattr(cli, "_terminate_pid_for_lock", lambda *_args, **_kwargs: True)
+    cli._acquire_locks(["main_schedule:var=au"])
+
+    waiter = store.get_job(waiter_id)
+    owner = store.get_job(owner_id)
+    assert waiter is not None and waiter.held_locks and "main_schedule:var=au" in waiter.held_locks
+    assert owner is not None and owner.status in {"cancelled", "failed"}
+

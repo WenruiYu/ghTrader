@@ -188,3 +188,50 @@ def test_control_api_job_lifecycle(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert "api-hello" in log_text
 
 
+def test_api_jobs_supports_filters_and_pagination(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+
+    mod = importlib.import_module("ghtrader.control.app")
+    importlib.reload(mod)
+    client = TestClient(mod.app)
+
+    # Seed two jobs with explicit metadata for deterministic filtering.
+    for title, meta in [
+        ("api-filter-au-main-schedule", {"kind": "main_schedule", "variety": "au", "symbol": "KQ.m@SHFE.au"}),
+        ("api-filter-cu-main-l5", {"kind": "main_l5", "variety": "cu", "symbol": "KQ.m@SHFE.cu"}),
+    ]:
+        r = client.post(
+            "/api/jobs",
+            json={
+                "title": title,
+                "argv": [sys.executable, "-c", "print('ok')"],
+                "cwd": str(tmp_path),
+                "metadata": meta,
+            },
+        )
+        assert r.status_code == 200
+
+    time.sleep(0.2)
+
+    page = client.get("/api/jobs?limit=1&offset=0").json()
+    assert page["ok"] is True
+    assert page["state"] == "ok"
+    assert page["limit"] == 1
+    assert isinstance(page["updated_at"], str)
+    assert page["total"] >= 2
+    assert len(page["jobs"]) == 1
+
+    qrows = client.get("/api/jobs?limit=10&q=api-filter").json()
+    assert qrows["ok"] is True
+    titles = [str((j or {}).get("title") or "") for j in qrows.get("jobs") or []]
+    assert any("api-filter-au-main-schedule" in t for t in titles)
+    assert any("api-filter-cu-main-l5" in t for t in titles)
+
+    scoped = client.get("/api/jobs?limit=10&kind=main_schedule&var=au&q=api-filter").json()
+    assert scoped["ok"] is True
+    scoped_titles = [str((j or {}).get("title") or "") for j in scoped.get("jobs") or []]
+    assert scoped_titles == ["api-filter-au-main-schedule"]
+
+

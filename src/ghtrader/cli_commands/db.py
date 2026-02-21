@@ -505,10 +505,46 @@ def register(main: click.Group) -> None:
         """Delete L1-only rows from main_l5 (keeps only true L5 depth)."""
         import json
 
+        from ghtrader.config import (
+            get_questdb_host,
+            get_questdb_ilp_port,
+            get_questdb_pg_dbname,
+            get_questdb_pg_password,
+            get_questdb_pg_port,
+            get_questdb_pg_user,
+        )
+        from ghtrader.data.ticks_schema import TICK_COLUMN_NAMES
         from ghtrader.questdb.client import make_questdb_query_config_from_env, connect_pg
+        from ghtrader.questdb.row_cleanup import replace_table_delete_where
+        from ghtrader.questdb.serving_db import ServingDBConfig, make_serving_backend
         from ghtrader.util.l5_detection import l5_sql_condition
 
         cfg = make_questdb_query_config_from_env()
+        backend = make_serving_backend(
+            ServingDBConfig(
+                backend="questdb",
+                host=str(get_questdb_host()),
+                questdb_ilp_port=int(get_questdb_ilp_port()),
+                questdb_pg_port=int(get_questdb_pg_port()),
+                questdb_pg_user=str(get_questdb_pg_user()),
+                questdb_pg_password=str(get_questdb_pg_password()),
+                questdb_pg_dbname=str(get_questdb_pg_dbname()),
+            )
+        )
+        base_cols = [
+            "symbol",
+            "ts",
+            "datetime_ns",
+            "trading_day",
+            "row_hash",
+        ]
+        tick_cols = [c for c in TICK_COLUMN_NAMES if c not in {"symbol", "datetime"}]
+        prov_cols = ["dataset_version", "ticks_kind", "underlying_contract", "segment_id", "schedule_hash"]
+        cols = base_cols + tick_cols + prov_cols
+
+        def _ensure_main_l5_table(table_name: str) -> None:
+            backend.ensure_table(table=str(table_name), include_segment_metadata=True)
+
         where = [f"NOT ({l5_sql_condition()})"]
         params: list[str] = []
         sym = str(symbol or "").strip()
@@ -524,9 +560,6 @@ def register(main: click.Group) -> None:
 
         where_sql = " AND ".join(where)
         count_sql = f"SELECT count() FROM ghtrader_ticks_main_l5_v2 WHERE {where_sql}"
-        delete_sql = f"DELETE FROM ghtrader_ticks_main_l5_v2 WHERE {where_sql}"
-
-        scoped = bool(sym or start or end)
         with connect_pg(cfg, connect_timeout_s=2) as conn:
             try:
                 conn.autocommit = True  # type: ignore[attr-defined]
@@ -535,67 +568,25 @@ def register(main: click.Group) -> None:
             with conn.cursor() as cur:
                 cur.execute(count_sql, params)
                 (count,) = cur.fetchone() or (0,)
-                if not apply:
-                    click.echo(json.dumps({"ok": True, "mode": "dry_run", "rows_to_delete": int(count)}))
-                    return
-                try:
-                    cur.execute(delete_sql, params)
-                    click.echo(json.dumps({"ok": True, "mode": "apply", "rows_deleted": int(count), "method": "delete"}))
-                    return
-                except Exception as e:
-                    if scoped:
-                        raise click.ClickException(f"DELETE not supported for scoped purge: {e}") from e
+        if not apply:
+            click.echo(json.dumps({"ok": True, "mode": "dry_run", "rows_to_delete": int(count)}))
+            return
 
-                    # Fallback: rebuild table with L5-only rows.
-                    from ghtrader.data.ticks_schema import TICK_COLUMN_NAMES
-                    from ghtrader.questdb.serving_db import ServingDBConfig, make_serving_backend
-                    from ghtrader.config import (
-                        get_questdb_host,
-                        get_questdb_ilp_port,
-                        get_questdb_pg_dbname,
-                        get_questdb_pg_password,
-                        get_questdb_pg_port,
-                        get_questdb_pg_user,
-                    )
-
-                    tmp_table = "ghtrader_ticks_main_l5_v2_clean"
-                    backend = make_serving_backend(
-                        ServingDBConfig(
-                            backend="questdb",
-                            host=str(get_questdb_host()),
-                            questdb_ilp_port=int(get_questdb_ilp_port()),
-                            questdb_pg_port=int(get_questdb_pg_port()),
-                            questdb_pg_user=str(get_questdb_pg_user()),
-                            questdb_pg_password=str(get_questdb_pg_password()),
-                            questdb_pg_dbname=str(get_questdb_pg_dbname()),
-                        )
-                    )
-                    backend.ensure_table(table=tmp_table, include_segment_metadata=True)
-
-                    base_cols = [
-                        "symbol",
-                        "ts",
-                        "datetime_ns",
-                        "trading_day",
-                        "row_hash",
-                    ]
-                    tick_cols = [c for c in TICK_COLUMN_NAMES if c not in {"symbol", "datetime"}]
-                    prov_cols = ["dataset_version", "ticks_kind", "underlying_contract", "segment_id", "schedule_hash"]
-                    cols = base_cols + tick_cols + prov_cols
-                    cols_sql = ", ".join(cols)
-                    insert_sql = (
-                        f"INSERT INTO {tmp_table} ({cols_sql}) "
-                        f"SELECT {cols_sql} FROM ghtrader_ticks_main_l5_v2 WHERE {where_sql}"
-                    )
-                    cur.execute(insert_sql, params)
-                    cur.execute("DROP TABLE ghtrader_ticks_main_l5_v2")
-                    cur.execute(f"RENAME TABLE {tmp_table} TO ghtrader_ticks_main_l5_v2")
-                    click.echo(
-                        json.dumps(
-                            {"ok": True, "mode": "apply", "rows_deleted": int(count), "method": "rebuild"},
-                            ensure_ascii=False,
-                        )
-                    )
+        deleted = replace_table_delete_where(
+            cfg=cfg,
+            table="ghtrader_ticks_main_l5_v2",
+            columns=cols,
+            delete_where_sql=where_sql,
+            delete_params=params,
+            ensure_table=_ensure_main_l5_table,
+            connect_timeout_s=2,
+        )
+        click.echo(
+            json.dumps(
+                {"ok": True, "mode": "apply", "rows_deleted": int(deleted), "method": "replace_table"},
+                ensure_ascii=False,
+            )
+        )
 
     @db_group.command("schema-check")
     @click.option("--json", "as_json", is_flag=True, help="Print JSON output")

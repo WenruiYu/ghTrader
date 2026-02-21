@@ -16,6 +16,7 @@ from typing import Any
 import structlog
 
 from ghtrader.control.db import JobRecord, JobStore
+from ghtrader.control.job_metadata import infer_job_metadata, merge_job_metadata
 
 log = structlog.get_logger()
 
@@ -72,6 +73,7 @@ class JobSpec:
     title: str
     argv: list[str]
     cwd: Path
+    metadata: dict[str, Any] | None = None
 
 
 class JobManager:
@@ -160,6 +162,10 @@ class JobManager:
         job_id = uuid.uuid4().hex[:12]
         log_path = self.logs_dir / f"job-{job_id}.log"
         argv = _normalize_argv(list(spec.argv))
+        metadata = merge_job_metadata(
+            infer_job_metadata(argv=argv, title=spec.title),
+            (dict(spec.metadata) if isinstance(spec.metadata, dict) else None),
+        )
         rec = self.store.create_job(
             job_id=job_id,
             title=spec.title,
@@ -167,14 +173,15 @@ class JobManager:
             cwd=spec.cwd,
             source="dashboard",
             log_path=log_path,
+            metadata=metadata,
         )
         started_at = _now_iso()
         env = os.environ.copy()
         env["GHTRADER_JOB_ID"] = job_id
         env["GHTRADER_JOB_SOURCE"] = "dashboard"
         env["GHTRADER_JOB_LOG_PATH"] = str(log_path)
-        env["GHTRADER_JOB_VERBOSE"] = "1"
-        env["GHTRADER_LOG_LEVEL"] = "debug"
+        env.setdefault("GHTRADER_JOB_VERBOSE", "0")
+        env.setdefault("GHTRADER_LOG_LEVEL", "info")
         env["PYTHONUNBUFFERED"] = "1"
 
         with self._spawn_lock:
@@ -226,6 +233,10 @@ class JobManager:
         job_id = uuid.uuid4().hex[:12]
         log_path = self.logs_dir / f"job-{job_id}.log"
         argv = _normalize_argv(list(spec.argv))
+        metadata = merge_job_metadata(
+            infer_job_metadata(argv=argv, title=spec.title),
+            (dict(spec.metadata) if isinstance(spec.metadata, dict) else None),
+        )
         self.store.create_job(
             job_id=job_id,
             title=spec.title,
@@ -233,6 +244,7 @@ class JobManager:
             cwd=spec.cwd,
             source="dashboard",
             log_path=log_path,
+            metadata=metadata,
         )
         out = self.store.get_job(job_id)
         assert out is not None
@@ -261,8 +273,8 @@ class JobManager:
         env["GHTRADER_JOB_ID"] = job_id
         env["GHTRADER_JOB_SOURCE"] = str(job.source or "dashboard")
         env["GHTRADER_JOB_LOG_PATH"] = str(log_path)
-        env["GHTRADER_JOB_VERBOSE"] = "1"
-        env["GHTRADER_LOG_LEVEL"] = "debug"
+        env.setdefault("GHTRADER_JOB_VERBOSE", "0")
+        env.setdefault("GHTRADER_LOG_LEVEL", "info")
         env["PYTHONUNBUFFERED"] = "1"
 
         with open(log_path, "ab", buffering=0) as f:

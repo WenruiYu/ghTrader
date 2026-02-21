@@ -76,8 +76,8 @@ def build_day_validation_artifacts(
         "missing_segments": list(missing_segments),
         "missing_segments_truncated": bool(int(missing_segments_total) > len(missing_segments)),
         "missing_seconds_ratio": (
-            float(missing_seconds) / float(expected_seconds)
-            if int(expected_seconds) > 0
+            float(missing_seconds) / float(expected_seconds_strict)
+            if int(expected_seconds_strict) > 0
             else 0.0
         ),
         "gap_buckets": dict(gap_buckets),
@@ -107,8 +107,8 @@ def build_day_validation_artifacts(
         missing_segments=int(missing_segments_total),
         missing_seconds=int(missing_seconds),
         missing_seconds_ratio=(
-            float(missing_seconds) / float(expected_seconds)
-            if int(expected_seconds) > 0
+            float(missing_seconds) / float(expected_seconds_strict)
+            if int(expected_seconds_strict) > 0
             else 0.0
         ),
         gap_bucket_2_5=int(gap_buckets.get("2_5") or 0),

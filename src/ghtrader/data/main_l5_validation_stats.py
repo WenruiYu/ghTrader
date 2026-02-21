@@ -41,6 +41,7 @@ def compute_day_gap_stats(
     gap_bucket_defs: list[tuple[str, int, int | None]],
     max_segments_per_day: int,
     sec_to_iso: Callable[[int], str],
+    gap_threshold_s_by_session: dict[str, float] | None = None,
 ) -> DayGapComputation:
     secs_sorted = sorted(sec_counts.keys())
 
@@ -115,13 +116,29 @@ def compute_day_gap_stats(
     gap_bucket_totals_by_session_delta: dict[str, dict[str, int]] = {}
     gap_count_gt_30_total_delta = 0
 
+    by_session_threshold: dict[str, float] = {}
+    if isinstance(gap_threshold_s_by_session, dict):
+        for k, v in gap_threshold_s_by_session.items():
+            sk = str(k or "").strip().lower()
+            if not sk:
+                continue
+            try:
+                by_session_threshold[sk] = max(0.5, float(v))
+            except Exception:
+                continue
+    default_gap_threshold = max(0.5, float(gap_threshold_s))
+
+    def gap_threshold_for_session(sess: str) -> float:
+        key = str(sess or "").strip().lower()
+        return float(by_session_threshold.get(key, default_gap_threshold))
+
     def record_gap(*, sess: str, gap_start: int, gap_end: int) -> None:
         nonlocal day_segments_total, max_gap_day, day_gap_count_gt_30, gap_count_gt_30_total_delta
         if gap_end < gap_start:
             return
         duration = int(gap_end - gap_start + 1)
         max_gap_day = max(max_gap_day, duration)
-        if duration >= gap_threshold_s:
+        if float(duration) >= gap_threshold_for_session(sess):
             day_segments_total += 1
             bucket_label = None
             for label, start_s, end_s in gap_bucket_defs:
@@ -183,7 +200,7 @@ def compute_day_gap_stats(
         for a, b in zip(secs_eff, secs_eff[1:]):
             if b - a > 1:
                 gap_len = int(b - a - 1)
-                if gap_len >= gap_threshold_s:
+                if float(gap_len) >= gap_threshold_for_session(sess):
                     observed_segments_session += 1
                 record_gap(sess=sess, gap_start=a + 1, gap_end=b - 1)
         if secs_eff[-1] < eff_end:
