@@ -127,3 +127,44 @@ def test_cli_lock_acquire_preempts_conflict_on_timeout(tmp_path: Path, monkeypat
     assert waiter is not None and waiter.held_locks and "main_schedule:var=au" in waiter.held_locks
     assert owner is not None and owner.status in {"cancelled", "failed"}
 
+
+def test_cli_lock_acquire_can_disable_preempt_on_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runs_dir = tmp_path / "runs"
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(runs_dir))
+    monkeypatch.setenv("GHTRADER_LOCK_WAIT_TIMEOUT_S", "0.2")
+    monkeypatch.setenv("GHTRADER_LOCK_POLL_INTERVAL_S", "0.05")
+    monkeypatch.setenv("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", "1")
+
+    from ghtrader.control.db import JobStore
+    from ghtrader.control.locks import LockStore
+
+    db_path = runs_dir / "control" / "jobs.db"
+    store = JobStore(db_path)
+    locks = LockStore(db_path)
+    owner_id = "owner_job"
+    waiter_id = "waiter_job"
+    store.create_job(job_id=owner_id, title="owner", command=["x"], cwd=tmp_path, source="terminal", log_path=None)
+    store.create_job(job_id=waiter_id, title="waiter", command=["y"], cwd=tmp_path, source="terminal", log_path=None)
+    store.update_job(owner_id, status="running", pid=os.getpid())
+    store.update_job(waiter_id, status="running", pid=os.getpid())
+    ok, _ = locks.acquire(lock_keys=["main_l5:symbol=KQ.m@SHFE.cu"], job_id=owner_id, pid=os.getpid(), wait=False)
+    assert ok is True
+
+    monkeypatch.setenv("GHTRADER_JOB_ID", waiter_id)
+    monkeypatch.setenv("GHTRADER_JOB_SOURCE", "terminal")
+    import ghtrader.cli as cli
+
+    def _unexpected_preempt(*_args, **_kwargs):
+        raise AssertionError("lock preempt should be disabled")
+
+    monkeypatch.setattr(cli, "_terminate_pid_for_lock", _unexpected_preempt)
+    with pytest.raises(RuntimeError, match="Failed to acquire locks"):
+        cli._acquire_locks(
+            ["main_l5:symbol=KQ.m@SHFE.cu"],
+            wait_timeout_s=0.2,
+            preempt_on_timeout=False,
+        )
+
+    owner = store.get_job(owner_id)
+    assert owner is not None and owner.status == "running"
+

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -100,24 +101,45 @@ def _assert_main_schedule_health(
     expected_hash: str,
     table: str = MAIN_SCHEDULE_TABLE_V2,
 ) -> None:
-    persisted = fetch_schedule(
-        cfg=cfg,
-        exchange=exchange,
-        variety=variety,
-        start_day=None,
-        end_day=None,
-        table=table,
-        connect_timeout_s=2,
-    )
-    persisted = persisted.dropna(subset=["trading_day", "main_contract"]).sort_values("trading_day").reset_index(drop=True)
     expected = expected_schedule[["date", "main_contract", "segment_id"]].dropna(subset=["date", "main_contract"]).sort_values("date").reset_index(drop=True)
-
     expected_rows = int(len(expected))
-    actual_rows = int(len(persisted))
-    if actual_rows != expected_rows:
-        raise RuntimeError(
-            f"main_schedule health check failed: rows mismatch (expected={expected_rows}, actual={actual_rows})"
+
+    try:
+        wal_wait_s = float(os.environ.get("GHTRADER_HEALTH_WAL_WAIT_S", "30") or "30")
+    except Exception:
+        wal_wait_s = 30.0
+    wal_wait_s = max(1.0, float(wal_wait_s))
+
+    last_error: str = ""
+    deadline = time.time() + float(wal_wait_s)
+    attempt = 0
+    while True:
+        attempt += 1
+        persisted = fetch_schedule(
+            cfg=cfg,
+            exchange=exchange,
+            variety=variety,
+            start_day=None,
+            end_day=None,
+            table=table,
+            connect_timeout_s=2,
         )
+        persisted = persisted.dropna(subset=["trading_day", "main_contract"]).sort_values("trading_day").reset_index(drop=True)
+        actual_rows = int(len(persisted))
+        if actual_rows == expected_rows:
+            break
+        last_error = f"rows mismatch (expected={expected_rows}, actual={actual_rows})"
+        if time.time() >= deadline:
+            raise RuntimeError(f"main_schedule health check failed: {last_error}")
+        wait = min(2.0, max(0.5, float(deadline - time.time()) / 2.0))
+        log.debug(
+            "main_schedule.health_wal_wait",
+            attempt=attempt,
+            expected=expected_rows,
+            actual=actual_rows,
+            wait_s=round(wait, 2),
+        )
+        time.sleep(wait)
 
     expected_days = [d for d in expected["date"].tolist() if isinstance(d, date)]
     actual_days = [d for d in persisted["trading_day"].tolist() if isinstance(d, date)]

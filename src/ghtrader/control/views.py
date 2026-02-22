@@ -375,6 +375,33 @@ def build_router() -> Any:
             "main_l5_worker_mode": worker_mode,
         }
 
+    def _validation_profile_suggestion(variety: str) -> dict[str, Any]:
+        v = str(variety or "").strip().lower()
+        profiles: dict[str, dict[str, Any]] = {
+            "cu": {
+                "label": "CU sparse-source profile",
+                "note": "CU is naturally sparse; use a looser gap threshold for manual validate runs.",
+                "gap_threshold_s": 8.0,
+                "strict_ratio": 0.65,
+                "max_segments_per_day": 300,
+            },
+            "ag": {
+                "label": "AG balanced profile",
+                "note": "AG keeps stricter thresholds after night-session attribution fixes.",
+                "gap_threshold_s": 5.0,
+                "strict_ratio": 0.8,
+                "max_segments_per_day": 200,
+            },
+            "au": {
+                "label": "AU conservative profile",
+                "note": "AU may hit isolated provider-anomaly days; review missing-day list before blocking.",
+                "gap_threshold_s": 5.0,
+                "strict_ratio": 0.75,
+                "max_segments_per_day": 200,
+            },
+        }
+        return dict(profiles.get(v) or {})
+
     def _pipeline_health_context(
         *,
         main_schedule_coverage: dict[str, Any],
@@ -424,18 +451,39 @@ def build_router() -> Any:
             main_l5_text = f"{main_days}d"
 
         val_status = str(main_l5_validation.get("status") or "").strip().lower()
+        val_state = str(main_l5_validation.get("state") or "").strip().lower()
+        val_overall = str(main_l5_validation.get("overall_state") or "").strip().lower()
+        val_status_label = str(main_l5_validation.get("status_label") or "").strip().lower()
+        status_token = val_overall or val_status or val_state or val_status_label
         checked_days = _safe_int(main_l5_validation.get("checked_days"), 0, min_value=0)
         missing_days = _safe_int(main_l5_validation.get("missing_days"), 0, min_value=0)
         missing_segments = _safe_int(main_l5_validation.get("missing_segments_total"), 0, min_value=0)
         if validation_error:
             validation_state = "error"
             validation_text = "summary unavailable"
+        elif status_token == "error":
+            validation_state = "error"
+            validation_text = (
+                f"{missing_days}/{checked_days}d miss · {missing_segments} seg"
+                if checked_days > 0
+                else "error"
+            )
+        elif status_token == "noop":
+            validation_state = "ok"
+            validation_text = "up-to-date (noop)"
         elif checked_days <= 0:
             validation_state = "warn"
             validation_text = "not run"
-        elif val_status == "ok":
+        elif status_token == "ok":
             validation_state = "ok"
             validation_text = f"{checked_days}d clean"
+        elif status_token == "warn":
+            validation_state = "warn"
+            validation_text = (
+                f"{missing_days}/{checked_days}d miss · {missing_segments} seg"
+                if checked_days > 0
+                else "warn"
+            )
         else:
             validation_state = "warn"
             validation_text = (
@@ -835,6 +883,7 @@ def build_router() -> Any:
                 "symbol": _derived_symbol_for_variety(var),
             },
         )
+        _data_page_cache_clear()
         return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=var), status_code=303)
 
     @router.post("/data/build/main_l5")
@@ -872,6 +921,7 @@ def build_router() -> Any:
                 "symbol": derived_symbol,
             },
         )
+        _data_page_cache_clear()
         return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=var), status_code=303)
 
     @router.post("/data/build/build")
@@ -1549,14 +1599,19 @@ def build_router() -> Any:
                     limit=8,
                 )
                 if overview.get("days_total"):
-                    out["main_l5_validation"] = {
-                        "status": "ok"
+                    base_status = (
+                        "ok"
                         if (
                             overview.get("missing_days", 0) == 0
                             and overview.get("missing_segments", 0) == 0
                             and overview.get("missing_half_seconds", 0) == 0
                         )
-                        else "warn",
+                        else "warn"
+                    )
+                    out["main_l5_validation"] = {
+                        "status": base_status,
+                        "status_label": base_status,
+                        "state": base_status,
                         "last_day": overview.get("last_day"),
                         "checked_days": overview.get("days_total"),
                         "missing_days": overview.get("missing_days"),
@@ -1590,29 +1645,96 @@ def build_router() -> Any:
                     variety=coverage_var,
                     derived_symbol=coverage_symbol,
                 )
-                if not out["main_l5_validation"] and isinstance(rep, dict):
+                rep_usable = isinstance(rep, dict)
+                if rep_usable and schedule_hash_filter:
+                    rep_sh = str((rep or {}).get("schedule_hash") or "").strip()
+                    if rep_sh and rep_sh != str(schedule_hash_filter):
+                        rep_usable = False
+
+                if not out["main_l5_validation"] and rep_usable:
+                    rep_state = str((rep or {}).get("state") or "").strip().lower()
+                    if rep_state == "noop":
+                        rep_status = "ok"
+                        rep_status_label = "noop"
+                    elif rep_state in {"ok", "warn", "error"}:
+                        rep_status = rep_state
+                        rep_status_label = rep_state
+                    else:
+                        rep_status = ("ok" if bool((rep or {}).get("ok")) else "warn")
+                        rep_status_label = rep_status
                     out["main_l5_validation"] = {
-                        "status": ("ok" if bool(rep.get("ok")) else "warn"),
-                        "last_run": rep.get("created_at"),
-                        "max_gap_s": rep.get("max_gap_s"),
-                        "gap_threshold_s": rep.get("gap_threshold_s"),
-                        "missing_seconds_ratio": rep.get("missing_seconds_ratio"),
-                        "schedule_hash": rep.get("schedule_hash"),
+                        "status": rep_status,
+                        "status_label": rep_status_label,
+                        "state": (rep_state or rep_status),
+                        "last_run": (rep or {}).get("created_at"),
+                        "max_gap_s": (rep or {}).get("max_gap_s"),
+                        "gap_threshold_s": (rep or {}).get("gap_threshold_s"),
+                        "missing_seconds_ratio": (rep or {}).get("missing_seconds_ratio"),
+                        "schedule_hash": (rep or {}).get("schedule_hash"),
                     }
-                if isinstance(rep, dict) and rep.get("_path"):
+                if rep_usable and (rep or {}).get("_path"):
                     out["main_l5_validation"]["report_name"] = Path(str(rep.get("_path"))).name
-                if isinstance(rep, dict) and rep.get("created_at") and not out["main_l5_validation"].get("last_run"):
-                    out["main_l5_validation"]["last_run"] = rep.get("created_at")
-                    for key in (
+                if rep_usable and isinstance(rep, dict):
+                    rep_state = str(rep.get("state") or "").strip().lower()
+                    if rep_state == "noop":
+                        out["main_l5_validation"]["status"] = "ok"
+                        out["main_l5_validation"]["status_label"] = "noop"
+                        out["main_l5_validation"]["state"] = "noop"
+                    elif rep_state in {"ok", "warn", "error"}:
+                        out["main_l5_validation"]["status"] = rep_state
+                        out["main_l5_validation"]["status_label"] = rep_state
+                        out["main_l5_validation"]["state"] = rep_state
+                    if rep.get("created_at"):
+                        out["main_l5_validation"]["last_run"] = rep.get("created_at")
+                    merge_if_missing = (
+                        "checked_days",
+                        "missing_days",
+                        "missing_segments_total",
+                        "missing_seconds_total",
+                        "missing_half_seconds_total",
+                        "expected_seconds_strict_total",
+                        "total_segments",
                         "max_gap_s",
                         "gap_threshold_s",
-                        "seconds_with_one_tick_total",
+                        "cadence_mode",
+                        "two_plus_ratio",
+                        "schedule_hash",
+                    )
+                    for key in merge_if_missing:
+                        if key in rep and key not in out["main_l5_validation"]:
+                            out["main_l5_validation"][key] = rep.get(key)
+                    merge_from_report = (
+                        "reason",
+                        "reason_code",
+                        "action_hint",
+                        "strict_ratio",
+                        "state",
+                        "overall_state",
+                        "engineering_state",
+                        "source_state",
+                        "policy_state",
                         "missing_seconds_ratio",
+                        "missing_half_seconds_state",
+                        "missing_half_seconds_ratio",
+                        "missing_half_seconds_info_ratio",
+                        "missing_half_seconds_block_ratio",
+                        "source_missing_days_count",
+                        "source_missing_days_tolerance",
+                        "source_missing_days_blocking",
+                        "source_blocking",
+                        "policy_sources",
+                        "policy_profile",
+                        "ticks_outside_sessions_seconds_total",
+                        "expected_seconds_strict_fixed_total",
+                        "gap_threshold_s_by_session",
+                        "seconds_with_one_tick_total",
                         "gap_buckets_total",
                         "gap_buckets_by_session_total",
                         "gap_count_gt_30s",
-                    ):
-                        if key in rep and key not in out["main_l5_validation"]:
+                        "tqsdk_check",
+                    )
+                    for key in merge_from_report:
+                        if key in rep:
                             out["main_l5_validation"][key] = rep.get(key)
             except Exception as e:
                 out["validation_error"] = str(e)
@@ -1724,6 +1846,7 @@ def build_router() -> Any:
                 "validation_error": validation_error,
                 "guardrails": guardrails,
                 "pipeline_health": pipeline_health,
+                "validation_profile_suggestion": _validation_profile_suggestion(v),
                 **_variety_nav_ctx(v, section="data", page_title="Data Hub"),
             },
         )

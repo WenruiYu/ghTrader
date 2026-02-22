@@ -33,6 +33,7 @@ from ghtrader.questdb.main_l5_validate import (
 from ghtrader.questdb.main_l5_validation_queries import (
     fetch_day_second_stats as _fetch_day_second_stats,
     fetch_per_second_counts as _fetch_per_second_counts,
+    fetch_per_second_counts_batch as _fetch_per_second_counts_batch,
     get_last_validated_day,
 )
 from ghtrader.questdb.main_schedule import fetch_schedule
@@ -60,6 +61,199 @@ def _env_float(name: str) -> float | None:
         return float(raw)
     except Exception:
         return None
+
+
+def _env_int(name: str) -> int | None:
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _var_key(var: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(var or "").strip()).strip("_").upper()
+
+
+def _clamp_float(value: float, *, min_value: float | None = None, max_value: float | None = None) -> float:
+    out = float(value)
+    if min_value is not None:
+        out = max(float(min_value), out)
+    if max_value is not None:
+        out = min(float(max_value), out)
+    return float(out)
+
+
+def _resolve_float_from_keys(
+    *,
+    keys: list[str],
+    default: float | None,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> tuple[float | None, str]:
+    for key in keys:
+        val = _env_float(key)
+        if val is not None:
+            return _clamp_float(float(val), min_value=min_value, max_value=max_value), f"env:{key}"
+    if default is None:
+        return None, "unset"
+    return _clamp_float(float(default), min_value=min_value, max_value=max_value), "default"
+
+
+def _resolve_int_from_keys(
+    *,
+    keys: list[str],
+    default: int,
+    min_value: int | None = None,
+) -> tuple[int, str]:
+    for key in keys:
+        val = _env_int(key)
+        if val is not None:
+            out = int(val)
+            if min_value is not None:
+                out = max(int(min_value), out)
+            return int(out), f"env:{key}"
+    out = int(default)
+    if min_value is not None:
+        out = max(int(min_value), out)
+    return int(out), "default"
+
+
+def _resolve_bool_from_keys(
+    *,
+    keys: list[str],
+    default: bool,
+) -> tuple[bool, str]:
+    for key in keys:
+        raw = str(os.environ.get(key, "") or "").strip()
+        if not raw:
+            continue
+        return _env_bool(key, default), f"env:{key}"
+    return bool(default), "default"
+
+
+def _resolve_validation_policy(
+    *,
+    variety: str,
+    gap_threshold_s: float | None,
+    strict_ratio: float | None,
+) -> dict[str, Any]:
+    var_key = _var_key(variety)
+    sources: dict[str, Any] = {}
+
+    if gap_threshold_s is not None:
+        eff_gap_threshold_s = _clamp_float(float(gap_threshold_s), min_value=0.5)
+        sources["gap_threshold_s"] = "cli"
+    else:
+        eff_gap_threshold_s, src = _resolve_float_from_keys(
+            keys=([f"GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S_{var_key}"] if var_key else []) + ["GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S"],
+            default=5.0,
+            min_value=0.5,
+        )
+        sources["gap_threshold_s"] = src
+    gap_threshold_s_by_session: dict[str, float] = {}
+    gap_threshold_s_by_session_source: dict[str, str] = {}
+    for sess in ("day", "night"):
+        keys = []
+        if var_key:
+            keys.append(f"GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S_{var_key}_{sess.upper()}")
+        keys.append(f"GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S_{sess.upper()}")
+        val, src = _resolve_float_from_keys(keys=keys, default=None, min_value=0.5)
+        if val is not None:
+            gap_threshold_s_by_session[sess] = float(val)
+            gap_threshold_s_by_session_source[sess] = src
+    sources["gap_threshold_s_by_session"] = gap_threshold_s_by_session_source
+
+    if strict_ratio is not None:
+        eff_strict_ratio = _clamp_float(float(strict_ratio), min_value=0.0, max_value=1.0)
+        sources["strict_ratio"] = "cli"
+    else:
+        eff_strict_ratio, src = _resolve_float_from_keys(
+            keys=([f"GHTRADER_L5_VALIDATE_STRICT_RATIO_{var_key}"] if var_key else []) + ["GHTRADER_L5_VALIDATE_STRICT_RATIO"],
+            default=0.8,
+            min_value=0.0,
+            max_value=1.0,
+        )
+        sources["strict_ratio"] = src
+
+    half_info_ratio, src = _resolve_float_from_keys(
+        keys=([f"GHTRADER_L5_VALIDATE_MISSING_HALF_INFO_RATIO_{var_key}"] if var_key else []) + ["GHTRADER_L5_VALIDATE_MISSING_HALF_INFO_RATIO"],
+        default=0.02,
+        min_value=0.0,
+        max_value=1.0,
+    )
+    sources["missing_half_info_ratio"] = src
+    half_block_ratio, src = _resolve_float_from_keys(
+        keys=([f"GHTRADER_L5_VALIDATE_MISSING_HALF_BLOCK_RATIO_{var_key}"] if var_key else []) + ["GHTRADER_L5_VALIDATE_MISSING_HALF_BLOCK_RATIO"],
+        default=0.10,
+        min_value=0.0,
+        max_value=1.0,
+    )
+    sources["missing_half_block_ratio"] = src
+    half_block_ratio = max(float(half_info_ratio or 0.0), float(half_block_ratio or 0.0))
+
+    gap_block_gt30, src = _resolve_int_from_keys(
+        keys=([f"GHTRADER_L5_VALIDATE_GAP_BLOCK_GT30_{var_key}"] if var_key else []) + ["GHTRADER_L5_VALIDATE_GAP_BLOCK_GT30"],
+        default=0,
+        min_value=0,
+    )
+    sources["gap_block_gt30"] = src
+
+    segments_warn_avg, src = _resolve_float_from_keys(
+        keys=([f"GHTRADER_L5_VALIDATE_SEGMENTS_WARN_AVG_PER_DAY_{var_key}"] if var_key else []) + ["GHTRADER_L5_VALIDATE_SEGMENTS_WARN_AVG_PER_DAY"],
+        default=500.0,
+        min_value=0.0,
+    )
+    sources["segments_warn_avg_per_day"] = src
+
+    outside_sessions_block_s, src = _resolve_float_from_keys(
+        keys=([f"GHTRADER_L5_VALIDATE_OUTSIDE_SESSIONS_BLOCK_S_{var_key}"] if var_key else []) + ["GHTRADER_L5_VALIDATE_OUTSIDE_SESSIONS_BLOCK_S"],
+        default=60.0,
+        min_value=0.0,
+    )
+    sources["outside_sessions_block_s"] = src
+
+    source_blocking, src = _resolve_bool_from_keys(
+        keys=([f"GHTRADER_L5_VALIDATE_SOURCE_BLOCKING_{var_key}"] if var_key else []) + ["GHTRADER_L5_VALIDATE_SOURCE_BLOCKING"],
+        default=False,
+    )
+    sources["source_blocking"] = src
+    source_missing_days_tolerance, src = _resolve_int_from_keys(
+        keys=([f"GHTRADER_L5_VALIDATE_SOURCE_MISSING_DAYS_TOLERANCE_{var_key}"] if var_key else []) + ["GHTRADER_L5_VALIDATE_SOURCE_MISSING_DAYS_TOLERANCE"],
+        default=0,
+        min_value=0,
+    )
+    sources["source_missing_days_tolerance"] = src
+
+    return {
+        "gap_threshold_s": float(eff_gap_threshold_s or 5.0),
+        "gap_threshold_s_by_session": gap_threshold_s_by_session,
+        "strict_ratio": float(eff_strict_ratio or 0.8),
+        "half_info_ratio": float(half_info_ratio or 0.02),
+        "half_block_ratio": float(half_block_ratio),
+        "gap_block_gt30": int(gap_block_gt30),
+        "segments_warn_avg_per_day": float(segments_warn_avg or 500.0),
+        "outside_sessions_block_s": float(outside_sessions_block_s or 60.0),
+        "source_blocking": bool(source_blocking),
+        "source_missing_days_tolerance": int(source_missing_days_tolerance),
+        "policy_sources": sources,
+    }
+
+
+def resolve_validation_policy_preview(
+    *,
+    variety: str,
+    gap_threshold_s: float | None = None,
+    strict_ratio: float | None = None,
+) -> dict[str, Any]:
+    """Resolve effective validation policy and source mapping for UI/API display."""
+    return _resolve_validation_policy(
+        variety=str(variety or "").strip().lower(),
+        gap_threshold_s=gap_threshold_s,
+        strict_ratio=strict_ratio,
+    )
 
 
 def _symbol_slug(symbol: str) -> str:
@@ -318,6 +512,12 @@ def validate_main_l5(
         report = {
             "ok": True,
             "state": "noop",
+            "overall_state": "ok",
+            "engineering_state": "ok",
+            "source_state": "ok",
+            "policy_state": "ok",
+            "reason_code": "noop_up_to_date",
+            "action_hint": "No new trading days for current schedule hash.",
             "reason": str(reason or "up_to_date"),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "exchange": ex,
@@ -360,6 +560,11 @@ def validate_main_l5(
             "missing_half_seconds_info_ratio": None,
             "missing_half_seconds_block_ratio": None,
             "missing_half_seconds_state": "ok",
+            "source_blocking": False,
+            "source_missing_days_tolerance": 0,
+            "source_missing_days_blocking": False,
+            "policy_sources": {},
+            "policy_profile": {"variety": var, "effective": {}, "sources": {}},
             "timeliness": {"p95_lag_s": None, "max_lag_s": None, "days_with_lag": 0},
             "sessions": {"count": 0, "source": "cache", "raw_trading_time": None},
             "holiday_night_skipped_days": 0,
@@ -554,43 +759,22 @@ def validate_main_l5(
         report_max_events = int(os.environ.get("GHTRADER_L5_VALIDATE_REPORT_MAX_EVENTS", "200") or "200")
     except Exception:
         report_max_events = 200
-    gap_threshold_s_by_session: dict[str, float] = {}
-    if gap_threshold_s is None:
-        var_key = re.sub(r"[^A-Za-z0-9]+", "_", var).strip("_").upper()
-        candidates = []
-        if var_key:
-            candidates.append(f"GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S_{var_key}")
-        candidates.append("GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S")
-        for key in candidates:
-            val = _env_float(key)
-            if val is not None:
-                gap_threshold_s = float(val)
-                break
-        if gap_threshold_s is None:
-            gap_threshold_s = 5.0
-
-        for sess in ("day", "night"):
-            sess_key = sess.upper()
-            sess_candidates = []
-            if var_key:
-                sess_candidates.append(f"GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S_{var_key}_{sess_key}")
-            sess_candidates.append(f"GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S_{sess_key}")
-            for key in sess_candidates:
-                sval = _env_float(key)
-                if sval is not None:
-                    gap_threshold_s_by_session[sess] = float(sval)
-                    break
-    if strict_ratio is None:
-        try:
-            strict_ratio = float(os.environ.get("GHTRADER_L5_VALIDATE_STRICT_RATIO", "0.8") or "0.8")
-        except Exception:
-            strict_ratio = 0.8
-    half_info_ratio = _env_float("GHTRADER_L5_VALIDATE_MISSING_HALF_INFO_RATIO")
-    half_block_ratio = _env_float("GHTRADER_L5_VALIDATE_MISSING_HALF_BLOCK_RATIO")
-    if half_info_ratio is None:
-        half_info_ratio = 0.02
-    if half_block_ratio is None:
-        half_block_ratio = 0.10
+    policy = _resolve_validation_policy(
+        variety=var,
+        gap_threshold_s=gap_threshold_s,
+        strict_ratio=strict_ratio,
+    )
+    gap_threshold_s = float(policy["gap_threshold_s"])
+    gap_threshold_s_by_session = dict(policy["gap_threshold_s_by_session"])
+    strict_ratio = float(policy["strict_ratio"])
+    half_info_ratio = float(policy["half_info_ratio"])
+    half_block_ratio = float(policy["half_block_ratio"])
+    gap_block_gt30 = int(policy["gap_block_gt30"])
+    segments_warn_avg = float(policy["segments_warn_avg_per_day"])
+    outside_sessions_block_s = float(policy["outside_sessions_block_s"])
+    source_blocking = bool(policy["source_blocking"])
+    source_missing_days_tolerance = int(policy["source_missing_days_tolerance"])
+    policy_sources = dict(policy.get("policy_sources") or {})
     tqsdk_check_max_days = max(0, int(tqsdk_check_max_days))
     tqsdk_check_max_segments = max(0, int(tqsdk_check_max_segments))
     max_segments_per_day = max(10, int(max_segments_per_day))
@@ -657,6 +841,8 @@ def validate_main_l5(
         strict_ratio=float(strict_ratio),
         missing_half_info_ratio=float(half_info_ratio),
         missing_half_block_ratio=float(half_block_ratio),
+        source_blocking=bool(source_blocking),
+        source_missing_days_tolerance=int(source_missing_days_tolerance),
     )
 
     day_stats: dict[date, dict[str, int]] = {}
@@ -665,6 +851,14 @@ def validate_main_l5(
             day_stats = _fetch_day_second_stats(cfg=cfg, symbol=ds, start_day=schedule_start, end_day=schedule_end, l5_only=True)
         except Exception:
             day_stats = {}
+
+    days_with_ticks = [d for d in schedule_days if int((day_stats.get(d) or {}).get("seconds_with_ticks") or 0) > 0]
+    per_second_cache: dict[date, dict[int, int]] = {}
+    if days_with_ticks:
+        try:
+            per_second_cache = _fetch_per_second_counts_batch(cfg=cfg, symbol=ds, trading_days=days_with_ticks, l5_only=True)
+        except Exception:
+            per_second_cache = {}
 
     days_all: list[dict[str, Any]] = []
     missing_days: list[str] = []
@@ -703,6 +897,11 @@ def validate_main_l5(
     tqsdk_present_segments = 0
     tqsdk_check_errors = 0
 
+    persisted_summary_rows = 0
+    persisted_gap_rows_deleted = 0
+    persisted_gap_rows_inserted = 0
+    persisted_tick_gap_rows = 0
+
     last_progress_ts = time.time()
 
     prev_trading_day: dict[date, date] = {}
@@ -738,11 +937,11 @@ def validate_main_l5(
         )
         day_cadence = "fixed_0p5s" if two_plus_ratio_day >= float(strict_ratio) else "event"
 
-        sec_counts = (
-            _fetch_per_second_counts(cfg=cfg, symbol=ds, trading_day=day, l5_only=True)
-            if seconds_with_ticks_day > 0
-            else {}
-        )
+        sec_counts: dict[int, int] = {}
+        if seconds_with_ticks_day > 0:
+            sec_counts = per_second_cache.get(day) or {}
+            if not sec_counts:
+                sec_counts = _fetch_per_second_counts(cfg=cfg, symbol=ds, trading_day=day, l5_only=True)
         day_calc = compute_day_gap_stats(
             intervals=intervals,
             sec_counts=sec_counts,
@@ -781,16 +980,16 @@ def validate_main_l5(
         day_gap_buckets_by_session = dict(day_calc.day_gap_buckets_by_session)
         day_gap_count_gt_30 = int(day_calc.day_gap_count_gt_30)
 
-        for label, delta in day_calc.gap_bucket_totals_delta.items():
-            gap_bucket_totals[label] = int(gap_bucket_totals.get(label, 0)) + int(delta)
-        for sess_key, buckets in day_calc.gap_bucket_totals_by_session_delta.items():
+        for label, count in day_gap_buckets.items():
+            gap_bucket_totals[label] = int(gap_bucket_totals.get(label, 0)) + int(count)
+        for sess_key, buckets in day_gap_buckets_by_session.items():
             if sess_key not in gap_bucket_totals_by_session:
                 gap_bucket_totals_by_session[sess_key] = {label: 0 for label, _, _ in gap_bucket_defs}
-            for label, delta in buckets.items():
+            for label, count in buckets.items():
                 gap_bucket_totals_by_session[sess_key][label] = (
-                    int(gap_bucket_totals_by_session[sess_key].get(label, 0)) + int(delta)
+                    int(gap_bucket_totals_by_session[sess_key].get(label, 0)) + int(count)
                 )
-        gap_count_gt_30_total += int(day_calc.gap_count_gt_30_total_delta)
+        gap_count_gt_30_total += int(day_gap_count_gt_30)
 
         if tqsdk_api is not None and tqsdk_check and day_segments_total > 0 and tqsdk_checked_days < tqsdk_check_max_days:
             tqsdk_out = verify_missing_segments_with_tqsdk(
@@ -824,8 +1023,6 @@ def validate_main_l5(
             observed_seconds_in_sessions=observed_in_sessions,
             seconds_with_one_tick=seconds_with_one,
             seconds_with_two_plus=seconds_with_two_plus,
-            summary_seconds_with_ticks=seconds_with_ticks_day,
-            summary_seconds_with_two_plus=seconds_with_two_plus_day,
             ticks_outside_sessions_seconds=observed_outside_sessions,
             last_tick_sec=last_tick_sec,
             session_end_sec=session_end_sec,
@@ -853,9 +1050,9 @@ def validate_main_l5(
         missing_half_seconds_total += int(day_missing_half_seconds)
         boundary_missing_seconds_total += int(day_boundary_missing)
         ticks_outside_sessions_total += int(observed_outside_sessions)
-        seconds_with_ticks_total += int(seconds_with_ticks_day)
-        seconds_with_one_tick_total += int(seconds_with_one_day)
-        seconds_with_two_plus_total += int(seconds_with_two_plus_day)
+        seconds_with_ticks_total += int(seconds_with_one) + int(seconds_with_two_plus)
+        seconds_with_one_tick_total += int(seconds_with_one)
+        seconds_with_two_plus_total += int(seconds_with_two_plus)
         max_gap_s = max(max_gap_s, int(max_gap_day))
         expected_seconds_total += int(expected_seconds)
         expected_seconds_strict_total += int(expected_seconds_strict)
@@ -865,6 +1062,17 @@ def validate_main_l5(
         total_segments_total += int(total_segments_day)
         summary_rows.append(summary_row)
         gap_rows.extend(day_gap_rows)
+
+        persist_batch_size = 100
+        if len(summary_rows) >= persist_batch_size and idx < len(schedule_days):
+            try:
+                persisted_summary_rows += int(upsert_main_l5_validate_summary_rows(cfg=cfg, rows=summary_rows))
+                persisted_gap_rows_inserted += int(insert_main_l5_validate_gap_rows(cfg=cfg, rows=gap_rows))
+                persisted_tick_gap_rows += int(upsert_main_l5_tick_gaps_from_validate_summary(cfg=cfg, summary_rows=summary_rows))
+            except Exception:
+                pass
+            summary_rows.clear()
+            gap_rows.clear()
 
         if idx == 1 or idx == len(schedule_days) or idx % progress_every_n == 0 or (time.time() - last_progress_ts) >= progress_every_s:
             log.info(
@@ -877,15 +1085,7 @@ def validate_main_l5(
             )
             last_progress_ts = time.time()
 
-    persisted_summary_rows = 0
-    persisted_gap_rows_deleted = 0
-    persisted_gap_rows_inserted = 0
-    persisted_tick_gap_rows = 0
     try:
-        try:
-            persisted_summary_rows = int(upsert_main_l5_validate_summary_rows(cfg=cfg, rows=summary_rows))
-        except Exception as e:
-            raise RuntimeError(f"main_l5_validate summary persist failed: {e}") from e
         try:
             persisted_gap_rows_deleted = int(
                 clear_main_l5_validate_gap_rows(
@@ -897,14 +1097,19 @@ def validate_main_l5(
             )
         except Exception as e:
             raise RuntimeError(f"main_l5_validate gaps clear failed: {e}") from e
-        try:
-            persisted_gap_rows_inserted = int(insert_main_l5_validate_gap_rows(cfg=cfg, rows=gap_rows))
-        except Exception as e:
-            raise RuntimeError(f"main_l5_validate gaps persist failed: {e}") from e
-        try:
-            persisted_tick_gap_rows = int(upsert_main_l5_tick_gaps_from_validate_summary(cfg=cfg, summary_rows=summary_rows))
-        except Exception as e:
-            raise RuntimeError(f"main_l5_validate tick_gaps persist failed: {e}") from e
+        if summary_rows:
+            try:
+                persisted_summary_rows += int(upsert_main_l5_validate_summary_rows(cfg=cfg, rows=summary_rows))
+            except Exception as e:
+                raise RuntimeError(f"main_l5_validate summary persist failed: {e}") from e
+            try:
+                persisted_gap_rows_inserted += int(insert_main_l5_validate_gap_rows(cfg=cfg, rows=gap_rows))
+            except Exception as e:
+                raise RuntimeError(f"main_l5_validate gaps persist failed: {e}") from e
+            try:
+                persisted_tick_gap_rows += int(upsert_main_l5_tick_gaps_from_validate_summary(cfg=cfg, summary_rows=summary_rows))
+            except Exception as e:
+                raise RuntimeError(f"main_l5_validate tick_gaps persist failed: {e}") from e
     finally:
         if tqsdk_api is not None:
             try:
@@ -950,13 +1155,71 @@ def validate_main_l5(
     else:
         missing_half_seconds_state = "ok"
 
-    ok = bool(
-        missing_segments_total == 0
-        and ticks_outside_sessions_total == 0
-        and len(missing_days) == 0
-        and missing_half_seconds_state != "error"
+    segments_blocking = bool(gap_count_gt_30_total > int(gap_block_gt30))
+    outside_sessions_blocking = bool(float(ticks_outside_sessions_total) > float(outside_sessions_block_s))
+    source_missing_days_count = int(len(missing_days))
+    source_missing_days_blocking = bool(
+        bool(source_blocking) and source_missing_days_count > int(source_missing_days_tolerance)
     )
-    state = "error" if not ok else ("warn" if missing_half_seconds_state == "info" else "ok")
+    segments_avg = float(missing_segments_total) / float(max(1, len(schedule_days)))
+
+    if outside_sessions_blocking:
+        engineering_state = "error"
+    elif ticks_outside_sessions_total > 0:
+        engineering_state = "warn"
+    else:
+        engineering_state = "ok"
+
+    if segments_blocking or missing_half_seconds_state == "error":
+        policy_state = "error"
+    elif missing_half_seconds_state == "info" or (segments_warn_avg > 0 and segments_avg > segments_warn_avg):
+        policy_state = "warn"
+    else:
+        policy_state = "ok"
+
+    source_warn = bool(
+        source_missing_days_count > 0 or tqsdk_check_errors > 0 or tqsdk_missing_segments > 0
+    )
+    if source_missing_days_blocking:
+        source_state = "error"
+    elif source_warn:
+        source_state = "warn"
+    else:
+        source_state = "ok"
+
+    if "error" in {engineering_state, source_state, policy_state}:
+        overall_state = "error"
+    elif "warn" in {engineering_state, source_state, policy_state}:
+        overall_state = "warn"
+    else:
+        overall_state = "ok"
+
+    ok = bool(overall_state == "ok")
+    state = str(overall_state)
+
+    reason_code = "quality_ok"
+    action_hint = "No action needed."
+    if outside_sessions_blocking:
+        reason_code = "outside_sessions_block"
+        action_hint = "Rebuild main_l5 with current sessions and rerun validate."
+    elif missing_half_seconds_state == "error":
+        reason_code = "missing_half_seconds_block"
+        action_hint = "Tune half-second policy or inspect strict-cadence days before training."
+    elif segments_blocking:
+        reason_code = "gap_gt30_block"
+        action_hint = "Review top gap days and adjust per-var/session gap policy if expected."
+    elif source_missing_days_blocking:
+        reason_code = "source_missing_days_block"
+        action_hint = "Verify provider anomaly days, then raise tolerance or backfill from alternate source."
+    elif source_state == "warn" and source_missing_days_count > 0:
+        reason_code = "source_missing_days_warn"
+        action_hint = "Source missing days detected; proceed with caution or increase tolerance per policy."
+    elif missing_half_seconds_state == "info":
+        reason_code = "missing_half_seconds_info"
+        action_hint = "Half-second misses are informational; monitor trend over time."
+    elif engineering_state == "warn":
+        reason_code = "outside_sessions_warn"
+        action_hint = "Outside-session ticks detected under warning threshold; verify ingest/session config."
     issues_total = int(len(days_with_issues))
     issues_truncated = bool(issues_total > report_max_days)
     if issues_truncated:
@@ -984,6 +1247,12 @@ def validate_main_l5(
     report = {
         "ok": ok,
         "state": state,
+        "overall_state": str(overall_state),
+        "engineering_state": str(engineering_state),
+        "source_state": str(source_state),
+        "policy_state": str(policy_state),
+        "reason_code": str(reason_code),
+        "action_hint": str(action_hint),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "exchange": ex,
         "variety": var,
@@ -993,6 +1262,7 @@ def validate_main_l5(
         "schedule_end": (schedule_end.isoformat() if schedule_end else None),
         "checked_days": int(len(schedule_days)),
         "missing_days": int(len(missing_days)),
+        "source_missing_days_count": int(source_missing_days_count),
         "missing_days_sample": missing_days[:20],
         "missing_segments_total": int(missing_segments_total),
         "missing_seconds_total": int(missing_seconds_total),
@@ -1028,6 +1298,30 @@ def validate_main_l5(
         "missing_half_seconds_info_ratio": float(half_info_ratio),
         "missing_half_seconds_block_ratio": float(half_block_ratio),
         "missing_half_seconds_state": str(missing_half_seconds_state),
+        "gap_block_gt30": int(gap_block_gt30),
+        "segments_warn_avg_per_day": float(segments_warn_avg),
+        "segments_avg_per_day": float(segments_avg),
+        "outside_sessions_block_s": float(outside_sessions_block_s),
+        "source_blocking": bool(source_blocking),
+        "source_missing_days_tolerance": int(source_missing_days_tolerance),
+        "source_missing_days_blocking": bool(source_missing_days_blocking),
+        "policy_sources": policy_sources,
+        "policy_profile": {
+            "variety": var,
+            "effective": {
+                "gap_threshold_s": float(gap_threshold_s),
+                "gap_threshold_s_by_session": {k: float(v) for k, v in gap_threshold_s_by_session.items()},
+                "strict_ratio": float(strict_ratio),
+                "missing_half_info_ratio": float(half_info_ratio),
+                "missing_half_block_ratio": float(half_block_ratio),
+                "gap_block_gt30": int(gap_block_gt30),
+                "segments_warn_avg_per_day": float(segments_warn_avg),
+                "outside_sessions_block_s": float(outside_sessions_block_s),
+                "source_blocking": bool(source_blocking),
+                "source_missing_days_tolerance": int(source_missing_days_tolerance),
+            },
+            "sources": policy_sources,
+        },
         "timeliness": {
             "p95_lag_s": lag_p95,
             "max_lag_s": lag_max,
@@ -1055,6 +1349,15 @@ def validate_main_l5(
             "provider_missing_segments": int(tqsdk_missing_segments),
             "provider_has_data_segments": int(tqsdk_present_segments),
             "errors": int(tqsdk_check_errors),
+        },
+        "gap_attribution": {
+            "provider_missing": int(tqsdk_missing_segments),
+            "provider_has_data": int(tqsdk_present_segments),
+            "unchecked": int(max(0, missing_segments_total - tqsdk_checked_segments)),
+            "provider_missing_pct": (
+                round(float(tqsdk_missing_segments) / float(tqsdk_checked_segments) * 100, 1)
+                if tqsdk_checked_segments > 0 else None
+            ),
         },
         "manifest": {
             "path": (manifest.get("_path") if isinstance(manifest, dict) else None),
@@ -1094,6 +1397,11 @@ def validate_main_l5(
         missing_segments=int(missing_segments_total),
         missing_half_seconds=int(missing_half_seconds_total),
         max_gap_s=int(max_gap_s),
+        engineering_state=str(engineering_state),
+        source_state=str(source_state),
+        policy_state=str(policy_state),
+        overall_state=str(overall_state),
+        reason_code=str(reason_code),
         cadence_mode=cadence_mode,
         two_plus_ratio=float(two_plus_ratio),
     )

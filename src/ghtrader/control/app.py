@@ -65,7 +65,7 @@ from ghtrader.control.variety_context import allowed_varieties as _allowed_varie
 from ghtrader.control.variety_context import default_variety as _default_variety
 from ghtrader.control.variety_context import derived_symbol_for_variety as _derived_symbol_for_variety
 from ghtrader.control.variety_context import symbol_matches_variety as _symbol_matches_variety_impl
-from ghtrader.control.views import build_router
+from ghtrader.control.views import _data_page_cache_clear, build_router
 from ghtrader.util.json_io import read_json as _read_json
 
 log = structlog.get_logger()
@@ -112,6 +112,14 @@ def _iter_symbol_dirs(root: Path) -> set[str]:
     except Exception:
         return out
     return out
+
+
+def _clear_data_quality_cache() -> None:
+    global _data_quality_at, _data_quality_cache_key, _data_quality_payload
+    with _data_quality_lock:
+        _data_quality_at = 0.0
+        _data_quality_cache_key = ""
+        _data_quality_payload = None
 
 
 def _scan_model_files(artifacts_dir: Path) -> list[dict[str, Any]]:
@@ -870,7 +878,11 @@ def create_app() -> Any:
                 if str(j.title or "").startswith(title):
                     if j.pid is None and str(j.status or "") == "queued":
                         started = jm.start_queued_job(j.id) or j
+                        _data_page_cache_clear()
+                        _clear_data_quality_cache()
                         return {"ok": True, "enqueued": [started.id], "count": 1, "deduped": True, "started": bool(started.pid)}
+                    _data_page_cache_clear()
+                    _clear_data_quality_cache()
                     return {"ok": True, "enqueued": [j.id], "count": 1, "deduped": True}
         except Exception:
             pass
@@ -890,6 +902,8 @@ def create_app() -> Any:
                 },
             )
         )
+        _data_page_cache_clear()
+        _clear_data_quality_cache()
         return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
 
     @app.post("/api/data/enqueue-main-l5-validate", response_class=JSONResponse)
@@ -954,6 +968,26 @@ def create_app() -> Any:
             if raw not in (None, ""):
                 argv += [flag, str(raw)]
 
+        policy_preview: dict[str, Any] = {}
+        try:
+            from ghtrader.data.main_l5_validation import resolve_validation_policy_preview
+
+            gp = payload.get("gap_threshold_s")
+            sr = payload.get("strict_ratio")
+            policy_preview = resolve_validation_policy_preview(
+                variety=v,
+                gap_threshold_s=(float(gp) if gp not in (None, "") else None),
+                strict_ratio=(float(sr) if sr not in (None, "") else None),
+            )
+            preview_sources = dict(policy_preview.get("policy_sources") or {})
+            if gp not in (None, ""):
+                preview_sources["gap_threshold_s"] = "ui_payload"
+            if sr not in (None, ""):
+                preview_sources["strict_ratio"] = "ui_payload"
+            policy_preview["policy_sources"] = preview_sources
+        except Exception:
+            policy_preview = {}
+
         title = f"main-l5-validate {ex}.{v} {derived_symbol}"
         store = request.app.state.job_store
         jm = request.app.state.job_manager
@@ -964,7 +998,17 @@ def create_app() -> Any:
                 if str(j.title or "").startswith(title):
                     if j.pid is None and str(j.status or "") == "queued":
                         started = jm.start_queued_job(j.id) or j
-                        return {"ok": True, "enqueued": [started.id], "count": 1, "deduped": True, "started": bool(started.pid)}
+                        _data_page_cache_clear()
+                        _clear_data_quality_cache()
+                        return {
+                            "ok": True,
+                            "enqueued": [started.id],
+                            "count": 1,
+                            "deduped": True,
+                            "started": bool(started.pid),
+                        }
+                    _data_page_cache_clear()
+                    _clear_data_quality_cache()
                     return {"ok": True, "enqueued": [j.id], "count": 1, "deduped": True}
         except Exception:
             pass
@@ -980,10 +1024,19 @@ def create_app() -> Any:
                     "variety": v,
                     "symbol": derived_symbol,
                     "incremental": bool(incremental),
+                    "policy_preview": policy_preview,
                 },
             )
         )
-        return {"ok": True, "enqueued": [rec.id], "count": 1, "deduped": False}
+        _data_page_cache_clear()
+        _clear_data_quality_cache()
+        return {
+            "ok": True,
+            "enqueued": [rec.id],
+            "count": 1,
+            "deduped": False,
+            "policy_preview": policy_preview,
+        }
 
     @app.get("/api/data/reports", response_class=JSONResponse)
     def api_data_reports(
@@ -1246,6 +1299,150 @@ def create_app() -> Any:
                 "gaps": [],
             }
 
+    @app.get("/api/data/quality/readiness", response_class=JSONResponse)
+    def api_data_quality_readiness(
+        request: Request,
+        exchange: str = "SHFE",
+        var: str = "",
+        symbol: str = "",
+    ) -> dict[str, Any]:
+        """Return layered readiness summary for one variety/symbol."""
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        ex = str(exchange).upper().strip() or "SHFE"
+        v = _normalize_variety_for_api(var)
+        derived_symbol = str(symbol or _derived_symbol_for_variety(v, exchange=ex)).strip()
+        report = None
+        report_error = ""
+        overview: dict[str, Any] = {}
+        try:
+            from ghtrader.data.main_l5_validation import read_latest_validation_report
+            from ghtrader.questdb.client import make_questdb_query_config_from_env
+            from ghtrader.questdb.main_l5_validate import fetch_main_l5_validate_overview
+
+            report = read_latest_validation_report(
+                runs_dir=get_runs_dir(),
+                exchange=ex,
+                variety=v,
+                derived_symbol=derived_symbol,
+            )
+            schedule_hash_filter = str((report or {}).get("schedule_hash") or "").strip() or None
+            cfg = make_questdb_query_config_from_env()
+            overview = fetch_main_l5_validate_overview(
+                cfg=cfg,
+                symbol=derived_symbol,
+                schedule_hash=schedule_hash_filter,
+            )
+        except Exception as e:
+            report_error = str(e)
+
+        rep = dict(report or {})
+        engineering_state = str(rep.get("engineering_state") or "warn")
+        source_state = str(rep.get("source_state") or "warn")
+        policy_state = str(rep.get("policy_state") or "warn")
+        overall_state = str(rep.get("overall_state") or rep.get("state") or "warn")
+        checked_days = int(rep.get("checked_days") or 0)
+        source_missing_days_count = int(rep.get("source_missing_days_count") or rep.get("missing_days") or 0)
+        provider_missing_day_rate = (
+            float(source_missing_days_count) / float(checked_days) if checked_days > 0 else 0.0
+        )
+
+        # SLO-style metrics for operations dashboarding.
+        store = request.app.state.job_store
+        main_l5_jobs = [j for j in store.list_jobs(limit=400) if str((j.metadata or {}).get("kind") or "") == "main_l5"]
+        succ = len([j for j in main_l5_jobs if str(j.status or "") == "succeeded"])
+        total = len(main_l5_jobs)
+        main_l5_build_success_rate = (float(succ) / float(total) if total > 0 else None)
+
+        return {
+            "ok": bool(not report_error),
+            "exchange": ex,
+            "var": v,
+            "symbol": derived_symbol,
+            "overall_state": overall_state,
+            "engineering_state": engineering_state,
+            "source_state": source_state,
+            "policy_state": policy_state,
+            "reason_code": str(rep.get("reason_code") or ""),
+            "action_hint": str(rep.get("action_hint") or ""),
+            "updated_at": str(rep.get("created_at") or ""),
+            "stale": False,
+            "slo_metrics": {
+                "provider_missing_day_rate": provider_missing_day_rate,
+                "outside_session_seconds": int(rep.get("ticks_outside_sessions_seconds_total") or 0),
+                "gap_count_gt_30": int(rep.get("gap_count_gt_30s") or 0),
+                "validation_runtime_p95": None,
+                "main_l5_build_success_rate": main_l5_build_success_rate,
+            },
+            "overview": overview,
+            "report_error": report_error or None,
+        }
+
+    @app.get("/api/data/quality/anomalies", response_class=JSONResponse)
+    def api_data_quality_anomalies(
+        request: Request,
+        exchange: str = "SHFE",
+        var: str = "",
+        symbol: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Return compact anomaly list from latest validation report."""
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        ex = str(exchange).upper().strip() or "SHFE"
+        v = _normalize_variety_for_api(var)
+        derived_symbol = str(symbol or _derived_symbol_for_variety(v, exchange=ex)).strip()
+        lim = max(1, min(int(limit or 50), 200))
+        try:
+            from ghtrader.data.main_l5_validation import read_latest_validation_report
+
+            rep = read_latest_validation_report(
+                runs_dir=get_runs_dir(),
+                exchange=ex,
+                variety=v,
+                derived_symbol=derived_symbol,
+            ) or {}
+            issues = list(rep.get("issues") or [])[:lim]
+            rows: list[dict[str, Any]] = []
+            for it in issues:
+                if not isinstance(it, dict):
+                    continue
+                rows.append(
+                    {
+                        "trading_day": it.get("trading_day"),
+                        "missing_segments_total": int(it.get("missing_segments_total") or 0),
+                        "missing_half_seconds": int(it.get("missing_half_seconds") or 0),
+                        "ticks_outside_sessions_seconds": int(it.get("ticks_outside_sessions_seconds") or 0),
+                        "max_gap_s": int(it.get("max_gap_s") or 0),
+                    }
+                )
+            return {
+                "ok": True,
+                "exchange": ex,
+                "var": v,
+                "symbol": derived_symbol,
+                "count": int(len(rows)),
+                "rows": rows,
+                "missing_days_sample": list(rep.get("missing_days_sample") or [])[:20],
+                "source_missing_days_count": int(rep.get("source_missing_days_count") or rep.get("missing_days") or 0),
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e), "exchange": ex, "var": v, "symbol": derived_symbol, "rows": []}
+
+    @app.get("/api/data/quality/profiles", response_class=JSONResponse)
+    def api_data_quality_profiles(request: Request, var: str = "") -> dict[str, Any]:
+        """Return effective validation profile values and source mapping."""
+        if not auth.is_authorized(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        v = _normalize_variety_for_api(var)
+        try:
+            from ghtrader.data.main_l5_validation import resolve_validation_policy_preview
+
+            profile = resolve_validation_policy_preview(variety=v)
+            return {"ok": True, "var": v, "profile": profile}
+        except Exception as e:
+            return {"ok": False, "var": v, "error": str(e), "profile": {}}
+
     @app.post("/api/questdb/query", response_class=JSONResponse)
     async def api_questdb_query(request: Request) -> dict[str, Any]:
         """
@@ -1433,12 +1630,38 @@ def create_app() -> Any:
                     pipeline["ingest"] = _ui_state_payload(state="warn", text="0 symbols", updated_at=summary_updated_at)
                     pipeline["main_l5"] = _ui_state_payload(state="warn", text="empty", updated_at=summary_updated_at)
                     data_status = "empty"
-                if validation_rows > 0:
-                    pipeline["validation"] = _ui_state_payload(
-                        state="ok",
-                        text=f"{validation_rows} rows",
-                        updated_at=summary_updated_at,
+                validation_state = ("ok" if validation_rows > 0 else "warn")
+                validation_text = (f"{validation_rows} rows" if validation_rows > 0 else "not run")
+                try:
+                    from ghtrader.data.main_l5_validation import read_latest_validation_report
+
+                    rep = read_latest_validation_report(
+                        runs_dir=runs_dir,
+                        exchange="SHFE",
+                        variety=v,
+                        derived_symbol=_derived_symbol_for_variety(v, exchange="SHFE"),
                     )
+                    if isinstance(rep, dict):
+                        rep_state = str(rep.get("state") or "").strip().lower()
+                        if rep_state == "error":
+                            validation_state = "error"
+                            validation_text = "error"
+                        elif rep_state == "warn":
+                            validation_state = "warn"
+                            validation_text = "warn"
+                        elif rep_state == "noop":
+                            validation_state = "ok"
+                            validation_text = "up-to-date"
+                        elif rep_state == "ok":
+                            validation_state = "ok"
+                            validation_text = "ok"
+                except Exception:
+                    pass
+                pipeline["validation"] = _ui_state_payload(
+                    state=validation_state,
+                    text=validation_text,
+                    updated_at=summary_updated_at,
+                )
         except Exception:
             if questdb_ok:
                 pipeline["main_l5"] = _ui_state_payload(

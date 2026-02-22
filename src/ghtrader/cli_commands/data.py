@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 import os
 from pathlib import Path
+from typing import Any
 
 import click
 import structlog
@@ -19,6 +20,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return bool(default)
 
 
+def _env_float(name: str, default: float, *, min_value: float | None = None) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)) or str(default))
+    except Exception:
+        value = float(default)
+    if min_value is not None:
+        value = max(float(min_value), float(value))
+    return float(value)
+
+
 def _set_current_job_progress_error(error: str) -> None:
     job_id = str(os.environ.get("GHTRADER_JOB_ID", "") or "").strip()
     if not job_id:
@@ -30,6 +41,75 @@ def _set_current_job_progress_error(error: str) -> None:
         JobProgress(job_id=job_id, runs_dir=get_runs_dir()).set_error(str(error))
     except Exception:
         pass
+
+
+def _is_running_main_l5_job(job: Any) -> bool:
+    if job is None:
+        return False
+    if str(getattr(job, "status", "") or "").strip().lower() != "running":
+        return False
+    meta = getattr(job, "metadata", None)
+    if isinstance(meta, dict):
+        sub1 = str(meta.get("subcommand") or "").strip().lower()
+        sub2 = str(meta.get("subcommand2") or "").strip().lower()
+        kind = str(meta.get("kind") or "").strip().lower()
+        if (sub1 == "data" and sub2 == "main-l5") or kind == "main_l5":
+            return True
+    parts = [str(x).strip().lower() for x in (getattr(job, "command", []) or [])]
+    if "main-l5" in parts:
+        return True
+    title = str(getattr(job, "title", "") or "").strip().lower()
+    return title.startswith("main-l5 ")
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def _find_running_main_l5_owner_for_symbol(symbol: str) -> dict[str, str] | None:
+    from ghtrader.config import get_runs_dir
+    from ghtrader.control.db import JobStore
+    from ghtrader.control.locks import LockStore
+
+    ds = str(symbol or "").strip()
+    if not ds:
+        return None
+    lock_key = f"main_l5:symbol={ds}"
+    db_path = Path(get_runs_dir()) / "control" / "jobs.db"
+    store = JobStore(db_path)
+    locks = LockStore(db_path)
+    current_job_id = str(os.environ.get("GHTRADER_JOB_ID", "") or "").strip()
+    for lock in locks.list_locks():
+        if str(lock.key) != lock_key:
+            continue
+        owner_job_id = str(lock.job_id or "").strip()
+        if not owner_job_id or owner_job_id == current_job_id:
+            continue
+        owner = store.get_job(owner_job_id)
+        if not _is_running_main_l5_job(owner):
+            continue
+        if not _pid_alive(getattr(owner, "pid", None)):
+            continue
+        return {
+            "job_id": owner_job_id,
+            "title": str(getattr(owner, "title", "") or "").strip(),
+        }
+    return None
+
+
+def _main_l5_validate_lock_conflict_message(*, symbol: str, owner_job_id: str) -> str:
+    ds = str(symbol or "").strip()
+    jid = str(owner_job_id or "").strip()
+    return (
+        f"main-l5 build in progress for {ds} (job_id={jid}). "
+        "Please retry main-l5-validate after the build completes."
+    )
 
 
 def register(main: click.Group) -> None:
@@ -145,7 +225,26 @@ def register(main: click.Group) -> None:
         ds = str(derived_symbol or "").strip() or f"KQ.m@{ex}.{v}"
         start_day = start.date() if start else None
         end_day = end.date() if end else None
-        _acquire_locks([f"main_l5:symbol={ds}"])
+        conflict = _find_running_main_l5_owner_for_symbol(ds)
+        if conflict is not None:
+            msg = _main_l5_validate_lock_conflict_message(symbol=ds, owner_job_id=str(conflict.get("job_id") or ""))
+            _set_current_job_progress_error(msg)
+            raise RuntimeError(msg)
+        validate_lock_wait_timeout_s = _env_float("GHTRADER_MAIN_L5_VALIDATE_LOCK_WAIT_TIMEOUT_S", 3.0, min_value=0.1)
+        try:
+            _acquire_locks(
+                [f"main_l5:symbol={ds}"],
+                wait_timeout_s=float(validate_lock_wait_timeout_s),
+                preempt_on_timeout=False,
+            )
+        except Exception as e:
+            conflict = _find_running_main_l5_owner_for_symbol(ds)
+            if conflict is not None:
+                msg = _main_l5_validate_lock_conflict_message(symbol=ds, owner_job_id=str(conflict.get("job_id") or ""))
+                _set_current_job_progress_error(msg)
+                raise RuntimeError(msg) from e
+            _set_current_job_progress_error(str(e))
+            raise
         try:
             report, out_path = validate_main_l5(
                 exchange=ex,

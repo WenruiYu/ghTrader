@@ -323,7 +323,12 @@ def _preempt_lock_conflicts(*, conflicts: list[dict[str, Any]], store: Any, lock
     return out
 
 
-def _acquire_locks(lock_keys: list[str]) -> None:
+def _acquire_locks(
+    lock_keys: list[str],
+    *,
+    wait_timeout_s: float | None = None,
+    preempt_on_timeout: bool | None = None,
+) -> None:
     """Acquire strict cross-session locks for the current CLI run."""
     job_id = _current_job_id()
     if not job_id:
@@ -342,12 +347,15 @@ def _acquire_locks(lock_keys: list[str]) -> None:
     except Exception:
         poll_interval_s = 1.0
     poll_interval_s = max(0.1, float(poll_interval_s))
-    try:
-        wait_timeout_s = float(os.environ.get("GHTRADER_LOCK_WAIT_TIMEOUT_S", "120") or "120")
-    except Exception:
-        wait_timeout_s = 120.0
+    if wait_timeout_s is None:
+        try:
+            wait_timeout_s = float(os.environ.get("GHTRADER_LOCK_WAIT_TIMEOUT_S", "120") or "120")
+        except Exception:
+            wait_timeout_s = 120.0
     wait_timeout_s = float(wait_timeout_s)
-    preempt_on_timeout = _env_bool("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", True)
+    if preempt_on_timeout is None:
+        preempt_on_timeout = _env_bool("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", True)
+    preempt_on_timeout = bool(preempt_on_timeout)
     try:
         preempt_grace_s = float(os.environ.get("GHTRADER_LOCK_PREEMPT_GRACE_S", "8") or "8")
     except Exception:

@@ -27,9 +27,6 @@ class DayGapComputation:
     session_end_sec: int | None
     last_tick_sec: int | None
     session_end_lag_s: int | None
-    gap_bucket_totals_delta: dict[str, int]
-    gap_bucket_totals_by_session_delta: dict[str, dict[str, int]]
-    gap_count_gt_30_total_delta: int
 
 
 def compute_day_gap_stats(
@@ -112,10 +109,6 @@ def compute_day_gap_stats(
     day_gap_buckets_by_session: dict[str, dict[str, int]] = {}
     day_gap_count_gt_30 = 0
 
-    gap_bucket_totals_delta: dict[str, int] = {label: 0 for label, _, _ in gap_bucket_defs}
-    gap_bucket_totals_by_session_delta: dict[str, dict[str, int]] = {}
-    gap_count_gt_30_total_delta = 0
-
     by_session_threshold: dict[str, float] = {}
     if isinstance(gap_threshold_s_by_session, dict):
         for k, v in gap_threshold_s_by_session.items():
@@ -133,7 +126,7 @@ def compute_day_gap_stats(
         return float(by_session_threshold.get(key, default_gap_threshold))
 
     def record_gap(*, sess: str, gap_start: int, gap_end: int) -> None:
-        nonlocal day_segments_total, max_gap_day, day_gap_count_gt_30, gap_count_gt_30_total_delta
+        nonlocal day_segments_total, max_gap_day, day_gap_count_gt_30
         if gap_end < gap_start:
             return
         duration = int(gap_end - gap_start + 1)
@@ -147,18 +140,13 @@ def compute_day_gap_stats(
                     break
             if bucket_label:
                 day_gap_buckets[bucket_label] = int(day_gap_buckets.get(bucket_label, 0)) + 1
-                gap_bucket_totals_delta[bucket_label] = int(gap_bucket_totals_delta.get(bucket_label, 0)) + 1
                 if sess:
                     sess_key = str(sess)
                     if sess_key not in day_gap_buckets_by_session:
                         day_gap_buckets_by_session[sess_key] = {label: 0 for label, _, _ in gap_bucket_defs}
-                    if sess_key not in gap_bucket_totals_by_session_delta:
-                        gap_bucket_totals_by_session_delta[sess_key] = {label: 0 for label, _, _ in gap_bucket_defs}
                     day_gap_buckets_by_session[sess_key][bucket_label] += 1
-                    gap_bucket_totals_by_session_delta[sess_key][bucket_label] += 1
             if duration > 30:
                 day_gap_count_gt_30 += 1
-                gap_count_gt_30_total_delta += 1
             if len(day_missing_segments) < max_segments_per_day:
                 day_missing_segments.append(
                     {
@@ -228,9 +216,6 @@ def compute_day_gap_stats(
         session_end_sec=(int(session_end_sec) if session_end_sec is not None else None),
         last_tick_sec=(int(last_tick_sec) if last_tick_sec is not None else None),
         session_end_lag_s=(int(session_end_lag_s) if session_end_lag_s is not None else None),
-        gap_bucket_totals_delta=gap_bucket_totals_delta,
-        gap_bucket_totals_by_session_delta=gap_bucket_totals_by_session_delta,
-        gap_count_gt_30_total_delta=int(gap_count_gt_30_total_delta),
     )
 
 

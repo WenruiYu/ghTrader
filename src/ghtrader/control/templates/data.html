@@ -247,14 +247,109 @@
           <div class="hint">Uses last validated day for current schedule hash; no-op if up-to-date.</div>
         </div>
       </div>
+      <details>
+        <summary>Advanced options (optional)</summary>
+        <div class="grid3">
+          <div><label>Gap threshold s</label><input name="gap_threshold_s" placeholder="e.g. 5"/></div>
+          <div><label>Strict ratio</label><input name="strict_ratio" placeholder="e.g. 0.8"/></div>
+          <div><label>Max segments/day</label><input name="max_segments_per_day" placeholder="e.g. 200"/></div>
+        </div>
+        <div class="grid3">
+          <div><label>TqSdk check max days</label><input name="tqsdk_check_max_days" placeholder="e.g. 2"/></div>
+          <div><label>TqSdk check max segments</label><input name="tqsdk_check_max_segments" placeholder="e.g. 8"/></div>
+          <div class="hint">Per-session and half-second dual-threshold policies use runtime env config.</div>
+        </div>
+      </details>
       <button type="submit">Validate main_l5</button>
     </form>
+    {% if validation_profile_suggestion %}
+      <div class="hint mt-2">
+        <span class="mono">{{ validation_profile_suggestion.label }}</span> ·
+        {{ validation_profile_suggestion.note }}
+        <button
+          type="button"
+          class="btn btn-secondary btn-sm"
+          id="applyValidationProfileBtn"
+          data-gap-threshold-s="{{ validation_profile_suggestion.gap_threshold_s }}"
+          data-strict-ratio="{{ validation_profile_suggestion.strict_ratio }}"
+          data-max-segments-per-day="{{ validation_profile_suggestion.max_segments_per_day }}"
+        >
+          Apply suggested params
+        </button>
+      </div>
+    {% endif %}
+    {% set validation_status = (main_l5_validation.get("status") or "warn") %}
+    {% if validation_status == "error" %}
+      <div class="alert-banner alert-error">
+        <div class="alert-banner-content">
+          <div class="alert-banner-title">Validation is blocking</div>
+          <div>Latest run is in <span class="mono">error</span> state. Check gaps and report before using the dataset.</div>
+        </div>
+      </div>
+    {% elif validation_status == "warn" %}
+      <div class="alert-banner alert-warn">
+        <div class="alert-banner-content">
+          <div class="alert-banner-title">Validation needs attention</div>
+          <div>Latest run is in <span class="mono">warn</span> state. Review half-second and gap thresholds before training.</div>
+        </div>
+      </div>
+    {% endif %}
+    <div class="card-title card-title-spaced">
+      <span>Data readiness</span>
+      <small>Engineering · Source · Policy</small>
+    </div>
+    {% set eng_state = main_l5_validation.get("engineering_state") or "warn" %}
+    {% set src_state = main_l5_validation.get("source_state") or "warn" %}
+    {% set pol_state = main_l5_validation.get("policy_state") or "warn" %}
+    {% set ov_state = main_l5_validation.get("overall_state") or main_l5_validation.get("state") or "warn" %}
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpiLabel">Overall</div>
+        <div class="kpiValue">{{ ov_state }}</div>
+        <div class="kpiSubtext">reason {{ main_l5_validation.get("reason_code") or "--" }}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpiLabel">Engineering</div>
+        <div class="kpiValue">{{ eng_state }}</div>
+        <div class="kpiSubtext">write/lock/session integrity</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpiLabel">Source</div>
+        <div class="kpiValue">{{ src_state }}</div>
+        <div class="kpiSubtext">provider availability</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpiLabel">Policy</div>
+        <div class="kpiValue">{{ pol_state }}</div>
+        <div class="kpiSubtext">threshold risk profile</div>
+      </div>
+    </div>
+    {% if main_l5_validation.get("action_hint") %}
+      <div class="hint mt-2">Next action: {{ main_l5_validation.get("action_hint") }}</div>
+    {% endif %}
+    {% if (main_l5_validation.get("source_missing_days_count") or 0) > 0 %}
+      <div class="hint mt-2">
+        Source-missing days: {{ main_l5_validation.get("source_missing_days_count") }} ·
+        tolerance {{ main_l5_validation.get("source_missing_days_tolerance") or 0 }} ·
+        sample {{ (main_l5_validation.get("missing_days_sample") or [])[:5] | join(", ") }}
+      </div>
+    {% endif %}
     <div class="card-title card-title-spaced">
       <span>Validation summary</span>
       <small>Latest report</small>
     </div>
     <div class="kv-list">
-      <div class="kv-k">Status</div><div class="kv-v">{{ main_l5_validation.status or "--" }}</div>
+      <div class="kv-k">Status</div>
+      <div class="kv-v">
+        {% set vs = main_l5_validation.get("status") or "warn" %}
+        <span class="status-indicator {% if vs == 'ok' %}status-indicator-ok{% elif vs == 'error' %}status-indicator-error{% else %}status-indicator-warn{% endif %}">
+          <span class="status-dot {% if vs == 'ok' %}status-dot-ok{% elif vs == 'error' %}status-dot-error{% else %}status-dot-warn{% endif %}"></span>
+          {{ (main_l5_validation.get("status_label") or vs) }}
+        </span>
+      </div>
+      <div class="kv-k">Run state</div><div class="kv-v">{{ main_l5_validation.get("state") or "--" }}</div>
+      <div class="kv-k">Reason code</div><div class="kv-v">{{ main_l5_validation.get("reason_code") or "--" }}</div>
+      <div class="kv-k">Action hint</div><div class="kv-v">{{ main_l5_validation.get("action_hint") or "--" }}</div>
       <div class="kv-k">Last validate</div><div class="kv-v">{{ main_l5_validation.last_run or "--" }}</div>
       <div class="kv-k">Last day</div><div class="kv-v">{{ main_l5_validation.last_day or "--" }}</div>
       <div class="kv-k">Checked days</div><div class="kv-v">{{ main_l5_validation.checked_days or "--" }}</div>
@@ -284,18 +379,35 @@
           --
         {% endif %}
       </div>
-      {% if main_l5_validation.get("cadence_mode") == "event" %}
-        <div class="kv-k">Seconds with 1 tick</div><div class="kv-v">{{ main_l5_validation.seconds_with_one_tick_total or "--" }}</div>
-      {% else %}
-        <div class="kv-k">Missing half-seconds</div>
-        <div class="kv-v">
-          {% if main_l5_validation.expected_seconds_strict_total %}
-            {{ main_l5_validation.missing_half_seconds_total or 0 }} / {{ main_l5_validation.expected_seconds_strict_total }}
-          {% else %}
-            {{ main_l5_validation.missing_half_seconds_total or "--" }}
-          {% endif %}
-        </div>
-      {% endif %}
+      <div class="kv-k">Seconds with 1 tick</div><div class="kv-v">{{ main_l5_validation.seconds_with_one_tick_total or "--" }}</div>
+      <div class="kv-k">Outside-session secs</div><div class="kv-v">{{ main_l5_validation.ticks_outside_sessions_seconds_total or "--" }}</div>
+      <div class="kv-k">Missing half-seconds</div>
+      <div class="kv-v">
+        {% if main_l5_validation.expected_seconds_strict_fixed_total %}
+          {{ main_l5_validation.missing_half_seconds_total or 0 }} / {{ main_l5_validation.expected_seconds_strict_fixed_total }}
+        {% elif main_l5_validation.expected_seconds_strict_total %}
+          {{ main_l5_validation.missing_half_seconds_total or 0 }} / {{ main_l5_validation.expected_seconds_strict_total }}
+        {% else %}
+          {{ main_l5_validation.missing_half_seconds_total or "--" }}
+        {% endif %}
+      </div>
+      <div class="kv-k">Half-second policy</div>
+      <div class="kv-v">
+        {% set hs = main_l5_validation.get("missing_half_seconds_state") or "ok" %}
+        <span class="status-indicator {% if hs == 'ok' %}status-indicator-ok{% elif hs == 'error' %}status-indicator-error{% else %}status-indicator-warn{% endif %}">
+          <span class="status-dot {% if hs == 'ok' %}status-dot-ok{% elif hs == 'error' %}status-dot-error{% else %}status-dot-warn{% endif %}"></span>
+          {{ hs }}
+        </span>
+        {% if main_l5_validation.get("missing_half_seconds_ratio") is not none %}
+          · ratio {{ "%.4f"|format(main_l5_validation.get("missing_half_seconds_ratio")) }}
+        {% endif %}
+        {% if main_l5_validation.get("missing_half_seconds_info_ratio") is not none %}
+          · info {{ "%.4f"|format(main_l5_validation.get("missing_half_seconds_info_ratio")) }}
+        {% endif %}
+        {% if main_l5_validation.get("missing_half_seconds_block_ratio") is not none %}
+          · block {{ "%.4f"|format(main_l5_validation.get("missing_half_seconds_block_ratio")) }}
+        {% endif %}
+      </div>
       <div class="kv-k">Gap buckets</div>
       <div class="kv-v">
         {% set buckets = main_l5_validation.get("gap_buckets_total") or {} %}
@@ -313,8 +425,41 @@
       <div class="kv-k">Gaps >30s</div><div class="kv-v">{{ main_l5_validation.gap_count_gt_30s or "--" }}</div>
       <div class="kv-k">Max gap (s)</div><div class="kv-v">{{ main_l5_validation.max_gap_s or "--" }}</div>
       <div class="kv-k">Gap threshold (s)</div><div class="kv-v">{{ main_l5_validation.gap_threshold_s or "--" }}</div>
+      <div class="kv-k">Gap threshold by session</div>
+      <div class="kv-v">
+        {% set gbs = main_l5_validation.get("gap_threshold_s_by_session") or {} %}
+        {% if gbs %}
+          {% if gbs.get("day") is not none %}day {{ gbs.get("day") }}{% endif %}
+          {% if gbs.get("night") is not none %}
+            {% if gbs.get("day") is not none %}, {% endif %}night {{ gbs.get("night") }}
+          {% endif %}
+        {% else %}
+          --
+        {% endif %}
+      </div>
       <div class="kv-k">TqSdk missing segs</div>
       <div class="kv-v">{{ (main_l5_validation.get("tqsdk_check") or {}).get("provider_missing_segments") or "--" }}</div>
+      <div class="kv-k">Source missing days</div>
+      <div class="kv-v">
+        {{ main_l5_validation.get("source_missing_days_count") or 0 }}
+        {% if main_l5_validation.get("source_missing_days_tolerance") is not none %}
+          (tol {{ main_l5_validation.get("source_missing_days_tolerance") }})
+        {% endif %}
+      </div>
+    </div>
+    <div class="card-title card-title-spaced">
+      <span>Effective policy</span>
+      <small>Value + source</small>
+    </div>
+    {% set psrc = main_l5_validation.get("policy_sources") or {} %}
+    <div class="kv-list">
+      <div class="kv-k">Gap threshold source</div><div class="kv-v">{{ psrc.get("gap_threshold_s") or "--" }}</div>
+      <div class="kv-k">Strict ratio source</div><div class="kv-v">{{ psrc.get("strict_ratio") or "--" }}</div>
+      <div class="kv-k">Gap block source</div><div class="kv-v">{{ psrc.get("gap_block_gt30") or "--" }}</div>
+      <div class="kv-k">Half info source</div><div class="kv-v">{{ psrc.get("missing_half_info_ratio") or "--" }}</div>
+      <div class="kv-k">Half block source</div><div class="kv-v">{{ psrc.get("missing_half_block_ratio") or "--" }}</div>
+      <div class="kv-k">Source blocking source</div><div class="kv-v">{{ psrc.get("source_blocking") or "--" }}</div>
+      <div class="kv-k">Source tolerance source</div><div class="kv-v">{{ psrc.get("source_missing_days_tolerance") or "--" }}</div>
     </div>
     <div class="card-title card-title-spaced">
       <span>Top gap days</span>
@@ -462,6 +607,21 @@
   (function() {
     const form = document.getElementById("mainL5ValidateForm");
     if (!form) return;
+    const applyBtn = document.getElementById("applyValidationProfileBtn");
+    if (applyBtn) {
+      applyBtn.addEventListener("click", () => {
+        const gap = String(applyBtn.dataset.gapThresholdS || "").trim();
+        const strict = String(applyBtn.dataset.strictRatio || "").trim();
+        const maxSeg = String(applyBtn.dataset.maxSegmentsPerDay || "").trim();
+        const gapInput = form.querySelector('input[name="gap_threshold_s"]');
+        const strictInput = form.querySelector('input[name="strict_ratio"]');
+        const maxSegInput = form.querySelector('input[name="max_segments_per_day"]');
+        if (gapInput && gap) gapInput.value = gap;
+        if (strictInput && strict) strictInput.value = strict;
+        if (maxSegInput && maxSeg) maxSegInput.value = maxSeg;
+        window.ghTrader.toast("Validation profile applied", "success");
+      });
+    }
     form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
       const submitBtn = form.querySelector('button[type="submit"]');
@@ -474,21 +634,31 @@
       const runsDir = String(form.querySelector('input[name="runs_dir"]')?.value || "runs").trim();
       const tqsdkCheck = form.querySelector('input[name="tqsdk_check"]')?.checked || false;
       const incremental = form.querySelector('input[name="incremental"]')?.checked || false;
+      const gapThreshold = String(form.querySelector('input[name="gap_threshold_s"]')?.value || "").trim();
+      const strictRatio = String(form.querySelector('input[name="strict_ratio"]')?.value || "").trim();
+      const maxSegmentsPerDay = String(form.querySelector('input[name="max_segments_per_day"]')?.value || "").trim();
+      const tqsdkCheckMaxDays = String(form.querySelector('input[name="tqsdk_check_max_days"]')?.value || "").trim();
+      const tqsdkCheckMaxSegments = String(form.querySelector('input[name="tqsdk_check_max_segments"]')?.value || "").trim();
+      const payload = {
+        exchange,
+        var: variety,
+        derived_symbol: derivedSymbol,
+        start: start || undefined,
+        end: end || undefined,
+        data_dir: dataDir,
+        runs_dir: runsDir,
+        tqsdk_check: tqsdkCheck,
+        incremental: incremental,
+      };
+      if (gapThreshold) payload.gap_threshold_s = gapThreshold;
+      if (strictRatio) payload.strict_ratio = strictRatio;
+      if (maxSegmentsPerDay) payload.max_segments_per_day = maxSegmentsPerDay;
+      if (tqsdkCheckMaxDays) payload.tqsdk_check_max_days = tqsdkCheckMaxDays;
+      if (tqsdkCheckMaxSegments) payload.tqsdk_check_max_segments = tqsdkCheckMaxSegments;
       try {
         const res = await window.ghTrader.withButtonBusy(
           submitBtn,
-          () =>
-            window.ghTrader.postJson("/api/data/enqueue-main-l5-validate", {
-              exchange,
-              var: variety,
-              derived_symbol: derivedSymbol,
-              start: start || undefined,
-              end: end || undefined,
-              data_dir: dataDir,
-              runs_dir: runsDir,
-              tqsdk_check: tqsdkCheck,
-              incremental: incremental,
-            }),
+          () => window.ghTrader.postJson("/api/data/enqueue-main-l5-validate", payload),
           { loadingText: "Queueing..." }
         );
         const id = (res.enqueued && res.enqueued.length > 0) ? res.enqueued[0] : "";

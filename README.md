@@ -159,6 +159,18 @@ http://127.0.0.1:8000/v/au/data
 - Job metadata: `runs/control/jobs.db`
 - Logs: `runs/control/logs/job-<id>.log`
 - Optional token (defense-in-depth): `ghtrader dashboard --token <TOKEN>` and access with `?token=<TOKEN>`
+- Layered data-quality runbook: `reports/data_quality_operations_manual.md`
+
+### Data quality APIs
+
+The Data Hub exposes layered readiness endpoints for operators and alerts:
+
+- `GET /api/data/quality/readiness`
+- `GET /api/data/quality/anomalies`
+- `GET /api/data/quality/profiles`
+
+These complement `main-l5-validate` reports with machine-readable fields:
+`engineering_state`, `source_state`, `policy_state`, `overall_state`, `reason_code`, `action_hint`.
 
 ---
 

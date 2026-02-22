@@ -334,11 +334,18 @@ Phase-0 focuses on **main_l5 correctness only**:
   - `5.2.2`: day/session coverage + cadence/gap summary (minimal integrity baseline)
   - `5.2.6`: field-level null/anomaly checks
   - `5.2.7`: intra-day gap ledger/statistics
+- **Layered quality contract (required)**:
+  - `Layer A: engineering_state` (**hard-blocking**): lock/preemption correctness, persistence failures, mixed `schedule_hash`, outside-session write threshold breaches, preflight/table-readiness failures.
+  - `Layer B: source_state` (**warn by default; optionally blocking**): provider missing segments/days, source-side sparse windows, exchange suspension/one-off event windows.
+  - `Layer C: policy_state` (**strategy-configurable**): per-variety/per-session thresholds (`gap`, `half-second`, `gt30`), risk appetite, and SLO profile.
+  - Validation outputs must persist all four fields: `engineering_state`, `source_state`, `policy_state`, `overall_state`.
 - **Main_l5 validation (Phase-0)**:
   - Validate coverage against **actual trading sessions** (night sessions + holidays) using cached `trading_time` from TqSdk.
   - Ingest/validate session semantics must be aligned: `main_l5` ingest must trim rows to the target trading day and target session windows before QuestDB write, so validation is not asked to diagnose cross-day spillover artifacts.
+  - **Session-window-first trimming**: When session windows are available, ingest must use session-window filtering as the primary row filter (not the heuristic `trading_day` derivation). Session windows correctly define cross-midnight spans (e.g., Friday 21:00 → Saturday 02:30 for Monday's night session), so they must take precedence. The heuristic `_derive_trading_day_series` (which uses `hour >= 18`) is a fallback for when session windows are unavailable, and must additionally handle early-morning ticks on non-trading days (e.g., Saturday 00:00-02:30) by mapping them to the next trading day via the trading calendar.
   - **Optimization**: Support incremental validation (check only new days) and parallel execution.
   - Validation must hold the same symbol lock namespace as `main_l5` (`main_l5:symbol=...`) to avoid reading rebuild in-flight states.
+  - Validation concurrency policy is strict fail-fast: if the same-symbol `main-l5` build is running, `main-l5-validate` must immediately fail with an explicit "build in progress, retry later" message; it must not preempt the build owner.
   - Incremental mode is a first-class path: when there are no new days for the active `schedule_hash`, command returns success with explicit no-op status (not an exception).
   - Respect **exchange-level session overrides**:
     - Skip night sessions during known suspension windows (e.g., SHFE night trading suspended from 2020-02-03 through 2020-05-06) in addition to holiday-gap skips.
@@ -349,6 +356,7 @@ Phase-0 focuses on **main_l5 correctness only**:
   - **Gap threshold**: gaps shorter than `gap_threshold_s` are ignored to avoid false positives from natural sparsity.
     - Gap threshold supports per-var/per-session overrides (day/night) on top of a global default to reduce false positives from different microstructure regimes.
   - **Detect + report only** (no auto-repair): missing segments (>= threshold), missing half-seconds (strict days), and summary counts.
+  - **Gap severity policy**: validation `ok` gate uses `gap_count_gt_30s` (gaps > 30 seconds) against a configurable block threshold (`GHTRADER_L5_VALIDATE_GAP_BLOCK_GT30`, default 0 = zero-tolerance). Short micro-gaps (2-15s) are tracked in gap buckets for observability but do not block `ok`. When `missing_segments_total > 0` but within tolerance, state is `warn` (not `error`).
   - Missing-half-second policy is two-level:
     - **info-level** threshold for observability/warning only;
     - **blocking-level** threshold for hard failure (`ok=false`).
@@ -383,6 +391,10 @@ Phase-0 focuses on **main_l5 correctness only**:
   - **Health gate** (required): command success must imply dataset health:
     - post-run coverage must include all schedule trading days in the effective schedule window,
     - no mixed `schedule_hash` state for `(symbol, ticks_kind='main_l5', dataset_version='v2')`.
+  - **Provider-anomaly tolerance (required)**:
+    - Health diagnostics must distinguish `provider_missing_days` from `engineering_missing_days`.
+    - `engineering_missing_days` are always blocking.
+    - `provider_missing_days` may be tolerated by a bounded config (default `0`) and must be reported with samples.
   - QuestDB ILP ingest must be **self-healing** for transport faults: if a persistent sender becomes closed/broken, drop and recreate sender, retry bounded times, and treat flush failures as write failures (no silent swallow).
   - If health checks fail, command must return non-zero and include missing-day/hash diagnostics.
 - **Idempotence**:
@@ -391,6 +403,7 @@ Phase-0 focuses on **main_l5 correctness only**:
 - **Stuck/cancelled run recovery**:
   - Lock acquisition must not block forever on orphaned/stuck owners.
   - On lock wait timeout, CLI may preempt conflicting lock owners (SIGTERM → SIGKILL fallback), mark conflicting jobs as cancelled/failed, release locks, and retry acquire.
+  - Exception: `data main-l5-validate` contending with same-symbol `main-l5` must use fail-fast retry guidance and no preemption, to protect active rebuild correctness.
   - This behavior must be env-configurable and auditable in logs.
 
 
@@ -1142,6 +1155,11 @@ Requirements:
       - Step 3: **Build main_l5** into `ghtrader_ticks_main_l5_v2`
     - The UI should expose only these steps in Phase-0.
     - Coverage/validation summaries on this page must query only current variety context.
+    - Validation UI must reflect runtime validation semantics (not only row counts):
+      - show `ok/warn/error/noop` run state,
+      - show half-second policy state (`ok/info/error`) with info/block thresholds,
+      - show global + per-session gap-threshold configuration when available.
+    - Advanced validation enqueue arguments should be available in a collapsible panel to keep the default form compact.
   - **Models** (`/v/{var}/models`):
     - Tab 1: Model inventory (list trained artifacts with search/filter)
     - Tab 2: Training (train form + sweep form + active training jobs)
@@ -1373,6 +1391,10 @@ Layout and interaction hierarchy:
 API payload contract (UI-facing summary/status endpoints):
 - Dashboard/UI status endpoints should converge on common fields where applicable:
   - `state`, `text`, `error`, `updated_at`, `stale` (+ domain-specific fields).
+- Data-quality/status payloads must include machine-readable guidance fields:
+  - `reason_code` (stable enum for root cause category),
+  - `action_hint` (operator next-step text),
+  - optional layered fields `engineering_state`, `source_state`, `policy_state`, `overall_state`.
 - Frontend should not infer critical state solely by string parsing logs/titles when structured fields are available.
 
 #### 5.10.6 Cross-page workflow continuity

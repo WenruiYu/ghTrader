@@ -160,16 +160,27 @@ def _derive_trading_day_series(*, dt_ns: pd.Series, data_dir: Path) -> pd.Series
     base_days = pd.Series(dt_local.dt.date, index=dt_ns.index, dtype="object")
     after18 = pd.Series((dt_local.dt.hour >= 18), index=dt_ns.index).fillna(False).astype(bool)
     trading_days = base_days.copy()
-    if bool(after18.any()):
-        unique_after = sorted({d for d in trading_days.loc[after18].tolist() if isinstance(d, date)})
-        next_map: dict[date, date] = {}
-        try:
-            from ghtrader.data.trading_calendar import get_trading_calendar
 
-            cal = sorted(set(get_trading_calendar(data_dir=Path(data_dir), refresh=False, allow_download=True)))
-        except Exception:
-            cal = []
-        for d in unique_after:
+    try:
+        from ghtrader.data.trading_calendar import get_trading_calendar
+
+        cal = sorted(set(get_trading_calendar(data_dir=Path(data_dir), refresh=False, allow_download=True)))
+    except Exception:
+        cal = []
+    cal_set = set(cal)
+
+    early_morning = pd.Series((dt_local.dt.hour < 6), index=dt_ns.index).fillna(False).astype(bool)
+    early_on_non_trading = pd.Series(False, index=dt_ns.index)
+    if cal_set and bool(early_morning.any()):
+        early_on_non_trading = early_morning & base_days.map(
+            lambda d: isinstance(d, date) and d not in cal_set
+        ).fillna(False).astype(bool)
+
+    needs_shift = after18 | early_on_non_trading
+    if bool(needs_shift.any()):
+        unique_dates = sorted({d for d in trading_days.loc[needs_shift].tolist() if isinstance(d, date)})
+        next_map: dict[date, date] = {}
+        for d in unique_dates:
             nd: date
             if cal:
                 i = bisect_right(cal, d)
@@ -177,9 +188,9 @@ def _derive_trading_day_series(*, dt_ns: pd.Series, data_dir: Path) -> pd.Series
             else:
                 nd = d + timedelta(days=1)
             next_map[d] = nd
-        shifted = trading_days.loc[after18].map(next_map)
-        fallback = trading_days.loc[after18].map(lambda d: (d + timedelta(days=1)) if isinstance(d, date) else d)
-        trading_days.loc[after18] = shifted.where(shifted.notna(), fallback)
+        shifted = trading_days.loc[needs_shift].map(next_map)
+        fallback = trading_days.loc[needs_shift].map(lambda d: (d + timedelta(days=1)) if isinstance(d, date) else d)
+        trading_days.loc[needs_shift] = shifted.where(shifted.notna(), fallback)
     return trading_days
 
 
@@ -242,9 +253,24 @@ def _build_session_windows_by_day(
 
     unique_days = sorted(set(trading_days))
     prev_trading_day: dict[date, date] = {}
-    for idx, d in enumerate(unique_days):
-        if idx > 0:
-            prev_trading_day[d] = unique_days[idx - 1]
+    try:
+        from ghtrader.data.trading_calendar import get_trading_calendar
+
+        full_cal = sorted(set(get_trading_calendar(data_dir=Path(data_dir), refresh=False, allow_download=True)))
+    except Exception:
+        full_cal = []
+    if full_cal:
+        cal_set = set(full_cal)
+        for d in unique_days:
+            i = bisect_right(full_cal, d) - 1
+            if i > 0:
+                prev_trading_day[d] = full_cal[i - 1] if full_cal[i] == d else full_cal[i]
+            elif i == 0 and full_cal[0] == d and len(full_cal) > 1:
+                pass
+    if not prev_trading_day:
+        for idx, d in enumerate(unique_days):
+            if idx > 0:
+                prev_trading_day[d] = unique_days[idx - 1]
 
     holiday_gap_days: set[date] = set()
     try:
@@ -688,28 +714,8 @@ def download_main_l5_for_days(
                     rows_before=int(rows_before),
                 )
 
-            df, dropped_cross_day = _trim_to_target_trading_day(df=df, day=day, data_dir=Path(data_dir))
-            if df.empty:
-                log.info(
-                    "tq_main_l5.download_day_empty_after_day_trim",
-                    symbol=underlying_symbol,
-                    day=day.isoformat(),
-                    day_index=int(idx),
-                    days_total=int(days_total),
-                    dropped_rows=int(rows_before),
-                )
-                return day.isoformat(), 0
-            if dropped_cross_day > 0:
-                log.info(
-                    "tq_main_l5.download_day_trimmed_cross_day_rows",
-                    symbol=underlying_symbol,
-                    day=day.isoformat(),
-                    dropped_rows=int(dropped_cross_day),
-                    kept_rows=int(len(df)),
-                )
-
             if day_session_windows is not None:
-                before_session = int(len(df))
+                before_trim = int(len(df))
                 df, dropped_outside = _trim_to_session_windows(df=df, windows=day_session_windows)
                 if df.empty:
                     log.info(
@@ -718,7 +724,7 @@ def download_main_l5_for_days(
                         day=day.isoformat(),
                         day_index=int(idx),
                         days_total=int(days_total),
-                        dropped_rows=int(before_session),
+                        dropped_rows=int(before_trim),
                     )
                     return day.isoformat(), 0
                 if dropped_outside > 0:
@@ -727,6 +733,26 @@ def download_main_l5_for_days(
                         symbol=underlying_symbol,
                         day=day.isoformat(),
                         dropped_rows=int(dropped_outside),
+                        kept_rows=int(len(df)),
+                    )
+            else:
+                df, dropped_cross_day = _trim_to_target_trading_day(df=df, day=day, data_dir=Path(data_dir))
+                if df.empty:
+                    log.info(
+                        "tq_main_l5.download_day_empty_after_day_trim",
+                        symbol=underlying_symbol,
+                        day=day.isoformat(),
+                        day_index=int(idx),
+                        days_total=int(days_total),
+                        dropped_rows=int(rows_before),
+                    )
+                    return day.isoformat(), 0
+                if dropped_cross_day > 0:
+                    log.info(
+                        "tq_main_l5.download_day_trimmed_cross_day_rows",
+                        symbol=underlying_symbol,
+                        day=day.isoformat(),
+                        dropped_rows=int(dropped_cross_day),
                         kept_rows=int(len(df)),
                     )
 

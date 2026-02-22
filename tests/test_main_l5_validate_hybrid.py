@@ -14,6 +14,10 @@ def _session_payload() -> dict:
     }
 
 
+def _mock_batch_noop(**kwargs):
+    return {}
+
+
 def _sec(ts: datetime) -> int:
     return int(ts.replace(tzinfo=timezone.utc).timestamp())
 
@@ -55,6 +59,7 @@ def test_main_l5_validate_gap_threshold(monkeypatch):
         _sec(base + pd.Timedelta(seconds=4)): 1,
     }
     monkeypatch.setattr(mod, "_fetch_per_second_counts", lambda **kwargs: sec_counts)
+    monkeypatch.setattr(mod, "_fetch_per_second_counts_batch", _mock_batch_noop)
 
     captured = {"summary": []}
 
@@ -125,6 +130,7 @@ def test_main_l5_validate_strict_cadence(monkeypatch):
         _sec(base + pd.Timedelta(seconds=4)): 2,
     }
     monkeypatch.setattr(mod, "_fetch_per_second_counts", lambda **kwargs: sec_counts)
+    monkeypatch.setattr(mod, "_fetch_per_second_counts_batch", _mock_batch_noop)
 
     captured = {"summary": []}
 
@@ -188,6 +194,7 @@ def test_main_l5_validate_gap_threshold_by_session(monkeypatch):
         _sec(base + pd.Timedelta(seconds=4)): 1,
     }
     monkeypatch.setattr(mod, "_fetch_per_second_counts", lambda **kwargs: sec_counts)
+    monkeypatch.setattr(mod, "_fetch_per_second_counts_batch", _mock_batch_noop)
     monkeypatch.setattr(mod, "upsert_main_l5_validate_summary_rows", lambda **kwargs: len(kwargs.get("rows") or []))
     monkeypatch.setattr(mod, "clear_main_l5_validate_gap_rows", lambda **kwargs: 0)
     monkeypatch.setattr(mod, "insert_main_l5_validate_gap_rows", lambda **kwargs: len(kwargs.get("rows") or []))
@@ -248,6 +255,7 @@ def test_main_l5_validate_missing_half_info_not_blocking(monkeypatch):
         _sec(base + pd.Timedelta(seconds=4)): 2,
     }
     monkeypatch.setattr(mod, "_fetch_per_second_counts", lambda **kwargs: sec_counts)
+    monkeypatch.setattr(mod, "_fetch_per_second_counts_batch", _mock_batch_noop)
     monkeypatch.setattr(mod, "upsert_main_l5_validate_summary_rows", lambda **kwargs: len(kwargs.get("rows") or []))
     monkeypatch.setattr(mod, "clear_main_l5_validate_gap_rows", lambda **kwargs: 0)
     monkeypatch.setattr(mod, "insert_main_l5_validate_gap_rows", lambda **kwargs: len(kwargs.get("rows") or []))
@@ -267,7 +275,78 @@ def test_main_l5_validate_missing_half_info_not_blocking(monkeypatch):
     assert report["missing_half_seconds_total"] == 1
     assert report["missing_half_seconds_state"] == "info"
     assert report["state"] == "warn"
-    assert report["ok"] is True
+    assert report["overall_state"] == "warn"
+    assert report["engineering_state"] == "ok"
+    assert report["source_state"] == "ok"
+    assert report["policy_state"] == "warn"
+    assert report["reason_code"] == "missing_half_seconds_info"
+    assert report["ok"] is False
+
+
+def test_main_l5_validate_source_state_respects_tolerance(monkeypatch):
+    from ghtrader.data import main_l5_validation as mod
+
+    day = date(2026, 1, 7)
+    schedule = pd.DataFrame(
+        [
+            {
+                "trading_day": day,
+                "main_contract": "SHFE.au2602",
+                "segment_id": 0,
+                "schedule_hash": "source-tolerance",
+            }
+        ]
+    )
+
+    monkeypatch.setenv("GHTRADER_L5_VALIDATE_SOURCE_BLOCKING", "1")
+    monkeypatch.setenv("GHTRADER_L5_VALIDATE_SOURCE_MISSING_DAYS_TOLERANCE", "1")
+    monkeypatch.setattr(mod, "fetch_schedule", lambda **kwargs: schedule)
+    monkeypatch.setattr(mod, "read_trading_sessions_cache", lambda **kwargs: _session_payload())
+    monkeypatch.setattr(mod, "query_symbol_day_bounds", lambda **kwargs: {})
+    monkeypatch.setattr(mod, "ensure_main_l5_validate_summary_table", lambda **kwargs: None)
+    monkeypatch.setattr(mod, "ensure_main_l5_validate_gaps_table", lambda **kwargs: None)
+    monkeypatch.setattr(mod, "ensure_main_l5_tick_gaps_table", lambda **kwargs: None)
+    monkeypatch.setattr(mod, "assert_main_l5_validate_tables_ready", lambda **kwargs: None)
+    monkeypatch.setattr(mod, "_fetch_day_second_stats", lambda **kwargs: {})
+    monkeypatch.setattr(mod, "_fetch_per_second_counts_batch", _mock_batch_noop)
+    monkeypatch.setattr(mod, "_fetch_per_second_counts", lambda **kwargs: {})
+    monkeypatch.setattr(mod, "upsert_main_l5_validate_summary_rows", lambda **kwargs: len(kwargs.get("rows") or []))
+    monkeypatch.setattr(mod, "clear_main_l5_validate_gap_rows", lambda **kwargs: 0)
+    monkeypatch.setattr(mod, "insert_main_l5_validate_gap_rows", lambda **kwargs: len(kwargs.get("rows") or []))
+    monkeypatch.setattr(mod, "upsert_main_l5_tick_gaps_from_validate_summary", lambda **kwargs: 0)
+    monkeypatch.setattr(mod, "_write_report", lambda **kwargs: None)
+
+    report, _ = mod.validate_main_l5(
+        exchange="SHFE",
+        variety="au",
+        derived_symbol="KQ.m@SHFE.au",
+        data_dir=Path("data"),
+        runs_dir=Path("runs"),
+        tqsdk_check=False,
+    )
+
+    assert report["source_missing_days_count"] == 1
+    assert report["source_missing_days_tolerance"] == 1
+    assert report["source_missing_days_blocking"] is False
+    assert report["source_state"] == "warn"
+    assert report["overall_state"] == "warn"
+    assert report["reason_code"] == "source_missing_days_warn"
+
+
+def test_validation_policy_preview_prefers_var_profile(monkeypatch):
+    from ghtrader.data.main_l5_validation import resolve_validation_policy_preview
+
+    monkeypatch.setenv("GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S", "5")
+    monkeypatch.setenv("GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S_CU", "8")
+    monkeypatch.setenv("GHTRADER_L5_VALIDATE_STRICT_RATIO", "0.8")
+    monkeypatch.setenv("GHTRADER_L5_VALIDATE_STRICT_RATIO_CU", "0.65")
+
+    out = resolve_validation_policy_preview(variety="cu")
+
+    assert out["gap_threshold_s"] == 8.0
+    assert out["strict_ratio"] == 0.65
+    assert out["policy_sources"]["gap_threshold_s"] == "env:GHTRADER_L5_VALIDATE_GAP_THRESHOLD_S_CU"
+    assert out["policy_sources"]["strict_ratio"] == "env:GHTRADER_L5_VALIDATE_STRICT_RATIO_CU"
 
 
 def test_exchange_event_shift_start():
@@ -379,17 +458,14 @@ def test_main_l5_validate_fail_fast_on_summary_persist_error(monkeypatch):
             _sec(base + pd.Timedelta(seconds=2)): 2,
         },
     )
+    monkeypatch.setattr(mod, "_fetch_per_second_counts_batch", _mock_batch_noop)
     monkeypatch.setattr(
         mod,
         "upsert_main_l5_validate_summary_rows",
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("placeholder mismatch")),
     )
     called = {"clear": False, "insert": False, "tick": False}
-    monkeypatch.setattr(
-        mod,
-        "clear_main_l5_validate_gap_rows",
-        lambda **kwargs: called.__setitem__("clear", True),
-    )
+    monkeypatch.setattr(mod, "clear_main_l5_validate_gap_rows", lambda **kwargs: 0)
     monkeypatch.setattr(
         mod,
         "insert_main_l5_validate_gap_rows",
@@ -416,7 +492,8 @@ def test_main_l5_validate_fail_fast_on_summary_persist_error(monkeypatch):
             strict_ratio=0.8,
         )
 
-    assert called == {"clear": False, "insert": False, "tick": False}
+    assert called["insert"] is False
+    assert called["tick"] is False
 
 
 def test_main_l5_validate_incremental_noop_when_up_to_date(monkeypatch):

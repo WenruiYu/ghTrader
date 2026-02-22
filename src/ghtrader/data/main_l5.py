@@ -5,6 +5,7 @@ Schedule-driven main_l5 builder (QuestDB-only, no raw ticks).
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -66,6 +67,44 @@ def _schedule_hash_from_rows(schedule: pd.DataFrame) -> str:
         return ""
 
 
+def _resolve_missing_days_tolerance(*, variety: str) -> tuple[int, str]:
+    var_key = re.sub(r"[^A-Za-z0-9]+", "", str(variety or "").strip()).upper()
+    keys = []
+    if var_key:
+        keys.append(f"GHTRADER_MAIN_L5_MISSING_DAYS_TOLERANCE_{var_key}")
+    keys.append("GHTRADER_MAIN_L5_MISSING_DAYS_TOLERANCE")
+    for key in keys:
+        raw = str(os.environ.get(key, "") or "").strip()
+        if not raw:
+            continue
+        try:
+            return max(0, int(raw)), f"env:{key}"
+        except Exception:
+            continue
+    return 0, "default"
+
+
+def _classify_missing_days(
+    *,
+    missing_days: list[date],
+    row_counts: dict[str, int] | None,
+) -> tuple[list[date], list[date]]:
+    rc = row_counts or {}
+    provider_missing: list[date] = []
+    engineering_missing: list[date] = []
+    for d in missing_days:
+        key = d.isoformat()
+        if key in rc:
+            try:
+                if int(rc.get(key, 0)) <= 0:
+                    provider_missing.append(d)
+                    continue
+            except Exception:
+                pass
+        engineering_missing.append(d)
+    return provider_missing, engineering_missing
+
+
 def _main_l5_update_report_dir(runs_dir: Path) -> Path:
     return runs_dir / "control" / "reports" / "main_l5_update"
 
@@ -82,12 +121,21 @@ def _write_main_l5_update_report(
     schedule: pd.DataFrame,
     covered_days: set[date],
     coverage_bounds: dict[str, Any] | None,
+    row_counts: dict[str, int] | None = None,
+    missing_days_tolerance: int = 0,
+    missing_days_tolerance_source: str = "default",
 ) -> Path | None:
     try:
         expected_days = sorted({d for d in schedule["trading_day"].tolist() if isinstance(d, date)})
     except Exception:
         expected_days = []
     missing_days = [d for d in expected_days if d not in covered_days]
+    provider_missing_days, engineering_missing_days = _classify_missing_days(
+        missing_days=missing_days,
+        row_counts=row_counts,
+    )
+    tolerated_provider_missing_days = max(0, min(int(missing_days_tolerance), int(len(provider_missing_days))))
+    provider_missing_days_excess = max(0, int(len(provider_missing_days)) - int(tolerated_provider_missing_days))
 
     missing_by_segment: list[dict[str, Any]] = []
     try:
@@ -117,6 +165,14 @@ def _write_main_l5_update_report(
         "expected_days": int(len(expected_days)),
         "covered_days": int(len(covered_days)),
         "missing_days": int(len(missing_days)),
+        "provider_missing_days": int(len(provider_missing_days)),
+        "engineering_missing_days": int(len(engineering_missing_days)),
+        "provider_missing_days_sample": [d.isoformat() for d in provider_missing_days[:8]],
+        "engineering_missing_days_sample": [d.isoformat() for d in engineering_missing_days[:8]],
+        "missing_days_tolerance": int(max(0, int(missing_days_tolerance))),
+        "missing_days_tolerance_source": str(missing_days_tolerance_source or "default"),
+        "tolerated_provider_missing_days": int(tolerated_provider_missing_days),
+        "provider_missing_days_excess": int(provider_missing_days_excess),
         "covered_first_day": bounds.get("first_day"),
         "covered_last_day": bounds.get("last_day"),
         "covered_last_ts": bounds.get("last_ts"),
@@ -729,6 +785,16 @@ def build_main_l5(
         except Exception:
             covered_days = set()
 
+    expected_days = sorted({d for d in schedule["trading_day"].tolist() if isinstance(d, date)})
+    missing_days = sorted([d for d in expected_days if d not in covered_days])
+    missing_days_tolerance, missing_days_tolerance_source = _resolve_missing_days_tolerance(variety=var_l)
+    provider_missing_days, engineering_missing_days = _classify_missing_days(
+        missing_days=missing_days,
+        row_counts=row_counts_agg,
+    )
+    tolerated_provider_missing_days = min(int(missing_days_tolerance), int(len(provider_missing_days)))
+    provider_missing_days_excess = max(0, int(len(provider_missing_days)) - int(tolerated_provider_missing_days))
+
     report_path = _write_main_l5_update_report(
         runs_dir=get_runs_dir(),
         derived_symbol=ds,
@@ -740,6 +806,9 @@ def build_main_l5(
         schedule=schedule,
         covered_days=covered_days,
         coverage_bounds=coverage_bounds,
+        row_counts=row_counts_agg,
+        missing_days_tolerance=int(missing_days_tolerance),
+        missing_days_tolerance_source=str(missing_days_tolerance_source),
     )
     if coverage_bounds:
         log.info(
@@ -751,8 +820,6 @@ def build_main_l5(
             covered_last_ts=coverage_bounds.get("last_ts"),
         )
 
-    expected_days = sorted({d for d in schedule["trading_day"].tolist() if isinstance(d, date)})
-    missing_days = sorted([d for d in expected_days if d not in covered_days])
     hashes_after: set[str] = set()
     health_errors: list[str] = []
     try:
@@ -767,8 +834,24 @@ def build_main_l5(
         )
     except Exception as e:
         health_errors.append(f"failed to query persisted schedule_hashes: {e}")
-    if missing_days:
-        health_errors.append(f"missing_days={len(missing_days)} sample={[d.isoformat() for d in missing_days[:8]]}")
+    if engineering_missing_days:
+        health_errors.append(
+            "engineering_missing_days="
+            + str(len(engineering_missing_days))
+            + " sample="
+            + str([d.isoformat() for d in engineering_missing_days[:8]])
+        )
+    if provider_missing_days_excess > 0:
+        health_errors.append(
+            "provider_missing_days="
+            + str(len(provider_missing_days))
+            + " tolerance="
+            + str(int(missing_days_tolerance))
+            + " excess="
+            + str(int(provider_missing_days_excess))
+            + " sample="
+            + str([d.isoformat() for d in provider_missing_days[:8]])
+        )
     if hashes_after and hashes_after != {str(schedule_hash)}:
         health_errors.append(
             f"persisted_hashes={sorted(hashes_after)} expected={[str(schedule_hash)]}"
@@ -779,6 +862,11 @@ def build_main_l5(
         expected_days=int(len(expected_days)),
         covered_days=int(len(covered_days)),
         missing_days=int(len(missing_days)),
+        provider_missing_days=int(len(provider_missing_days)),
+        engineering_missing_days=int(len(engineering_missing_days)),
+        missing_days_tolerance=int(missing_days_tolerance),
+        missing_days_tolerance_source=str(missing_days_tolerance_source),
+        provider_missing_days_excess=int(provider_missing_days_excess),
         persisted_hashes=sorted(hashes_after),
         ok=bool(len(health_errors) == 0),
     )

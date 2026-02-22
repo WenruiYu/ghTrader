@@ -315,6 +315,97 @@ def test_main_l5_enforce_health_raises_on_missing_coverage(monkeypatch, tmp_path
         )
 
 
+def test_main_l5_enforce_health_tolerates_provider_missing_days(monkeypatch, tmp_path) -> None:
+    from ghtrader.data import main_l5 as ml5
+    import ghtrader.questdb.client as qclient
+    import ghtrader.questdb.main_schedule as qms
+    import ghtrader.questdb.queries as qqueries
+    import ghtrader.tq.ingest as ingest
+    import ghtrader.config as cfg
+
+    monkeypatch.setenv("GHTRADER_MAIN_L5_MISSING_DAYS_TOLERANCE", "1")
+    schedule_hash = "hash-health-provider-tol"
+    schedule = _schedule_df(schedule_hash)
+
+    monkeypatch.setattr(qclient, "make_questdb_query_config_from_env", lambda: object())
+    monkeypatch.setattr(qms, "fetch_schedule", lambda **kwargs: schedule)
+    monkeypatch.setattr(cfg, "get_runs_dir", lambda: tmp_path)
+    monkeypatch.setattr(ml5, "_clear_main_l5_symbol", lambda **kwargs: 0)
+    monkeypatch.setattr(ml5, "_purge_main_l5_l1", lambda **kwargs: 0)
+
+    monkeypatch.setattr(qqueries, "query_symbol_day_bounds", lambda **kwargs: {})
+    monkeypatch.setattr(qqueries, "list_schedule_hashes_for_symbol", lambda **kwargs: {schedule_hash})
+    monkeypatch.setattr(qqueries, "list_trading_days_for_symbol", lambda **kwargs: [date(2025, 1, 2), date(2025, 1, 3)])
+
+    monkeypatch.setattr(
+        ingest,
+        "download_main_l5_for_days",
+        lambda **kwargs: {
+            "rows_total": len(kwargs["trading_days"]) - 1,
+            "row_counts": {
+                date(2025, 1, 2).isoformat(): 10,
+                date(2025, 1, 3).isoformat(): 10,
+                date(2025, 1, 4).isoformat(): 0,  # provider anomaly style missing day
+            },
+        },
+    )
+
+    res = ml5.build_main_l5(
+        var="au",
+        derived_symbol="KQ.m@SHFE.au",
+        exchange="SHFE",
+        data_dir=str(tmp_path),
+        update_mode=False,
+        enforce_health=True,
+    )
+    assert res.days_total == 3
+
+
+def test_main_l5_enforce_health_blocks_engineering_missing_days_even_with_tolerance(monkeypatch, tmp_path) -> None:
+    from ghtrader.data import main_l5 as ml5
+    import ghtrader.questdb.client as qclient
+    import ghtrader.questdb.main_schedule as qms
+    import ghtrader.questdb.queries as qqueries
+    import ghtrader.tq.ingest as ingest
+    import ghtrader.config as cfg
+
+    monkeypatch.setenv("GHTRADER_MAIN_L5_MISSING_DAYS_TOLERANCE", "3")
+    schedule_hash = "hash-health-engineering-missing"
+    schedule = _schedule_df(schedule_hash)
+
+    monkeypatch.setattr(qclient, "make_questdb_query_config_from_env", lambda: object())
+    monkeypatch.setattr(qms, "fetch_schedule", lambda **kwargs: schedule)
+    monkeypatch.setattr(cfg, "get_runs_dir", lambda: tmp_path)
+    monkeypatch.setattr(ml5, "_clear_main_l5_symbol", lambda **kwargs: 0)
+    monkeypatch.setattr(ml5, "_purge_main_l5_l1", lambda **kwargs: 0)
+
+    monkeypatch.setattr(qqueries, "query_symbol_day_bounds", lambda **kwargs: {})
+    monkeypatch.setattr(qqueries, "list_schedule_hashes_for_symbol", lambda **kwargs: {schedule_hash})
+    monkeypatch.setattr(qqueries, "list_trading_days_for_symbol", lambda **kwargs: [date(2025, 1, 2), date(2025, 1, 3)])
+    monkeypatch.setattr(
+        ingest,
+        "download_main_l5_for_days",
+        lambda **kwargs: {
+            "rows_total": len(kwargs["trading_days"]) - 1,
+            "row_counts": {
+                date(2025, 1, 2).isoformat(): 10,
+                date(2025, 1, 3).isoformat(): 10,
+                # 2025-01-04 missing entirely -> engineering missing day
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="main_l5 health check failed"):
+        ml5.build_main_l5(
+            var="au",
+            derived_symbol="KQ.m@SHFE.au",
+            exchange="SHFE",
+            data_dir=str(tmp_path),
+            update_mode=False,
+            enforce_health=True,
+        )
+
+
 def test_main_l5_writes_progress_state(monkeypatch, tmp_path) -> None:
     from ghtrader.data import main_l5 as ml5
     import ghtrader.questdb.client as qclient

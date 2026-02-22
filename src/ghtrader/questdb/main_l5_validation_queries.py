@@ -76,6 +76,48 @@ def fetch_per_second_counts(
     return out
 
 
+def fetch_per_second_counts_batch(
+    *,
+    cfg: Any,
+    symbol: str,
+    trading_days: list[date],
+    l5_only: bool = True,
+) -> dict[date, dict[int, int]]:
+    if not trading_days:
+        return {}
+    l5_cond = l5_sql_condition() if l5_only else ""
+    l5_where = f" AND {l5_cond} " if l5_cond else " "
+    sym = str(symbol).strip()
+    out: dict[date, dict[int, int]] = {}
+    chunk_size = 30
+    for i in range(0, len(trading_days), chunk_size):
+        chunk = trading_days[i : i + chunk_size]
+        placeholders = ",".join(["%s"] * len(chunk))
+        sql = (
+            "SELECT cast(trading_day as string) AS td, "
+            "       cast(datetime_ns/1000000000 as long) AS sec, count() AS n "
+            "FROM ghtrader_ticks_main_l5_v2 "
+            f"WHERE symbol=%s AND ticks_kind='main_l5' AND dataset_version='v2'{l5_where}"
+            f"AND trading_day IN ({placeholders}) "
+            "GROUP BY td, sec"
+        )
+        params: list[Any] = [sym] + [d.isoformat() for d in chunk]
+        with connect_pg(cfg, connect_timeout_s=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                for row in cur.fetchall():
+                    if row[0] is None or row[1] is None:
+                        continue
+                    try:
+                        td = date.fromisoformat(str(row[0]))
+                    except Exception:
+                        continue
+                    if td not in out:
+                        out[td] = {}
+                    out[td][int(row[1])] = int(row[2] or 0)
+    return out
+
+
 def get_last_validated_day(
     *,
     cfg: Any,
@@ -106,6 +148,7 @@ def get_last_validated_day(
 __all__ = [
     "fetch_day_second_stats",
     "fetch_per_second_counts",
+    "fetch_per_second_counts_batch",
     "get_last_validated_day",
 ]
 
