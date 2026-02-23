@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from ghtrader.config import env_bool, env_float, env_int
 from ghtrader.control.jobs import JobSpec, python_module_argv
 from ghtrader.control.supervisor_helpers import (
     argv_opt,
@@ -18,12 +19,12 @@ from ghtrader.control.supervisor_helpers import (
 
 
 def scheduler_enabled() -> bool:
-    if str(os.environ.get("GHTRADER_DISABLE_TQSDK_SCHEDULER", "")).strip().lower() in {"1", "true", "yes"}:
+    if env_bool("GHTRADER_DISABLE_TQSDK_SCHEDULER", False):
         return False
     # Avoid background threads during pytest unless explicitly enabled.
-    if ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")) and str(
-        os.environ.get("GHTRADER_ENABLE_TQSDK_SCHEDULER_IN_TESTS", "")
-    ).strip().lower() not in {"1", "true", "yes"}:
+    if ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")) and not env_bool(
+        "GHTRADER_ENABLE_TQSDK_SCHEDULER_IN_TESTS", False
+    ):
         return False
     return True
 
@@ -34,11 +35,11 @@ def gateway_supervisor_enabled() -> bool:
 
     Disabled by default during pytest to avoid background process management in unit tests.
     """
-    if str(os.environ.get("GHTRADER_DISABLE_GATEWAY_SUPERVISOR", "")).strip().lower() in {"1", "true", "yes"}:
+    if env_bool("GHTRADER_DISABLE_GATEWAY_SUPERVISOR", False):
         return False
-    if ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")) and str(
-        os.environ.get("GHTRADER_ENABLE_GATEWAY_SUPERVISOR_IN_TESTS", "")
-    ).strip().lower() not in {"1", "true", "yes"}:
+    if ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")) and not env_bool(
+        "GHTRADER_ENABLE_GATEWAY_SUPERVISOR_IN_TESTS", False
+    ):
         return False
     return True
 
@@ -49,11 +50,11 @@ def strategy_supervisor_enabled() -> bool:
 
     Disabled by default during pytest to avoid background process management in unit tests.
     """
-    if str(os.environ.get("GHTRADER_DISABLE_STRATEGY_SUPERVISOR", "")).strip().lower() in {"1", "true", "yes"}:
+    if env_bool("GHTRADER_DISABLE_STRATEGY_SUPERVISOR", False):
         return False
-    if ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")) and str(
-        os.environ.get("GHTRADER_ENABLE_STRATEGY_SUPERVISOR_IN_TESTS", "")
-    ).strip().lower() not in {"1", "true", "yes"}:
+    if ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")) and not env_bool(
+        "GHTRADER_ENABLE_STRATEGY_SUPERVISOR_IN_TESTS", False
+    ):
         return False
     return True
 
@@ -250,7 +251,7 @@ def start_tqsdk_scheduler(
             try:
                 store = app.state.job_store
                 jm = app.state.job_manager
-                max_parallel = int(os.environ.get("GHTRADER_MAX_PARALLEL_TQSDK_JOBS", str(max_parallel_default)))
+                max_parallel = int(env_int("GHTRADER_MAX_PARALLEL_TQSDK_JOBS", int(max_parallel_default)))
                 max_parallel = max(1, max_parallel)
                 tick(store, jm, max_parallel)
             except Exception as e:
@@ -281,7 +282,7 @@ def start_strategy_supervisor(
                 tick(store, jm, runs_dir)
             except Exception as e:
                 log.warning("strategy_supervisor.tick_failed", error=str(e))
-            time.sleep(float(os.environ.get("GHTRADER_STRATEGY_SUPERVISOR_POLL_SECONDS", "2.0")))
+            time.sleep(float(env_float("GHTRADER_STRATEGY_SUPERVISOR_POLL_SECONDS", 2.0)))
 
     t = threading.Thread(target=_loop, name="strategy-supervisor", daemon=True)
     t.start()
@@ -307,7 +308,7 @@ def start_gateway_supervisor(
                 tick(store, jm, runs_dir)
             except Exception as e:
                 log.warning("gateway_supervisor.tick_failed", error=str(e))
-            time.sleep(float(os.environ.get("GHTRADER_GATEWAY_SUPERVISOR_POLL_SECONDS", "2.0")))
+            time.sleep(float(env_float("GHTRADER_GATEWAY_SUPERVISOR_POLL_SECONDS", 2.0)))
 
     t = threading.Thread(target=_loop, name="gateway-supervisor", daemon=True)
     t.start()

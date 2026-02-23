@@ -43,7 +43,8 @@ The canonical product/spec/plan for this repo is [`PRD.md`](PRD.md). All future 
 - Python-only MVP; type hints where they add value
 - Keep modules consolidated (minimal file count)
 - Add dependencies only when they pay for themselves
-- Secrets never committed; credentials come from environment variables / `.env`
+- Secrets never committed; credentials come from local env files (`.env`, `runs/control/accounts.env`).
+- Business/runtime tuning is stored in Config Service (`runs/control/config.db`), not `.env`.
 
 ---
 
@@ -65,9 +66,9 @@ pip install tqsdk
 # pip install -e ".[tabular]"
 
 # Configure TqSdk credentials (Pro account with tq_dl required)
-# Option 1: Create .env file (recommended)
+# Option 1: Create .env file (recommended; secrets/bootstrap only)
 cp env.example .env
-# Edit .env and fill in your credentials
+# Edit .env and fill in your credentials only
 
 # Option 2: Set environment variables directly
 export TQSDK_USER="your_username"
@@ -75,6 +76,9 @@ export TQSDK_PASSWORD="your_password"
 
 # Optional: override trading calendar holiday list (no akshare)
 export TQ_CHINESE_HOLIDAY_URL="https://files.shinnytech.com/shinny_chinese_holiday.json"
+
+# Business/runtime config: use Config Service (CLI or dashboard UI)
+ghtrader config set --key GHTRADER_LOCK_WAIT_TIMEOUT_S --value 120 --type float --reason bootstrap
 
 # Start QuestDB (canonical store) and initialize tables
 docker compose -f infra/questdb/docker-compose.yml up -d
@@ -129,11 +133,15 @@ The control plane is variety-centric with fixed SHFE varieties: `cu`, `au`, `ag`
 | **Data** | `/v/{var}/data` | Main schedule + main_l5 build/validation for current variety |
 | **Models** | `/v/{var}/models` | Variety-scoped model inventory, training, benchmarks |
 | **Trading** | `/v/{var}/trading` | Trading console filtered to current variety context |
+| **Config** | `/v/{var}/config` | Effective config preview, set, history, rollback |
 | **SQL** | `/explorer` | QuestDB SQL explorer (read-only; canonical ticks) |
 | **System** | `/system` | CPU, memory, disk, GPU monitoring |
 
-Legacy routes remain for compatibility and redirect to default variety `cu`:
-`/`, `/jobs`, `/data`, `/models`, `/trading`, `/ops*` -> `/v/cu/...`
+Legacy non-variety routes redirect to default variety `cu`:
+`/`, `/jobs`, `/data`, `/models`, `/trading` -> `/v/cu/...`
+
+Removed compatibility surface:
+`/ops*` and `/api/ops/compat` are removed; use canonical `/v/{var}/...` pages and `/api/...` endpoints.
 
 Examples:
 
@@ -254,16 +262,16 @@ Configure connection (see `env.example`):
 Common flows:
 
 ```bash
-# Probe L5 start (manual) and copy the env line
+# Probe L5 start (manual)
 ghtrader data l5-start --exchange SHFE --var cu
-# Then set in .env:
-#   GHTRADER_L5_START_DATE_CU=YYYY-MM-DD
+# Then persist to config service:
+#   ghtrader config set --key GHTRADER_L5_START_DATE_CU --value YYYY-MM-DD --type str --reason l5_probe
 # Repeat for AU/AG:
 #   ghtrader data l5-start --exchange SHFE --var au
 #   ghtrader data l5-start --exchange SHFE --var ag
 
 # Build main schedule from TqSdk KQ.m@ mapping
-# (uses per-var env start key -> latest trading day)
+# (uses per-var config key -> latest trading day)
 ghtrader main-schedule --var cu
 
 # Build derived main_l5 ticks for the continuous alias (writes to QuestDB)
@@ -273,10 +281,11 @@ ghtrader main-l5 --var cu --symbol KQ.m@SHFE.cu
 ghtrader build --symbol KQ.m@SHFE.cu --ticks-kind main_l5
 ```
 
-Pipeline robustness defaults (recommended in `.env`):
+Pipeline robustness defaults (recommended in Config Service):
 - `GHTRADER_PIPELINE_ENFORCE_HEALTH=true` (step success implies persisted state is healthy)
 - `GHTRADER_LOCK_WAIT_TIMEOUT_S=120` + `GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT=true` (recover from stuck lock owners)
 - Optionally tune `GHTRADER_MAIN_L5_TOTAL_WORKERS` / `GHTRADER_MAIN_L5_SEGMENT_WORKERS` to cap ingest fan-out
+- Use Dashboard Config page or `ghtrader config set ...`; do not use `.env` for business tuning keys
 
 ## Data maintenance (Update)
 
@@ -290,7 +299,7 @@ Dashboard update:
 - Data → Contracts → **Update** (bulk or per-contract)
 
 Optional daily Update scheduler (dashboard):
-- Set `GHTRADER_DAILY_UPDATE_TARGETS=SHFE:cu` (and optionally `GHTRADER_DAILY_UPDATE_RECENT_EXPIRED_DAYS=10`) in `.env` and restart the dashboard.
+- Set `GHTRADER_DAILY_UPDATE_TARGETS=SHFE:cu` (and optionally `GHTRADER_DAILY_UPDATE_RECENT_EXPIRED_DAYS=10`) in Config Service (`/v/{var}/config`) and restart the dashboard.
 
 ## Labels (event-time, multi-horizon)
 

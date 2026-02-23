@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
+from ghtrader.config import get_env
 
 def auth_enabled() -> bool:
-    return bool(os.environ.get("GHTRADER_DASHBOARD_TOKEN"))
+    return bool(get_env("GHTRADER_DASHBOARD_TOKEN", ""))
 
 
 def is_authorized(request: Any) -> bool:
@@ -14,7 +14,7 @@ def is_authorized(request: Any) -> bool:
 
     If GHTRADER_DASHBOARD_TOKEN is unset, auth is disabled.
     """
-    token = os.environ.get("GHTRADER_DASHBOARD_TOKEN")
+    token = get_env("GHTRADER_DASHBOARD_TOKEN", "")
     if not token:
         return True
 

@@ -8,12 +8,9 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import json
-import os
-import pickle
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -22,290 +19,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import ghtrader.research.distributed as distu
-from ghtrader.config import env_bool, env_int
-from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+
+from .models_base import (
+    BaseModel,
+    ModelType,
+    TickSequenceDataset,
+    _env_bool,
+    _env_int,
+    resolve_dataloader_kwargs as _resolve_dataloader_kwargs,
+    sequence_predict_proba_batched as _sequence_predict_proba_batched,
+)
+from .models_baselines import LightGBMModel, LogisticModel, XGBoostModel
+from .models_factory import (
+    create_model as _create_model_impl,
+    load_model as _load_model_impl,
+    model_artifact_path,
+)
 
 log = structlog.get_logger()
-
-ModelType = Literal["logistic", "xgboost", "lightgbm", "deeplob", "transformer", "tcn", "tlob", "ssm", "tkan", "lobert", "kanformer"]
-
-
-def _env_int(key: str, default: int) -> int:
-    return env_int(key, default)
-
-
-def _env_bool(key: str, default: bool) -> bool:
-    return env_bool(key, default)
-
-
-def _resolve_dataloader_kwargs(
-    *,
-    num_workers: int,
-    prefetch_factor: int | None,
-    pin_memory: bool | None,
-    device: torch.device,
-) -> dict[str, Any]:
-    workers = int(num_workers)
-    if workers <= 0:
-        auto_default = max(2, min(64, (os.cpu_count() or 8) // 8))
-        workers = max(1, _env_int("GHTRADER_TRAIN_NUM_WORKERS_AUTO", auto_default))
-
-    pin = bool(pin_memory) if pin_memory is not None else (device.type == "cuda")
-    out: dict[str, Any] = {
-        "num_workers": int(workers),
-        "pin_memory": bool(pin),
-    }
-    if workers > 0:
-        pf = int(prefetch_factor) if prefetch_factor is not None else _env_int("GHTRADER_TRAIN_PREFETCH_FACTOR", 2)
-        out["prefetch_factor"] = max(1, int(pf))
-        out["persistent_workers"] = _env_bool("GHTRADER_TRAIN_PERSISTENT_WORKERS", True)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Base model interface
-# ---------------------------------------------------------------------------
-
-class BaseModel(ABC):
-    """Abstract base for all models."""
-    
-    name: str
-    
-    @abstractmethod
-    def fit(self, X: np.ndarray, y: np.ndarray, **kwargs: Any) -> None:
-        """Fit the model."""
-        pass
-    
-    @abstractmethod
-    def predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
-        """Predict class probabilities. Shape: (n_samples, n_classes)."""
-        pass
-    
-    @abstractmethod
-    def save(self, path: Path) -> None:
-        """Save model to disk."""
-        pass
-    
-    @abstractmethod
-    def load(self, path: Path) -> None:
-        """Load model from disk."""
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Tabular baselines
-# ---------------------------------------------------------------------------
-
-class LogisticModel(BaseModel):
-    """Logistic regression baseline."""
-    
-    name = "logistic"
-    
-    def __init__(self, n_classes: int = 3, **kwargs: Any) -> None:
-        self.n_classes = n_classes
-        self.scaler = StandardScaler()
-        self.model = LogisticRegression(
-            solver="lbfgs",
-            max_iter=1000,
-            **kwargs,
-        )
-    
-    def fit(self, X: np.ndarray, y: np.ndarray, **kwargs: Any) -> None:
-        # Remove NaN rows
-        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
-        X_clean = X[mask]
-        y_clean = y[mask].astype(int)
-        
-        # Scale features
-        X_scaled = self.scaler.fit_transform(X_clean)
-        
-        # Fit model
-        self.model.fit(X_scaled, y_clean)
-        log.info("logistic.fit_done", n_samples=len(y_clean))
-    
-    def predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
-        X_scaled = self.scaler.transform(X)
-        return self.model.predict_proba(X_scaled)
-    
-    def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "wb") as f:
-            pickle.dump({"scaler": self.scaler, "model": self.model}, f)
-    
-    def load(self, path: Path) -> None:
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-        self.scaler = data["scaler"]
-        self.model = data["model"]
-
-
-class LightGBMModel(BaseModel):
-    """LightGBM baseline."""
-    
-    name = "lightgbm"
-    
-    def __init__(self, n_classes: int = 3, **kwargs: Any) -> None:
-        self.n_classes = n_classes
-        self.params = {
-            "objective": "multiclass",
-            "num_class": n_classes,
-            "metric": "multi_logloss",
-            "boosting_type": "gbdt",
-            "num_leaves": 63,
-            "learning_rate": 0.05,
-            "feature_fraction": 0.8,
-            "bagging_fraction": 0.8,
-            "bagging_freq": 5,
-            "verbose": -1,
-            "n_jobs": -1,
-            **kwargs,
-        }
-        self.model = None
-    
-    def fit(self, X: np.ndarray, y: np.ndarray, n_rounds: int = 500, **kwargs: Any) -> None:
-        import lightgbm as lgb
-        
-        # Remove NaN rows
-        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
-        X_clean = X[mask]
-        y_clean = y[mask].astype(int)
-        
-        # Create dataset
-        train_data = lgb.Dataset(X_clean, label=y_clean)
-        
-        # Train
-        self.model = lgb.train(
-            self.params,
-            train_data,
-            num_boost_round=n_rounds,
-        )
-        log.info("lightgbm.fit_done", n_samples=len(y_clean), n_rounds=n_rounds)
-    
-    def predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
-        if self.model is None:
-            raise RuntimeError("Model not fitted")
-        return self.model.predict(X)
-    
-    def save(self, path: Path) -> None:
-        if self.model is None:
-            raise RuntimeError("Model not fitted")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.model.save_model(str(path))
-    
-    def load(self, path: Path) -> None:
-        import lightgbm as lgb
-        self.model = lgb.Booster(model_file=str(path))
-
-
-class XGBoostModel(BaseModel):
-    """XGBoost baseline."""
-    
-    name = "xgboost"
-    
-    def __init__(self, n_classes: int = 3, **kwargs: Any) -> None:
-        self.n_classes = n_classes
-        self.params = {
-            "objective": "multi:softprob",
-            "num_class": n_classes,
-            "eval_metric": "mlogloss",
-            "max_depth": 6,
-            "learning_rate": 0.05,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "n_jobs": -1,
-            **kwargs,
-        }
-        self.model = None
-    
-    def fit(self, X: np.ndarray, y: np.ndarray, n_rounds: int = 500, **kwargs: Any) -> None:
-        import xgboost as xgb
-        
-        # Remove NaN rows
-        mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
-        X_clean = X[mask]
-        y_clean = y[mask].astype(int)
-        
-        # Create DMatrix
-        dtrain = xgb.DMatrix(X_clean, label=y_clean)
-        
-        # Train
-        self.model = xgb.train(self.params, dtrain, num_boost_round=n_rounds)
-        log.info("xgboost.fit_done", n_samples=len(y_clean), n_rounds=n_rounds)
-    
-    def predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
-        import xgboost as xgb
-        if self.model is None:
-            raise RuntimeError("Model not fitted")
-        dtest = xgb.DMatrix(X)
-        return self.model.predict(dtest)
-    
-    def save(self, path: Path) -> None:
-        if self.model is None:
-            raise RuntimeError("Model not fitted")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.model.save_model(str(path))
-    
-    def load(self, path: Path) -> None:
-        import xgboost as xgb
-        self.model = xgb.Booster()
-        self.model.load_model(str(path))
-
-
-# ---------------------------------------------------------------------------
-# Deep learning: Dataset and utilities
-# ---------------------------------------------------------------------------
-
-class TickSequenceDataset(Dataset):
-    """Dataset for tick sequences (for DeepLOB/Transformer)."""
-    
-    def __init__(
-        self,
-        features: np.ndarray,
-        labels: np.ndarray,
-        seq_len: int = 100,
-        *,
-        segment_id: np.ndarray | None = None,
-    ) -> None:
-        """
-        Args:
-            features: Shape (n_samples, n_features)
-            labels: Shape (n_samples,) or (n_samples, n_horizons)
-            seq_len: Sequence length for each sample
-        """
-        self.features = features
-        self.labels = labels
-        self.seq_len = seq_len
-        self.segment_id = segment_id
-        
-        # Valid indices: need seq_len history and valid label
-        self.valid_indices = []
-        for i in range(seq_len, len(features)):
-            if not np.isnan(labels[i]).any():
-                if self.segment_id is not None:
-                    # Enforce "no cross-segment" windows: the whole history window and the
-                    # label index must share the same segment id.
-                    s = self.segment_id[i]
-                    window = self.segment_id[i - seq_len : i + 1]
-                    if not np.all(window == s):
-                        continue
-                self.valid_indices.append(i)
-    
-    def __len__(self) -> int:
-        return len(self.valid_indices)
-    
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        i = self.valid_indices[idx]
-        # Sequence: [i - seq_len, i)
-        seq = self.features[i - self.seq_len : i]
-        label = self.labels[i]
-        
-        # Handle NaN in sequence by replacing with 0
-        seq = np.nan_to_num(seq, nan=0.0)
-        
-        return torch.tensor(seq, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
-
 
 # ---------------------------------------------------------------------------
 # DeepLOB model
@@ -554,26 +287,14 @@ class DeepLOBModel(BaseModel):
             except Exception:
                 seg_arr = None
 
-        out = np.full((len(X_scaled), self.n_classes), np.nan, dtype=float)
-        self.model.eval()
-        with torch.no_grad():
-            for i in range(self.seq_len, len(X_scaled)):
-                if seg_arr is not None:
-                    s = seg_arr[i]
-                    if not np.all(seg_arr[i - self.seq_len : i + 1] == s):
-                        continue
-
-                seq = X_scaled[i - self.seq_len : i]
-                seq = np.nan_to_num(seq, nan=0.0)
-                seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
-                outputs = self.model(seq_tensor)
-                probs = F.softmax(outputs, dim=-1).cpu().numpy()
-                p0 = probs[0]
-                if getattr(p0, "ndim", 1) == 2:
-                    p0 = p0[0]
-                out[i] = p0
-
-        return out
+        return _sequence_predict_proba_batched(
+            model=self.model,
+            X_scaled=X_scaled,
+            seq_len=self.seq_len,
+            n_classes=self.n_classes,
+            device=self.device,
+            seg_arr=seg_arr,
+        )
     
     def save(self, path: Path) -> None:
         if self.model is None:
@@ -845,26 +566,14 @@ class TransformerModel(BaseModel):
             except Exception:
                 seg_arr = None
 
-        out = np.full((len(X_scaled), self.n_classes), np.nan, dtype=float)
-        self.model.eval()
-        with torch.no_grad():
-            for i in range(self.seq_len, len(X_scaled)):
-                if seg_arr is not None:
-                    s = seg_arr[i]
-                    if not np.all(seg_arr[i - self.seq_len : i + 1] == s):
-                        continue
-
-                seq = X_scaled[i - self.seq_len : i]
-                seq = np.nan_to_num(seq, nan=0.0)
-                seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
-                outputs = self.model(seq_tensor)
-                probs = F.softmax(outputs, dim=-1).cpu().numpy()
-                p0 = probs[0]
-                if getattr(p0, "ndim", 1) == 2:
-                    p0 = p0[0]
-                out[i] = p0
-
-        return out
+        return _sequence_predict_proba_batched(
+            model=self.model,
+            X_scaled=X_scaled,
+            seq_len=self.seq_len,
+            n_classes=self.n_classes,
+            device=self.device,
+            seg_arr=seg_arr,
+        )
     
     def save(self, path: Path) -> None:
         if self.model is None:
@@ -1181,26 +890,14 @@ class TCNModel(BaseModel):
             except Exception:
                 seg_arr = None
 
-        out = np.full((len(X_scaled), self.n_classes), np.nan, dtype=float)
-        self.model.eval()
-        with torch.no_grad():
-            for i in range(self.seq_len, len(X_scaled)):
-                if seg_arr is not None:
-                    s = seg_arr[i]
-                    if not np.all(seg_arr[i - self.seq_len : i + 1] == s):
-                        continue
-
-                seq = X_scaled[i - self.seq_len : i]
-                seq = np.nan_to_num(seq, nan=0.0)
-                seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
-                outputs = self.model(seq_tensor)
-                probs = F.softmax(outputs, dim=-1).cpu().numpy()
-                p0 = probs[0]
-                if getattr(p0, "ndim", 1) == 2:
-                    p0 = p0[0]
-                out[i] = p0
-
-        return out
+        return _sequence_predict_proba_batched(
+            model=self.model,
+            X_scaled=X_scaled,
+            seq_len=self.seq_len,
+            n_classes=self.n_classes,
+            device=self.device,
+            seg_arr=seg_arr,
+        )
     
     def save(self, path: Path) -> None:
         if self.model is None:
@@ -1523,26 +1220,14 @@ class TLOBModel(BaseModel):
             except Exception:
                 seg_arr = None
 
-        out = np.full((len(X_scaled), self.n_classes), np.nan, dtype=float)
-        self.model.eval()
-        with torch.no_grad():
-            for i in range(self.seq_len, len(X_scaled)):
-                if seg_arr is not None:
-                    s = seg_arr[i]
-                    if not np.all(seg_arr[i - self.seq_len : i + 1] == s):
-                        continue
-
-                seq = X_scaled[i - self.seq_len : i]
-                seq = np.nan_to_num(seq, nan=0.0)
-                seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
-                outputs = self.model(seq_tensor)
-                probs = F.softmax(outputs, dim=-1).cpu().numpy()
-                p0 = probs[0]
-                if getattr(p0, "ndim", 1) == 2:
-                    p0 = p0[0]
-                out[i] = p0
-
-        return out
+        return _sequence_predict_proba_batched(
+            model=self.model,
+            X_scaled=X_scaled,
+            seq_len=self.seq_len,
+            n_classes=self.n_classes,
+            device=self.device,
+            seg_arr=seg_arr,
+        )
     
     def save(self, path: Path) -> None:
         if self.model is None:
@@ -1861,26 +1546,14 @@ class SSMModel(BaseModel):
             except Exception:
                 seg_arr = None
 
-        out = np.full((len(X_scaled), self.n_classes), np.nan, dtype=float)
-        self.model.eval()
-        with torch.no_grad():
-            for i in range(self.seq_len, len(X_scaled)):
-                if seg_arr is not None:
-                    s = seg_arr[i]
-                    if not np.all(seg_arr[i - self.seq_len : i + 1] == s):
-                        continue
-
-                seq = X_scaled[i - self.seq_len : i]
-                seq = np.nan_to_num(seq, nan=0.0)
-                seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
-                outputs = self.model(seq_tensor)
-                probs = F.softmax(outputs, dim=-1).cpu().numpy()
-                p0 = probs[0]
-                if getattr(p0, "ndim", 1) == 2:
-                    p0 = p0[0]
-                out[i] = p0
-
-        return out
+        return _sequence_predict_proba_batched(
+            model=self.model,
+            X_scaled=X_scaled,
+            seq_len=self.seq_len,
+            n_classes=self.n_classes,
+            device=self.device,
+            seg_arr=seg_arr,
+        )
     
     def save(self, path: Path) -> None:
         if self.model is None:
@@ -2342,26 +2015,14 @@ class TKANModel(BaseModel):
             except Exception:
                 seg_arr = None
 
-        out = np.full((len(X_scaled), self.n_classes), np.nan, dtype=float)
-        self.model.eval()
-        with torch.no_grad():
-            for i in range(self.seq_len, len(X_scaled)):
-                if seg_arr is not None:
-                    s = seg_arr[i]
-                    if not np.all(seg_arr[i - self.seq_len : i + 1] == s):
-                        continue
-
-                seq = X_scaled[i - self.seq_len : i]
-                seq = np.nan_to_num(seq, nan=0.0)
-                seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
-                outputs = self.model(seq_tensor)
-                probs = F.softmax(outputs, dim=-1).cpu().numpy()
-                p0 = probs[0]
-                if getattr(p0, "ndim", 1) == 2:
-                    p0 = p0[0]
-                out[i] = p0
-
-        return out
+        return _sequence_predict_proba_batched(
+            model=self.model,
+            X_scaled=X_scaled,
+            seq_len=self.seq_len,
+            n_classes=self.n_classes,
+            device=self.device,
+            seg_arr=seg_arr,
+        )
     
     def save(self, path: Path) -> None:
         if self.model is None:
@@ -2710,26 +2371,14 @@ class LOBERTModel(BaseModel):
             except Exception:
                 seg_arr = None
 
-        out = np.full((len(X_scaled), self.n_classes), np.nan, dtype=float)
-        self.model.eval()
-        with torch.no_grad():
-            for i in range(self.seq_len, len(X_scaled)):
-                if seg_arr is not None:
-                    s = seg_arr[i]
-                    if not np.all(seg_arr[i - self.seq_len : i + 1] == s):
-                        continue
-
-                seq = X_scaled[i - self.seq_len : i]
-                seq = np.nan_to_num(seq, nan=0.0)
-                seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
-                outputs = self.model(seq_tensor)
-                probs = F.softmax(outputs, dim=-1).cpu().numpy()
-                p0 = probs[0]
-                if getattr(p0, "ndim", 1) == 2:
-                    p0 = p0[0]
-                out[i] = p0
-
-        return out
+        return _sequence_predict_proba_batched(
+            model=self.model,
+            X_scaled=X_scaled,
+            seq_len=self.seq_len,
+            n_classes=self.n_classes,
+            device=self.device,
+            seg_arr=seg_arr,
+        )
     
     def save(self, path: Path) -> None:
         if self.model is None:
@@ -3036,26 +2685,14 @@ class KANFormerModel(BaseModel):
             except Exception:
                 seg_arr = None
 
-        out = np.full((len(X_scaled), self.n_classes), np.nan, dtype=float)
-        self.model.eval()
-        with torch.no_grad():
-            for i in range(self.seq_len, len(X_scaled)):
-                if seg_arr is not None:
-                    s = seg_arr[i]
-                    if not np.all(seg_arr[i - self.seq_len : i + 1] == s):
-                        continue
-
-                seq = X_scaled[i - self.seq_len : i]
-                seq = np.nan_to_num(seq, nan=0.0)
-                seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(self.device)
-                outputs = self.model(seq_tensor)
-                probs = F.softmax(outputs, dim=-1).cpu().numpy()
-                p0 = probs[0]
-                if getattr(p0, "ndim", 1) == 2:
-                    p0 = p0[0]
-                out[i] = p0
-
-        return out
+        return _sequence_predict_proba_batched(
+            model=self.model,
+            X_scaled=X_scaled,
+            seq_len=self.seq_len,
+            n_classes=self.n_classes,
+            device=self.device,
+            seg_arr=seg_arr,
+        )
     
     def save(self, path: Path) -> None:
         if self.model is None:
@@ -3101,56 +2738,25 @@ class KANFormerModel(BaseModel):
 # ---------------------------------------------------------------------------
 
 def create_model(model_type: str, **kwargs: Any) -> BaseModel:
-    """Factory function to create a model by type."""
-    if model_type == "logistic":
-        # Common callers pass deep-model-only knobs; strip them for baselines.
-        kwargs.pop("n_features", None)
-        kwargs.pop("seq_len", None)
-        kwargs.pop("hidden_dim", None)
-        kwargs.pop("d_model", None)
-        kwargs.pop("n_heads", None)
-        kwargs.pop("n_layers", None)
-        kwargs.pop("n_channels", None)
-        kwargs.pop("d_state", None)
-        return LogisticModel(**kwargs)
-    elif model_type == "lightgbm":
-        kwargs.pop("n_features", None)
-        kwargs.pop("seq_len", None)
-        kwargs.pop("hidden_dim", None)
-        kwargs.pop("d_model", None)
-        kwargs.pop("n_heads", None)
-        kwargs.pop("n_layers", None)
-        kwargs.pop("n_channels", None)
-        kwargs.pop("d_state", None)
-        return LightGBMModel(**kwargs)
-    elif model_type == "xgboost":
-        kwargs.pop("n_features", None)
-        kwargs.pop("seq_len", None)
-        kwargs.pop("hidden_dim", None)
-        kwargs.pop("d_model", None)
-        kwargs.pop("n_heads", None)
-        kwargs.pop("n_layers", None)
-        kwargs.pop("n_channels", None)
-        kwargs.pop("d_state", None)
-        return XGBoostModel(**kwargs)
-    elif model_type == "deeplob":
-        return DeepLOBModel(**kwargs)
-    elif model_type == "transformer":
-        return TransformerModel(**kwargs)
-    elif model_type == "tcn":
-        return TCNModel(**kwargs)
-    elif model_type == "tlob":
-        return TLOBModel(**kwargs)
-    elif model_type == "ssm":
-        return SSMModel(**kwargs)
-    elif model_type == "tkan":
-        return TKANModel(**kwargs)
-    elif model_type == "lobert":
-        return LOBERTModel(**kwargs)
-    elif model_type == "kanformer":
-        return KANFormerModel(**kwargs)
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
+    return _create_model_impl(
+        model_type=model_type,
+        baseline_factories={
+            "logistic": LogisticModel,
+            "lightgbm": LightGBMModel,
+            "xgboost": XGBoostModel,
+        },
+        deep_factories={
+            "deeplob": DeepLOBModel,
+            "transformer": TransformerModel,
+            "tcn": TCNModel,
+            "tlob": TLOBModel,
+            "ssm": SSMModel,
+            "tkan": TKANModel,
+            "lobert": LOBERTModel,
+            "kanformer": KANFormerModel,
+        },
+        **kwargs,
+    )
 
 
 def train_model(
@@ -3296,12 +2902,7 @@ def train_model(
     model_dir = artifacts_dir / symbol / model_type
     model_dir.mkdir(parents=True, exist_ok=True)
     
-    if model_type in ["logistic"]:
-        model_path = model_dir / f"model_h{horizon}.pkl"
-    elif model_type in ["lightgbm", "xgboost"]:
-        model_path = model_dir / f"model_h{horizon}.json"
-    else:
-        model_path = model_dir / f"model_h{horizon}.pt"
+    model_path = model_artifact_path(model_dir=model_dir, model_type=str(model_type), horizon=int(horizon))
     
     if (not ddp_active) or distu.is_rank0():
         model.save(model_path)
@@ -3355,6 +2956,4 @@ def train_model(
 
 def load_model(model_type: ModelType, path: Path, **kwargs: Any) -> BaseModel:
     """Load a trained model from disk."""
-    model = create_model(model_type, **kwargs)
-    model.load(path)
-    return model
+    return _load_model_impl(create_model_fn=create_model, model_type=model_type, path=path, **kwargs)

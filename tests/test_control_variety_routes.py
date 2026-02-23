@@ -18,7 +18,7 @@ def _make_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
 
 @pytest.mark.parametrize("variety", ["cu", "au", "ag"])
-@pytest.mark.parametrize("page", ["dashboard", "data", "models", "jobs", "trading"])
+@pytest.mark.parametrize("page", ["dashboard", "data", "models", "jobs", "trading", "config"])
 def test_variety_workspace_routes_render(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variety: str, page: str
 ) -> None:
@@ -41,7 +41,7 @@ def test_invalid_variety_route_returns_404(tmp_path: Path, monkeypatch: pytest.M
         ("/models", "/v/cu/models"),
         ("/jobs", "/v/cu/jobs"),
         ("/trading", "/v/cu/trading"),
-        ("/ops", "/v/cu/data"),
+        ("/config", "/v/cu/config"),
     ],
 )
 def test_legacy_routes_redirect_to_default_variety(

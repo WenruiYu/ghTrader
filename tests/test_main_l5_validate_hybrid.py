@@ -4,6 +4,13 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("GHTRADER_DISABLE_DOTENV", "true")
 
 
 def _session_payload() -> dict:
@@ -90,6 +97,8 @@ def test_main_l5_validate_gap_threshold(monkeypatch):
     assert report["gap_buckets_total"]["gt_30"] == 0
     assert report["gap_count_gt_30s"] == 0
     assert captured["summary"][0].cadence_mode == "event"
+    assert isinstance(report.get("config_snapshot"), dict)
+    assert "config_hash" in report["config_snapshot"]
 
 
 def test_main_l5_validate_strict_cadence(monkeypatch):

@@ -21,7 +21,8 @@ from typing import Any
 import click
 import structlog
 
-from ghtrader.config import get_runs_dir, load_config
+from ghtrader.config_service import enforce_no_legacy_env, get_config_resolver
+from ghtrader.config import get_env, get_runs_dir, load_config
 from ghtrader.control.job_metadata import infer_job_metadata, merge_job_metadata
 
 # ---------------------------------------------------------------------------
@@ -117,9 +118,9 @@ def _wrap_dashboard_stdio() -> None:
 
 
 def _setup_logging(verbose: bool) -> None:
-    env_level = os.environ.get("GHTRADER_LOG_LEVEL", "").strip().lower()
-    env_verbose = os.environ.get("GHTRADER_JOB_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
-    is_dashboard = os.environ.get("GHTRADER_JOB_SOURCE", "").strip() == "dashboard"
+    env_level = str(get_env("GHTRADER_LOG_LEVEL", "") or "").strip().lower()
+    env_verbose = str(get_env("GHTRADER_JOB_VERBOSE", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+    is_dashboard = str(get_env("GHTRADER_JOB_SOURCE", "") or "").strip() == "dashboard"
     force_debug = bool(verbose or env_verbose or env_level in {"debug", "trace"})
     if force_debug:
         level = logging.DEBUG
@@ -146,8 +147,8 @@ def _setup_logging(verbose: bool) -> None:
         cache_logger_on_first_use=True,
     )
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-    log_path = os.environ.get("GHTRADER_JOB_LOG_PATH", "").strip()
-    if log_path and (os.environ.get("GHTRADER_JOB_SOURCE", "").strip() or "terminal") != "dashboard":
+    log_path = str(get_env("GHTRADER_JOB_LOG_PATH", "") or "").strip()
+    if log_path and (str(get_env("GHTRADER_JOB_SOURCE", "") or "").strip() or "terminal") != "dashboard":
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_path))
     logging.basicConfig(format="%(message)s", level=level, handlers=handlers)
@@ -164,10 +165,12 @@ def _start_job_heartbeat() -> None:
     global _heartbeat_thread
     if _heartbeat_thread and _heartbeat_thread.is_alive():
         return
-    if os.environ.get("GHTRADER_JOB_HEARTBEAT_DISABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+    if (str(get_env("GHTRADER_JOB_SOURCE", "") or "").strip() or "terminal") != "dashboard":
+        return
+    if str(get_env("GHTRADER_JOB_HEARTBEAT_DISABLED", "") or "").strip().lower() in {"1", "true", "yes", "on"}:
         return
     try:
-        interval = float(os.environ.get("GHTRADER_JOB_HEARTBEAT_S", "15") or "15")
+        interval = float(get_env("GHTRADER_JOB_HEARTBEAT_S", "15") or "15")
     except Exception:
         interval = 15.0
     if interval <= 0:
@@ -175,7 +178,7 @@ def _start_job_heartbeat() -> None:
     interval = max(2.0, float(interval))
     _heartbeat_stop.clear()
     log = structlog.get_logger()
-    job_id = os.environ.get("GHTRADER_JOB_ID", "").strip()
+    job_id = str(get_env("GHTRADER_JOB_ID", "") or "").strip()
     cmd = " ".join(sys.argv[1:]).strip() or "ghtrader"
     started_at = time.time()
 
@@ -194,9 +197,9 @@ def _stop_job_heartbeat() -> None:
     if _heartbeat_stop.is_set():
         return
     _heartbeat_stop.set()
-    if os.environ.get("GHTRADER_JOB_SOURCE", "").strip() == "dashboard":
+    if str(get_env("GHTRADER_JOB_SOURCE", "") or "").strip() == "dashboard":
         log = structlog.get_logger()
-        job_id = os.environ.get("GHTRADER_JOB_ID", "").strip()
+        job_id = str(get_env("GHTRADER_JOB_ID", "") or "").strip()
         cmd = " ".join(sys.argv[1:]).strip() or "ghtrader"
         log.info("job.heartbeat_stop", job_id=job_id, cmd=cmd)
 
@@ -214,16 +217,7 @@ def _logs_dir(runs_dir: Path) -> Path:
 
 
 def _current_job_id() -> str | None:
-    return os.environ.get("GHTRADER_JOB_ID") or None
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = str(os.environ.get(name, "1" if default else "0") or "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return bool(default)
+    return str(get_env("GHTRADER_JOB_ID", "") or "").strip() or None
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -342,24 +336,16 @@ def _acquire_locks(
     locks = LockStore(_jobs_db_path(runs_dir))
 
     store.update_job(job_id, status="queued", waiting_locks=lock_keys, held_locks=[])
-    try:
-        poll_interval_s = float(os.environ.get("GHTRADER_LOCK_POLL_INTERVAL_S", "1") or "1")
-    except Exception:
-        poll_interval_s = 1.0
+    resolver = get_config_resolver()
+    poll_interval_s = float(resolver.get_float("GHTRADER_LOCK_POLL_INTERVAL_S", 1.0))
     poll_interval_s = max(0.1, float(poll_interval_s))
     if wait_timeout_s is None:
-        try:
-            wait_timeout_s = float(os.environ.get("GHTRADER_LOCK_WAIT_TIMEOUT_S", "120") or "120")
-        except Exception:
-            wait_timeout_s = 120.0
+        wait_timeout_s = float(resolver.get_float("GHTRADER_LOCK_WAIT_TIMEOUT_S", 120.0))
     wait_timeout_s = float(wait_timeout_s)
     if preempt_on_timeout is None:
-        preempt_on_timeout = _env_bool("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", True)
+        preempt_on_timeout = resolver.get_bool("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", True)
     preempt_on_timeout = bool(preempt_on_timeout)
-    try:
-        preempt_grace_s = float(os.environ.get("GHTRADER_LOCK_PREEMPT_GRACE_S", "8") or "8")
-    except Exception:
-        preempt_grace_s = 8.0
+    preempt_grace_s = float(resolver.get_float("GHTRADER_LOCK_PREEMPT_GRACE_S", 8.0))
     preempt_grace_s = max(0.5, float(preempt_grace_s))
 
     started_at = time.time()
@@ -408,6 +394,7 @@ def main(ctx: click.Context, verbose: bool) -> None:
     ctx.obj["verbose"] = verbose
     _setup_logging(verbose)
     load_config()
+    enforce_no_legacy_env(argv=list(sys.argv))
     _start_job_heartbeat()
 
 
@@ -415,12 +402,14 @@ def main(ctx: click.Context, verbose: bool) -> None:
 from ghtrader.cli_commands.data import register as _register_data
 from ghtrader.cli_commands.db import register as _register_db
 from ghtrader.cli_commands.features import register as _register_features
+from ghtrader.cli_commands.configuration import register as _register_configuration
 from ghtrader.cli_commands.research import register as _register_research
 from ghtrader.cli_commands.runtime import register as _register_runtime
 
 _register_data(main)
 _register_db(main)
 _register_features(main)
+_register_configuration(main)
 _register_research(main)
 _register_runtime(main)
 
@@ -433,14 +422,12 @@ def entrypoint() -> None:
     - terminal users running `ghtrader ...`
     - the dashboard spawning subprocess jobs (via env GHTRADER_JOB_ID)
     """
-    job_id = os.environ.get("GHTRADER_JOB_ID", "").strip() or uuid.uuid4().hex[:12]
+    job_id = str(get_env("GHTRADER_JOB_ID", "") or "").strip() or uuid.uuid4().hex[:12]
     os.environ["GHTRADER_JOB_ID"] = job_id
-    source = os.environ.get("GHTRADER_JOB_SOURCE", "").strip() or "terminal"
+    source = str(get_env("GHTRADER_JOB_SOURCE", "") or "").strip() or "terminal"
     os.environ["GHTRADER_JOB_SOURCE"] = source
     if source == "dashboard":
         _wrap_dashboard_stdio()
-
-    load_config()
 
     runs_dir = get_runs_dir()
     db_path = _jobs_db_path(runs_dir)
@@ -448,7 +435,7 @@ def entrypoint() -> None:
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     default_log_path = logs_dir / f"job-{job_id}.log"
-    log_path_str = os.environ.get("GHTRADER_JOB_LOG_PATH", "").strip()
+    log_path_str = str(get_env("GHTRADER_JOB_LOG_PATH", "") or "").strip()
     log_path = Path(log_path_str) if log_path_str else default_log_path
     if source != "dashboard":
         os.environ["GHTRADER_JOB_LOG_PATH"] = str(log_path)

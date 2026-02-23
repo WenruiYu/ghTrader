@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from datetime import date, datetime, timedelta, timezone
-import os
 import threading
 import time
 from pathlib import Path
@@ -15,7 +14,7 @@ from typing import Any
 import pandas as pd
 import structlog
 
-from ghtrader.config import get_tqsdk_auth
+from ghtrader.config import env_float, env_int, get_tqsdk_auth
 from ghtrader.data.manifest import write_manifest
 from ghtrader.data.ticks_schema import DatasetVersion, TICK_COLUMN_NAMES, row_hash_from_ticks_df
 
@@ -418,42 +417,19 @@ def download_main_l5_for_days(
         lowered = text.lower()
         return "timeout" in lowered or "timed out" in lowered or "超时" in text
 
-    try:
-        retry_max = int(os.environ.get("GHTRADER_TQ_RETRY_MAX", "3") or "3")
-    except Exception:
-        retry_max = 3
+    retry_max = env_int("GHTRADER_TQ_RETRY_MAX", 3)
     retry_max = max(0, int(retry_max))
-    try:
-        retry_base_s = float(os.environ.get("GHTRADER_TQ_RETRY_BASE_S", "10") or "10")
-    except Exception:
-        retry_base_s = 10.0
+    retry_base_s = env_float("GHTRADER_TQ_RETRY_BASE_S", 10.0)
     retry_base_s = max(0.0, float(retry_base_s))
-    try:
-        retry_max_s = float(os.environ.get("GHTRADER_TQ_RETRY_MAX_S", "300") or "300")
-    except Exception:
-        retry_max_s = 300.0
+    retry_max_s = env_float("GHTRADER_TQ_RETRY_MAX_S", 300.0)
     retry_max_s = max(retry_base_s, float(retry_max_s))
-    try:
-        maintenance_wait_s = float(os.environ.get("GHTRADER_TQ_MAINTENANCE_WAIT_S", "2100") or "2100")
-    except Exception:
-        maintenance_wait_s = 2100.0
+    maintenance_wait_s = env_float("GHTRADER_TQ_MAINTENANCE_WAIT_S", 2100.0)
     maintenance_wait_s = max(0.0, float(maintenance_wait_s))
-    try:
-        maintenance_max_retries = int(os.environ.get("GHTRADER_TQ_MAINTENANCE_MAX_RETRIES", "3") or "3")
-    except Exception:
-        maintenance_max_retries = 3
+    maintenance_max_retries = env_int("GHTRADER_TQ_MAINTENANCE_MAX_RETRIES", 3)
     maintenance_max_retries = max(0, int(maintenance_max_retries))
-    try:
-        maintenance_max_total_wait_s = float(
-            os.environ.get("GHTRADER_TQ_MAINTENANCE_MAX_TOTAL_WAIT_S", "7200") or "7200"
-        )
-    except Exception:
-        maintenance_max_total_wait_s = 7200.0
+    maintenance_max_total_wait_s = env_float("GHTRADER_TQ_MAINTENANCE_MAX_TOTAL_WAIT_S", 7200.0)
     maintenance_max_total_wait_s = max(0.0, float(maintenance_max_total_wait_s))
-    try:
-        timeout_reset_after = int(os.environ.get("GHTRADER_TQ_TIMEOUT_RESET_AFTER", "2") or "2")
-    except Exception:
-        timeout_reset_after = 2
+    timeout_reset_after = env_int("GHTRADER_TQ_TIMEOUT_RESET_AFTER", 2)
     timeout_reset_after = max(1, int(timeout_reset_after))
 
     row_counts: dict[str, int] = {}
@@ -467,15 +443,9 @@ def download_main_l5_for_days(
     days_total = int(len(unique_days))
     total_rows = 0
     last_progress_ts = time.time()
-    try:
-        progress_every_s = float(os.environ.get("GHTRADER_PROGRESS_EVERY_S", "15") or "15")
-    except Exception:
-        progress_every_s = 15.0
+    progress_every_s = env_float("GHTRADER_PROGRESS_EVERY_S", 15.0)
     progress_every_s = max(5.0, float(progress_every_s))
-    try:
-        progress_every_n = int(os.environ.get("GHTRADER_PROGRESS_EVERY_N", "25") or "25")
-    except Exception:
-        progress_every_n = 25
+    progress_every_n = env_int("GHTRADER_PROGRESS_EVERY_N", 25)
     progress_every_n = max(1, int(progress_every_n))
     log.info(
         "tq_main_l5.download_start",
@@ -499,7 +469,7 @@ def download_main_l5_for_days(
             except Exception:
                 requested_workers = None
         if requested_workers is None:
-            raw_workers = str(os.environ.get("GHTRADER_INGEST_WORKERS", "") or "").strip()
+            raw_workers = str(env_int("GHTRADER_INGEST_WORKERS", 0) or "").strip()
             if raw_workers:
                 try:
                     requested_workers = int(raw_workers)

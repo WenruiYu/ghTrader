@@ -30,6 +30,8 @@ def build_day_validation_artifacts(
     observed_seconds_in_sessions: int,
     seconds_with_one_tick: int,
     seconds_with_two_plus: int,
+    summary_seconds_with_ticks: int | None = None,
+    summary_seconds_with_two_plus: int | None = None,
     ticks_outside_sessions_seconds: int,
     last_tick_sec: int | None,
     session_end_sec: int | None,
@@ -90,14 +92,24 @@ def build_day_validation_artifacts(
     day_out["_has_missing_day"] = bool(missing_day)
 
     total_segments = int(observed_segments) + int(missing_segments_total)
+    sec_ticks = (
+        int(summary_seconds_with_ticks)
+        if summary_seconds_with_ticks is not None
+        else (int(seconds_with_one_tick) + int(seconds_with_two_plus))
+    )
+    sec_two_plus = (
+        int(summary_seconds_with_two_plus)
+        if summary_seconds_with_two_plus is not None
+        else int(seconds_with_two_plus)
+    )
     summary_row = MainL5ValidateSummaryRow(
         symbol=str(symbol),
         trading_day=day_iso,
         cadence_mode=str(cadence_mode),
         expected_seconds=int(expected_seconds),
         expected_seconds_strict=int(expected_seconds_strict),
-        seconds_with_ticks=int(seconds_with_one_tick) + int(seconds_with_two_plus),
-        seconds_with_two_plus=int(seconds_with_two_plus),
+        seconds_with_ticks=int(sec_ticks),
+        seconds_with_two_plus=int(sec_two_plus),
         two_plus_ratio=float(two_plus_ratio),
         observed_segments=int(observed_segments),
         total_segments=int(total_segments),

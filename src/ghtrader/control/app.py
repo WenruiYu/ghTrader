@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import threading
 import time
 import json
 import uuid
@@ -17,21 +16,12 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import redis.asyncio as redis
 
+from ghtrader.config_service import enforce_no_legacy_env, get_config_resolver
 from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
 from ghtrader.control import auth
 from ghtrader.control.db import JobStore
 from ghtrader.control.job_command import extract_cli_subcommand, extract_cli_subcommands
 from ghtrader.control.jobs import JobManager, JobSpec, python_module_argv
-from ghtrader.control.accounts_env import (
-    accounts_env_delete_profile as _accounts_env_delete_profile,
-    accounts_env_get_profile_values as _accounts_env_get_profile_values,
-    accounts_env_is_configured as _accounts_env_is_configured,
-    accounts_env_upsert_profile as _accounts_env_upsert_profile,
-    canonical_profile as _canonical_profile,
-    parse_profiles_csv as _parse_profiles_csv,
-    read_accounts_env_values as _read_accounts_env_values,
-)
-from ghtrader.control.brokers import get_supported_brokers as _get_supported_brokers
 from ghtrader.control.state_helpers import (
     artifact_age_sec as _artifact_age_sec,
     health_error as _health_error,
@@ -57,16 +47,18 @@ from ghtrader.control.supervisors import (
     strategy_supervisor_tick as _strategy_supervisor_tick_impl,
     tqsdk_scheduler_tick as _tqsdk_scheduler_tick_impl,
 )
-from ghtrader.control.routes.accounts import build_accounts_router
-from ghtrader.control.routes.gateway import build_gateway_router
-from ghtrader.control.routes.models import build_models_router
+from ghtrader.control.routes.accounts import router as accounts_router
+from ghtrader.control.routes.gateway import gateway_status_payload, router as gateway_router
+from ghtrader.control.routes.models import router as models_router
 from ghtrader.control.routes import build_api_router, build_root_router
 from ghtrader.control.variety_context import allowed_varieties as _allowed_varieties
 from ghtrader.control.variety_context import default_variety as _default_variety
 from ghtrader.control.variety_context import derived_symbol_for_variety as _derived_symbol_for_variety
 from ghtrader.control.variety_context import symbol_matches_variety as _symbol_matches_variety_impl
+from ghtrader.control.cache import TTLCacheSlot
 from ghtrader.control.views import _data_page_cache_clear, build_router
 from ghtrader.util.json_io import read_json as _read_json
+from ghtrader.util.observability import get_store
 
 log = structlog.get_logger()
 
@@ -74,25 +66,13 @@ _TQSDK_HEAVY_SUBCOMMANDS = {"account"}
 _TQSDK_HEAVY_DATA_SUBCOMMANDS = {"repair", "health", "main-l5-validate"}
 
 _UI_STATUS_TTL_S = 5.0
-_ui_status_at: float = 0.0
-_ui_status_payload: dict[str, Any] | None = None
-_ui_status_lock = threading.Lock()
+_ui_status_cache = TTLCacheSlot()
 
 _DASH_SUMMARY_TTL_S = 10.0
-_dash_summary_at: float = 0.0
-_dash_summary_payload: dict[str, Any] | None = None
-_dash_summary_lock = threading.Lock()
-
-_BENCHMARKS_TTL_S = 10.0
-_benchmarks_at: float = 0.0
-_benchmarks_payload: dict[str, Any] | None = None
-_benchmarks_lock = threading.Lock()
+_dash_summary_cache = TTLCacheSlot()
 
 _DATA_QUALITY_TTL_S = 60.0
-_data_quality_at: float = 0.0
-_data_quality_cache_key: str = ""
-_data_quality_payload: dict[str, Any] | None = None
-_data_quality_lock = threading.Lock()
+_data_quality_cache = TTLCacheSlot()
 
 
 from ghtrader.util.time import now_iso as _now_iso
@@ -115,11 +95,7 @@ def _iter_symbol_dirs(root: Path) -> set[str]:
 
 
 def _clear_data_quality_cache() -> None:
-    global _data_quality_at, _data_quality_cache_key, _data_quality_payload
-    with _data_quality_lock:
-        _data_quality_at = 0.0
-        _data_quality_cache_key = ""
-        _data_quality_payload = None
+    _data_quality_cache.clear()
 
 
 def _scan_model_files(artifacts_dir: Path) -> list[dict[str, Any]]:
@@ -244,49 +220,23 @@ def _job_matches_variety(job: Any, variety: str) -> bool:
     return f" {v} " in f" {title} "
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = str(os.environ.get(name, "1" if default else "0") or "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return bool(default)
-
-
-def _env_float(name: str, default: float, *, min_value: float | None = None) -> float:
-    try:
-        val = float(str(os.environ.get(name, default) or default).strip())
-    except Exception:
-        val = float(default)
-    if min_value is not None:
-        val = max(float(min_value), float(val))
-    return float(val)
-
-
-def _env_int(name: str, default: int, *, min_value: int | None = None) -> int:
-    try:
-        val = int(str(os.environ.get(name, default) or default).strip())
-    except Exception:
-        val = int(default)
-    if min_value is not None:
-        val = max(int(min_value), int(val))
-    return int(val)
-
-
 def _dashboard_guardrails_context() -> dict[str, Any]:
-    enforce_health_global = _env_bool("GHTRADER_PIPELINE_ENFORCE_HEALTH", True)
-    enforce_health_schedule = _env_bool("GHTRADER_MAIN_SCHEDULE_ENFORCE_HEALTH", enforce_health_global)
-    enforce_health_main_l5 = _env_bool("GHTRADER_MAIN_L5_ENFORCE_HEALTH", enforce_health_global)
+    resolver = get_config_resolver()
+    enforce_health_global = resolver.get_bool("GHTRADER_PIPELINE_ENFORCE_HEALTH", True)
+    enforce_health_schedule = resolver.get_bool("GHTRADER_MAIN_SCHEDULE_ENFORCE_HEALTH", enforce_health_global)
+    enforce_health_main_l5 = resolver.get_bool("GHTRADER_MAIN_L5_ENFORCE_HEALTH", enforce_health_global)
 
-    lock_wait_timeout_s = _env_float("GHTRADER_LOCK_WAIT_TIMEOUT_S", 120.0, min_value=0.0)
-    lock_poll_interval_s = _env_float("GHTRADER_LOCK_POLL_INTERVAL_S", 1.0, min_value=0.1)
-    lock_force_cancel = _env_bool("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", True)
-    lock_preempt_grace_s = _env_float("GHTRADER_LOCK_PREEMPT_GRACE_S", 8.0, min_value=1.0)
+    lock_wait_timeout_s = resolver.get_float("GHTRADER_LOCK_WAIT_TIMEOUT_S", 120.0, min_value=0.0)
+    lock_poll_interval_s = resolver.get_float("GHTRADER_LOCK_POLL_INTERVAL_S", 1.0, min_value=0.1)
+    lock_force_cancel = resolver.get_bool("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", True)
+    lock_preempt_grace_s = resolver.get_float("GHTRADER_LOCK_PREEMPT_GRACE_S", 8.0, min_value=1.0)
 
-    total_workers_raw = str(os.environ.get("GHTRADER_MAIN_L5_TOTAL_WORKERS", "") or "").strip()
-    segment_workers_raw = str(os.environ.get("GHTRADER_MAIN_L5_SEGMENT_WORKERS", "") or "").strip()
-    total_workers = _env_int("GHTRADER_MAIN_L5_TOTAL_WORKERS", 0, min_value=0) if total_workers_raw else 0
-    segment_workers = _env_int("GHTRADER_MAIN_L5_SEGMENT_WORKERS", 0, min_value=0) if segment_workers_raw else 0
+    total_workers_raw, _src_total = resolver.get_raw_with_source("GHTRADER_MAIN_L5_TOTAL_WORKERS", None)
+    segment_workers_raw, _src_seg = resolver.get_raw_with_source("GHTRADER_MAIN_L5_SEGMENT_WORKERS", None)
+    total_workers_raw = str(total_workers_raw or "").strip() if total_workers_raw is not None else ""
+    segment_workers_raw = str(segment_workers_raw or "").strip() if segment_workers_raw is not None else ""
+    total_workers = resolver.get_int("GHTRADER_MAIN_L5_TOTAL_WORKERS", 0, min_value=0) if total_workers_raw else 0
+    segment_workers = resolver.get_int("GHTRADER_MAIN_L5_SEGMENT_WORKERS", 0, min_value=0) if segment_workers_raw else 0
     health_gate_strict = bool(enforce_health_schedule and enforce_health_main_l5)
 
     return {
@@ -330,10 +280,6 @@ def _ui_state_payload(
 def _scheduler_enabled() -> bool:
     return _scheduler_enabled_impl()
 
-
-def _mask_account_id(aid: str) -> str:
-    s = str(aid or "")
-    return (s[:2] + "***" + s[-2:]) if len(s) >= 6 else "***"
 
 def _start_tqsdk_scheduler(app: FastAPI, *, max_parallel_default: int = 4) -> None:
     _start_tqsdk_scheduler_impl(
@@ -478,6 +424,7 @@ class ConnectionManager:
 
 def create_app() -> Any:
     runs_dir = get_runs_dir()
+    enforce_no_legacy_env()
     store = JobStore(_jobs_db_path(runs_dir))
     jm = JobManager(store=store, logs_dir=_logs_dir(runs_dir))
     jm.reconcile()
@@ -491,6 +438,25 @@ def create_app() -> Any:
         pass
 
     app = FastAPI(title="ghTrader Control", version="0.1.0")
+    obs = get_store("control.api")
+
+    @app.middleware("http")
+    async def _observe_http_requests(request: Request, call_next: Any) -> Any:
+        started = time.perf_counter()
+        ok = False
+        try:
+            response = await call_next(request)
+            status = int(getattr(response, "status_code", 500))
+            ok = status < 500
+            return response
+        finally:
+            route = request.scope.get("route")
+            route_path = str(getattr(route, "path", "") or request.url.path or "/")
+            obs.observe(
+                metric=f"{request.method} {route_path}",
+                latency_s=(time.perf_counter() - started),
+                ok=bool(ok),
+            )
     app.state.job_store = store
     app.state.job_manager = jm
     if _scheduler_enabled():
@@ -545,17 +511,11 @@ def create_app() -> Any:
         q = str(search or "").strip().lower()
         only_issues = bool(issues_only)
 
-        global _data_quality_at, _data_quality_cache_key, _data_quality_payload
         now = time.time()
         cache_key = f"{ex}|{v}|{lim}|{q}|{int(only_issues)}"
-        with _data_quality_lock:
-            if (
-                isinstance(_data_quality_payload, dict)
-                and _data_quality_cache_key == cache_key
-                and (now - float(_data_quality_at)) <= float(_DATA_QUALITY_TTL_S)
-                and not refresh
-            ):
-                return dict(_data_quality_payload)
+        cached = _data_quality_cache.get(ttl_s=_DATA_QUALITY_TTL_S, key=cache_key, now=now)
+        if isinstance(cached, dict) and not refresh:
+            return dict(cached)
 
         runs_dir = get_runs_dir()
         snap_path = runs_dir / "control" / "cache" / "contracts_snapshot" / f"contracts_exchange={ex}_var={v}.json"
@@ -820,10 +780,7 @@ def create_app() -> Any:
         if errors and not out_rows:
             payload["ok"] = False
             payload["error"] = errors[0]
-        with _data_quality_lock:
-            _data_quality_payload = dict(payload)
-            _data_quality_cache_key = cache_key
-            _data_quality_at = time.time()
+        _data_quality_cache.set(dict(payload), key=cache_key, now=time.time())
         return payload
 
     @app.post("/api/data/enqueue-l5-start", response_class=JSONResponse)
@@ -1488,17 +1445,10 @@ def create_app() -> Any:
             raise HTTPException(status_code=401, detail="Unauthorized")
 
         v = _normalize_variety_for_api(var, allow_legacy_default=True)
-        global _dash_summary_at, _dash_summary_payload
         now = time.time()
-        with _dash_summary_lock:
-            if (
-                _dash_summary_payload is not None
-                and (now - float(_dash_summary_at)) <= float(_DASH_SUMMARY_TTL_S)
-                and str((_dash_summary_payload or {}).get("_cache_var") or "") == v
-            ):
-                out = dict(_dash_summary_payload)
-                out.pop("_cache_var", None)
-                return out
+        cached = _dash_summary_cache.get(ttl_s=_DASH_SUMMARY_TTL_S, key=v, now=now)
+        if isinstance(cached, dict):
+            return dict(cached)
 
         data_dir = get_data_dir()
         runs_dir = get_runs_dir()
@@ -1721,9 +1671,7 @@ def create_app() -> Any:
             "pipeline": pipeline,
             "guardrails": guardrails,
         }
-        with _dash_summary_lock:
-            _dash_summary_payload = {**dict(payload), "_cache_var": v}
-            _dash_summary_at = time.time()
+        _dash_summary_cache.set(dict(payload), key=v, now=time.time())
         return payload
 
     @app.get("/api/ui/status", response_class=JSONResponse)
@@ -1736,11 +1684,10 @@ def create_app() -> Any:
         if not auth.is_authorized(request):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
-        global _ui_status_at, _ui_status_payload
         now = time.time()
-        with _ui_status_lock:
-            if _ui_status_payload is not None and (now - float(_ui_status_at)) <= float(_UI_STATUS_TTL_S):
-                return dict(_ui_status_payload)
+        cached = _ui_status_cache.get(ttl_s=_UI_STATUS_TTL_S, now=now)
+        if isinstance(cached, dict):
+            return dict(cached)
 
         runs_dir = get_runs_dir()
         data_dir = get_data_dir()
@@ -1790,474 +1737,16 @@ def create_app() -> Any:
             "running_count": int(running_count),
             "queued_count": int(queued_count),
         }
-        with _ui_status_lock:
-            _ui_status_payload = dict(payload)
-            _ui_status_at = time.time()
+        _ui_status_cache.set(dict(payload), now=time.time())
         return payload
-
-    def api_models_inventory(request: Request, var: str = "") -> dict[str, Any]:
-        """
-        List trained model artifacts from artifacts/ directory.
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-        artifacts_dir = get_artifacts_dir()
-        models: list[dict[str, Any]] = []
-        var_filter = _normalize_variety_for_api(var) if str(var or "").strip() else ""
-
-        try:
-            if not artifacts_dir.exists():
-                return {"ok": True, "models": []}
-
-            def _human_size(size_bytes: int) -> str:
-                for unit in ["B", "KB", "MB", "GB"]:
-                    if size_bytes < 1024:
-                        return f"{size_bytes:.1f} {unit}"
-                    size_bytes /= 1024
-                return f"{size_bytes:.1f} TB"
-
-            from datetime import datetime, timezone
-
-            files = _scan_model_files(artifacts_dir)
-            files_sorted = sorted(files, key=lambda x: float(x.get("mtime") or 0.0), reverse=True)
-            for f in files_sorted:
-                try:
-                    mtime = float(f.get("mtime") or 0.0)
-                    created_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
-                    p = Path(str(f.get("path") or ""))
-                    rel = str(p.relative_to(artifacts_dir)) if artifacts_dir in p.parents else str(p.name)
-                    size_bytes = int(f.get("size_bytes") or 0)
-                    models.append(
-                        {
-                            "name": rel,
-                            "model_type": str(f.get("model_type") or ""),
-                            "symbol": str(f.get("symbol") or ""),
-                            "horizon": int(f.get("horizon") or 0),
-                            "namespace": str(f.get("namespace") or ""),
-                            "created_at": created_at,
-                            "size_bytes": size_bytes,
-                            "size_human": _human_size(size_bytes),
-                            "path": str(p),
-                        }
-                    )
-                except Exception:
-                    continue
-
-        except Exception as e:
-            log.warning("api_models_inventory.error", error=str(e))
-            return {"ok": False, "models": [], "error": str(e)}
-
-        if var_filter:
-            models = [m for m in models if _symbol_matches_variety(str(m.get("symbol") or ""), var_filter)]
-        return {"ok": True, "models": models, "var": (var_filter or None)}
-
-    def api_models_benchmarks(request: Request, limit: int = 20, var: str = "") -> dict[str, Any]:
-        """
-        List recent benchmark summaries from runs/benchmarks/**/<run_id>.json.
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-        global _benchmarks_at, _benchmarks_payload
-        var_filter = _normalize_variety_for_api(var) if str(var or "").strip() else ""
-        lim = max(1, min(int(limit or 20), 200))
-        now = time.time()
-        with _benchmarks_lock:
-            if _benchmarks_payload is not None and (now - float(_benchmarks_at)) <= float(_BENCHMARKS_TTL_S):
-                payload = dict(_benchmarks_payload)
-                rows = list(payload.get("benchmarks") or [])
-                if var_filter:
-                    rows = [r for r in rows if _symbol_matches_variety(str((r or {}).get("symbol") or ""), var_filter)]
-                payload["benchmarks"] = rows[:lim]
-                payload["var"] = var_filter or None
-                return payload
-
-        runs_dir = get_runs_dir()
-        root = runs_dir / "benchmarks"
-        if not root.exists():
-            return {"ok": True, "benchmarks": [], "var": var_filter or None}
-
-        out: list[dict[str, Any]] = []
-        from datetime import datetime, timezone
-
-        try:
-            for p in root.rglob("*.json"):
-                try:
-                    if not p.is_file():
-                        continue
-                    rel = p.relative_to(runs_dir).as_posix()
-                    st = p.stat()
-                    created_at = datetime.fromtimestamp(float(st.st_mtime), tz=timezone.utc).isoformat()
-                    payload = json.loads(p.read_text(encoding="utf-8"))
-                    offline = payload.get("offline") if isinstance(payload.get("offline"), dict) else {}
-                    latency = payload.get("latency") if isinstance(payload.get("latency"), dict) else {}
-                    out.append(
-                        {
-                            "run_id": str(payload.get("run_id") or p.stem),
-                            "timestamp": str(payload.get("timestamp") or ""),
-                            "model_type": str(payload.get("model_type") or ""),
-                            "symbol": str(payload.get("symbol") or ""),
-                            "horizon": int(payload.get("horizon") or 0),
-                            "accuracy": offline.get("accuracy"),
-                            "f1_macro": offline.get("f1_macro"),
-                            "log_loss": offline.get("log_loss"),
-                            "ece": offline.get("ece"),
-                            "inference_p95_ms": latency.get("inference_p95_ms"),
-                            "created_at": created_at,
-                            "path": rel,
-                        }
-                    )
-                except Exception:
-                    continue
-        except Exception as e:
-            return {"ok": False, "benchmarks": [], "error": str(e)}
-
-        out = sorted(out, key=lambda x: (str(x.get("timestamp") or ""), str(x.get("created_at") or "")), reverse=True)
-        payload2 = {"ok": True, "benchmarks": out}
-        with _benchmarks_lock:
-            _benchmarks_payload = dict(payload2)
-            _benchmarks_at = time.time()
-        rows = list(out)
-        if var_filter:
-            rows = [r for r in rows if _symbol_matches_variety(str((r or {}).get("symbol") or ""), var_filter)]
-        return {"ok": True, "benchmarks": rows[:lim], "var": var_filter or None}
 
     # ---------------------------------------------------------------------
     # Trading artifacts helpers
     # ---------------------------------------------------------------------
 
-    def api_accounts(request: Request) -> dict[str, Any]:
-        """
-        List broker account profiles (runs/control/accounts.env) + last verification + gateway/strategy summary.
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-        runs_dir = get_runs_dir()
-        verify_dir = runs_dir / "control" / "cache" / "accounts"
-        gateway_root = runs_dir / "gateway"
-        strategy_root = runs_dir / "strategy"
-
-        env = _read_accounts_env_values(runs_dir=runs_dir)
-        profiles: list[str] = ["default"]
-        for p in _parse_profiles_csv(env.get("GHTRADER_TQ_ACCOUNT_PROFILES", "")):
-            cp = _canonical_profile(p)
-            if cp and cp not in profiles:
-                profiles.append(cp)
-
-        out_profiles: list[dict[str, Any]] = []
-        for p in profiles:
-            p = _canonical_profile(p)
-            vals = _accounts_env_get_profile_values(env=env, profile=p)
-            broker_id = str(vals.get("broker_id") or "")
-            acc = str(vals.get("account_id") or "")
-            configured = _accounts_env_is_configured(env=env, profile=p)
-            verify = _read_json_file(verify_dir / f"account={p}.json") if verify_dir.exists() else None
-
-            gw_root = gateway_root / f"account={p}"
-            st_root = strategy_root / f"account={p}"
-            gw_state_path = gw_root / "state.json"
-            st_state_path = st_root / "state.json"
-            gw_desired_path = gw_root / "desired.json"
-            st_desired_path = st_root / "desired.json"
-
-            gw_desired = _read_json_file(gw_desired_path) if gw_desired_path.exists() else None
-            st_desired = _read_json_file(st_desired_path) if st_desired_path.exists() else None
-
-            gw_age = _artifact_age_sec(gw_state_path) if gw_state_path.exists() else None
-            st_age = _artifact_age_sec(st_state_path) if st_state_path.exists() else None
-
-            gw_cfg = (
-                gw_desired.get("desired")
-                if isinstance(gw_desired, dict) and isinstance(gw_desired.get("desired"), dict)
-                else (gw_desired or {})
-            )
-            st_cfg = (
-                st_desired.get("desired")
-                if isinstance(st_desired, dict) and isinstance(st_desired.get("desired"), dict)
-                else (st_desired or {})
-            )
-            gw_mode = str((gw_cfg or {}).get("mode") or "idle")
-            st_mode = str((st_cfg or {}).get("mode") or "idle")
-
-            gw_status = _status_from_desired_and_state(root_exists=gw_root.exists(), desired_mode=gw_mode, state_age=gw_age)
-            st_status = _status_from_desired_and_state(root_exists=st_root.exists(), desired_mode=st_mode, state_age=st_age)
-
-            out_profiles.append(
-                {
-                    "profile": p,
-                    "configured": configured,
-                    "broker_id": broker_id,
-                    "account_id_masked": _mask_account_id(acc) if acc else "",
-                    "verify": verify,
-                    "gateway": {"exists": bool(gw_root.exists()), "status": gw_status, "desired_mode": gw_mode, "state_age_sec": gw_age},
-                    "strategy": {"exists": bool(st_root.exists()), "status": st_status, "desired_mode": st_mode, "state_age_sec": st_age},
-                }
-            )
-
-        return {"ok": True, "profiles": out_profiles, "generated_at": _now_iso()}
-
-    async def api_accounts_upsert(request: Request) -> dict[str, Any]:
-        """
-        Upsert a broker account profile into runs/control/accounts.env.
-
-        Payload: {profile, broker_id, account_id, password}
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        payload = await request.json()
-        profile = str(payload.get("profile") or "").strip()
-        broker_id = str(payload.get("broker_id") or "").strip()
-        account_id = str(payload.get("account_id") or "").strip()
-        password = str(payload.get("password") or "").strip()
-        if not profile:
-            raise HTTPException(status_code=400, detail="missing profile")
-        if not broker_id or not account_id or not password:
-            raise HTTPException(status_code=400, detail="missing broker_id/account_id/password")
-
-        runs_dir = get_runs_dir()
-        try:
-            _accounts_env_upsert_profile(
-                runs_dir=runs_dir,
-                profile=profile,
-                broker_id=broker_id,
-                account_id=account_id,
-                password=password,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"accounts_env_upsert_failed: {e}")
-
-        return {"ok": True, "profile": _canonical_profile(profile)}
-
-    async def api_accounts_delete(request: Request) -> dict[str, Any]:
-        """
-        Delete a broker account profile from runs/control/accounts.env.
-
-        Payload: {profile}
-        Also removes runs/control/cache/accounts/account=<profile>.json verify cache.
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        payload = await request.json()
-        profile = str(payload.get("profile") or "").strip()
-        if not profile:
-            raise HTTPException(status_code=400, detail="missing profile")
-        p = _canonical_profile(profile)
-
-        runs_dir = get_runs_dir()
-        try:
-            _accounts_env_delete_profile(runs_dir=runs_dir, profile=p)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"accounts_env_delete_failed: {e}")
-
-        # Remove verify cache if present.
-        verify_path = runs_dir / "control" / "cache" / "accounts" / f"account={p}.json"
-        try:
-            if verify_path.exists():
-                verify_path.unlink()
-        except Exception:
-            pass
-
-        return {"ok": True, "profile": p}
-
-    def api_brokers(request: Request) -> dict[str, Any]:
-        """
-        Return supported broker IDs for TqSdk (best-effort).
-
-        Implementation: fetch + parse ShinnyTech list, cache to runs/control/cache/brokers.json,
-        and fall back to a small built-in list when unavailable.
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        runs_dir = get_runs_dir()
-        brokers, source = _get_supported_brokers(runs_dir=runs_dir)
-        return {"ok": True, "brokers": brokers, "source": source, "generated_at": _now_iso()}
-
-    async def api_accounts_enqueue_verify(request: Request) -> dict[str, Any]:
-        """
-        Enqueue a broker account verification job (runs `ghtrader account verify ...`).
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        payload = await request.json()
-        prof = str(payload.get("account_profile") or "default").strip() or "default"
-
-        argv = python_module_argv("ghtrader.cli", "account", "verify", "--account", prof, "--json")
-        title = f"account-verify {prof}"
-        jm = request.app.state.job_manager
-        rec = jm.enqueue_job(
-            JobSpec(
-                title=title,
-                argv=argv,
-                cwd=Path.cwd(),
-                metadata={"kind": "account_verify", "account_profile": prof},
-            )
-        )
-        return {"ok": True, "enqueued": [rec.id], "count": 1}
-
     # ---------------------------------------------------------------------
     # Gateway (AccountGateway; OMS/EMS per account profile)
     # ---------------------------------------------------------------------
-
-    def api_gateway_status(request: Request, account_profile: str = "default") -> dict[str, Any]:
-        """
-        Read gateway state for a broker account profile (Redis hot state first, file mirror fallback).
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-        runs_dir = get_runs_dir()
-        try:
-            from ghtrader.tq.runtime import canonical_account_profile
-
-            prof = canonical_account_profile(str(account_profile or "default"))
-        except Exception:
-            prof = str(account_profile or "default").strip() or "default"
-
-        root = runs_dir / "gateway" / f"account={prof}"
-        st = _read_redis_json(f"ghtrader:gateway:state:{prof}") or (_read_json_file(root / "state.json") if root.exists() else None)
-        desired = _read_redis_json(f"ghtrader:gateway:desired:{prof}") or (_read_json_file(root / "desired.json") if root.exists() else None)
-        targets = _read_json_file(root / "targets.json") if root.exists() else None
-
-        return {
-            "ok": True,
-            "account_profile": prof,
-            "root": str(root),
-            "exists": bool(root.exists()),
-            "state": st,
-            "desired": desired,
-            "targets": targets,
-            "generated_at": _now_iso(),
-        }
-
-    def api_gateway_list(request: Request, limit: int = 200) -> dict[str, Any]:
-        """
-        List gateway profiles + summary state.
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-        runs_dir = get_runs_dir()
-        root = runs_dir / "gateway"
-        lim = max(1, min(int(limit or 200), 500))
-
-        rows: list[dict[str, Any]] = []
-        try:
-            if root.exists():
-                for d in sorted([p for p in root.iterdir() if p.is_dir() and p.name.startswith("account=")], key=lambda x: x.name)[:lim]:
-                    prof = d.name.split("=", 1)[-1] if "=" in d.name else d.name
-                    st = _read_redis_json(f"ghtrader:gateway:state:{prof}") or (_read_json_file(d / "state.json") if (d / "state.json").exists() else None)
-                    desired = _read_redis_json(f"ghtrader:gateway:desired:{prof}") or (_read_json_file(d / "desired.json") if (d / "desired.json").exists() else None)
-                    health = st.get("health") if isinstance(st, dict) and isinstance(st.get("health"), dict) else {}
-                    effective = st.get("effective") if isinstance(st, dict) and isinstance(st.get("effective"), dict) else {}
-                    rows.append(
-                        {
-                            "account_profile": str(prof),
-                            "root": str(d),
-                            "health": health,
-                            "effective": effective,
-                            "desired": desired.get("desired") if isinstance(desired, dict) else desired,
-                            "updated_at": (st or {}).get("updated_at") if isinstance(st, dict) else None,
-                        }
-                    )
-        except Exception as e:
-            return {"ok": False, "error": str(e), "profiles": [], "generated_at": _now_iso()}
-
-        return {"ok": True, "profiles": rows, "generated_at": _now_iso()}
-
-    async def api_gateway_desired(request: Request) -> dict[str, Any]:
-        """
-        Upsert gateway desired.json for a profile.
-
-        Payload:
-          {account_profile, desired: {mode, symbols, executor, sim_account, confirm_live, max_abs_position, ...}}
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        payload = await request.json()
-        ap = str(payload.get("account_profile") or "default").strip() or "default"
-        desired_in = payload.get("desired") if isinstance(payload.get("desired"), dict) else {}
-
-        try:
-            from ghtrader.tq.gateway import GatewayDesired, write_gateway_desired
-            from ghtrader.tq.runtime import canonical_account_profile
-
-            prof = canonical_account_profile(ap)
-            d = GatewayDesired(
-                mode=str(desired_in.get("mode") or "idle").strip(),  # type: ignore[arg-type]
-                symbols=list(desired_in.get("symbols")) if isinstance(desired_in.get("symbols"), list) else None,
-                executor=str(desired_in.get("executor") or "targetpos").strip().lower() in {"direct"} and "direct" or "targetpos",  # type: ignore[arg-type]
-                sim_account=str(desired_in.get("sim_account") or "tqsim").strip().lower() in {"tqkq"} and "tqkq" or "tqsim",  # type: ignore[arg-type]
-                confirm_live=str(desired_in.get("confirm_live") or "").strip(),
-                max_abs_position=max(0, int(desired_in.get("max_abs_position") or 1)),
-                max_order_size=max(1, int(desired_in.get("max_order_size") or 1)),
-                max_ops_per_sec=max(1, int(desired_in.get("max_ops_per_sec") or 10)),
-                max_daily_loss=(float(desired_in.get("max_daily_loss")) if str(desired_in.get("max_daily_loss") or "").strip() else None),
-                enforce_trading_time=bool(desired_in.get("enforce_trading_time")) if ("enforce_trading_time" in desired_in) else True,
-            )
-            write_gateway_desired(runs_dir=get_runs_dir(), profile=prof, desired=d)
-            return {"ok": True, "account_profile": prof}
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"gateway_desired_failed: {e}")
-
-    async def api_gateway_command(request: Request) -> dict[str, Any]:
-        """
-        Append an operator command (Redis stream primary; file mirror for audit).
-
-        Payload:
-          {account_profile, type, params?}
-        """
-        if not auth.is_authorized(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        payload = await request.json()
-        ap = str(payload.get("account_profile") or "default").strip() or "default"
-        cmd_type = str(payload.get("type") or "").strip()
-        if not cmd_type:
-            raise HTTPException(status_code=400, detail="missing type")
-
-        try:
-            from ghtrader.tq.gateway import commands_path
-            from ghtrader.tq.runtime import canonical_account_profile
-
-            prof = canonical_account_profile(ap)
-            p = commands_path(runs_dir=get_runs_dir(), profile=prof)
-            p.parent.mkdir(parents=True, exist_ok=True)
-
-            cmd = {
-                "ts": _now_iso(),
-                "command_id": uuid.uuid4().hex[:12],
-                "account_profile": prof,
-                "type": cmd_type,
-                "params": payload.get("params") if isinstance(payload.get("params"), dict) else {},
-            }
-            with open(p, "a", encoding="utf-8") as f:
-                f.write(json.dumps(cmd, ensure_ascii=False, default=str) + "\n")
-
-            # Primary command bus: Redis stream.
-            try:
-                r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
-                params = cmd.get("params") if isinstance(cmd.get("params"), dict) else {}
-                await r.xadd(
-                    f"ghtrader:commands:{prof}",
-                    {
-                        "ts": str(cmd.get("ts") or ""),
-                        "command_id": str(cmd.get("command_id") or ""),
-                        "account_profile": prof,
-                        "type": str(cmd.get("type") or ""),
-                        "params": json.dumps(params, ensure_ascii=False, default=str),
-                        "symbol": str(params.get("symbol") or ""),
-                        "target": str(params.get("target") or ""),
-                    },
-                    maxlen=10000,
-                    approximate=True,
-                )
-                await r.aclose()
-            except Exception:
-                pass
-            return {"ok": True, "account_profile": prof, "command_id": cmd["command_id"]}
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"gateway_command_failed: {e}")
 
     # ---------------------------------------------------------------------
     # Strategy (AI StrategyRunner; consumes gateway state, writes targets)
@@ -2768,7 +2257,7 @@ def create_app() -> Any:
             live_enabled = False
 
         # Compose from existing endpoints (keep behavior consistent and minimize duplication).
-        gw = api_gateway_status(request, account_profile=prof)
+        gw = gateway_status_payload(account_profile=prof)
         st = api_strategy_status(request, account_profile=prof)
 
         # Add derived component statuses for clarity.
@@ -2933,29 +2422,9 @@ def create_app() -> Any:
             payload["var"] = var_filter
         return payload
 
-    app.include_router(
-        build_models_router(
-            models_inventory_handler=api_models_inventory,
-            models_benchmarks_handler=api_models_benchmarks,
-        )
-    )
-    app.include_router(
-        build_accounts_router(
-            accounts_handler=api_accounts,
-            accounts_upsert_handler=api_accounts_upsert,
-            accounts_delete_handler=api_accounts_delete,
-            brokers_handler=api_brokers,
-            accounts_enqueue_verify_handler=api_accounts_enqueue_verify,
-        )
-    )
-    app.include_router(
-        build_gateway_router(
-            gateway_status_handler=api_gateway_status,
-            gateway_list_handler=api_gateway_list,
-            gateway_desired_handler=api_gateway_desired,
-            gateway_command_handler=api_gateway_command,
-        )
-    )
+    app.include_router(models_router)
+    app.include_router(accounts_router)
+    app.include_router(gateway_router)
 
     return app
 

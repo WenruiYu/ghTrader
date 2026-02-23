@@ -33,27 +33,32 @@ def _new_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return TestClient(mod.app), cap_jm
 
 
-def test_api_ops_compat_contract_exposes_canonical_mapping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_api_ops_compat_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     client, _ = _new_client(tmp_path, monkeypatch)
-
     resp = client.get("/api/ops/compat")
-    assert resp.status_code == 200
-    payload = resp.json()
-    assert payload.get("policy") == "compatibility-layer-only"
-    assert "/data" in (payload.get("canonical_roots") or [])
-
-    rules = payload.get("rules") or []
-    mapping = {r["legacy"]: r["canonical"] for r in rules if isinstance(r, dict)}
-    assert mapping.get("/ops/model/train") == "/models/model/train"
-    assert "/ops/ingest/download" not in mapping
-    assert all(str((r or {}).get("mode")) in {"redirect", "alias"} for r in rules if isinstance(r, dict))
+    assert resp.status_code == 404
 
 
-def test_ops_model_train_alias_still_submits_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ops_model_train_alias_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, _ = _new_client(tmp_path, monkeypatch)
+    resp = client.post(
+        "/ops/model/train",
+        data={
+            "model": "xgboost",
+            "symbol": "KQ.m@SHFE.cu",
+            "gpus": "1",
+            "ddp": "false",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 404
+
+
+def test_models_model_train_canonical_still_submits_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     client, cap_jm = _new_client(tmp_path, monkeypatch)
 
     resp = client.post(
-        "/ops/model/train",
+        "/models/model/train",
         data={
             "model": "xgboost",
             "symbol": "KQ.m@SHFE.cu",

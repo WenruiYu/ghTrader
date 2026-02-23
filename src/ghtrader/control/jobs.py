@@ -15,6 +15,7 @@ from typing import Any
 
 import structlog
 
+from ghtrader.config import env_float
 from ghtrader.control.db import JobRecord, JobStore
 from ghtrader.control.job_metadata import infer_job_metadata, merge_job_metadata
 
@@ -91,7 +92,7 @@ class JobManager:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self._spawn_lock = threading.Lock()
         try:
-            cancel_grace_s = float(os.environ.get("GHTRADER_JOB_CANCEL_GRACE_S", "8") or "8")
+            cancel_grace_s = float(env_float("GHTRADER_JOB_CANCEL_GRACE_S", 8.0))
         except Exception:
             cancel_grace_s = 8.0
         self._cancel_grace_s = max(1.0, float(cancel_grace_s))

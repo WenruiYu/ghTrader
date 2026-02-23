@@ -30,6 +30,46 @@ log = structlog.get_logger()
 # Flag to track if config has been loaded
 _config_loaded = False
 
+_ENV_ONLY_KEYS: set[str] = {
+    "GHTRADER_RUNS_DIR",
+    "GHTRADER_DATA_DIR",
+    "GHTRADER_ARTIFACTS_DIR",
+    "GHTRADER_LIVE_ENABLED",
+    "GHTRADER_DASHBOARD_TOKEN",
+    "GHTRADER_DISABLE_DOTENV",
+    "GHTRADER_CONFIG_ALLOW_LEGACY_ENV",
+    "GHTRADER_TQ_ACCOUNT_PROFILES",
+    "GHTRADER_QUESTDB_PG_PASSWORD",
+}
+_ENV_ONLY_PREFIXES: tuple[str, ...] = ("TQ_", "TQSDK_", "GHTRADER_JOB_")
+
+
+def _use_config_service_for_key(key: str) -> bool:
+    k = str(key or "").strip()
+    if not k:
+        return False
+    if k in _ENV_ONLY_KEYS:
+        return False
+    if any(k.startswith(prefix) for prefix in _ENV_ONLY_PREFIXES):
+        return False
+    return k.startswith("GHTRADER_")
+
+
+def _try_get_from_config_service(key: str) -> str | None:
+    try:
+        from ghtrader.config_service import get_config_resolver
+
+        resolver = get_config_resolver()
+        value, _source = resolver.get_raw_with_source(str(key), None)
+        if value is None:
+            return None
+        out = str(value)
+        if not out.strip():
+            return None
+        return out
+    except Exception:
+        return None
+
 
 def find_dotenv() -> Path | None:
     """Find the .env file, searching up from current directory."""
@@ -96,7 +136,13 @@ def load_config() -> None:
 
 def get_env(key: str, default: str | None = None, required: bool = False) -> str | None:
     """Get an environment variable with optional default and required check."""
-    value = os.environ.get(key, default)
+    value = os.environ.get(key, None)
+    if _use_config_service_for_key(key):
+        cfg_value = _try_get_from_config_service(key)
+        if cfg_value is not None:
+            value = cfg_value
+    if value is None:
+        value = default
     if required and not value:
         raise RuntimeError(
             f"Required environment variable {key} is not set. "

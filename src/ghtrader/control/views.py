@@ -4,7 +4,6 @@ import json
 import os
 import re
 import shutil
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -17,13 +16,14 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
+from ghtrader.config_service import get_config_resolver
+from ghtrader.config import get_artifacts_dir, get_data_dir, get_env, get_runs_dir
 from ghtrader.control import auth
 from ghtrader.control.job_metadata import infer_job_metadata, merge_job_metadata
 from ghtrader.control.jobs import JobSpec, python_module_argv
-from ghtrader.control.ops_compat import canonical_for_legacy
 from ghtrader.control.settings import get_tqsdk_scheduler_state, set_tqsdk_scheduler_max_parallel
 from ghtrader.control.system_info import cpu_mem_info, disk_usage, gpu_info
+from ghtrader.control.cache import TTLCacheMap
 from ghtrader.control.variety_context import (
     allowed_varieties as _allowed_varieties,
     default_variety as _default_variety,
@@ -32,36 +32,27 @@ from ghtrader.control.variety_context import (
     require_supported_variety as _require_supported_variety,
     symbol_matches_variety as _symbol_matches_variety,
 )
+from ghtrader.control.views_config import register_config_routes
+from ghtrader.control.views_helpers import safe_int as _safe_int
+from ghtrader.control.views_system import register_system_routes
 
 log = structlog.get_logger()
 
 _DATA_PAGE_CACHE_TTL_S = 5.0
-_DATA_PAGE_CACHE: dict[str, tuple[float, Any]] = {}
-_DATA_PAGE_CACHE_LOCK = threading.Lock()
+_DATA_PAGE_CACHE = TTLCacheMap()
 
 
 def _data_page_cache_get(key: str, *, ttl_s: float | None = None) -> Any | None:
     ttl = float(_DATA_PAGE_CACHE_TTL_S if ttl_s is None else ttl_s)
-    now = time.time()
-    with _DATA_PAGE_CACHE_LOCK:
-        item = _DATA_PAGE_CACHE.get(key)
-        if not item:
-            return None
-        ts, payload = item
-        if (now - float(ts)) > ttl:
-            _DATA_PAGE_CACHE.pop(key, None)
-            return None
-        return payload
+    return _DATA_PAGE_CACHE.get(str(key), ttl_s=ttl, now=time.time())
 
 
 def _data_page_cache_set(key: str, payload: Any) -> None:
-    with _DATA_PAGE_CACHE_LOCK:
-        _DATA_PAGE_CACHE[key] = (time.time(), payload)
+    _DATA_PAGE_CACHE.set(str(key), payload, now=time.time())
 
 
 def _data_page_cache_clear() -> None:
-    with _DATA_PAGE_CACHE_LOCK:
-        _DATA_PAGE_CACHE.clear()
+    _DATA_PAGE_CACHE.clear()
 
 
 def build_router() -> Any:
@@ -97,6 +88,7 @@ def build_router() -> Any:
             "data": "Data Hub",
             "models": "Models",
             "trading": "Trading",
+            "config": "Configuration",
             "sql": "SQL Explorer",
             "system": "System",
         }
@@ -149,27 +141,6 @@ def build_router() -> Any:
             return f"/jobs/{job_id}{token_qs}{sep}var={variety}"
         return f"/jobs/{job_id}{token_qs}"
 
-    def _log_ops_hit(legacy_path: str) -> None:
-        try:
-            log.info(
-                "ops.compat.hit",
-                legacy=str(legacy_path),
-                canonical=(canonical_for_legacy(legacy_path) or ""),
-            )
-        except Exception:
-            pass
-
-    def _safe_int(raw: Any, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
-        try:
-            val = int(str(raw).strip())
-        except Exception:
-            val = int(default)
-        if min_value is not None:
-            val = max(int(min_value), val)
-        if max_value is not None:
-            val = min(int(max_value), val)
-        return int(val)
-
     def _cuda_device_count() -> int:
         try:
             import torch
@@ -179,7 +150,7 @@ def build_router() -> Any:
             return 0
 
     def _resolve_torchrun_path() -> str | None:
-        cand = str(os.environ.get("GHTRADER_TORCHRUN_BIN", "torchrun") or "").strip() or "torchrun"
+        cand = str(get_env("GHTRADER_TORCHRUN_BIN", "torchrun") or "").strip() or "torchrun"
         return shutil.which(cand)
 
     def _has_active_ddp_training(request: Request) -> bool:
@@ -326,34 +297,19 @@ def build_router() -> Any:
             "latest_trading_error": latest_trading_error,
         }
 
-    def _env_bool(name: str, default: bool) -> bool:
-        raw = str(os.environ.get(name, "1" if default else "0") or "").strip().lower()
-        if raw in {"1", "true", "yes", "on"}:
-            return True
-        if raw in {"0", "false", "no", "off"}:
-            return False
-        return bool(default)
-
-    def _env_float(name: str, default: float, *, min_value: float | None = None) -> float:
-        try:
-            val = float(str(os.environ.get(name, default) or default).strip())
-        except Exception:
-            val = float(default)
-        if min_value is not None:
-            val = max(float(min_value), float(val))
-        return float(val)
-
     def _pipeline_guardrails_context() -> dict[str, Any]:
-        enforce_health_global = _env_bool("GHTRADER_PIPELINE_ENFORCE_HEALTH", True)
-        enforce_health_schedule = _env_bool("GHTRADER_MAIN_SCHEDULE_ENFORCE_HEALTH", enforce_health_global)
-        enforce_health_main_l5 = _env_bool("GHTRADER_MAIN_L5_ENFORCE_HEALTH", enforce_health_global)
-        lock_wait_timeout_s = _env_float("GHTRADER_LOCK_WAIT_TIMEOUT_S", 120.0, min_value=0.0)
-        lock_poll_interval_s = _env_float("GHTRADER_LOCK_POLL_INTERVAL_S", 1.0, min_value=0.1)
-        lock_force_cancel = _env_bool("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", True)
-        lock_preempt_grace_s = _env_float("GHTRADER_LOCK_PREEMPT_GRACE_S", 8.0, min_value=1.0)
-
-        total_workers_raw = str(os.environ.get("GHTRADER_MAIN_L5_TOTAL_WORKERS", "") or "").strip()
-        segment_workers_raw = str(os.environ.get("GHTRADER_MAIN_L5_SEGMENT_WORKERS", "") or "").strip()
+        resolver = get_config_resolver()
+        enforce_health_global = resolver.get_bool("GHTRADER_PIPELINE_ENFORCE_HEALTH", True)
+        enforce_health_schedule = resolver.get_bool("GHTRADER_MAIN_SCHEDULE_ENFORCE_HEALTH", enforce_health_global)
+        enforce_health_main_l5 = resolver.get_bool("GHTRADER_MAIN_L5_ENFORCE_HEALTH", enforce_health_global)
+        lock_wait_timeout_s = resolver.get_float("GHTRADER_LOCK_WAIT_TIMEOUT_S", 120.0, min_value=0.0)
+        lock_poll_interval_s = resolver.get_float("GHTRADER_LOCK_POLL_INTERVAL_S", 1.0, min_value=0.1)
+        lock_force_cancel = resolver.get_bool("GHTRADER_LOCK_FORCE_CANCEL_ON_TIMEOUT", True)
+        lock_preempt_grace_s = resolver.get_float("GHTRADER_LOCK_PREEMPT_GRACE_S", 8.0, min_value=1.0)
+        total_workers_raw, _src_total = resolver.get_raw_with_source("GHTRADER_MAIN_L5_TOTAL_WORKERS", None)
+        segment_workers_raw, _src_seg = resolver.get_raw_with_source("GHTRADER_MAIN_L5_SEGMENT_WORKERS", None)
+        total_workers_raw = str(total_workers_raw or "").strip() if total_workers_raw is not None else ""
+        segment_workers_raw = str(segment_workers_raw or "").strip() if segment_workers_raw is not None else ""
         total_workers = _safe_int(total_workers_raw, 0, min_value=0) if total_workers_raw else 0
         segment_workers = _safe_int(segment_workers_raw, 0, min_value=0) if segment_workers_raw else 0
 
@@ -756,67 +712,6 @@ def build_router() -> Any:
         )
 
     # ---------------------------------------------------------------------
-    # Ops -> Data redirect (backward compatibility)
-    # ---------------------------------------------------------------------
-
-    @router.get("/ops")
-    def ops_redirect(request: Request):
-        """Redirect /ops to /data for backward compatibility (unified workflow in Contracts tab)."""
-        _require_auth(request)
-        _log_ops_hit("/ops")
-        # Redirect to the unified Data Hub (Contracts tab has the 8-step workflow)
-        return RedirectResponse(url=f"{_var_page('data', token_qs=_token_qs(request))}#contracts", status_code=303)
-
-    @router.get("/ops/ingest")
-    def ops_ingest_redirect(request: Request):
-        _require_auth(request)
-        _log_ops_hit("/ops/ingest")
-        return RedirectResponse(url=f"{_var_page('data', token_qs=_token_qs(request))}#ingest", status_code=303)
-
-    @router.get("/ops/build")
-    def ops_build_redirect(request: Request):
-        _require_auth(request)
-        _log_ops_hit("/ops/build")
-        return RedirectResponse(url=f"{_var_page('data', token_qs=_token_qs(request))}#build", status_code=303)
-
-    @router.get("/ops/model")
-    def ops_model_redirect(request: Request):
-        _require_auth(request)
-        _log_ops_hit("/ops/model")
-        return RedirectResponse(url=_var_page("models", token_qs=_token_qs(request)), status_code=303)
-
-    @router.get("/ops/eval")
-    def ops_eval_redirect(request: Request):
-        _require_auth(request)
-        _log_ops_hit("/ops/eval")
-        return RedirectResponse(url=_var_page("models", token_qs=_token_qs(request)), status_code=303)
-
-    @router.get("/ops/trading")
-    def ops_trading_redirect(request: Request):
-        _require_auth(request)
-        _log_ops_hit("/ops/trading")
-        return RedirectResponse(url=_var_page("trading", token_qs=_token_qs(request)), status_code=303)
-
-    @router.get("/ops/locks")
-    def ops_locks_redirect(request: Request):
-        _require_auth(request)
-        _log_ops_hit("/ops/locks")
-        return RedirectResponse(url=f"{_var_page('data', token_qs=_token_qs(request))}#locks", status_code=303)
-
-    @router.get("/ops/integrity")
-    def ops_integrity_redirect(request: Request):
-        _require_auth(request)
-        _log_ops_hit("/ops/integrity")
-        return RedirectResponse(url=f"{_var_page('data', token_qs=_token_qs(request))}#integrity", status_code=303)
-
-    @router.get("/ops/integrity/report/{name}")
-    def ops_integrity_report_redirect(request: Request, name: str):
-        """Redirect to /data/integrity/report for backward compatibility."""
-        _require_auth(request)
-        _log_ops_hit("/ops/integrity/report/{name}")
-        return RedirectResponse(url=f"/data/integrity/report/{name}{_token_qs(request)}", status_code=303)
-
-    # ---------------------------------------------------------------------
     # Data Hub routes (consolidated from Ops)
     # ---------------------------------------------------------------------
 
@@ -956,39 +851,10 @@ def build_router() -> Any:
         rec = jm.start_job(JobSpec(title=title, argv=argv, cwd=Path.cwd()))
         return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(symbol)), status_code=303)
 
-    # ---------------------------------------------------------------------
-    # Legacy /ops/* POST routes (alias to canonical active handlers)
-    # ---------------------------------------------------------------------
-
-    @router.post("/ops/settings/tqsdk_scheduler")
-    async def ops_settings_tqsdk_scheduler(request: Request):
-        _log_ops_hit("/ops/settings/tqsdk_scheduler")
-        return await data_settings_tqsdk_scheduler(request)
-
-    @router.post("/ops/build/build")
-    async def ops_build_build(request: Request):
-        _log_ops_hit("/ops/build/build")
-        return await data_build_build(request)
-
-    @router.post("/ops/build/main_schedule")
-    async def ops_build_main_schedule(request: Request):
-        _log_ops_hit("/ops/build/main_schedule")
-        return await data_build_main_schedule(request)
-
-    @router.post("/ops/build/main_l5")
-    async def ops_build_main_l5(request: Request):
-        _log_ops_hit("/ops/build/main_l5")
-        return await data_build_main_l5(request)
-
-    # Note: /ops/model/* and /ops/eval/* routes are kept as-is since they
-    # redirect to /models page which is separate from the Data Hub consolidation.
-    # These routes submit jobs and redirect to job detail, so they work independently.
+    # Models/Eval form actions
     @router.post("/models/model/train")
-    @router.post("/ops/model/train")
     async def ops_model_train(request: Request):
         _require_auth(request)
-        if request.url.path.startswith("/ops/"):
-            _log_ops_hit("/ops/model/train")
         form = await request.form()
         model = str(form.get("model") or "").strip()
         symbol = str(form.get("symbol") or "").strip()
@@ -1034,11 +900,8 @@ def build_router() -> Any:
         return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(symbol)), status_code=303)
 
     @router.post("/models/model/sweep")
-    @router.post("/ops/model/sweep")
     async def ops_model_sweep(request: Request):
         _require_auth(request)
-        if request.url.path.startswith("/ops/"):
-            _log_ops_hit("/ops/model/sweep")
         form = await request.form()
         symbol = str(form.get("symbol") or "").strip()
         model = str(form.get("model") or "deeplob").strip()
@@ -1084,11 +947,8 @@ def build_router() -> Any:
         return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(symbol)), status_code=303)
 
     @router.post("/models/eval/benchmark")
-    @router.post("/ops/eval/benchmark")
     async def ops_eval_benchmark(request: Request):
         _require_auth(request)
-        if request.url.path.startswith("/ops/"):
-            _log_ops_hit("/ops/eval/benchmark")
         form = await request.form()
         model = str(form.get("model") or "").strip()
         symbol = str(form.get("symbol") or "").strip()
@@ -1120,11 +980,8 @@ def build_router() -> Any:
         return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(symbol)), status_code=303)
 
     @router.post("/models/eval/compare")
-    @router.post("/ops/eval/compare")
     async def ops_eval_compare(request: Request):
         _require_auth(request)
-        if request.url.path.startswith("/ops/"):
-            _log_ops_hit("/ops/eval/compare")
         form = await request.form()
         symbol = str(form.get("symbol") or "").strip()
         models = str(form.get("models") or "").strip()
@@ -1156,11 +1013,8 @@ def build_router() -> Any:
         return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(symbol)), status_code=303)
 
     @router.post("/models/eval/backtest")
-    @router.post("/ops/eval/backtest")
     async def ops_eval_backtest(request: Request):
         _require_auth(request)
-        if request.url.path.startswith("/ops/"):
-            _log_ops_hit("/ops/eval/backtest")
         form = await request.form()
         model = str(form.get("model") or "").strip()
         symbol = str(form.get("symbol") or "").strip()
@@ -1195,11 +1049,8 @@ def build_router() -> Any:
         return RedirectResponse(url=_job_redirect_url(request, rec.id, variety=_infer_variety_from_symbol(symbol)), status_code=303)
 
     @router.post("/models/eval/paper")
-    @router.post("/ops/eval/paper")
     async def ops_eval_paper(request: Request):
         _require_auth(request)
-        if request.url.path.startswith("/ops/"):
-            _log_ops_hit("/ops/eval/paper")
         form = await request.form()
         model = str(form.get("model") or "").strip()
         symbols = str(form.get("symbols") or "").strip()
@@ -1220,11 +1071,8 @@ def build_router() -> Any:
         )
 
     @router.post("/models/eval/daily_train")
-    @router.post("/ops/eval/daily_train")
     async def ops_eval_daily_train(request: Request):
         _require_auth(request)
-        if request.url.path.startswith("/ops/"):
-            _log_ops_hit("/ops/eval/daily_train")
         form = await request.form()
         symbols = str(form.get("symbols") or "").strip()
         model = str(form.get("model") or "deeplob").strip()
@@ -1851,107 +1699,25 @@ def build_router() -> Any:
             },
         )
 
-    @router.get("/explorer")
-    def explorer_page(request: Request):
-        _require_auth(request)
-        nav_var = _request_variety_hint(request)
-        store = request.app.state.job_store
-        jobs = store.list_jobs(limit=50)
-        running = [j for j in jobs if j.status == "running"]
-
-        q = "SELECT count() AS n_ticks FROM ghtrader_ticks_main_l5_v2"
-        return templates.TemplateResponse(
-            request,
-            "explorer.html",
-            {
-                "request": request,
-                "title": "SQL Explorer",
-                "token_qs": _token_qs(request),
-                "running_count": len(running),
-                "query": q,
-                "limit": 200,
-                "columns": [],
-                "rows": [],
-                "error": "",
-                **_variety_nav_ctx(nav_var, section="sql", page_title="SQL Explorer"),
-            },
-        )
-
-    @router.post("/explorer")
-    async def explorer_run(request: Request):
-        _require_auth(request)
-        nav_var = _request_variety_hint(request)
-        form = await request.form()
-        query = str(form.get("query") or "").strip()
-        limit_raw = str(form.get("limit") or "200").strip()
-
-        try:
-            limit = int(limit_raw)
-        except Exception:
-            limit = 200
-        limit = max(1, min(limit, 500))
-
-        columns: list[str] = []
-        rows: list[dict[str, str]] = []
-        err = ""
-
-        if not query:
-            err = "Query is required."
-        else:
-            try:
-                from ghtrader.questdb.client import make_questdb_query_config_from_env
-                from ghtrader.questdb.queries import query_sql_read_only
-
-                cfg = make_questdb_query_config_from_env()
-                columns, rows = query_sql_read_only(cfg=cfg, query=query, limit=int(limit), connect_timeout_s=2)
-            except Exception as e:
-                err = str(e)
-
-        return templates.TemplateResponse(
-            request,
-            "explorer.html",
-            {
-                "request": request,
-                "title": "SQL Explorer",
-                "token_qs": _token_qs(request),
-                "query": query,
-                "limit": limit,
-                "columns": columns,
-                "rows": rows,
-                "error": err,
-                **_variety_nav_ctx(nav_var, section="sql", page_title="SQL Explorer"),
-            },
-        )
-
-    @router.get("/system")
-    def system_page(request: Request):
-        _require_auth(request)
-        nav_var = _request_variety_hint(request)
-        store = request.app.state.job_store
-        jobs = store.list_jobs(limit=50)
-        running = [j for j in jobs if j.status == "running"]
-
-        data_dir = get_data_dir()
-        runs_dir = get_runs_dir()
-        artifacts_dir = get_artifacts_dir()
-
-        return templates.TemplateResponse(
-            request,
-            "system.html",
-            {
-                "request": request,
-                "title": "System",
-                "token_qs": _token_qs(request),
-                "running_count": len(running),
-                # Render fast and fetch live metrics via /api/system (JS).
-                "paths": [
-                    {"key": "data", "path": str(data_dir), "exists": bool(data_dir.exists())},
-                    {"key": "runs", "path": str(runs_dir), "exists": bool(runs_dir.exists())},
-                    {"key": "artifacts", "path": str(artifacts_dir), "exists": bool(artifacts_dir.exists())},
-                ],
-                **_variety_nav_ctx(nav_var, section="system", page_title="System"),
-            },
-        )
+    register_config_routes(
+        router=router,
+        templates=templates,
+        require_auth=_require_auth,
+        token_qs=_token_qs,
+        page_variety=_page_variety,
+        variety_nav_ctx=_variety_nav_ctx,
+        var_page=_var_page,
+        job_summary=_job_summary,
+        job_matches_variety=_job_matches_variety,
+    )
+    register_system_routes(
+        router=router,
+        templates=templates,
+        require_auth=_require_auth,
+        token_qs=_token_qs,
+        request_variety_hint=_request_variety_hint,
+        variety_nav_ctx=_variety_nav_ctx,
+    )
 
     return router
 

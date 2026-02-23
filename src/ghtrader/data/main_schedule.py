@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import time
 from dataclasses import dataclass
@@ -18,7 +17,7 @@ from uuid import uuid4
 import pandas as pd
 import structlog
 
-from ghtrader.config import get_data_dir, get_runs_dir
+from ghtrader.config import env_bool, env_float, get_data_dir, get_env, get_runs_dir
 from ghtrader.data.trading_calendar import get_trading_days
 from ghtrader.questdb.main_schedule import (
     MAIN_SCHEDULE_TABLE_V2,
@@ -43,7 +42,7 @@ class MainScheduleResult:
 
 
 def _job_progress_from_env(*, runs_dir: Path, total_phases: int, message: str) -> Any | None:
-    job_id = str(os.environ.get("GHTRADER_JOB_ID", "") or "").strip()
+    job_id = str(get_env("GHTRADER_JOB_ID", "") or "").strip()
     if not job_id:
         return None
     try:
@@ -83,15 +82,6 @@ def _schedule_report_dir(runs_dir: Path) -> Path:
     return runs_dir / "control" / "reports" / "main_schedule"
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = str(os.environ.get(name, "1" if default else "0") or "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return bool(default)
-
-
 def _assert_main_schedule_health(
     *,
     cfg: Any,
@@ -104,10 +94,7 @@ def _assert_main_schedule_health(
     expected = expected_schedule[["date", "main_contract", "segment_id"]].dropna(subset=["date", "main_contract"]).sort_values("date").reset_index(drop=True)
     expected_rows = int(len(expected))
 
-    try:
-        wal_wait_s = float(os.environ.get("GHTRADER_HEALTH_WAL_WAIT_S", "30") or "30")
-    except Exception:
-        wal_wait_s = 30.0
+    wal_wait_s = float(env_float("GHTRADER_HEALTH_WAL_WAIT_S", 30.0))
     wal_wait_s = max(1.0, float(wal_wait_s))
 
     last_error: str = ""
@@ -309,7 +296,7 @@ def build_tqsdk_main_schedule(
         message=f"Trading days in window: {len(trading_days)}",
     )
     if (
-        _env_bool("GHTRADER_MAIN_SCHEDULE_FAST_NOOP", True)
+        env_bool("GHTRADER_MAIN_SCHEDULE_FAST_NOOP", True)
         and trading_days
         and state.get("first_day") == resolved_start
         and state.get("last_day") == resolved_end

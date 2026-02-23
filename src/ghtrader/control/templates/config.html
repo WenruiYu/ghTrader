@@ -1,0 +1,301 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page page--config">
+  <div class="page-head">
+    <div>
+      <div class="page-subtitle">Control Plane</div>
+      <h2 class="page-title">Configuration · {{ variety|upper }}</h2>
+      <div class="muted text-sm">All business config writes go to Config Service (not `.env`).</div>
+    </div>
+    <div class="page-meta">
+      <span class="pill pill-running">running {{ running_count }}</span>
+      <span class="pill pill-queued">queued {{ queued_count }}</span>
+      <a class="btn btn-secondary btn-sm" href="{{ variety_path_prefix }}/jobs{{ token_qs }}">Jobs</a>
+    </div>
+  </div>
+
+  <div class="alert-banner alert-info">
+    <div class="alert-banner-content">
+      <div class="alert-banner-title">Write target: Config Service</div>
+      <div>
+        This page updates <span class="mono">runs/control/config.db</span> with revision/audit history.
+        Secrets/bootstrap keys remain file-local and are not editable here.
+      </div>
+    </div>
+  </div>
+
+  <div class="split-pane">
+    <div class="card">
+      <div class="card-title">
+        <span>Update config</span>
+        <small>Validated write with revision audit</small>
+      </div>
+      <form class="form" id="configSetForm">
+        <div class="grid2">
+          <div>
+            <label>Key</label>
+            <select id="configKeySelect" required></select>
+          </div>
+          <div>
+            <label>Type</label>
+            <select id="configTypeSelect">
+              <option value="str">str</option>
+              <option value="int">int</option>
+              <option value="float">float</option>
+              <option value="bool">bool</option>
+              <option value="json">json</option>
+            </select>
+          </div>
+        </div>
+        <div class="grid2">
+          <div>
+            <label>Value</label>
+            <input id="configValueInput" placeholder="new value" required />
+          </div>
+          <div>
+            <label>Reason</label>
+            <input id="configReasonInput" value="ui_update" required />
+          </div>
+        </div>
+        <div class="grid2">
+          <div>
+            <label>Actor (optional)</label>
+            <input id="configActorInput" placeholder="e.g. ops@host" />
+          </div>
+          <div>
+            <label>Current revision/hash</label>
+            <input id="configHeadInput" value="--" readonly />
+          </div>
+        </div>
+        <div class="hint" id="configFieldHint">Select a key to view description and defaults.</div>
+        <button type="submit" id="configSetButton">Apply config update</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span>Revision history</span>
+        <small>Rollback to prior snapshots</small>
+      </div>
+      <div class="toolbar mb-2">
+        <button class="btn btn-secondary btn-sm" id="configRefreshHistoryBtn" type="button">Refresh</button>
+      </div>
+      <div class="tableWrap table-scroll-md">
+        <table class="table table-compact" id="configHistoryTable">
+          <thead>
+            <tr>
+              <th>Revision</th>
+              <th>Created</th>
+              <th>Actor</th>
+              <th>Reason</th>
+              <th>Changed</th>
+              <th>Hash</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">
+      <span>Effective preview</span>
+      <small>Resolved value + source</small>
+    </div>
+    <div class="toolbar mb-2">
+      <input id="configPrefixInput" placeholder="prefix filter (e.g. GHTRADER_L5_VALIDATE_)" />
+      <button class="btn btn-secondary btn-sm" id="configRefreshEffectiveBtn" type="button">Reload</button>
+    </div>
+    <div class="tableWrap table-scroll-lg">
+      <table class="table table-compact" id="configEffectiveTable">
+        <thead>
+          <tr>
+            <th>Key</th>
+            <th>Value</th>
+            <th>Source</th>
+            <th>Type</th>
+            <th>Editable</th>
+            <th>Domain</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(() => {
+  const keySelect = document.getElementById("configKeySelect");
+  const typeSelect = document.getElementById("configTypeSelect");
+  const valueInput = document.getElementById("configValueInput");
+  const reasonInput = document.getElementById("configReasonInput");
+  const actorInput = document.getElementById("configActorInput");
+  const fieldHint = document.getElementById("configFieldHint");
+  const headInput = document.getElementById("configHeadInput");
+  const prefixInput = document.getElementById("configPrefixInput");
+  const effectiveBody = document.querySelector("#configEffectiveTable tbody");
+  const historyBody = document.querySelector("#configHistoryTable tbody");
+  const setForm = document.getElementById("configSetForm");
+  const setBtn = document.getElementById("configSetButton");
+  const refreshEffectiveBtn = document.getElementById("configRefreshEffectiveBtn");
+  const refreshHistoryBtn = document.getElementById("configRefreshHistoryBtn");
+
+  let schemaItems = [];
+
+  function esc(v) {
+    return String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function selectedSchemaItem() {
+    const key = String(keySelect?.value || "");
+    return schemaItems.find((x) => String(x.key || "") === key) || null;
+  }
+
+  function syncFieldHint() {
+    const item = selectedSchemaItem();
+    if (!item) {
+      fieldHint.textContent = "Select a key to view description and defaults.";
+      return;
+    }
+    typeSelect.value = String(item.value_type || "str");
+    fieldHint.textContent = `default=${item.default ?? ""} | domain=${item.domain || "general"} | ${item.description || ""}`;
+  }
+
+  async function loadSchema() {
+    const resp = await window.ghTrader.fetchApi("/api/config/schema");
+    if (!resp.ok) throw new Error(`schema http ${resp.status}`);
+    const body = await resp.json();
+    schemaItems = Array.isArray(body.items) ? body.items.filter((x) => x && x.editable) : [];
+    keySelect.innerHTML = schemaItems.map((x) => `<option value="${esc(x.key)}">${esc(x.key)}</option>`).join("");
+    if (schemaItems.length === 0) {
+      keySelect.innerHTML = '<option value="">(no editable keys)</option>';
+    }
+    syncFieldHint();
+  }
+
+  async function loadEffective() {
+    const pfx = String(prefixInput.value || "").trim();
+    const url = pfx ? `/api/config/effective-preview?prefix=${encodeURIComponent(pfx)}` : "/api/config/effective-preview";
+    const resp = await window.ghTrader.fetchApi(url);
+    if (!resp.ok) throw new Error(`effective http ${resp.status}`);
+    const body = await resp.json();
+    const items = Array.isArray(body.items) ? body.items : [];
+    headInput.value = `${body.revision || "--"} / ${body.config_hash || "--"}`;
+    effectiveBody.innerHTML = items.map((row) => {
+      return `<tr>
+        <td class="mono">${esc(row.key)}</td>
+        <td class="mono">${esc(row.value)}</td>
+        <td>${esc(row.source || "")}</td>
+        <td>${esc(row.value_type || "")}</td>
+        <td>${row.editable ? "yes" : "no"}</td>
+        <td>${esc(row.domain || "")}</td>
+        <td>${esc(row.description || "")}</td>
+      </tr>`;
+    }).join("");
+  }
+
+  async function loadHistory() {
+    const resp = await window.ghTrader.fetchApi("/api/config/history?limit=50");
+    if (!resp.ok) throw new Error(`history http ${resp.status}`);
+    const body = await resp.json();
+    const rows = Array.isArray(body.items) ? body.items : [];
+    historyBody.innerHTML = rows.map((row) => {
+      const changedCount = Array.isArray(row.changed_keys) ? row.changed_keys.length : 0;
+      const rev = Number(row.revision || 0);
+      return `<tr>
+        <td>${rev}</td>
+        <td class="mono">${esc(row.created_at || "")}</td>
+        <td>${esc(row.actor || "")}</td>
+        <td>${esc(row.reason || "")}</td>
+        <td>${changedCount}</td>
+        <td class="mono">${esc(row.config_hash || "")}</td>
+        <td><button type="button" class="btn btn-secondary btn-sm configRollbackBtn" data-revision="${rev}">Rollback</button></td>
+      </tr>`;
+    }).join("");
+  }
+
+  async function refreshAll() {
+    await Promise.all([loadSchema(), loadEffective(), loadHistory()]);
+  }
+
+  keySelect?.addEventListener("change", syncFieldHint);
+
+  setForm?.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const item = selectedSchemaItem();
+    if (!item) {
+      window.ghTrader.toast("No editable config key selected.", "warn");
+      return;
+    }
+    const key = String(item.key || "");
+    const value = String(valueInput.value || "").trim();
+    const reason = String(reasonInput.value || "").trim() || "ui_update";
+    const actor = String(actorInput.value || "").trim();
+    if (!key || value === "") {
+      window.ghTrader.toast("Key and value are required.", "warn");
+      return;
+    }
+    await window.ghTrader.withButtonBusy(setBtn, async () => {
+      const payload = {
+        values: { [key]: value },
+        types: { [key]: String(typeSelect.value || item.value_type || "str") },
+        reason,
+      };
+      if (actor) payload.actor = actor;
+      const out = await window.ghTrader.postJson("/api/config/set", payload);
+      window.ghTrader.toast(`Updated revision ${out.revision}`, "success");
+      await loadEffective();
+      await loadHistory();
+    }, { loadingText: "Applying..." });
+  });
+
+  historyBody?.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest(".configRollbackBtn");
+    if (!btn) return;
+    const rev = Number(btn.dataset.revision || 0);
+    if (!rev) return;
+    const reason = prompt(`Rollback to revision ${rev}. Enter reason:`, `ui_rollback_to_${rev}`);
+    if (reason === null) return;
+    await window.ghTrader.withButtonBusy(btn, async () => {
+      const out = await window.ghTrader.postJson("/api/config/rollback", {
+        revision: rev,
+        reason: String(reason || "").trim() || `ui_rollback_to_${rev}`,
+      });
+      window.ghTrader.toast(`Rolled back. New revision ${out.revision}`, "success");
+      await loadEffective();
+      await loadHistory();
+    }, { loadingText: "Rolling..." });
+  });
+
+  refreshEffectiveBtn?.addEventListener("click", async () => {
+    try {
+      await loadEffective();
+      window.ghTrader.toast("Effective preview refreshed.", "info");
+    } catch (e) {
+      window.ghTrader.toast(String(e.message || e), "error");
+    }
+  });
+
+  refreshHistoryBtn?.addEventListener("click", async () => {
+    try {
+      await loadHistory();
+      window.ghTrader.toast("History refreshed.", "info");
+    } catch (e) {
+      window.ghTrader.toast(String(e.message || e), "error");
+    }
+  });
+
+  refreshAll().catch((e) => {
+    window.ghTrader.toast(String(e.message || e), "error");
+  });
+})();
+</script>
+{% endblock %}
+

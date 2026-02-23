@@ -22,8 +22,10 @@ from ghtrader.datasets.features import FactorEngine, read_features_for_symbol
 from ghtrader.datasets.labels import read_labels_for_symbol, create_walk_forward_splits, apply_split
 from ghtrader.research.models import create_model, load_model
 from ghtrader.research.pipeline import LatencyContext, LatencyTracker
+from ghtrader.util.observability import get_store
 
 log = structlog.get_logger()
+_obs_store = get_store("research.benchmark")
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +247,7 @@ def measure_inference_latency(
             _ = model.predict_proba(sample)
     
     inf_stats = tracker.get_stats("inference")
+    _obs_store.observe(metric="inference.sample_loop", latency_s=float(inf_stats["mean"]), ok=True)
     
     return LatencyMetrics(
         inference_mean_ms=inf_stats["mean"] * 1000,
@@ -286,6 +289,7 @@ def run_benchmark(
     """
     import uuid
     
+    benchmark_started = time.time()
     run_id = uuid.uuid4().hex[:12]
     report = BenchmarkReport(
         run_id=run_id,
@@ -301,10 +305,12 @@ def run_benchmark(
     # Load data
     from ghtrader.datasets.features import read_features_manifest
 
+    t_data = time.time()
     features_df = read_features_for_symbol(data_dir, symbol)
     labels_df = read_labels_for_symbol(data_dir, symbol)
     
     df = features_df.merge(labels_df[["datetime", f"label_{horizon}"]], on="datetime")
+    _obs_store.observe(metric="run_benchmark.data_load", latency_s=(time.time() - t_data), ok=True)
     
     manifest = read_features_manifest(data_dir, symbol)
     feature_cols = list(manifest.get("enabled_factors") or [])
@@ -331,8 +337,10 @@ def run_benchmark(
     splits = create_walk_forward_splits(len(X), n_splits=n_splits, min_train_samples=min_train_samples)
     if not splits:
         log.error("benchmark.no_splits")
+        _obs_store.observe(metric="run_benchmark.splits", ok=False)
         report_path = runs_dir / "benchmarks" / symbol / model_type / f"{run_id}.json"
         report.save(report_path)
+        _obs_store.observe(metric="run_benchmark.total", latency_s=(time.time() - benchmark_started), ok=False)
         return report
 
     split_metrics: list[OfflineMetrics] = []
@@ -424,6 +432,7 @@ def run_benchmark(
     report.save(report_path)
     
     log.info("benchmark.done", report_path=str(report_path))
+    _obs_store.observe(metric="run_benchmark.total", latency_s=(time.time() - benchmark_started), ok=True)
     
     return report
 

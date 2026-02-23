@@ -67,19 +67,21 @@ def _first_fill_offsets(
     n = int(len(reference_prices))
     out = np.full(n, np.nan, dtype="float64")
     h = int(max(1, horizon))
+    unresolved = np.ones(n, dtype=bool)
     for k in range(1, h + 1):
         end = n - k
         if end <= 0:
             break
+        if not np.any(unresolved[:end]):
+            break
         fut = reference_prices[k:]
         cur = order_prices[:end]
         cond = (fut <= cur) if is_bid_side else (fut >= cur)
-        unresolved = np.isnan(out[:end])
-        newly = cond & unresolved
+        newly = cond & unresolved[:end]
         if np.any(newly):
-            seg = out[:end]
-            seg[newly] = float(k)
-            out[:end] = seg
+            idx = np.nonzero(newly)[0]
+            out[idx] = float(k)
+            unresolved[idx] = False
     return out
 
 
@@ -455,8 +457,8 @@ def build_fill_labels_for_symbol(
         )
         if df_day.empty:
             continue
-        df_day = df_day.copy()
         if "row_hash" not in df_day.columns or pd.to_numeric(df_day["row_hash"], errors="coerce").isna().all():
+            df_day = df_day.copy()
             df_day["row_hash"] = row_hash_from_ticks_df(df_day)
         sh = ""
         if "schedule_hash" in df_day.columns and not df_day["schedule_hash"].empty:

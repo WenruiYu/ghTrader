@@ -20,10 +20,12 @@ import zmq
 import redis
 
 from ghtrader.util.json_io import read_json, write_json_atomic
+from ghtrader.util.observability import get_store
 from ghtrader.research.models import load_model
 from ghtrader.trading.strategy_control import StrategyStateWriter
 
 log = structlog.get_logger()
+_obs_store = get_store("trading.strategy_runner")
 
 ModelType = Literal["logistic", "xgboost", "lightgbm", "deeplob", "transformer", "tcn", "tlob", "ssm"]
 
@@ -149,9 +151,23 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
     sub_socket = zmq_ctx.socket(zmq.SUB)
     sub_socket.connect(f"ipc:///tmp/ghtrader_gateway_pub_{prof}.ipc")
     sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
-    
-    req_socket = zmq_ctx.socket(zmq.REQ)
-    req_socket.connect(f"ipc:///tmp/ghtrader_gateway_rep_{prof}.ipc")
+
+    req_endpoint = f"ipc:///tmp/ghtrader_gateway_rep_{prof}.ipc"
+
+    def _new_req_socket() -> Any:
+        s = zmq_ctx.socket(zmq.REQ)
+        s.connect(req_endpoint)
+        s.setsockopt(zmq.LINGER, 0)
+        s.setsockopt(zmq.SNDTIMEO, 100)
+        s.setsockopt(zmq.RCVTIMEO, 100)
+        try:
+            s.setsockopt(zmq.REQ_RELAXED, 1)
+            s.setsockopt(zmq.REQ_CORRELATE, 1)
+        except Exception:
+            pass
+        return s
+
+    req_socket = _new_req_socket()
 
     requested_symbols = [str(s).strip() for s in (cfg.symbols or []) if str(s).strip()]
     if not requested_symbols:
@@ -224,6 +240,7 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
     last_zmq_timeout_event_at = 0.0
     safe_halt_active = False
     while True:
+        loop_started = time.perf_counter()
         try:
             # ZMQ Poll (Hot Path)
             if not sub_socket.poll(timeout=1000):
@@ -240,6 +257,8 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
                     writer.event(evt)
                     statew.append_event(evt)
                     last_zmq_timeout_event_at = now_ts
+                _obs_store.observe(metric="loop", latency_s=(time.perf_counter() - loop_started), ok=False)
+                _obs_store.observe(metric="gateway_state_timeout", ok=False)
                 statew.flush_state()
                 continue
             msg = sub_socket.recv_json()
@@ -258,6 +277,7 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
         except Exception as e:
             ticks = {}
             symbol_mapping = {}
+            _obs_store.observe(metric="gateway_state_read", ok=False)
             statew.set_health(ok=False, running=True, error=str(e), last_loop_at=_now_iso())
             if not safe_halt_active:
                 safe_halt_active = True
@@ -328,6 +348,7 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
             except Exception as e:
                 writer.event({"type": "predict_failed", "symbol": req_sym, "exec_symbol": exec_sym, "error": str(e)})
                 statew.append_event({"type": "predict_failed", "symbol": req_sym, "exec_symbol": exec_sym, "error": str(e)})
+                _obs_store.observe(metric="predict", ok=False)
                 desired_targets[exec_sym] = 0
 
         if desired_targets and desired_targets != last_targets:
@@ -346,9 +367,19 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
             # ZMQ Send Targets
             try:
                 req_socket.send_json({"type": "set_targets", "targets": {str(k): int(v) for k, v in last_targets.items()}})
-                req_socket.recv_json() # Wait for ACK
-            except Exception:
-                pass
+                ack = req_socket.recv_json()
+                if not (isinstance(ack, dict) and str(ack.get("status") or "").lower() == "ok"):
+                    raise RuntimeError(f"gateway_ack_error: {ack}")
+                _obs_store.observe(metric="gateway_ack", ok=True)
+            except Exception as e:
+                writer.event({"type": "gateway_ack_failed", "error": str(e)})
+                statew.append_event({"type": "gateway_ack_failed", "error": str(e)})
+                _obs_store.observe(metric="gateway_ack", ok=False)
+                try:
+                    req_socket.close(0)
+                except Exception:
+                    pass
+                req_socket = _new_req_socket()
 
             writer.event({"type": "target_change", "targets": dict(last_targets)})
             statew.set_targets(dict(last_targets), dict(meta))
@@ -356,6 +387,7 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
         else:
             # Keep state fresh even when targets don't change.
             statew.flush_state()
+        _obs_store.observe(metric="loop", latency_s=(time.perf_counter() - loop_started), ok=True)
 
         # No sleep in ZMQ mode (driven by SUB poll)
         # time.sleep(float(max(0.05, cfg.poll_interval_sec)))

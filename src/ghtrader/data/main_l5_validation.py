@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -9,6 +8,7 @@ from typing import Any
 
 import structlog
 
+from ghtrader.config_service import get_config_resolver
 from ghtrader.config import get_data_dir, get_runs_dir
 from ghtrader.data.exchange_events import ExchangeEvent, events_for_day, load_exchange_events
 from ghtrader.data.manifest import list_manifests, read_manifest
@@ -44,35 +44,6 @@ from ghtrader.util.json_io import read_json, write_json_atomic
 log = structlog.get_logger()
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = str(os.environ.get(name, "1" if default else "0") or "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return bool(default)
-
-
-def _env_float(name: str) -> float | None:
-    raw = str(os.environ.get(name, "") or "").strip()
-    if not raw:
-        return None
-    try:
-        return float(raw)
-    except Exception:
-        return None
-
-
-def _env_int(name: str) -> int | None:
-    raw = str(os.environ.get(name, "") or "").strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except Exception:
-        return None
-
-
 def _var_key(var: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", str(var or "").strip()).strip("_").upper()
 
@@ -93,13 +64,12 @@ def _resolve_float_from_keys(
     min_value: float | None = None,
     max_value: float | None = None,
 ) -> tuple[float | None, str]:
-    for key in keys:
-        val = _env_float(key)
-        if val is not None:
-            return _clamp_float(float(val), min_value=min_value, max_value=max_value), f"env:{key}"
-    if default is None:
-        return None, "unset"
-    return _clamp_float(float(default), min_value=min_value, max_value=max_value), "default"
+    return get_config_resolver().resolve_float_from_keys(
+        keys=list(keys),
+        default=default,
+        min_value=min_value,
+        max_value=max_value,
+    )
 
 
 def _resolve_int_from_keys(
@@ -108,17 +78,12 @@ def _resolve_int_from_keys(
     default: int,
     min_value: int | None = None,
 ) -> tuple[int, str]:
-    for key in keys:
-        val = _env_int(key)
-        if val is not None:
-            out = int(val)
-            if min_value is not None:
-                out = max(int(min_value), out)
-            return int(out), f"env:{key}"
-    out = int(default)
-    if min_value is not None:
-        out = max(int(min_value), out)
-    return int(out), "default"
+    return get_config_resolver().resolve_int_from_keys(
+        keys=list(keys),
+        default=int(default),
+        min_value=min_value,
+        max_value=None,
+    )
 
 
 def _resolve_bool_from_keys(
@@ -126,12 +91,10 @@ def _resolve_bool_from_keys(
     keys: list[str],
     default: bool,
 ) -> tuple[bool, str]:
-    for key in keys:
-        raw = str(os.environ.get(key, "") or "").strip()
-        if not raw:
-            continue
-        return _env_bool(key, default), f"env:{key}"
-    return bool(default), "default"
+    return get_config_resolver().resolve_bool_from_keys(
+        keys=list(keys),
+        default=bool(default),
+    )
 
 
 def _resolve_validation_policy(
@@ -728,37 +691,19 @@ def validate_main_l5(
     except Exception as e:
         raise RuntimeError(f"main_l5_validate preflight failed: {e}") from e
 
+    resolver = get_config_resolver()
     if tqsdk_check is None:
-        raw = str(os.environ.get("GHTRADER_L5_VALIDATE_TQ_CHECK", "1") or "1").strip().lower()
-        tqsdk_check = raw not in {"0", "false", "no", "off"}
+        tqsdk_check = resolver.get_bool("GHTRADER_L5_VALIDATE_TQ_CHECK", True)
     if tqsdk_check_max_days is None:
-        try:
-            tqsdk_check_max_days = int(os.environ.get("GHTRADER_L5_VALIDATE_TQ_CHECK_MAX_DAYS", "2") or "2")
-        except Exception:
-            tqsdk_check_max_days = 2
+        tqsdk_check_max_days = resolver.get_int("GHTRADER_L5_VALIDATE_TQ_CHECK_MAX_DAYS", 2)
     if tqsdk_check_max_segments is None:
-        try:
-            tqsdk_check_max_segments = int(os.environ.get("GHTRADER_L5_VALIDATE_TQ_CHECK_MAX_SEGMENTS", "8") or "8")
-        except Exception:
-            tqsdk_check_max_segments = 8
+        tqsdk_check_max_segments = resolver.get_int("GHTRADER_L5_VALIDATE_TQ_CHECK_MAX_SEGMENTS", 8)
     if max_segments_per_day is None:
-        try:
-            max_segments_per_day = int(os.environ.get("GHTRADER_L5_VALIDATE_MAX_SEGMENTS_PER_DAY", "200") or "200")
-        except Exception:
-            max_segments_per_day = 200
-    try:
-        report_max_days = int(os.environ.get("GHTRADER_L5_VALIDATE_REPORT_MAX_DAYS", "200") or "200")
-    except Exception:
-        report_max_days = 200
-    report_include_segments = _env_bool("GHTRADER_L5_VALIDATE_REPORT_INCLUDE_SEGMENTS", False)
-    try:
-        report_segments_sample = int(os.environ.get("GHTRADER_L5_VALIDATE_REPORT_SEGMENTS_SAMPLE", "5") or "5")
-    except Exception:
-        report_segments_sample = 5
-    try:
-        report_max_events = int(os.environ.get("GHTRADER_L5_VALIDATE_REPORT_MAX_EVENTS", "200") or "200")
-    except Exception:
-        report_max_events = 200
+        max_segments_per_day = resolver.get_int("GHTRADER_L5_VALIDATE_MAX_SEGMENTS_PER_DAY", 200)
+    report_max_days = resolver.get_int("GHTRADER_L5_VALIDATE_REPORT_MAX_DAYS", 200)
+    report_include_segments = resolver.get_bool("GHTRADER_L5_VALIDATE_REPORT_INCLUDE_SEGMENTS", False)
+    report_segments_sample = resolver.get_int("GHTRADER_L5_VALIDATE_REPORT_SEGMENTS_SAMPLE", 5)
+    report_max_events = resolver.get_int("GHTRADER_L5_VALIDATE_REPORT_MAX_EVENTS", 200)
     policy = _resolve_validation_policy(
         variety=var,
         gap_threshold_s=gap_threshold_s,
@@ -791,15 +736,9 @@ def validate_main_l5(
     half_info_ratio = max(0.0, min(1.0, float(half_info_ratio)))
     half_block_ratio = max(float(half_info_ratio), min(1.0, float(half_block_ratio)))
 
-    try:
-        progress_every_s = float(os.environ.get("GHTRADER_PROGRESS_EVERY_S", "15") or "15")
-    except Exception:
-        progress_every_s = 15.0
+    progress_every_s = resolver.get_float("GHTRADER_PROGRESS_EVERY_S", 15.0)
     progress_every_s = max(5.0, float(progress_every_s))
-    try:
-        progress_every_n = int(os.environ.get("GHTRADER_PROGRESS_EVERY_N", "25") or "25")
-    except Exception:
-        progress_every_n = 25
+    progress_every_n = resolver.get_int("GHTRADER_PROGRESS_EVERY_N", 25)
     progress_every_n = max(1, int(progress_every_n))
 
     tz = None
@@ -859,6 +798,15 @@ def validate_main_l5(
             per_second_cache = _fetch_per_second_counts_batch(cfg=cfg, symbol=ds, trading_days=days_with_ticks, l5_only=True)
         except Exception:
             per_second_cache = {}
+        if per_second_cache:
+            missing_days = [d for d in days_with_ticks if d not in per_second_cache]
+            if missing_days:
+                try:
+                    per_second_cache.update(
+                        _fetch_per_second_counts_batch(cfg=cfg, symbol=ds, trading_days=missing_days, l5_only=True)
+                    )
+                except Exception:
+                    pass
 
     days_all: list[dict[str, Any]] = []
     missing_days: list[str] = []
@@ -1244,6 +1192,7 @@ def validate_main_l5(
         lag_max = int(sorted_lags[-1])
         idx = int(0.95 * (len(sorted_lags) - 1))
         lag_p95 = int(sorted_lags[max(0, idx)])
+    cfg_snapshot = get_config_resolver().export_snapshot_payload()
     report = {
         "ok": ok,
         "state": state,
@@ -1364,6 +1313,7 @@ def validate_main_l5(
             "run_id": (manifest.get("run_id") if isinstance(manifest, dict) else None),
             "created_at": (manifest.get("created_at") if isinstance(manifest, dict) else None),
         },
+        "config_snapshot": cfg_snapshot,
         "persist": {
             "summary_rows_upserted": int(persisted_summary_rows),
             "gap_rows_deleted": int(persisted_gap_rows_deleted),

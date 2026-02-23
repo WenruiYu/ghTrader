@@ -8,30 +8,13 @@ from typing import Any
 import click
 import structlog
 
+from ghtrader.config import env_bool, env_float, get_env
+
 log = structlog.get_logger()
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = str(os.environ.get(name, "1" if default else "0") or "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return bool(default)
-
-
-def _env_float(name: str, default: float, *, min_value: float | None = None) -> float:
-    try:
-        value = float(os.environ.get(name, str(default)) or str(default))
-    except Exception:
-        value = float(default)
-    if min_value is not None:
-        value = max(float(min_value), float(value))
-    return float(value)
-
-
 def _set_current_job_progress_error(error: str) -> None:
-    job_id = str(os.environ.get("GHTRADER_JOB_ID", "") or "").strip()
+    job_id = str(get_env("GHTRADER_JOB_ID", "") or "").strip()
     if not job_id:
         return
     try:
@@ -84,7 +67,7 @@ def _find_running_main_l5_owner_for_symbol(symbol: str) -> dict[str, str] | None
     db_path = Path(get_runs_dir()) / "control" / "jobs.db"
     store = JobStore(db_path)
     locks = LockStore(db_path)
-    current_job_id = str(os.environ.get("GHTRADER_JOB_ID", "") or "").strip()
+    current_job_id = str(get_env("GHTRADER_JOB_ID", "") or "").strip()
     for lock in locks.list_locks():
         if str(lock.key) != lock_key:
             continue
@@ -230,7 +213,7 @@ def register(main: click.Group) -> None:
             msg = _main_l5_validate_lock_conflict_message(symbol=ds, owner_job_id=str(conflict.get("job_id") or ""))
             _set_current_job_progress_error(msg)
             raise RuntimeError(msg)
-        validate_lock_wait_timeout_s = _env_float("GHTRADER_MAIN_L5_VALIDATE_LOCK_WAIT_TIMEOUT_S", 3.0, min_value=0.1)
+        validate_lock_wait_timeout_s = max(0.1, float(env_float("GHTRADER_MAIN_L5_VALIDATE_LOCK_WAIT_TIMEOUT_S", 3.0)))
         try:
             _acquire_locks(
                 [f"main_l5:symbol={ds}"],
@@ -407,9 +390,9 @@ def register(main: click.Group) -> None:
         from ghtrader.data.main_schedule import build_main_schedule
 
         _ = ctx
-        enforce_health = _env_bool(
+        enforce_health = env_bool(
             "GHTRADER_MAIN_SCHEDULE_ENFORCE_HEALTH",
-            _env_bool("GHTRADER_PIPELINE_ENFORCE_HEALTH", True),
+            env_bool("GHTRADER_PIPELINE_ENFORCE_HEALTH", True),
         )
         _acquire_locks([f"main_schedule:var={variety.lower()}"])
         try:
@@ -452,9 +435,9 @@ def register(main: click.Group) -> None:
         _ = ctx
         var_l = variety.lower().strip()
         ds = (derived_symbol or "").strip() or f"KQ.m@SHFE.{var_l}"
-        enforce_health = _env_bool(
+        enforce_health = env_bool(
             "GHTRADER_MAIN_L5_ENFORCE_HEALTH",
-            _env_bool("GHTRADER_PIPELINE_ENFORCE_HEALTH", True),
+            env_bool("GHTRADER_PIPELINE_ENFORCE_HEALTH", True),
         )
         _acquire_locks([f"main_l5:symbol={ds}"])
         try:

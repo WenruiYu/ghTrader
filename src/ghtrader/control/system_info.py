@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ghtrader.config import get_env
+
 
 @dataclass(frozen=True)
 class DiskUsage:
@@ -474,17 +476,17 @@ def system_snapshot(
             force=True,
         )
 
-    qdb_conf = _read_questdb_server_conf_limit(os.environ.get("GHTRADER_QUESTDB_SERVER_CONF_PATH"))
-    qdb_env_limit = os.environ.get("GHTRADER_QDB_PG_NET_CONNECTION_LIMIT")
+    qdb_conf = _read_questdb_server_conf_limit(get_env("GHTRADER_QUESTDB_SERVER_CONF_PATH", ""))
+    qdb_env_limit = str(get_env("GHTRADER_QDB_PG_NET_CONNECTION_LIMIT", "") or "").strip()
     qdb_env_limit_val = None
     try:
-        if qdb_env_limit is not None:
+        if qdb_env_limit:
             qdb_env_limit_val = int(qdb_env_limit)
     except Exception:
         qdb_env_limit_val = None
 
-    svc_name = os.environ.get("GHTRADER_QUESTDB_SYSTEMD_SERVICE", "questdb")
-    svc_scope = os.environ.get("GHTRADER_QUESTDB_SYSTEMD_SCOPE", "system")
+    svc_name = str(get_env("GHTRADER_QUESTDB_SYSTEMD_SERVICE", "questdb") or "questdb")
+    svc_scope = str(get_env("GHTRADER_QUESTDB_SYSTEMD_SCOPE", "system") or "system")
     svc_status = _systemd_service_status(service=str(svc_name), scope=str(svc_scope))
 
     # Build response from caches

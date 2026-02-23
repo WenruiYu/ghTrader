@@ -28,7 +28,7 @@
         {% set nav_var = variety if variety is defined else ((parts[2] if parts|length > 2 and parts[1] == "v" and parts[2] in allowed_vars else "cu")) %}
         {% set nav_section = parts[3] if parts|length > 3 and parts[1] == "v" else "" %}
         {% set nav_prefix = "/v/" ~ nav_var %}
-        {% set switch_section = nav_section if nav_section in ["dashboard", "jobs", "data", "models", "trading"] else "dashboard" %}
+        {% set switch_section = nav_section if nav_section in ["dashboard", "jobs", "data", "models", "trading", "config"] else "dashboard" %}
         {% set qsep = "&" if token_qs else "?" %}
         <a href="{{ nav_prefix }}/dashboard{{ token_qs }}" class="{% if nav_section == 'dashboard' or path == '/' %}active{% endif %}">Dashboard</a>
         <a href="{{ nav_prefix }}/jobs{{ token_qs }}" class="{% if nav_section == 'jobs' or path.startswith('/jobs') %}active{% endif %}">
@@ -37,9 +37,10 @@
             <span class="nav-badge">{{ running_count }}</span>
           {% endif %}
         </a>
-        <a href="{{ nav_prefix }}/data{{ token_qs }}" class="{% if nav_section == 'data' or path.startswith('/data') or path.startswith('/ops') %}active{% endif %}">Data</a>
+        <a href="{{ nav_prefix }}/data{{ token_qs }}" class="{% if nav_section == 'data' or path.startswith('/data') %}active{% endif %}">Data</a>
         <a href="{{ nav_prefix }}/models{{ token_qs }}" class="{% if nav_section == 'models' or path.startswith('/models') %}active{% endif %}">Models</a>
         <a href="{{ nav_prefix }}/trading{{ token_qs }}" class="{% if nav_section == 'trading' or path.startswith('/trading') %}active{% endif %}">Trading</a>
+        <a href="{{ nav_prefix }}/config{{ token_qs }}" class="{% if nav_section == 'config' or path.startswith('/config') %}active{% endif %}">Config</a>
         <a href="/explorer{{ token_qs }}{% if token_qs %}&{% else %}?{% endif %}var={{ nav_var }}" class="{% if path.startswith('/explorer') %}active{% endif %}">SQL</a>
         <a href="/system{{ token_qs }}{% if token_qs %}&{% else %}?{% endif %}var={{ nav_var }}" class="{% if path.startswith('/system') %}active{% endif %}">System</a>
       </nav>

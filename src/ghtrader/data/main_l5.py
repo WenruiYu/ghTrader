@@ -4,7 +4,6 @@ Schedule-driven main_l5 builder (QuestDB-only, no raw ticks).
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -14,6 +13,9 @@ from typing import Any
 import json
 import pandas as pd
 import structlog
+
+from ghtrader.config import get_env
+from ghtrader.config_service import get_config_resolver
 
 log = structlog.get_logger()
 
@@ -28,7 +30,7 @@ class MainL5BuildResult:
 
 
 def _job_progress_from_env(*, runs_dir: Path, total_phases: int, message: str) -> Any | None:
-    job_id = str(os.environ.get("GHTRADER_JOB_ID", "") or "").strip()
+    job_id = str(get_env("GHTRADER_JOB_ID", "") or "").strip()
     if not job_id:
         return None
     try:
@@ -68,19 +70,16 @@ def _schedule_hash_from_rows(schedule: pd.DataFrame) -> str:
 
 
 def _resolve_missing_days_tolerance(*, variety: str) -> tuple[int, str]:
+    resolver = get_config_resolver()
     var_key = re.sub(r"[^A-Za-z0-9]+", "", str(variety or "").strip()).upper()
     keys = []
     if var_key:
         keys.append(f"GHTRADER_MAIN_L5_MISSING_DAYS_TOLERANCE_{var_key}")
     keys.append("GHTRADER_MAIN_L5_MISSING_DAYS_TOLERANCE")
     for key in keys:
-        raw = str(os.environ.get(key, "") or "").strip()
-        if not raw:
-            continue
-        try:
-            return max(0, int(raw)), f"env:{key}"
-        except Exception:
-            continue
+        val, src = resolver.get_optional_int(key, min_value=0)
+        if val is not None:
+            return int(val), str(src)
     return 0, "default"
 
 
@@ -124,6 +123,7 @@ def _write_main_l5_update_report(
     row_counts: dict[str, int] | None = None,
     missing_days_tolerance: int = 0,
     missing_days_tolerance_source: str = "default",
+    config_snapshot: dict[str, Any] | None = None,
 ) -> Path | None:
     try:
         expected_days = sorted({d for d in schedule["trading_day"].tolist() if isinstance(d, date)})
@@ -176,6 +176,7 @@ def _write_main_l5_update_report(
         "covered_first_day": bounds.get("first_day"),
         "covered_last_day": bounds.get("last_day"),
         "covered_last_ts": bounds.get("last_ts"),
+        "config_snapshot": dict(config_snapshot or {}),
         "missing_by_segment": missing_by_segment,
     }
 
@@ -437,9 +438,11 @@ def build_main_l5(
 
     try:
         from ghtrader.util.worker_policy import resolve_worker_count
+        resolver = get_config_resolver()
 
         requested_total_workers: int | None = None
-        raw_total_workers = str(os.environ.get("GHTRADER_MAIN_L5_TOTAL_WORKERS", "") or "").strip()
+        raw_total_workers, _src_total = resolver.get_raw_with_source("GHTRADER_MAIN_L5_TOTAL_WORKERS", None)
+        raw_total_workers = str(raw_total_workers or "").strip() if raw_total_workers is not None else ""
         if raw_total_workers:
             try:
                 requested_total_workers = int(raw_total_workers)
@@ -452,7 +455,8 @@ def build_main_l5(
             total_worker_budget = min(int(total_worker_budget), 8)
 
         requested_segment_workers: int | None = None
-        raw_segment_workers = str(os.environ.get("GHTRADER_MAIN_L5_SEGMENT_WORKERS", "") or "").strip()
+        raw_segment_workers, _src_seg = resolver.get_raw_with_source("GHTRADER_MAIN_L5_SEGMENT_WORKERS", None)
+        raw_segment_workers = str(raw_segment_workers or "").strip() if raw_segment_workers is not None else ""
         if raw_segment_workers:
             try:
                 requested_segment_workers = int(raw_segment_workers)
@@ -809,6 +813,7 @@ def build_main_l5(
         row_counts=row_counts_agg,
         missing_days_tolerance=int(missing_days_tolerance),
         missing_days_tolerance_source=str(missing_days_tolerance_source),
+        config_snapshot=get_config_resolver().export_snapshot_payload(),
     )
     if coverage_bounds:
         log.info(

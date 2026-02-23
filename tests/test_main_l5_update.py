@@ -65,6 +65,12 @@ def test_main_l5_update_backfills_missing_days(monkeypatch, tmp_path) -> None:
     assert cleared["called"] is False
     assert calls == [[date(2025, 1, 3), date(2025, 1, 4)]]
     assert res.days_total == 2
+    report_dir = tmp_path / "control" / "reports" / "main_l5_update"
+    reports = sorted(report_dir.glob("*.json"))
+    assert reports
+    payload = json.loads(reports[-1].read_text(encoding="utf-8"))
+    assert isinstance(payload.get("config_snapshot"), dict)
+    assert "config_hash" in payload["config_snapshot"]
 
 
 def test_main_l5_update_hash_mismatch_forces_rebuild(monkeypatch, tmp_path) -> None:

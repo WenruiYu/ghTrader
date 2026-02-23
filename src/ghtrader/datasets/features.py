@@ -12,7 +12,6 @@ from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-import os
 from pathlib import Path
 import time
 from typing import Any, Callable
@@ -378,12 +377,27 @@ class BookSlopeFactor(Factor):
         return (bid_weighted - ask_weighted) / total if total > 0 else 0.0
     
     def compute_batch(self, df: pd.DataFrame) -> pd.Series:
-        result = []
-        for _, row in df.iterrows():
-            bid_vols = [row[f"bid_volume{i}"] for i in range(1, 6)]
-            ask_vols = [row[f"ask_volume{i}"] for i in range(1, 6)]
-            result.append(self._compute_slope(bid_vols, ask_vols))
-        return pd.Series(result, index=df.index)
+        bid_cols = [f"bid_volume{i}" for i in range(1, 6)]
+        ask_cols = [f"ask_volume{i}" for i in range(1, 6)]
+        bids = (
+            df[bid_cols]
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
+            .to_numpy(dtype="float64", copy=False)
+        )
+        asks = (
+            df[ask_cols]
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
+            .to_numpy(dtype="float64", copy=False)
+        )
+        weights = np.asarray([1.0, 2.0, 3.0, 4.0, 5.0], dtype="float64")
+        bid_weighted = bids @ weights
+        ask_weighted = asks @ weights
+        total = bid_weighted + ask_weighted
+        out = np.zeros_like(total, dtype="float64")
+        np.divide((bid_weighted - ask_weighted), total, out=out, where=(total > 0.0))
+        return pd.Series(out, index=df.index)
     
     def compute_incremental(self, state: dict[str, Any], tick: dict[str, Any]) -> float:
         bid_vols = [tick.get(f"bid_volume{i}", 0) for i in range(1, 6)]
@@ -482,6 +496,8 @@ class FactorEngine:
         - Primary storage: QuestDB (QuestDB-first).
         """
         from ghtrader.config import (
+            env_float,
+            env_int,
             get_questdb_host,
             get_questdb_ilp_port,
             get_questdb_pg_dbname,
@@ -610,15 +626,9 @@ class FactorEngine:
         days_total = int(len(dates))
         started_at = time.time()
         last_progress_ts = started_at
-        try:
-            progress_every_s = float(os.environ.get("GHTRADER_BUILD_PROGRESS_EVERY_S", "30") or "30")
-        except Exception:
-            progress_every_s = 30.0
+        progress_every_s = float(env_float("GHTRADER_BUILD_PROGRESS_EVERY_S", 30.0))
         progress_every_s = max(5.0, float(progress_every_s))
-        try:
-            progress_every_n = int(os.environ.get("GHTRADER_BUILD_PROGRESS_EVERY_N", "5") or "5")
-        except Exception:
-            progress_every_n = 5
+        progress_every_n = int(env_int("GHTRADER_BUILD_PROGRESS_EVERY_N", 5))
         progress_every_n = max(1, int(progress_every_n))
         log.info(
             "features.build_start",
@@ -645,8 +655,8 @@ class FactorEngine:
             )
             if df_day.empty:
                 continue
-            df_day = df_day.copy()
             if "row_hash" not in df_day.columns or pd.to_numeric(df_day["row_hash"], errors="coerce").isna().all():
+                df_day = df_day.copy()
                 df_day["row_hash"] = row_hash_from_ticks_df(df_day)
             if tk == "main_l5":
                 try:

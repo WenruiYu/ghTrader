@@ -4,7 +4,6 @@ TqSdk-based L5 start date discovery (hybrid: probe + cache + env override).
 
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -13,7 +12,7 @@ from typing import Any
 
 import structlog
 
-from ghtrader.config import get_runs_dir, get_tqsdk_auth
+from ghtrader.config import env_float, get_runs_dir, get_tqsdk_auth
 from ghtrader.data.trading_calendar import get_trading_days
 from ghtrader.tq.catalog import get_contract_catalog
 from ghtrader.util.json_io import read_json as _read_json, write_json_atomic as _write_json_atomic
@@ -209,10 +208,7 @@ def resolve_l5_start_date(
     if runs_dir is None:
         runs_dir = get_runs_dir()
 
-    try:
-        ttl_s = float(os.environ.get("GHTRADER_L5_START_TTL_S", "86400") or "86400")
-    except Exception:
-        ttl_s = 86400.0
+    ttl_s = float(env_float("GHTRADER_L5_START_TTL_S", 86400.0))
     ttl_s = max(60.0, float(ttl_s))
 
     if not refresh:
@@ -238,10 +234,7 @@ def resolve_l5_start_date(
     except Exception as e:
         raise RuntimeError("tqsdk not installed. Install with: pip install tqsdk") from e
 
-    try:
-        progress_every_s = float(os.environ.get("GHTRADER_L5_PROBE_PROGRESS_S", "15") or "15")
-    except Exception:
-        progress_every_s = 15.0
+    progress_every_s = float(env_float("GHTRADER_L5_PROBE_PROGRESS_S", 15.0))
     progress_every_s = max(5.0, float(progress_every_s))
 
     catalog = get_contract_catalog(exchange=ex, var=v, runs_dir=Path(runs_dir), refresh=bool(refresh_catalog))

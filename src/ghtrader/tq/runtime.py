@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 import structlog
 
-from ghtrader.config import get_runs_dir, get_tqsdk_auth, is_live_enabled, load_config
+from ghtrader.config import get_env, get_runs_dir, get_tqsdk_auth, is_live_enabled, load_config
 
 log = structlog.get_logger()
 
@@ -159,7 +159,7 @@ def list_account_profiles_from_env() -> list[str]:
     - additional profiles are taken from `GHTRADER_TQ_ACCOUNT_PROFILES=main,alt,...`
     """
     load_config()
-    raw = str(os.environ.get("GHTRADER_TQ_ACCOUNT_PROFILES", "") or "").strip()
+    raw = str(get_env("GHTRADER_TQ_ACCOUNT_PROFILES", "") or "").strip()
     profiles: list[str] = ["default"]
     if not raw:
         return profiles

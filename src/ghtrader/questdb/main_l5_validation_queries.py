@@ -90,19 +90,19 @@ def fetch_per_second_counts_batch(
     sym = str(symbol).strip()
     out: dict[date, dict[int, int]] = {}
     chunk_size = 30
-    for i in range(0, len(trading_days), chunk_size):
-        chunk = trading_days[i : i + chunk_size]
-        placeholders = ",".join(["%s"] * len(chunk))
-        sql = (
-            "SELECT cast(trading_day as string) AS td, "
-            "       cast(datetime_ns/1000000000 as long) AS sec, count() AS n "
-            "FROM ghtrader_ticks_main_l5_v2 "
-            f"WHERE symbol=%s AND ticks_kind='main_l5' AND dataset_version='v2'{l5_where}"
-            f"AND trading_day IN ({placeholders}) "
-            "GROUP BY td, sec"
-        )
-        params: list[Any] = [sym] + [d.isoformat() for d in chunk]
-        with connect_pg(cfg, connect_timeout_s=5) as conn:
+    with connect_pg(cfg, connect_timeout_s=5) as conn:
+        for i in range(0, len(trading_days), chunk_size):
+            chunk = trading_days[i : i + chunk_size]
+            placeholders = ",".join(["%s"] * len(chunk))
+            sql = (
+                "SELECT cast(trading_day as string) AS td, "
+                "       cast(datetime_ns/1000000000 as long) AS sec, count() AS n "
+                "FROM ghtrader_ticks_main_l5_v2 "
+                f"WHERE symbol=%s AND ticks_kind='main_l5' AND dataset_version='v2'{l5_where}"
+                f"AND trading_day IN ({placeholders}) "
+                "GROUP BY td, sec"
+            )
+            params: list[Any] = [sym] + [d.isoformat() for d in chunk]
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 for row in cur.fetchall():

@@ -29,12 +29,14 @@ import structlog
 import zmq
 import redis
 
-from ghtrader.config import get_tqsdk_auth, is_live_enabled, load_config
+from ghtrader.config import env_bool, get_tqsdk_auth, is_live_enabled, load_config
 from ghtrader.util.json_io import read_json, write_json_atomic
+from ghtrader.util.observability import get_store
 
 from .runtime import canonical_account_profile, create_tq_account, snapshot_account_state, trading_day_from_ts_ns
 
 log = structlog.get_logger()
+_obs_store = get_store("trading.gateway")
 
 
 def _resolve_symbols_for_execution(
@@ -412,7 +414,7 @@ def run_gateway(
     account_profile: str,
     runs_dir: Path,
     snapshot_interval_sec: float = 10.0,
-    poll_interval_sec: float = 0.5,
+    poll_interval_sec: float = 0.2,
 ) -> None:
     """
     Long-running AccountGateway loop.
@@ -462,6 +464,7 @@ def run_gateway(
     last_targets: dict[str, int] = {}
     zmq_targets: dict[str, int] = {}
     start_balance: float | None = None
+    risk_kill_active = False
 
     last_snapshot_at = 0.0
     last_wait_ok_at = 0.0
@@ -485,6 +488,8 @@ def run_gateway(
     seen_command_ids: set[str] = set()
 
     while True:
+        loop_started = time.perf_counter()
+        loop_ok = True
         desired = read_gateway_desired(runs_dir=runs_dir, profile=prof, redis_client=redis_client)
         desired_mode = desired.mode
         desired_symbols = desired.symbols_list()
@@ -520,6 +525,7 @@ def run_gateway(
             last_targets = {}
             zmq_targets = {}
             start_balance = None
+            risk_kill_active = False
             current_mode = effective_mode
             current_symbols = []
 
@@ -553,7 +559,7 @@ def run_gateway(
                     writer.set_health(ok=True, connected=True, last_wait_update_at=_now_iso(), error="")
 
                 # Optional defense-in-depth: attach TqSdk risk rules when requested.
-                if api is not None and str(os.environ.get("GHTRADER_GATEWAY_ENABLE_TQSDK_RISK_RULES", "")).strip().lower() in {"1", "true", "yes"}:
+                if api is not None and env_bool("GHTRADER_GATEWAY_ENABLE_TQSDK_RISK_RULES", False):
                     try:
                         from tqsdk.risk_rule import TqRuleOrderRateLimit  # type: ignore
 
@@ -564,9 +570,12 @@ def run_gateway(
             except Exception as e:
                 writer.set_health(ok=False, connected=False, last_wait_update_at=_now_iso(), error=str(e))
                 writer.append_event({"type": "gateway_connect_failed", "error": str(e), "mode": effective_mode})
+                _obs_store.observe(metric="connect", ok=False)
+                loop_ok = False
                 api = None
                 account = None
                 time.sleep(1.0)
+                _obs_store.observe(metric="loop", latency_s=(time.perf_counter() - loop_started), ok=False)
                 continue
 
         # Manage subscriptions (best-effort; only if api is connected and mode is not idle).
@@ -673,14 +682,57 @@ def run_gateway(
 
             # Main update loop
             try:
-                deadline = time.time() + float(poll_interval_sec)
+                t_wait = time.perf_counter()
+                wait_window = max(0.05, float(poll_interval_sec))
+                deadline = time.time() + wait_window
                 ok = bool(api.wait_update(deadline=deadline))
+                _obs_store.observe(metric="wait_update", latency_s=(time.perf_counter() - t_wait), ok=bool(ok))
                 if ok:
                     last_wait_ok_at = time.time()
                     writer.set_health(ok=True, connected=True, last_wait_update_at=_now_iso(), error="")
             except Exception as e:
                 writer.set_health(ok=False, connected=True, last_wait_update_at=_now_iso(), error=str(e))
                 writer.append_event({"type": "wait_update_failed", "error": str(e)})
+                _obs_store.observe(metric="wait_update", ok=False)
+                loop_ok = False
+
+            # Real-time daily-loss guard: evaluate on every update loop, not only snapshots.
+            try:
+                if account is not None and desired.max_daily_loss is not None and not risk_kill_active:
+                    bal_now = _safe_float(getattr(account, "balance", None))
+                    if bal_now is not None:
+                        if start_balance is None:
+                            start_balance = float(bal_now)
+                        if float(bal_now) < float(start_balance) - float(desired.max_daily_loss):
+                            risk_kill_active = True
+                            writer.append_event(
+                                {
+                                    "type": "risk_kill",
+                                    "reason": "max_daily_loss_realtime",
+                                    "start_balance": float(start_balance),
+                                    "balance": float(bal_now),
+                                    "max_daily_loss": float(desired.max_daily_loss),
+                                }
+                            )
+                            try:
+                                if exec_direct is not None:
+                                    exec_direct.cancel_all_alive()
+                                if exec_targetpos is not None:
+                                    for s in list(current_symbols):
+                                        exec_targetpos.set_target(s, 0)
+                            except Exception:
+                                pass
+                            try:
+                                write_gateway_desired(
+                                    runs_dir=runs_dir,
+                                    profile=prof,
+                                    desired=GatewayDesired(mode="idle"),
+                                    redis_client=redis_client,
+                                )
+                            except Exception:
+                                pass
+            except Exception:
+                pass
 
             # Update market cache (for StrategyRunner): last tick + quote summary per symbol.
             try:
@@ -965,6 +1017,7 @@ def run_gateway(
             writer.set_health(ok=True, connected=False, last_wait_update_at=_now_iso(), error="")
             writer.set_effective(mode=current_mode, symbols=current_symbols, executor=desired.executor)
             time.sleep(1.0)
+        _obs_store.observe(metric="loop", latency_s=(time.perf_counter() - loop_started), ok=bool(loop_ok))
 
 
 __all__ = [

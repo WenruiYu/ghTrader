@@ -10,14 +10,13 @@ The event list is later expanded into a daily schedule and persisted to QuestDB.
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-import os
 import time
 from pathlib import Path
 from typing import Any
 
 import structlog
 
-from ghtrader.config import get_tqsdk_auth
+from ghtrader.config import env_float, get_tqsdk_auth
 from ghtrader.data.trading_sessions import normalize_trading_sessions, write_trading_sessions_cache
 from ghtrader.tq.runtime import trading_day_from_ts_ns
 
@@ -124,10 +123,7 @@ def extract_main_schedule_events(
     last_progress_ts = time.time()
     last_seen_td: date | None = None
     last_seen_underlying: str | None = None
-    try:
-        progress_every_s = float(os.environ.get("GHTRADER_PROGRESS_EVERY_S", "15") or "15")
-    except Exception:
-        progress_every_s = 15.0
+    progress_every_s = float(env_float("GHTRADER_PROGRESS_EVERY_S", 15.0))
     progress_every_s = max(5.0, float(progress_every_s))
     log.info(
         "tq_main_schedule.extract_start",

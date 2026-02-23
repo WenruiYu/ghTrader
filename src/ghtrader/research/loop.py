@@ -71,7 +71,7 @@ def build_research_loop_template(
             "acceptance_gates": {
                 "must_improve_accuracy": False,
                 "must_not_regress_latency": True,
-                "must_not_break_ops_compat": True,
+                "must_not_break_control_routes": True,
             },
             "results": {},
         },

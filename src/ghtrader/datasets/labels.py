@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-import os
 from pathlib import Path
 import time
 from typing import Any, Literal
@@ -164,6 +163,8 @@ def build_labels_for_symbol(
     - Primary storage: QuestDB (QuestDB-first).
     """
     from ghtrader.config import (
+        env_float,
+        env_int,
         get_questdb_host,
         get_questdb_ilp_port,
         get_questdb_pg_dbname,
@@ -286,15 +287,9 @@ def build_labels_for_symbol(
     days_total = int(len(dates))
     started_at = time.time()
     last_progress_ts = started_at
-    try:
-        progress_every_s = float(os.environ.get("GHTRADER_BUILD_PROGRESS_EVERY_S", "30") or "30")
-    except Exception:
-        progress_every_s = 30.0
+    progress_every_s = float(env_float("GHTRADER_BUILD_PROGRESS_EVERY_S", 30.0))
     progress_every_s = max(5.0, float(progress_every_s))
-    try:
-        progress_every_n = int(os.environ.get("GHTRADER_BUILD_PROGRESS_EVERY_N", "5") or "5")
-    except Exception:
-        progress_every_n = 5
+    progress_every_n = int(env_int("GHTRADER_BUILD_PROGRESS_EVERY_N", 5))
     progress_every_n = max(1, int(progress_every_n))
     log.info(
         "labels.build_start",
@@ -321,8 +316,8 @@ def build_labels_for_symbol(
         )
         if df_day.empty:
             continue
-        df_day = df_day.copy()
         if "row_hash" not in df_day.columns or pd.to_numeric(df_day["row_hash"], errors="coerce").isna().all():
+            df_day = df_day.copy()
             df_day["row_hash"] = row_hash_from_ticks_df(df_day)
         if tk == "main_l5" and schedule_hash is None and "schedule_hash" in df_day.columns:
             try:
@@ -389,8 +384,9 @@ def build_labels_for_symbol(
                         allow_cross = bool(u0 and u1 and u0 == u1)
 
                 if allow_cross:
-                    df_future = df_next.head(int(max_h)).copy()
+                    df_future = df_next.head(int(max_h))
                     if "row_hash" not in df_future.columns or pd.to_numeric(df_future["row_hash"], errors="coerce").isna().all():
+                        df_future = df_future.copy()
                         df_future["row_hash"] = row_hash_from_ticks_df(df_future)
 
         if not df_future.empty:

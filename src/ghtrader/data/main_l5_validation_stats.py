@@ -28,6 +28,15 @@ class DayGapComputation:
     last_tick_sec: int | None
     session_end_lag_s: int | None
 
+    # Backward-compatible aliases kept for existing tests/callers.
+    @property
+    def gap_bucket_totals_delta(self) -> dict[str, int]:
+        return dict(self.day_gap_buckets)
+
+    @property
+    def gap_count_gt_30_total_delta(self) -> int:
+        return int(self.day_gap_count_gt_30)
+
 
 def compute_day_gap_stats(
     *,

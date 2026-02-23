@@ -21,6 +21,8 @@ from typing import Any, Callable
 import numpy as np
 import structlog
 
+from ghtrader.util.observability import get_store
+
 log = structlog.get_logger()
 
 
@@ -123,6 +125,7 @@ class LatencyContext:
 
 # Global latency tracker
 _latency_tracker = LatencyTracker()
+_obs_store = get_store("research.pipeline")
 
 
 def get_latency_tracker() -> LatencyTracker:
@@ -189,6 +192,7 @@ def run_daily_pipeline(
     }
     
     log.info("daily_pipeline.start", run_id=run_id, symbols=symbols)
+    pipeline_started = time.time()
     
     for symbol in symbols:
         symbol_report: dict[str, Any] = {"symbol": symbol, "steps": {}}
@@ -206,6 +210,11 @@ def run_daily_pipeline(
                 "duration": time.time() - t0,
                 "note": refresh_note,
             }
+            _obs_store.observe(
+                metric="daily_pipeline.refresh_data",
+                latency_s=float(symbol_report["steps"]["refresh_data"]["duration"]),
+                ok=True,
+            )
             
             # Step 2: Build features
             log.info("daily_pipeline.step", symbol=symbol, step="build_features")
@@ -213,6 +222,11 @@ def run_daily_pipeline(
             engine = FactorEngine()
             engine.build_features_for_symbol(symbol=symbol, data_dir=data_dir, ticks_kind="main_l5")
             symbol_report["steps"]["build_features"] = {"status": "ok", "duration": time.time() - t0}
+            _obs_store.observe(
+                metric="daily_pipeline.build_features",
+                latency_s=float(symbol_report["steps"]["build_features"]["duration"]),
+                ok=True,
+            )
             
             # Step 3: Build labels
             log.info("daily_pipeline.step", symbol=symbol, step="build_labels")
@@ -224,6 +238,11 @@ def run_daily_pipeline(
                 ticks_kind="main_l5",
             )
             symbol_report["steps"]["build_labels"] = {"status": "ok", "duration": time.time() - t0}
+            _obs_store.observe(
+                metric="daily_pipeline.build_labels",
+                latency_s=float(symbol_report["steps"]["build_labels"]["duration"]),
+                ok=True,
+            )
 
             # Step 3: Regime model + latest regime states
             log.info("daily_pipeline.step", symbol=symbol, step="regime")
@@ -238,6 +257,11 @@ def run_daily_pipeline(
                 "duration": time.time() - t0,
                 "model_path": str(regime_model_path),
             }
+            _obs_store.observe(
+                metric="daily_pipeline.regime",
+                latency_s=float(symbol_report["steps"]["regime"]["duration"]),
+                ok=True,
+            )
             
             # Step 4: Train model
             log.info("daily_pipeline.step", symbol=symbol, step="train")
@@ -250,6 +274,11 @@ def run_daily_pipeline(
                 horizon=horizon,
             )
             symbol_report["steps"]["train"] = {"status": "ok", "duration": time.time() - t0}
+            _obs_store.observe(
+                metric="daily_pipeline.train",
+                latency_s=float(symbol_report["steps"]["train"]["duration"]),
+                ok=True,
+            )
             
             # Step 5: Backtest evaluation
             log.info("daily_pipeline.step", symbol=symbol, step="backtest")
@@ -269,9 +298,15 @@ def run_daily_pipeline(
                 "duration": time.time() - t0,
                 "metrics": metrics.to_dict(),
             }
+            _obs_store.observe(
+                metric="daily_pipeline.backtest",
+                latency_s=float(symbol_report["steps"]["backtest"]["duration"]),
+                ok=True,
+            )
             
             # Step 6: Promotion gate
             log.info("daily_pipeline.step", symbol=symbol, step="promote")
+            t0 = time.time()
             gate = PromotionGate()
             production_path = artifacts_dir / "production" / symbol / model_type / f"model_h{horizon}.pt"
             
@@ -284,14 +319,22 @@ def run_daily_pipeline(
             symbol_report["steps"]["promote"] = {
                 "status": "promoted" if promoted else "rejected",
                 "gate_passed": promoted,
+                "duration": time.time() - t0,
             }
+            _obs_store.observe(
+                metric="daily_pipeline.promote",
+                latency_s=float(symbol_report["steps"]["promote"]["duration"]),
+                ok=bool(promoted),
+            )
             
             symbol_report["status"] = "success"
+            _obs_store.observe(metric="daily_pipeline.symbol", ok=True)
             
         except Exception as e:
             log.error("daily_pipeline.failed", symbol=symbol, error=str(e))
             symbol_report["status"] = "failed"
             symbol_report["error"] = str(e)
+            _obs_store.observe(metric="daily_pipeline.symbol", ok=False)
         
         report["results"][symbol] = symbol_report
     
@@ -300,6 +343,7 @@ def run_daily_pipeline(
     report_dir.mkdir(parents=True, exist_ok=True)
     with open(report_dir / "report.json", "w") as f:
         json.dump(report, f, indent=2, default=str)
+    _obs_store.observe(metric="daily_pipeline.total", latency_s=(time.time() - pipeline_started), ok=True)
     
     log.info("daily_pipeline.done", run_id=run_id, report_path=str(report_dir / "report.json"))
     
@@ -340,12 +384,14 @@ def run_hyperparam_sweep(
     Returns:
         Best config and metrics
     """
+    sweep_started = time.time()
     try:
         import ray
         from ray import tune
         from ray.tune.schedulers import ASHAScheduler
     except ImportError:
         log.error("sweep.ray_not_installed")
+        _obs_store.observe(metric="sweep.import", ok=False)
         raise RuntimeError("Ray is required for sweeps. Install with: pip install ray[tune]")
     
     from ghtrader.datasets.features import read_features_for_symbol, read_features_manifest
@@ -355,9 +401,11 @@ def run_hyperparam_sweep(
     log.info("sweep.start", symbol=symbol, model_type=model_type, n_trials=n_trials)
     
     # Load data once
+    t_data = time.time()
     features_df = read_features_for_symbol(data_dir, symbol)
     labels_df = read_labels_for_symbol(data_dir, symbol)
     df = features_df.merge(labels_df[["datetime", f"label_{horizon}"]], on="datetime")
+    _obs_store.observe(metric="sweep.data_load", latency_s=(time.time() - t_data), ok=True)
     
     # Guardrails: ensure features/labels manifests align.
     manifest = read_features_manifest(data_dir, symbol)
@@ -494,6 +542,7 @@ def run_hyperparam_sweep(
             "best_accuracy": best_result["accuracy"],
             "n_trials": n_trials,
         }, f, indent=2)
+    _obs_store.observe(metric="sweep.total", latency_s=(time.time() - sweep_started), ok=True)
     
     return {
         "best_config": best_config,

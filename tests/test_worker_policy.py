@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_config(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("GHTRADER_DISABLE_DOTENV", "true")
+
 
 def test_check_workers_clamps_to_caps(monkeypatch) -> None:
     from ghtrader.util.worker_policy import resolve_worker_count

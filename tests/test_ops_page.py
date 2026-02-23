@@ -8,11 +8,7 @@ from fastapi.testclient import TestClient
 
 
 def test_ops_page_renders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Test that /ops redirects to Data Hub with unified workflow.
-    
-    The Pipeline tab has been consolidated into the Contracts tab workflow.
-    /ops now redirects to /data#contracts.
-    """
+    """Legacy /ops entrypoints are removed after compatibility cutover."""
     monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
@@ -21,13 +17,11 @@ def test_ops_page_renders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     importlib.reload(mod)
     client = TestClient(mod.app)
 
-    # /ops should redirect to /data#contracts
+    # /ops should be removed
     r = client.get("/ops", follow_redirects=False)
-    assert r.status_code in {302, 303, 307, 308}
-    assert "/data" in r.headers.get("location", "")
-    assert "#contracts" in r.headers.get("location", "")
+    assert r.status_code == 404
 
-    # Following the redirect should render the Data Hub
+    # Canonical data route remains healthy.
     r_data = client.get("/data")
     assert r_data.status_code == 200
     html = r_data.text
@@ -35,7 +29,7 @@ def test_ops_page_renders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert "Build Schedule" in html
     assert "Build main_l5" in html
 
-    # Legacy Ops pages redirect to consolidated page.
+    # Other /ops aliases are removed as well.
     r2 = client.get("/ops/ingest", follow_redirects=False)
-    assert r2.status_code in {302, 303, 307, 308}
+    assert r2.status_code == 404
 

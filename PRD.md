@@ -1521,7 +1521,7 @@ Dashboard responsibility:
 - **live_monitor**: connect to the real broker account and record snapshots/events, but **never send orders**. This is the required first step before any live order routing.
 - **live_trade**: orders are allowed using `TqAccount(...)`. Requires both `GHTRADER_LIVE_ENABLED=true` and `confirm_live=I_UNDERSTAND`; if either is missing, the gateway automatically downgrades to `live_monitor`.
 
-#### 5.11.3 Account configuration (.env + dashboard-managed accounts.env)
+#### 5.11.3 Account configuration (secrets-only env + dashboard-managed accounts.env)
 
 TqSdk requires:
 
@@ -1543,6 +1543,28 @@ TqSdk requires:
       - `TQ_ACCOUNT_PASSWORD_P`
     - Example (`P=MAIN`): `TQ_BROKER_ID_MAIN`, `TQ_ACCOUNT_ID_MAIN`, `TQ_ACCOUNT_PASSWORD_MAIN`
   - **Supported broker IDs**: dashboard should provide a selection list sourced from ShinnyTech’s published list (cached locally; fallback to manual entry if unavailable).
+
+##### 5.11.3.0 Configuration governance and Config Service (new baseline)
+
+`ghTrader` must move business/runtime configuration away from env-sprawl into a local Config Service.
+
+- **Config Service backend**: `runs/control/config.db` (SQLite, WAL mode), with revisioned snapshots.
+- **Config scope**:
+  - **Managed by Config Service**: business thresholds, worker policy, validation policy, dashboard/runtime tuning.
+  - **Kept in secrets env files only**: credentials and safety-gate bootstrap (`.env`, `runs/control/accounts.env`).
+- **Resolution precedence**:
+  1. Explicit CLI arguments
+  2. Config Service effective value
+  3. Code default
+- **Legacy env policy**:
+  - Deprecated business env keys must be rejected with a hard error once migration is enabled.
+  - Secrets/bootstrap env keys remain valid.
+- **Auditability requirements**:
+  - Every config mutation must produce a revision entry (`actor`, `timestamp`, `reason`, `diff`).
+  - Dashboard and CLI must support config history and rollback by revision.
+- **Run traceability**:
+  - Each materialized run must persist effective config snapshot + config hash in run artifacts.
+  - Config hash must be queryable together with run metadata.
 
 ##### 5.11.3.1 Account verification (read-only)
 
@@ -2105,6 +2127,12 @@ Implementation:
   - config
   - metrics/report
 
+Config traceability is mandatory:
+
+- Effective config must be materialized from Config Service + explicit CLI args.
+- A deterministic `config_hash` (from canonicalized snapshot payload) must be written to run artifacts.
+- Re-running the same code + data + config_hash must reproduce equivalent outputs within expected stochastic tolerance.
+
 ### 6.3 Performance and latency
 
 - Provide latency instrumentation across:
@@ -2215,6 +2243,12 @@ CI requirements:
   - `runs/control/accounts.env` (dashboard-managed broker account profiles; contains secrets)
 - `env.example` must be provided.
 - Never commit secrets.
+
+Security boundary for configuration:
+
+- Config Service must not store broker passwords or other live-trading secrets.
+- Config APIs must redact secret-like values and avoid logging plaintext credentials.
+- Secrets remain file-local (`.env`, `accounts.env`) and are never mirrored into `config.db`.
 
 ### 6.6 Operational Resilience [Partial]
 
