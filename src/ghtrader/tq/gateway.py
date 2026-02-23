@@ -402,6 +402,61 @@ def _write_commands_cursor(*, runs_dir: Path, profile: str, offset: int) -> None
     write_json_atomic(p, {"updated_at": _now_iso(), "offset": int(max(0, int(offset)))})
 
 
+def risk_kill_state_path(*, runs_dir: Path, profile: str) -> Path:
+    return gateway_root(runs_dir=runs_dir, profile=profile) / "risk_kill.json"
+
+
+def _read_risk_kill_state(*, runs_dir: Path, profile: str) -> dict[str, Any]:
+    obj = read_json(risk_kill_state_path(runs_dir=runs_dir, profile=profile))
+    if not isinstance(obj, dict):
+        return {"active": False, "reason": "", "updated_at": "", "activated_at": ""}
+    return {
+        "active": bool(obj.get("active")),
+        "reason": str(obj.get("reason") or ""),
+        "updated_at": str(obj.get("updated_at") or ""),
+        "activated_at": str(obj.get("activated_at") or ""),
+    }
+
+
+def _write_risk_kill_state(*, runs_dir: Path, profile: str, active: bool, reason: str) -> dict[str, Any]:
+    prev = _read_risk_kill_state(runs_dir=runs_dir, profile=profile)
+    now_s = _now_iso()
+    activated_at = str(prev.get("activated_at") or "")
+    if bool(active):
+        if not activated_at:
+            activated_at = now_s
+    else:
+        activated_at = ""
+    payload = {
+        "schema_version": 1,
+        "updated_at": now_s,
+        "account_profile": canonical_account_profile(profile),
+        "active": bool(active),
+        "reason": str(reason or ""),
+        "activated_at": activated_at,
+    }
+    write_json_atomic(risk_kill_state_path(runs_dir=runs_dir, profile=profile), payload)
+    return payload
+
+
+def _clear_risk_kill_state(*, runs_dir: Path, profile: str) -> None:
+    p = risk_kill_state_path(runs_dir=runs_dir, profile=profile)
+    try:
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def _connect_local_redis() -> redis.Redis | None:
+    try:
+        rc = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+        rc.ping()
+        return rc
+    except Exception:
+        return None
+
+
 def _close_api(api: Any) -> None:
     try:
         api.close()
@@ -434,11 +489,7 @@ def run_gateway(
     rep_socket.bind(f"ipc:///tmp/ghtrader_gateway_rep_{prof}.ipc")
 
     # Redis Setup (Warm Path)
-    try:
-        redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
-        redis_client.ping()
-    except Exception:
-        redis_client = None
+    redis_client = _connect_local_redis()
 
     writer = GatewayWriter(runs_dir=runs_dir, profile=prof, pub_socket=pub_socket, redis_client=redis_client)
 
@@ -464,7 +515,14 @@ def run_gateway(
     last_targets: dict[str, int] = {}
     zmq_targets: dict[str, int] = {}
     start_balance: float | None = None
-    risk_kill_active = False
+    risk_kill_state = _read_risk_kill_state(runs_dir=runs_dir, profile=prof)
+    risk_kill_active = bool(risk_kill_state.get("active"))
+    risk_kill_reason = str(risk_kill_state.get("reason") or "")
+    risk_kill_updated_at = str(risk_kill_state.get("updated_at") or "")
+    warm_path_degraded = redis_client is None
+    warm_path_reason = "redis_unavailable" if warm_path_degraded else ""
+    redis_retry_interval_s = 3.0
+    last_redis_retry_at = 0.0
 
     last_snapshot_at = 0.0
     last_wait_ok_at = 0.0
@@ -479,17 +537,129 @@ def run_gateway(
     data_dir = get_data_dir()
 
     writer.set_health(ok=False, connected=False, last_wait_update_at="", error="")
-    writer.set_effective(mode="idle", symbols=[], executor="targetpos")
+    writer.set_effective(
+        mode="idle",
+        symbols=[],
+        executor="targetpos",
+        risk_kill_active=bool(risk_kill_active),
+        risk_kill_reason=str(risk_kill_reason),
+        risk_kill_updated_at=str(risk_kill_updated_at),
+        warm_path_degraded=bool(warm_path_degraded),
+        warm_path_reason=str(warm_path_reason),
+    )
     writer.append_event({"type": "gateway_start"})
+    if risk_kill_active:
+        writer.append_event({"type": "risk_kill_rehydrated", "reason": risk_kill_reason or "persisted_state"})
 
     cmd_offset = _read_commands_cursor(runs_dir=runs_dir, profile=prof)
     redis_cmd_stream = f"ghtrader:commands:{prof}"
     redis_cmd_id = "$"
     seen_command_ids: set[str] = set()
 
+    def _set_warm_path_state(*, degraded: bool, reason: str = "") -> None:
+        nonlocal warm_path_degraded, warm_path_reason
+        degraded_b = bool(degraded)
+        reason_s = str(reason or "") if degraded_b else ""
+        changed = (degraded_b != warm_path_degraded) or (reason_s != warm_path_reason)
+        warm_path_degraded = degraded_b
+        warm_path_reason = reason_s
+        writer.set_effective(warm_path_degraded=bool(warm_path_degraded), warm_path_reason=str(warm_path_reason))
+        if changed:
+            writer.append_event(
+                {
+                    "type": "warm_path_state",
+                    "degraded": bool(warm_path_degraded),
+                    "reason": str(warm_path_reason),
+                }
+            )
+
+    def _sync_warm_path_redis_client(rc: redis.Redis | None) -> None:
+        writer.redis_client = rc
+
+    def _ensure_redis_connection() -> None:
+        nonlocal redis_client, last_redis_retry_at
+        if redis_client is not None:
+            return
+        now_t = time.time()
+        if (now_t - float(last_redis_retry_at)) < float(redis_retry_interval_s):
+            return
+        last_redis_retry_at = now_t
+        rc = _connect_local_redis()
+        if rc is None:
+            _set_warm_path_state(degraded=True, reason="redis_unavailable")
+            return
+        redis_client = rc
+        _sync_warm_path_redis_client(redis_client)
+        _set_warm_path_state(degraded=False, reason="")
+        writer.append_event({"type": "warm_path_recovered", "component": "redis"})
+
+    def _enforce_risk_kill_actions() -> None:
+        try:
+            if exec_direct is not None:
+                exec_direct.cancel_all_alive()
+            if exec_targetpos is not None:
+                for s in list(current_symbols):
+                    exec_targetpos.set_target(s, 0)
+        except Exception:
+            pass
+        try:
+            write_gateway_desired(
+                runs_dir=runs_dir,
+                profile=prof,
+                desired=GatewayDesired(mode="idle"),
+                redis_client=redis_client,
+            )
+        except Exception:
+            pass
+
+    def _activate_risk_kill(*, reason: str, details: dict[str, Any] | None = None) -> None:
+        nonlocal risk_kill_active, risk_kill_reason, risk_kill_updated_at
+        if risk_kill_active:
+            return
+        risk_kill_active = True
+        risk_kill_reason = str(reason or "")
+        st = _write_risk_kill_state(
+            runs_dir=runs_dir,
+            profile=prof,
+            active=True,
+            reason=str(risk_kill_reason),
+        )
+        risk_kill_updated_at = str(st.get("updated_at") or _now_iso())
+        writer.set_effective(
+            risk_kill_active=True,
+            risk_kill_reason=str(risk_kill_reason),
+            risk_kill_updated_at=str(risk_kill_updated_at),
+        )
+        evt = {"type": "risk_kill", "reason": str(risk_kill_reason)}
+        if isinstance(details, dict):
+            evt.update(details)
+        writer.append_event(evt)
+        _enforce_risk_kill_actions()
+
+    def _reset_risk_kill(*, reason: str) -> None:
+        nonlocal risk_kill_active, risk_kill_reason, risk_kill_updated_at
+        was_active = bool(risk_kill_active)
+        risk_kill_active = False
+        risk_kill_reason = ""
+        risk_kill_updated_at = _now_iso()
+        _clear_risk_kill_state(runs_dir=runs_dir, profile=prof)
+        writer.set_effective(
+            risk_kill_active=False,
+            risk_kill_reason="",
+            risk_kill_updated_at=str(risk_kill_updated_at),
+        )
+        writer.append_event(
+            {
+                "type": "risk_kill_reset",
+                "reason": str(reason or "operator_reset"),
+                "was_active": bool(was_active),
+            }
+        )
+
     while True:
         loop_started = time.perf_counter()
         loop_ok = True
+        _ensure_redis_connection()
         desired = read_gateway_desired(runs_dir=runs_dir, profile=prof, redis_client=redis_client)
         desired_mode = desired.mode
         desired_symbols = desired.symbols_list()
@@ -525,7 +695,6 @@ def run_gateway(
             last_targets = {}
             zmq_targets = {}
             start_balance = None
-            risk_kill_active = False
             current_mode = effective_mode
             current_symbols = []
 
@@ -704,33 +873,14 @@ def run_gateway(
                         if start_balance is None:
                             start_balance = float(bal_now)
                         if float(bal_now) < float(start_balance) - float(desired.max_daily_loss):
-                            risk_kill_active = True
-                            writer.append_event(
-                                {
-                                    "type": "risk_kill",
-                                    "reason": "max_daily_loss_realtime",
+                            _activate_risk_kill(
+                                reason="max_daily_loss_realtime",
+                                details={
                                     "start_balance": float(start_balance),
                                     "balance": float(bal_now),
                                     "max_daily_loss": float(desired.max_daily_loss),
-                                }
+                                },
                             )
-                            try:
-                                if exec_direct is not None:
-                                    exec_direct.cancel_all_alive()
-                                if exec_targetpos is not None:
-                                    for s in list(current_symbols):
-                                        exec_targetpos.set_target(s, 0)
-                            except Exception:
-                                pass
-                            try:
-                                write_gateway_desired(
-                                    runs_dir=runs_dir,
-                                    profile=prof,
-                                    desired=GatewayDesired(mode="idle"),
-                                    redis_client=redis_client,
-                                )
-                            except Exception:
-                                pass
             except Exception:
                 pass
 
@@ -769,21 +919,8 @@ def run_gateway(
 
             # Kill-switch file (operator emergency stop).
             try:
-                if (gateway_root(runs_dir=runs_dir, profile=prof) / "KILL").exists():
-                    writer.append_event({"type": "risk_kill", "reason": "kill_switch_file"})
-                    # Best-effort: cancel+flatten then go idle.
-                    try:
-                        if exec_direct is not None:
-                            exec_direct.cancel_all_alive()
-                        if exec_targetpos is not None:
-                            for s in list(current_symbols):
-                                exec_targetpos.set_target(s, 0)
-                    except Exception:
-                        pass
-                    try:
-                        write_gateway_desired(runs_dir=runs_dir, profile=prof, desired=GatewayDesired(mode="idle"), redis_client=redis_client)
-                    except Exception:
-                        pass
+                if (gateway_root(runs_dir=runs_dir, profile=prof) / "KILL").exists() and not risk_kill_active:
+                    _activate_risk_kill(reason="kill_switch_file")
                     time.sleep(1.0)
             except Exception:
                 pass
@@ -821,6 +958,9 @@ def run_gateway(
                                 )
                     except Exception as e:
                         writer.append_event({"type": "gateway_commands_stream_failed", "error": str(e)})
+                        redis_client = None
+                        _sync_warm_path_redis_client(None)
+                        _set_warm_path_state(degraded=True, reason="redis_stream_failed")
 
                 # Fallback/audit mirror: append-only file.
                 cmd_p = commands_path(runs_dir=runs_dir, profile=prof)
@@ -891,9 +1031,21 @@ def run_gateway(
                         except Exception as e:
                             writer.append_event({"type": "gateway_disarm_failed", "error": str(e)})
 
+                    if ctype == "reset_risk_kill":
+                        _reset_risk_kill(reason="operator_reset")
+
                     if ctype == "set_target":
                         # Manual target setting (for one-lot testing)
                         try:
+                            if risk_kill_active:
+                                writer.append_event(
+                                    {
+                                        "type": "manual_target_failed",
+                                        "error": "risk_kill_active",
+                                        "risk_kill_reason": str(risk_kill_reason),
+                                    }
+                                )
+                                continue
                             params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
                             sym = str((obj.get("symbol") if "symbol" in obj else params.get("symbol")) or "").strip()
                             tgt_raw = obj.get("target") if "target" in obj else params.get("target")
@@ -920,7 +1072,7 @@ def run_gateway(
                 writer.append_event({"type": "gateway_commands_failed", "error": str(e)})
 
             # Targets → execution (only when order-enabled).
-            orders_enabled = bool(current_mode in {"sim", "live_trade"})
+            orders_enabled = bool(current_mode in {"sim", "live_trade"} and not risk_kill_active)
             if orders_enabled:
                 try:
                     # Hot path target source is ZMQ only. Disk targets are audit mirrors.
@@ -961,9 +1113,11 @@ def run_gateway(
                     account_meta = {
                         "mode": str(current_mode),
                         "account_profile": prof,
-                        "orders_enabled": bool(current_mode in {"sim", "live_trade"}),
+                        "orders_enabled": bool(current_mode in {"sim", "live_trade"} and not risk_kill_active),
                         "monitor_only": bool(current_mode in {"paper", "live_monitor"}),
                         "live_enabled": bool(is_live_enabled()),
+                        "risk_kill_active": bool(risk_kill_active),
+                        "risk_kill_reason": str(risk_kill_reason),
                     }
                     if account is not None:
                         snap = snapshot_account_state(
@@ -983,27 +1137,14 @@ def run_gateway(
                                 start_balance = float(bal)
                             if start_balance is not None and desired.max_daily_loss is not None and bal is not None:
                                 if float(bal) < float(start_balance) - float(desired.max_daily_loss):
-                                    writer.append_event(
-                                        {
-                                            "type": "risk_kill",
-                                            "reason": "max_daily_loss",
+                                    _activate_risk_kill(
+                                        reason="max_daily_loss",
+                                        details={
                                             "start_balance": float(start_balance),
                                             "balance": float(bal),
                                             "max_daily_loss": float(desired.max_daily_loss),
-                                        }
+                                        },
                                     )
-                                    try:
-                                        if exec_direct is not None:
-                                            exec_direct.cancel_all_alive()
-                                        if exec_targetpos is not None:
-                                            for s in list(current_symbols):
-                                                exec_targetpos.set_target(s, 0)
-                                    except Exception:
-                                        pass
-                                    try:
-                                        write_gateway_desired(runs_dir=runs_dir, profile=prof, desired=GatewayDesired(mode="idle"), redis_client=redis_client)
-                                    except Exception:
-                                        pass
                         except Exception:
                             pass
                     else:
@@ -1015,7 +1156,16 @@ def run_gateway(
         else:
             # Idle / disconnected: keep state fresh for the dashboard.
             writer.set_health(ok=True, connected=False, last_wait_update_at=_now_iso(), error="")
-            writer.set_effective(mode=current_mode, symbols=current_symbols, executor=desired.executor)
+            writer.set_effective(
+                mode=current_mode,
+                symbols=current_symbols,
+                executor=desired.executor,
+                risk_kill_active=bool(risk_kill_active),
+                risk_kill_reason=str(risk_kill_reason),
+                risk_kill_updated_at=str(risk_kill_updated_at),
+                warm_path_degraded=bool(warm_path_degraded),
+                warm_path_reason=str(warm_path_reason),
+            )
             time.sleep(1.0)
         _obs_store.observe(metric="loop", latency_s=(time.perf_counter() - loop_started), ok=bool(loop_ok))
 
@@ -1030,6 +1180,7 @@ __all__ = [
     "gateway_root",
     "read_gateway_desired",
     "read_gateway_targets",
+    "risk_kill_state_path",
     "run_gateway",
     "snapshots_path",
     "state_path",

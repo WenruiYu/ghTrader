@@ -132,8 +132,19 @@ def register(main: click.Group) -> None:
         )
         backend = make_serving_backend(cfg)
 
-        # Ensure main_l5 table schema exists (best-effort idempotent DDL).
+        # Ensure main_l5 table schema exists (idempotent + fail-fast contract checks).
         backend.ensure_table(table=str(main_l5_table), include_segment_metadata=True)
+        from ghtrader.questdb.client import QuestDBQueryConfig
+        from ghtrader.questdb.migrate import ensure_schema_v2
+
+        schema_out = ensure_schema_v2(
+            cfg=QuestDBQueryConfig(host=h, pg_port=int(p), pg_user=u, pg_password=pw, pg_dbname=dbn),
+            apply=True,
+            connect_timeout_s=2,
+        )
+        if not bool(schema_out.get("ok", False)):
+            click.echo(json.dumps({"ok": False, "error": "ensure_schema_failed", "detail": schema_out}))
+            raise SystemExit(1)
 
         # Validate tables are queryable (so failures are surfaced loudly).
         try:
@@ -158,6 +169,7 @@ def register(main: click.Group) -> None:
                     "pg_user": u,
                     "pg_dbname": dbn,
                     "tables": {"main_l5": str(main_l5_table)},
+                    "schema_migration": {"ok": True, "tables_checked": schema_out.get("tables_checked", 0)},
                 }
             )
         )

@@ -133,6 +133,9 @@ async def api_gateway_command(request: Request) -> dict[str, Any]:
     cmd_type = str(payload.get("type") or "").strip()
     if not cmd_type:
         raise HTTPException(status_code=400, detail="missing type")
+    allowed_types = {"cancel_all", "flatten", "disarm_live", "set_target", "reset_risk_kill"}
+    if cmd_type not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"unsupported type: {cmd_type}")
 
     try:
         from ghtrader.tq.gateway import commands_path

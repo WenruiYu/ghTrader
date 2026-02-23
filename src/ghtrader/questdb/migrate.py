@@ -25,11 +25,85 @@ _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 from ghtrader.util.time import now_iso as _now_iso
 
 
+SCHEMA_MIGRATIONS_TABLE_V2 = "ghtrader_schema_migrations_v2"
+
+
 def _ident(name: str) -> str:
     n = str(name or "").strip()
     if not n or not _SQL_IDENT_RE.match(n):
         raise ValueError(f"Invalid SQL identifier: {name!r}")
     return n
+
+
+def ensure_schema_migration_ledger(*, cur: Any, table: str = SCHEMA_MIGRATIONS_TABLE_V2) -> None:
+    """
+    Ensure migration ledger table exists.
+
+    This ledger is append-only and used for operational auditing/triage.
+    """
+    t = _ident(table)
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {t} (
+          ts TIMESTAMP,
+          migration_id SYMBOL,
+          table_name SYMBOL,
+          action SYMBOL,
+          status SYMBOL,
+          detail STRING
+        ) TIMESTAMP(ts) PARTITION BY DAY WAL
+        """
+    )
+
+
+def append_schema_migration_ledger(
+    *,
+    cur: Any,
+    migration_id: str,
+    table_name: str,
+    action: str,
+    status: str,
+    detail: str = "",
+    ledger_table: str = SCHEMA_MIGRATIONS_TABLE_V2,
+) -> None:
+    t = _ident(ledger_table)
+    cur.execute(
+        f"INSERT INTO {t} (ts, migration_id, table_name, action, status, detail) VALUES (%s,%s,%s,%s,%s,%s)",
+        (
+            datetime.now(timezone.utc),
+            str(migration_id or ""),
+            str(table_name or ""),
+            str(action or ""),
+            str(status or ""),
+            str(detail or ""),
+        ),
+    )
+
+
+def list_table_columns_with_cursor(*, cur: Any, table: str) -> set[str]:
+    t = _ident(table)
+    cur.execute(f'SELECT "column" FROM table_columns(\'{t}\')')
+    rows = cur.fetchall()
+    out: set[str] = set()
+    for row in rows or []:
+        try:
+            if isinstance(row, (tuple, list)):
+                raw = row[0] if row else ""
+            elif isinstance(row, dict):
+                raw = row.get("column")
+            else:
+                raw = getattr(row, "column", None)
+                if raw is None:
+                    try:
+                        raw = row[0]  # type: ignore[index]
+                    except Exception:
+                        raw = row
+            name = str(raw or "").strip()
+        except Exception:
+            name = ""
+        if name:
+            out.add(name)
+    return out
 
 
 @dataclass(frozen=True)
@@ -336,5 +410,13 @@ def ensure_schema_v2(
     }
 
 
-__all__ = ["migrate_column_names_v2", "best_effort_rename_provenance_columns_v2", "ensure_schema_v2"]
+__all__ = [
+    "SCHEMA_MIGRATIONS_TABLE_V2",
+    "append_schema_migration_ledger",
+    "best_effort_rename_provenance_columns_v2",
+    "ensure_schema_migration_ledger",
+    "ensure_schema_v2",
+    "list_table_columns_with_cursor",
+    "migrate_column_names_v2",
+]
 

@@ -175,12 +175,22 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
 
     from ghtrader.datasets.features import FactorEngine
 
+    def _connect_local_redis() -> redis.Redis | None:
+        try:
+            rc = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+            rc.ping()
+            return rc
+        except Exception:
+            return None
+
     # Redis Setup (Warm Path)
-    try:
-        redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
-        redis_client.ping()
-    except Exception:
-        redis_client = None
+    redis_client = _connect_local_redis()
+    warm_path_degraded = redis_client is None
+    warm_path_reason = "redis_unavailable" if warm_path_degraded else ""
+    redis_retry_interval_s = 3.0
+    redis_healthcheck_interval_s = 5.0
+    last_redis_retry_at = 0.0
+    last_redis_healthcheck_at = 0.0
 
     writer = StrategyWriter(runs_dir=cfg.runs_dir, account_profile=prof)
     statew = StrategyStateWriter(runs_dir=cfg.runs_dir, profile=prof, redis_client=redis_client)
@@ -210,8 +220,51 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
         position_size=int(cfg.position_size),
         artifacts_dir=str(cfg.artifacts_dir),
         poll_interval_sec=float(cfg.poll_interval_sec),
+        warm_path_degraded=bool(warm_path_degraded),
+        warm_path_reason=str(warm_path_reason),
     )
     statew.append_event({"type": "strategy_start", "run_id": writer.run_id})
+
+    def _set_warm_path_state(*, degraded: bool, reason: str = "") -> None:
+        nonlocal warm_path_degraded, warm_path_reason
+        degraded_b = bool(degraded)
+        reason_s = str(reason or "") if degraded_b else ""
+        changed = (degraded_b != warm_path_degraded) or (reason_s != warm_path_reason)
+        warm_path_degraded = degraded_b
+        warm_path_reason = reason_s
+        statew.set_effective(warm_path_degraded=bool(warm_path_degraded), warm_path_reason=str(warm_path_reason))
+        if changed:
+            evt = {"type": "warm_path_state", "degraded": bool(warm_path_degraded), "reason": str(warm_path_reason)}
+            writer.event(evt)
+            statew.append_event(evt)
+
+    def _ensure_redis_connection() -> None:
+        nonlocal redis_client, last_redis_retry_at, last_redis_healthcheck_at
+        now_t = time.time()
+        if redis_client is not None and (now_t - float(last_redis_healthcheck_at)) >= float(redis_healthcheck_interval_s):
+            last_redis_healthcheck_at = now_t
+            try:
+                redis_client.ping()
+            except Exception:
+                redis_client = None
+                statew.redis_client = None
+                _set_warm_path_state(degraded=True, reason="redis_ping_failed")
+
+        if redis_client is not None:
+            return
+        if (now_t - float(last_redis_retry_at)) < float(redis_retry_interval_s):
+            return
+        last_redis_retry_at = now_t
+        rc = _connect_local_redis()
+        if rc is None:
+            _set_warm_path_state(degraded=True, reason="redis_unavailable")
+            return
+        redis_client = rc
+        statew.redis_client = rc
+        _set_warm_path_state(degraded=False, reason="")
+        evt = {"type": "warm_path_recovered", "component": "redis"}
+        writer.event(evt)
+        statew.append_event(evt)
 
     # Models + factor specs (keyed by requested symbol for artifact lookup)
     models: dict[str, Any] = {}
@@ -241,6 +294,7 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
     safe_halt_active = False
     while True:
         loop_started = time.perf_counter()
+        _ensure_redis_connection()
         try:
             # ZMQ Poll (Hot Path)
             if not sub_socket.poll(timeout=1000):

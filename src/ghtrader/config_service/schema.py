@@ -298,6 +298,17 @@ def key_is_managed(key: str) -> bool:
     return True
 
 
+def key_is_env_only(key: str) -> bool:
+    k = str(key or "").strip()
+    if not k:
+        return False
+    if k in ALLOWED_ENV_KEYS:
+        return True
+    if any(k.startswith(prefix) for prefix in ALLOWED_ENV_PREFIXES):
+        return True
+    return False
+
+
 def key_is_ui_editable(key: str) -> bool:
     k = str(key or "").strip()
     if not k:

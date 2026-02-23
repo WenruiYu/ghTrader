@@ -2321,6 +2321,38 @@ def create_app() -> Any:
         except Exception:
             pass
 
+        warm_path_reasons: list[str] = []
+        gw_eff = {}
+        st_eff = {}
+        risk_kill_active = False
+        risk_kill_reason = ""
+        try:
+            gw_state = gw.get("state") if isinstance(gw.get("state"), dict) else {}
+            gw_eff = gw_state.get("effective") if isinstance(gw_state.get("effective"), dict) else {}
+            if bool(gw_eff.get("warm_path_degraded")):
+                gw_r = str(gw_eff.get("warm_path_reason") or "").strip()
+                warm_path_reasons.append(f"gateway:{gw_r}" if gw_r else "gateway")
+            risk_kill_active = bool(gw_eff.get("risk_kill_active"))
+            risk_kill_reason = str(gw_eff.get("risk_kill_reason") or "")
+        except Exception:
+            pass
+        try:
+            st_state = st.get("state") if isinstance(st.get("state"), dict) else {}
+            st_eff = st_state.get("effective") if isinstance(st_state.get("effective"), dict) else {}
+            if bool(st_eff.get("warm_path_degraded")):
+                st_r = str(st_eff.get("warm_path_reason") or "").strip()
+                warm_path_reasons.append(f"strategy:{st_r}" if st_r else "strategy")
+        except Exception:
+            pass
+        warm_path_degraded = bool(warm_path_reasons)
+        state_notes: list[str] = []
+        if gw_stale or st_stale:
+            state_notes.append("state stale")
+        if warm_path_degraded:
+            state_notes.append("warm path degraded")
+        if risk_kill_active:
+            state_notes.append("risk kill active")
+
         if var_filter:
             # Gateway desired/effective symbols and snapshots filtered for current variety view.
             gw_desired = gw.get("desired") if isinstance(gw.get("desired"), dict) else None
@@ -2407,10 +2439,14 @@ def create_app() -> Any:
             "ok": True,
             "account_profile": prof,
             "live_enabled": bool(live_enabled),
-            "state": ("warn" if (gw_stale or st_stale) else "ok"),
-            "text": ("state stale" if (gw_stale or st_stale) else "healthy"),
+            "state": ("warn" if state_notes else "ok"),
+            "text": ("; ".join(state_notes) if state_notes else "healthy"),
             "error": "",
             "stale": bool(gw_stale or st_stale),
+            "warm_path_degraded": bool(warm_path_degraded),
+            "warm_path_reasons": list(warm_path_reasons),
+            "risk_kill_active": bool(risk_kill_active),
+            "risk_kill_reason": str(risk_kill_reason),
             "updated_at": _now_iso(),
             "gateway": {**gw, "component_status": gw_status, "state_age_sec": gw_age, "stale": gw_stale},
             "strategy": {**st, "stale": st_stale},

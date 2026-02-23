@@ -10,7 +10,7 @@ from typing import Any
 import structlog
 
 from ghtrader.util.json_io import read_json, write_json_atomic
-from .ticks_schema import ticks_schema_hash
+from .ticks_schema import row_hash_algorithm_version, ticks_schema_hash
 
 log = structlog.get_logger()
 
@@ -26,6 +26,7 @@ class IngestManifest:
     row_counts: dict[str, int]
     schema_hash: str
     code_version: str
+    row_hash_algo: str = "fnv1a64_v1"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -38,11 +39,14 @@ class IngestManifest:
             "row_counts": self.row_counts,
             "schema_hash": self.schema_hash,
             "code_version": self.code_version,
+            "row_hash_algo": self.row_hash_algo,
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "IngestManifest":
-        return cls(**d)
+        payload = dict(d or {})
+        payload.setdefault("row_hash_algo", row_hash_algorithm_version())
+        return cls(**payload)
 
 
 def manifests_dir(data_dir: Path) -> Path:
@@ -89,6 +93,7 @@ def write_manifest(
         row_counts=row_counts,
         schema_hash=ticks_schema_hash(),
         code_version=_get_git_hash(),
+        row_hash_algo=row_hash_algorithm_version(),
     )
 
     out_dir = manifests_dir(data_dir)

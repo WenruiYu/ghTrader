@@ -203,35 +203,80 @@ class QuestDBBackend(ServingDBBackend):
                 except Exception:
                     pass
                 with conn.cursor() as cur:
+                    migration_id = f"ensure_table:{str(table)}:v2"
                     cur.execute(ddl)
-                    # Best-effort column rename migration (v2): tolerate older column names.
-                    from .migrate import best_effort_rename_provenance_columns_v2
+                    from .migrate import (
+                        append_schema_migration_ledger,
+                        best_effort_rename_provenance_columns_v2,
+                        ensure_schema_migration_ledger,
+                        list_table_columns_with_cursor,
+                    )
+
+                    # Ledger is best-effort; schema contract checks remain strict.
+                    try:
+                        ensure_schema_migration_ledger(cur=cur)
+                    except Exception:
+                        pass
 
                     best_effort_rename_provenance_columns_v2(cur=cur, table=str(table))
-                    # Best-effort schema evolution: add any newly-required columns to existing tables.
-                    # QuestDB lacks strong IF NOT EXISTS for columns across versions; ignore failures.
-                    for name, typ in [("trading_day", "SYMBOL"), ("row_hash", "LONG")] + [(c, "DOUBLE") for c in tick_numeric_cols] + [
+
+                    required_cols: list[tuple[str, str]] = [("trading_day", "SYMBOL"), ("row_hash", "LONG")] + [
+                        (c, "DOUBLE") for c in tick_numeric_cols
+                    ] + [
                         ("dataset_version", "SYMBOL"),
                         ("ticks_kind", "SYMBOL"),
-                    ]:
+                    ]
+                    if include_segment_metadata:
+                        required_cols += [("underlying_contract", "SYMBOL"), ("segment_id", "LONG"), ("schedule_hash", "SYMBOL")]
+
+                    ddl_errors: list[str] = []
+                    for name, typ in required_cols:
                         try:
                             cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
-                        except Exception:
-                            pass
-                    if include_segment_metadata:
-                        for name, typ in [("underlying_contract", "SYMBOL"), ("segment_id", "LONG"), ("schedule_hash", "SYMBOL")]:
-                            try:
-                                cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
-                            except Exception:
-                                pass
+                        except Exception as e:
+                            err_s = str(e)
+                            if "already exists" in err_s.lower():
+                                continue
+                            ddl_errors.append(f"add_column:{name}:{err_s}")
 
                     # Best-effort: enable dedup on existing tables (no-op if already enabled).
                     try:
                         cur.execute(f"ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS(ts, symbol, ticks_kind, dataset_version, row_hash)")
+                    except Exception as e:
+                        ddl_errors.append(f"dedup_enable:{e}")
+
+                    existing_cols = list_table_columns_with_cursor(cur=cur, table=str(table))
+                    missing_required = [name for name, _ in required_cols if name not in existing_cols]
+
+                    status = "ok"
+                    detail = f"required={len(required_cols)} missing={len(missing_required)} ddl_errors={len(ddl_errors)}"
+                    if missing_required or ddl_errors:
+                        status = "failed"
+                        detail = (
+                            f"missing_required={missing_required}; "
+                            f"ddl_errors={ddl_errors}"
+                        )
+                    try:
+                        append_schema_migration_ledger(
+                            cur=cur,
+                            migration_id=migration_id,
+                            table_name=str(table),
+                            action="ensure_table",
+                            status=status,
+                            detail=detail,
+                        )
                     except Exception:
                         pass
+
+                    if missing_required:
+                        raise RuntimeError(
+                            f"QuestDB schema contract violation for {table}: missing required columns {missing_required}"
+                        )
+                    if ddl_errors:
+                        raise RuntimeError(f"QuestDB schema evolution failed for {table}: {ddl_errors}")
         except Exception as e:
             log.warning("serving_db.questdb_ddl_failed", table=table, error=str(e))
+            raise
 
     def ingest_df(self, *, table: str, df: pd.DataFrame) -> None:
         df2 = df.copy(deep=False)

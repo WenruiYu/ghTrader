@@ -95,14 +95,23 @@ def register(main: click.Group) -> None:
     @click.option("--reason", default="cli_set", show_default=True, type=str, help="Change reason")
     @click.option("--json", "as_json", is_flag=True, help="Print JSON")
     def config_set(key: str, value: str, value_type: str, reason: str, as_json: bool) -> None:
+        from ghtrader.config_service.schema import key_is_env_only, key_is_managed
+
+        key_s = str(key or "").strip()
+        if not key_is_managed(key_s):
+            detail = "env-only key" if key_is_env_only(key_s) else "unmanaged key"
+            raise click.ClickException(f"refusing to set {key_s}: {detail}")
         resolver = get_config_resolver()
         coerced = _coerce_value(value, value_type)
-        rev = resolver.set_values(
-            values={str(key): coerced},
-            actor="cli",
-            reason=str(reason or "cli_set"),
-            action="set",
-        )
+        try:
+            rev = resolver.set_values(
+                values={key_s: coerced},
+                actor="cli",
+                reason=str(reason or "cli_set"),
+                action="set",
+            )
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
         payload = {
             "ok": True,
             "revision": int(rev.revision),

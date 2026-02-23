@@ -23,39 +23,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,control,questdb]"
 
-      - name: Run tests with coverage gate
+      - name: Run unit tests with deterministic coverage gate
         run: |
           pytest -q -m "not integration and not ddp_integration" \
             --cov=src/ghtrader \
             --cov-report=term-missing \
-            --cov-fail-under=35
-
-name: CI
-
-on:
-  push:
-  pull_request:
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,control,questdb]"
-
-      - name: Run pytest
-        run: pytest
-
-      - name: Run coverage gate
-        run: pytest --cov=ghtrader --cov-fail-under=50
+            --cov-fail-under=50
 

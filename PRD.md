@@ -5,7 +5,7 @@
 - **Product**: ghTrader (research-only AI-centric SHFE tick system)
 - **Scope**: SHFE CU/AU/AG directional micro-alpha research at tick/HFT granularity
 - **Status**: Active (canonical)
-- **Last updated**: 2026-02-21
+- **Last updated**: 2026-02-23
 - **Owner**: ghTrader maintainers
 
 ---
@@ -2393,6 +2393,20 @@ Database administration commands:
 - Harden dataset building for large-scale multi-day ingestion
 - Implement distributed training with DDP across 8 GPUs
 
+**2026-02 full-file audit hardening (architecture + reliability)**:
+- Enforce trading lock symmetry for strategy execution (`trade:strategy:account=<PROFILE>` plus account lock) to prevent duplicate StrategyRunner writers.
+- Persist gateway risk-kill state across restart and require explicit operator reset before re-enabling execution.
+- Harden warm-path degradation semantics: when Redis/WS is unavailable, surface explicit degraded mode in API/UI and retain deterministic file-based fallback state.
+- Replace best-effort QuestDB schema drift handling with explicit migration ledger + required-column checks (fail-fast for contract violations).
+- Enforce strict provenance checks for `main_l5` feature/label builds (`segment_id` + `schedule_hash` required in strict mode).
+- Enforce Config Service env-only key rejection at storage boundary (not only UI/API layer filtering).
+- Normalize CI to one canonical workflow definition with deterministic quality gates.
+- Keep file-level architecture audit synchronized in `reports/architecture_file_audit_index.md` (100 source files).
+
+Implementation update (2026-02-23):
+- Completed in-code implementation for the full Phase-0a hardening set above (`P0-A1..P0-C2`), including targeted regression coverage updates.
+- Detailed rollout status and touched file groups are tracked in `reports/system_optimization_roadmap.md`.
+
 **Database and Performance**:
 - Optimize QuestDB partitioning for typical query patterns
 - Add materialized views for common aggregations
@@ -2412,6 +2426,12 @@ Database administration commands:
 - Add latency regression tests for inference pipeline
 
 ### 10.5 Best-in-Class Alignment Roadmap (Phased)
+
+**Phase-0a: Immediate safety hardening (new, 2026-02 audit)**:
+- Trading safety envelope: strategy lock symmetry, durable risk-kill state, degraded warm-path visibility (§3.1, §5.11).
+- Data contract hardening: schema migration ledger + strict provenance gate for labels/features (§5.2, §5.3, §5.4).
+- Control-plane gate integrity: canonical CI workflow and Config Service env-only boundary enforcement (§6.4, §6.5, §7).
+- Authoritative execution plan and batch rollout are tracked in `reports/system_optimization_roadmap.md`.
 
 **Phase-0: Data governance + reliability (prereq for all)**:
 - Define data SLIs/SLOs (freshness, completeness, error budget) and dashboard surfacing (§6.6, §5.10)
@@ -2440,7 +2460,10 @@ Database administration commands:
 
 ### 10.6 Implementation Traceability Matrix (All Files)
 
-- Full file-level matrix (src/tests/infra, one file per row): `reports/prd_traceability_matrix.md`.
+- Full source file-level architecture audit (one source file per row): `reports/architecture_file_audit_index.md`.
+- Critical-path deep dive (trading/data/control, P0/P1 findings): `reports/architecture_critical_path_deep_dive.md`.
+- Prioritized optimization batches (P0/P1/P2): `reports/system_optimization_roadmap.md`.
+- PRD domain crosswalk + pending module tracker: `reports/prd_traceability_matrix.md`.
 - Coverage and missing-module snapshots are maintained in the matrix report.
 - Big-bang closeout report (deletions/decisions/gaps): `reports/prd_bigbang_closeout.md`.
 

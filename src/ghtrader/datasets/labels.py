@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import structlog
 
-from ghtrader.data.ticks_schema import DatasetVersion, TicksKind, row_hash_from_ticks_df
+from ghtrader.data.ticks_schema import DatasetVersion, TicksKind, row_hash_algorithm_version, row_hash_from_ticks_df
 
 log = structlog.get_logger()
 
@@ -165,6 +165,7 @@ def build_labels_for_symbol(
     from ghtrader.config import (
         env_float,
         env_int,
+        get_config_resolver,
         get_questdb_host,
         get_questdb_ilp_port,
         get_questdb_pg_dbname,
@@ -185,6 +186,7 @@ def build_labels_for_symbol(
     tk = str(ticks_kind).lower().strip() or "main_l5"
     if tk != "main_l5":
         raise ValueError("ticks_kind raw is deferred (Phase-1/2)")
+    strict_provenance = bool(get_config_resolver().get_bool("GHTRADER_MAIN_L5_STRICT_PROVENANCE", True))
     hs = [int(h) for h in horizons if int(h) > 0]
     if not hs:
         raise ValueError("horizons must be non-empty")
@@ -273,8 +275,13 @@ def build_labels_for_symbol(
                     schedule_hash = str(v0)
         except Exception:
             schedule_hash = None
+    if strict_provenance and not str(schedule_hash or "").strip():
+        raise ValueError(
+            "Strict provenance mode requires non-empty schedule_hash for main_l5 labels build."
+        )
 
     build_id = _hash_csv([symbol, tk, dv, str(schedule_hash or ""), horizons_str, str(int(threshold_k)), str(price_tick)])
+    row_hash_algo = row_hash_algorithm_version()
     # QuestDB ILP expects tz-naive timestamps.
     build_ts = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -316,6 +323,12 @@ def build_labels_for_symbol(
         )
         if df_day.empty:
             continue
+        if tk == "main_l5" and strict_provenance:
+            missing_cols = [c for c in ("schedule_hash", "underlying_contract", "segment_id") if c not in df_day.columns]
+            if missing_cols:
+                raise ValueError(
+                    f"Strict provenance mode requires columns {missing_cols} for {symbol} day={dt.isoformat()}"
+                )
         if "row_hash" not in df_day.columns or pd.to_numeric(df_day["row_hash"], errors="coerce").isna().all():
             df_day = df_day.copy()
             df_day["row_hash"] = row_hash_from_ticks_df(df_day)
@@ -343,6 +356,19 @@ def build_labels_for_symbol(
                     seg0_opt = None if pd.isna(sval) else int(sval)
             except Exception:
                 seg0_opt = None
+        if strict_provenance:
+            if not str(u0 or "").strip():
+                raise ValueError(
+                    f"Strict provenance mode requires underlying_contract for {symbol} day={dt.isoformat()}"
+                )
+            if seg0_opt is None:
+                raise ValueError(
+                    f"Strict provenance mode requires segment_id for {symbol} day={dt.isoformat()}"
+                )
+            if not str(schedule_hash or "").strip():
+                raise ValueError(
+                    f"Strict provenance mode requires schedule_hash for {symbol} day={dt.isoformat()}"
+                )
         seg0 = int(seg0_opt or 0)
 
         df_future = pd.DataFrame()
@@ -380,7 +406,7 @@ def build_labels_for_symbol(
                         seg1_opt = None
 
                     allow_cross = bool(seg0_opt is not None and seg1_opt is not None and seg0_opt == seg1_opt)
-                    if not allow_cross:
+                    if (not allow_cross) and (not strict_provenance):
                         allow_cross = bool(u0 and u1 and u0 == u1)
 
                 if allow_cross:
@@ -476,6 +502,7 @@ def build_labels_for_symbol(
         threshold_k=int(threshold_k),
         price_tick=float(price_tick),
         schedule_hash=str(schedule_hash or ""),
+        row_hash_algo=str(row_hash_algo),
         rows_total=int(rows_total),
         first_day=(dates[0].isoformat() if dates else ""),
         last_day=(dates[-1].isoformat() if dates else ""),
@@ -500,6 +527,7 @@ def build_labels_for_symbol(
         "rows_total": int(rows_total),
         "days": int(days_done),
         "schedule_hash": str(schedule_hash or ""),
+        "row_hash_algo": str(row_hash_algo),
         "horizons": sorted(hs),
         "threshold_k": int(threshold_k),
         "price_tick": float(price_tick),
@@ -587,6 +615,7 @@ def read_labels_manifest(data_dir: Path, symbol: str) -> dict[str, Any]:
             "horizons": hs,
             "threshold_k": b.get("threshold_k"),
             "schema_hash": "",
+            "row_hash_algo": str(b.get("row_hash_algo") or row_hash_algorithm_version()),
             "questdb": {
                 "table": LABELS_TABLE_V2,
                 "builds_table": LABEL_BUILDS_TABLE_V2,

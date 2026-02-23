@@ -230,11 +230,13 @@ def register(main: click.Group) -> None:
         runs_dir: str,
         poll_interval_sec: float,
     ) -> None:
+        from ghtrader.cli import _acquire_locks
         from ghtrader.tq.runtime import canonical_account_profile
         from ghtrader.trading.strategy_runner import StrategyConfig, run_strategy_runner
 
         _ = ctx
         prof = canonical_account_profile(account_profile)
+        _acquire_locks([f"trade:account={prof}", f"trade:strategy:account={prof}"])
         cfg = StrategyConfig(
             account_profile=prof,
             symbols=[str(s).strip() for s in symbols if str(s).strip()],

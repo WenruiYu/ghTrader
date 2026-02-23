@@ -33,6 +33,7 @@ TICK_NUMERIC_COLUMNS: list[str] = [c for c in TICK_COLUMN_NAMES if c not in {"sy
 
 DatasetVersion = Literal["v2"]
 TicksKind = Literal["raw", "main_l5"]
+ROW_HASH_ALGO_VERSION = "fnv1a64_v1"
 
 
 def ticks_schema_hash() -> str:
@@ -77,6 +78,11 @@ def row_hash_from_ticks_df(df: pd.DataFrame) -> pd.Series:
         h *= prime
 
     return pd.Series(h.view(np.int64), index=df.index, dtype="int64")
+
+
+def row_hash_algorithm_version() -> str:
+    """Stable identifier for row-hash algorithm compatibility checks."""
+    return str(ROW_HASH_ALGO_VERSION)
 
 
 def row_hash_aggregates(row_hash: pd.Series) -> dict[str, int | None]:

@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import structlog
 
-from ghtrader.data.ticks_schema import DatasetVersion, TicksKind, row_hash_from_ticks_df
+from ghtrader.data.ticks_schema import DatasetVersion, TicksKind, row_hash_algorithm_version, row_hash_from_ticks_df
 
 log = structlog.get_logger()
 
@@ -498,6 +498,7 @@ class FactorEngine:
         from ghtrader.config import (
             env_float,
             env_int,
+        get_config_resolver,
             get_questdb_host,
             get_questdb_ilp_port,
             get_questdb_pg_dbname,
@@ -522,6 +523,7 @@ class FactorEngine:
         tk = str(ticks_kind).lower().strip() or "main_l5"
         if tk != "main_l5":
             raise ValueError("ticks_kind raw is deferred (Phase-1/2)")
+        strict_provenance = bool(get_config_resolver().get_bool("GHTRADER_MAIN_L5_STRICT_PROVENANCE", True))
 
         # Derived ticks require schedule provenance to prevent roll-boundary leakage.
         underlying_by_date: dict[date, str] = {}
@@ -606,10 +608,15 @@ class FactorEngine:
                         schedule_hash = str(v0)
             except Exception:
                 schedule_hash = None
+        if strict_provenance and not str(schedule_hash or "").strip():
+            raise ValueError(
+                "Strict provenance mode requires non-empty schedule_hash for main_l5 features build."
+            )
 
         build_id = _hash_csv([symbol, tk, dv, str(schedule_hash or ""), ",".join(self.enabled_factors)])
         factors_hash = _hash_csv(list(self.enabled_factors))
         schema_hash = _hash_csv(["symbol", "datetime_ns", "trading_day", "row_hash"] + list(self.enabled_factors))
+        row_hash_algo = row_hash_algorithm_version()
         # QuestDB ILP expects tz-naive timestamps.
         build_ts = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -655,22 +662,41 @@ class FactorEngine:
             )
             if df_day.empty:
                 continue
+            if tk == "main_l5" and strict_provenance:
+                missing_cols = [c for c in ("schedule_hash", "underlying_contract", "segment_id") if c not in df_day.columns]
+                if missing_cols:
+                    raise ValueError(
+                        f"Strict provenance mode requires columns {missing_cols} for {symbol} day={dt.isoformat()}"
+                    )
             if "row_hash" not in df_day.columns or pd.to_numeric(df_day["row_hash"], errors="coerce").isna().all():
                 df_day = df_day.copy()
                 df_day["row_hash"] = row_hash_from_ticks_df(df_day)
             if tk == "main_l5":
+                u0s = ""
                 try:
                     if "underlying_contract" in df_day.columns and not df_day["underlying_contract"].empty:
                         u0 = df_day["underlying_contract"].iloc[0]
-                        underlying_by_date[dt] = "" if pd.isna(u0) else str(u0)
+                        u0s = "" if pd.isna(u0) else str(u0)
                 except Exception:
-                    pass
+                    u0s = ""
+                if strict_provenance and not str(u0s).strip():
+                    raise ValueError(
+                        f"Strict provenance mode requires underlying_contract for {symbol} day={dt.isoformat()}"
+                    )
+                underlying_by_date[dt] = str(u0s)
+
+                seg_opt: int | None = None
                 try:
                     if "segment_id" in df_day.columns and not df_day["segment_id"].empty:
                         s0 = pd.to_numeric(df_day["segment_id"].iloc[0], errors="coerce")
-                        segment_id_by_date[dt] = int(0 if pd.isna(s0) else s0)
+                        seg_opt = None if pd.isna(s0) else int(s0)
                 except Exception:
-                    segment_id_by_date[dt] = 0
+                    seg_opt = None
+                if strict_provenance and seg_opt is None:
+                    raise ValueError(
+                        f"Strict provenance mode requires segment_id for {symbol} day={dt.isoformat()}"
+                    )
+                segment_id_by_date[dt] = int(seg_opt or 0)
                 try:
                     if schedule_hash is None and "schedule_hash" in df_day.columns and not df_day["schedule_hash"].empty:
                         sh0 = df_day["schedule_hash"].iloc[0]
@@ -678,6 +704,10 @@ class FactorEngine:
                             schedule_hash = str(sh0)
                 except Exception:
                     pass
+                if strict_provenance and not str(schedule_hash or "").strip():
+                    raise ValueError(
+                        f"Strict provenance mode requires schedule_hash for {symbol} day={dt.isoformat()}"
+                    )
 
             # Build tail from previous available tick day (lookback only).
             tail_ticks: pd.DataFrame | None = None
@@ -690,7 +720,7 @@ class FactorEngine:
                         seg_prev = segment_id_by_date.get(prev_dt)
                         seg_cur = segment_id_by_date.get(dt)
                         allow = (seg_prev is not None and seg_cur is not None and seg_prev == seg_cur)
-                        if not allow:
+                        if (not allow) and (not strict_provenance):
                             u_prev = underlying_by_date.get(prev_dt)
                             u_cur = underlying_by_date.get(dt)
                             allow = bool(u_prev and u_cur and u_prev == u_cur)
@@ -799,6 +829,7 @@ class FactorEngine:
             factors=",".join(list(self.enabled_factors)),
             schema_hash=str(schema_hash),
             schedule_hash=str(schedule_hash or ""),
+            row_hash_algo=str(row_hash_algo),
             rows_total=int(rows_total),
             first_day=(dates[0].isoformat() if dates else ""),
             last_day=(dates[-1].isoformat() if dates else ""),
@@ -823,6 +854,7 @@ class FactorEngine:
             "rows_total": int(rows_total),
             "days": int(days_done),
             "schedule_hash": str(schedule_hash or ""),
+            "row_hash_algo": str(row_hash_algo),
         }
 
 
@@ -913,6 +945,7 @@ def read_features_manifest(data_dir: Path, symbol: str) -> dict[str, Any]:
             "dataset_version": str(dv),
             "enabled_factors": enabled,
             "schema_hash": str(b.get("schema_hash") or ""),
+            "row_hash_algo": str(b.get("row_hash_algo") or row_hash_algorithm_version()),
             "rows_total": b.get("rows_total"),
             "questdb": {
                 "table": FEATURES_TABLE_V2,

@@ -2822,6 +2822,10 @@ def train_model(
         raise ValueError(f"ticks_kind mismatch between features ({tk_f}) and labels ({tk_l}) for symbol={symbol}")
     if dv_f != dv_l:
         raise ValueError(f"dataset_version mismatch between features ({dv_f}) and labels ({dv_l}) for symbol={symbol}")
+    rh_f = str(feat_manifest.get("row_hash_algo") or "")
+    rh_l = str(lab_manifest.get("row_hash_algo") or "")
+    if rh_f and rh_l and rh_f != rh_l:
+        raise ValueError(f"row_hash_algo mismatch between features ({rh_f}) and labels ({rh_l}) for symbol={symbol}")
     if str(symbol).startswith("KQ.m@") and tk_f != "main_l5":
         raise ValueError(
             "Continuous symbols (KQ.m@...) must be trained from derived main_l5 ticks. "
@@ -2934,6 +2938,8 @@ def train_model(
                 "feature_schema_hash": str(feat_manifest.get("schema_hash") or "") if isinstance(feat_manifest, dict) else "",
                 # Labels build table does not currently store a schema hash; keep best-effort.
                 "label_schema_hash": str(lab_manifest.get("schema_hash") or "") if isinstance(lab_manifest, dict) else "",
+                "feature_row_hash_algo": str(feat_manifest.get("row_hash_algo") or "") if isinstance(feat_manifest, dict) else "",
+                "label_row_hash_algo": str(lab_manifest.get("row_hash_algo") or "") if isinstance(lab_manifest, dict) else "",
             }
             if str(tk_f) == "main_l5":
                 # Required schedule provenance for roll-boundary safety.

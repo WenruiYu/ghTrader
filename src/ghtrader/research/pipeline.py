@@ -416,13 +416,24 @@ def run_hyperparam_sweep(
     tk_l = str(lab_manifest.get("ticks_kind") or "")
     if tk_f != tk_l:
         raise ValueError(f"ticks_kind mismatch between features ({tk_f}) and labels ({tk_l}) for symbol={symbol}")
+    rh_f = str(manifest.get("row_hash_algo") or "")
+    rh_l = str(lab_manifest.get("row_hash_algo") or "")
+    if rh_f and rh_l and rh_f != rh_l:
+        raise ValueError(f"row_hash_algo mismatch between features ({rh_f}) and labels ({rh_l}) for symbol={symbol}")
     if str(symbol).startswith("KQ.m@") and tk_f != "main_l5":
         raise ValueError("Continuous symbols (KQ.m@...) must use derived main_l5 ticks for sweep.")
     if tk_f == "main_l5":
+        from ghtrader.config import get_config_resolver
+
+        strict_provenance = bool(get_config_resolver().get_bool("GHTRADER_MAIN_L5_STRICT_PROVENANCE", True))
         sf = dict(manifest.get("schedule") or {})
         sl = dict(lab_manifest.get("schedule") or {})
         hf = str(sf.get("hash") or "")
         hl = str(sl.get("hash") or "")
+        if strict_provenance and (not hf or not hl):
+            raise ValueError(
+                f"Strict provenance mode requires schedule hashes for features/labels (symbol={symbol})."
+            )
         if hf and hl and hf != hl:
             raise ValueError(f"schedule_hash mismatch between features ({hf}) and labels ({hl}) for symbol={symbol}")
 

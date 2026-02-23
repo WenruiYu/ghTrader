@@ -99,3 +99,23 @@ def test_ui_editable_and_value_validation_boundaries():
     with pytest.raises(ValueError):
         coerce_value_for_key("GHTRADER_L5_VALIDATE_STRICT_RATIO", "1.3")
 
+
+def test_config_store_rejects_env_only_keys(tmp_path: Path):
+    resolver = ConfigResolver(runs_dir=tmp_path / "runs")
+    with pytest.raises(ValueError, match="config_key_not_writable:GHTRADER_DASHBOARD_TOKEN:env_only"):
+        resolver.set_values(
+            values={"GHTRADER_DASHBOARD_TOKEN": "secret"},
+            actor="test",
+            reason="should_fail",
+        )
+
+
+def test_config_store_rejects_unmanaged_keys(tmp_path: Path):
+    resolver = ConfigResolver(runs_dir=tmp_path / "runs")
+    with pytest.raises(ValueError, match="config_key_not_writable:NOT_MANAGED_KEY:unmanaged"):
+        resolver.set_values(
+            values={"NOT_MANAGED_KEY": "x"},
+            actor="test",
+            reason="should_fail",
+        )
+

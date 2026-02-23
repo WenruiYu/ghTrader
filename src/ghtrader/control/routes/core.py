@@ -221,12 +221,15 @@ async def api_config_set(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="no_valid_values")
 
     resolver = get_config_resolver()
-    rev = resolver.set_values(
-        values=coerced,
-        actor=actor,
-        reason=reason,
-        action="set",
-    )
+    try:
+        rev = resolver.set_values(
+            values=coerced,
+            actor=actor,
+            reason=reason,
+            action="set",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"error": "invalid_config_values", "issues": [{"key": "*", "error": str(e)}]}) from e
     return {
         "ok": True,
         "actor": actor,

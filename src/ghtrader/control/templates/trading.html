@@ -18,6 +18,14 @@
       <span class="status-dot status-dot-unknown"></span>
       <span>Live enabled: --</span>
     </div>
+    <div class="status-indicator" id="tradingWarmPathIndicator">
+      <span class="status-dot status-dot-unknown"></span>
+      <span>Warm path: --</span>
+    </div>
+    <div class="status-indicator" id="tradingRiskKillIndicator">
+      <span class="status-dot status-dot-unknown"></span>
+      <span>Risk kill: --</span>
+    </div>
     <div class="status-indicator" id="tradingAccountIndicator">
       <span class="status-dot status-dot-idle"></span>
       <span>Account profile:</span>
@@ -470,6 +478,7 @@
             <button type="button" class="btn btn-secondary btn-sm" id="gatewayCmdCancelAll">Cancel all orders</button>
             <button type="button" class="btn btn-secondary btn-sm" id="gatewayCmdFlatten">Flatten positions</button>
             <button type="button" class="btn btn-danger btn-sm" id="gatewayCmdDisarm">Disarm live (switch to live_monitor)</button>
+            <button type="button" class="btn btn-warning btn-sm" id="gatewayCmdResetRiskKill">Reset risk-kill</button>
           </div>
         </div>
 

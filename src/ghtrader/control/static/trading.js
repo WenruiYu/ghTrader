@@ -115,6 +115,7 @@
   const gatewayCmdCancelAll = document.getElementById("gatewayCmdCancelAll");
   const gatewayCmdFlatten = document.getElementById("gatewayCmdFlatten");
   const gatewayCmdDisarm = document.getElementById("gatewayCmdDisarm");
+  const gatewayCmdResetRiskKill = document.getElementById("gatewayCmdResetRiskKill");
 
   // Strategy panel
   const strategyProfileEl = document.getElementById("strategyProfile");
@@ -477,6 +478,25 @@
         if (txt) txt.textContent = "Live enabled: " + (liveEnabled ? "true" : "false");
         if (dot) dot.className = "status-dot " + (liveEnabled ? "status-dot-ok" : "status-dot-warn");
       }
+      const warmPathDegraded = (data.warm_path_degraded === true);
+      const warmPathReasons = Array.isArray(data.warm_path_reasons) ? data.warm_path_reasons : [];
+      const warmEl = document.getElementById("tradingWarmPathIndicator");
+      if (warmEl) {
+        const dot = warmEl.querySelector(".status-dot");
+        const txt = warmEl.querySelector("span:last-child");
+        const details = warmPathReasons.length ? (" (" + warmPathReasons.join(", ") + ")") : "";
+        if (txt) txt.textContent = warmPathDegraded ? ("Warm path: degraded" + details) : "Warm path: healthy";
+        if (dot) dot.className = "status-dot " + (warmPathDegraded ? "status-dot-warn" : "status-dot-ok");
+      }
+      const riskKillActive = (data.risk_kill_active === true);
+      const riskKillReason = String(data.risk_kill_reason || "");
+      const riskKillEl = document.getElementById("tradingRiskKillIndicator");
+      if (riskKillEl) {
+        const dot = riskKillEl.querySelector(".status-dot");
+        const txt = riskKillEl.querySelector("span:last-child");
+        if (txt) txt.textContent = riskKillActive ? ("Risk kill: active" + (riskKillReason ? (" (" + riskKillReason + ")") : "")) : "Risk kill: inactive";
+        if (dot) dot.className = "status-dot " + (riskKillActive ? "status-dot-warn" : "status-dot-ok");
+      }
 
       // KPIs
       const kpiMode = document.getElementById("kpiMode");
@@ -485,7 +505,9 @@
       if (kpiModeDetail) {
         const gwJob = gw.active_job_id ? ("gateway job: " + gw.active_job_id) : "";
         const stJob = (data.strategy && data.strategy.active_job_id) ? ("strategy job: " + data.strategy.active_job_id) : "";
-        const parts = [gwJob, stJob].filter(Boolean);
+        const warmState = warmPathDegraded ? "warm path degraded" : "";
+        const riskState = riskKillActive ? ("risk kill active" + (riskKillReason ? (": " + riskKillReason) : "")) : "";
+        const parts = [gwJob, stJob, warmState, riskState].filter(Boolean);
         kpiModeDetail.textContent = parts.length ? parts.join(" · ") : "No active process";
       }
 
@@ -526,6 +548,8 @@
         lines.push('<div class="text-sm"><span class="muted">Gateway mode:</span> ' + esc(String(gwMode || "--")) + '</div>');
         lines.push('<div class="text-sm"><span class="muted">Gateway job:</span> ' + (gw.active_job_id ? ('<a href="/jobs/' + esc(gw.active_job_id) + tokenQs + varQs + '">' + esc(gw.active_job_id) + '</a>') : "--") + '</div>');
         lines.push('<div class="text-sm"><span class="muted">Gateway error:</span> ' + esc(String(gw.error || "")) + '</div>');
+        lines.push('<div class="text-sm"><span class="muted">Warm path:</span> ' + esc(String(warmPathDegraded ? ("degraded " + warmPathReasons.join(",")) : "healthy")) + '</div>');
+        lines.push('<div class="text-sm"><span class="muted">Risk kill:</span> ' + esc(String(riskKillActive ? ("active " + (riskKillReason || "")) : "inactive")) + '</div>');
 
         lines.push('<div class="text-sm"><span class="muted">Strategy:</span> ' + esc(String(st.status || "--")) + '</div>');
         lines.push('<div class="text-sm"><span class="muted">Strategy job:</span> ' + (st.active_job_id ? ('<a href="/jobs/' + esc(st.active_job_id) + tokenQs + varQs + '">' + esc(st.active_job_id) + '</a>') : "--") + '</div>');
@@ -587,7 +611,10 @@
       const monitorGatewayStatus = document.getElementById("monitorGatewayStatus");
       const monitorGatewayMode = document.getElementById("monitorGatewayMode");
       const monitorGatewaySymbols = document.getElementById("monitorGatewaySymbols");
-      if (monitorGatewayStatus) monitorGatewayStatus.textContent = String(gw.component_status || gw.status || "--");
+      if (monitorGatewayStatus) {
+        const statusText = String(gw.component_status || gw.status || "--");
+        monitorGatewayStatus.textContent = warmPathDegraded ? (statusText + " / warm-degraded") : statusText;
+      }
       if (monitorGatewayMode) monitorGatewayMode.textContent = String(mode || "idle");
       if (monitorGatewaySymbols) {
         const effectiveSymbols = (gwState && gwState.effective && gwState.effective.symbols) ? gwState.effective.symbols : [];
@@ -1079,6 +1106,12 @@
       sendGatewayCommand("disarm_live", {});
     });
   }
+  if (gatewayCmdResetRiskKill) {
+    gatewayCmdResetRiskKill.addEventListener("click", () => {
+      if (!confirm("Reset risk-kill for profile '" + selectedAccountProfile + "' and allow order routing again?")) return;
+      sendGatewayCommand("reset_risk_kill", {});
+    });
+  }
 
   if (gatewayRefreshBtn) gatewayRefreshBtn.addEventListener("click", () => loadGatewayStatus());
 
@@ -1536,6 +1569,13 @@
       wsConnected = false;
       const indicator = document.getElementById("tradingLastUpdate");
       if (indicator) indicator.style.color = "#dc3545";
+      const warmEl = document.getElementById("tradingWarmPathIndicator");
+      if (warmEl) {
+        const dot = warmEl.querySelector(".status-dot");
+        const txt = warmEl.querySelector("span:last-child");
+        if (txt) txt.textContent = "Warm path: degraded (ws disconnected)";
+        if (dot) dot.className = "status-dot status-dot-warn";
+      }
       setTimeout(connectWebSocket, 2000);
     };
 

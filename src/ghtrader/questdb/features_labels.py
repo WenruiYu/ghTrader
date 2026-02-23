@@ -7,6 +7,7 @@ from typing import Any, Iterable
 import structlog
 
 from .client import QuestDBQueryConfig, connect_pg as _connect
+from ghtrader.data.ticks_schema import row_hash_algorithm_version
 
 log = structlog.get_logger()
 
@@ -71,6 +72,7 @@ def ensure_features_tables(
       factors STRING,
       schema_hash SYMBOL,
       schedule_hash SYMBOL,
+      row_hash_algo SYMBOL,
       rows_total LONG,
       first_day SYMBOL,
       last_day SYMBOL
@@ -116,6 +118,10 @@ def ensure_features_tables(
                     cur.execute(f"ALTER TABLE {ft} ADD COLUMN {c} DOUBLE")
                 except Exception:
                     pass
+            try:
+                cur.execute(f"ALTER TABLE {bt} ADD COLUMN row_hash_algo SYMBOL")
+            except Exception:
+                pass
 
             # Ensure dedup is enabled for idempotent rebuilds.
             try:
@@ -175,6 +181,7 @@ def ensure_labels_tables(
       threshold_k LONG,
       price_tick DOUBLE,
       schedule_hash SYMBOL,
+      row_hash_algo SYMBOL,
       rows_total LONG,
       first_day SYMBOL,
       last_day SYMBOL
@@ -223,6 +230,10 @@ def ensure_labels_tables(
                     cur.execute(f"ALTER TABLE {lt} ADD COLUMN {c} DOUBLE")
                 except Exception:
                     pass
+            try:
+                cur.execute(f"ALTER TABLE {bt} ADD COLUMN row_hash_algo SYMBOL")
+            except Exception:
+                pass
 
             try:
                 cur.execute(
@@ -246,6 +257,7 @@ def insert_feature_build(
     rows_total: int,
     first_day: str | None,
     last_day: str | None,
+    row_hash_algo: str | None = None,
     builds_table: str = FEATURE_BUILDS_TABLE_V2,
     connect_timeout_s: int = 2,
 ) -> None:
@@ -253,8 +265,8 @@ def insert_feature_build(
     now = datetime.now(timezone.utc)
     sql = (
         f"INSERT INTO {bt} "
-        "(ts, symbol, ticks_kind, dataset_version, build_id, factors_hash, factors, schema_hash, schedule_hash, rows_total, first_day, last_day) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+        "(ts, symbol, ticks_kind, dataset_version, build_id, factors_hash, factors, schema_hash, schedule_hash, row_hash_algo, rows_total, first_day, last_day) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
     )
     params = (
         now,
@@ -266,6 +278,7 @@ def insert_feature_build(
         str(factors),
         str(schema_hash),
         str(schedule_hash or ""),
+        str(row_hash_algo or row_hash_algorithm_version()),
         int(rows_total),
         str(first_day or ""),
         str(last_day or ""),
@@ -289,6 +302,7 @@ def insert_label_build(
     rows_total: int,
     first_day: str | None,
     last_day: str | None,
+    row_hash_algo: str | None = None,
     builds_table: str = LABEL_BUILDS_TABLE_V2,
     connect_timeout_s: int = 2,
 ) -> None:
@@ -296,8 +310,8 @@ def insert_label_build(
     now = datetime.now(timezone.utc)
     sql = (
         f"INSERT INTO {bt} "
-        "(ts, symbol, ticks_kind, dataset_version, build_id, horizons, threshold_k, price_tick, schedule_hash, rows_total, first_day, last_day) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+        "(ts, symbol, ticks_kind, dataset_version, build_id, horizons, threshold_k, price_tick, schedule_hash, row_hash_algo, rows_total, first_day, last_day) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
     )
     params = (
         now,
@@ -309,6 +323,7 @@ def insert_label_build(
         int(threshold_k),
         float(price_tick),
         str(schedule_hash or ""),
+        str(row_hash_algo or row_hash_algorithm_version()),
         int(rows_total),
         str(first_day or ""),
         str(last_day or ""),
@@ -328,17 +343,44 @@ def get_latest_feature_build(
     connect_timeout_s: int = 2,
 ) -> dict[str, Any] | None:
     bt = _ident(str(builds_table).strip() or FEATURE_BUILDS_TABLE_V2)
-    sql = (
+    sql_new = (
+        f"SELECT ts, build_id, factors_hash, factors, schema_hash, schedule_hash, row_hash_algo, rows_total, first_day, last_day "
+        f"FROM {bt} WHERE symbol=%s AND ticks_kind=%s AND dataset_version=%s "
+        "ORDER BY ts DESC LIMIT 1"
+    )
+    sql_legacy = (
         f"SELECT ts, build_id, factors_hash, factors, schema_hash, schedule_hash, rows_total, first_day, last_day "
         f"FROM {bt} WHERE symbol=%s AND ticks_kind=%s AND dataset_version=%s "
         "ORDER BY ts DESC LIMIT 1"
     )
     with _connect(cfg, connect_timeout_s=connect_timeout_s) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, [str(symbol), str(ticks_kind), str(dataset_version)])
-            row = cur.fetchone()
+            row = None
+            legacy_shape = False
+            try:
+                cur.execute(sql_new, [str(symbol), str(ticks_kind), str(dataset_version)])
+                row = cur.fetchone()
+            except Exception as e:
+                if "row_hash_algo" not in str(e).lower():
+                    raise
+                legacy_shape = True
+                cur.execute(sql_legacy, [str(symbol), str(ticks_kind), str(dataset_version)])
+                row = cur.fetchone()
             if not row:
                 return None
+            if legacy_shape:
+                return {
+                    "ts": str(row[0]) if row[0] is not None else "",
+                    "build_id": str(row[1] or ""),
+                    "factors_hash": str(row[2] or ""),
+                    "factors": str(row[3] or ""),
+                    "schema_hash": str(row[4] or ""),
+                    "schedule_hash": str(row[5] or ""),
+                    "row_hash_algo": row_hash_algorithm_version(),
+                    "rows_total": int(row[6]) if row[6] is not None else None,
+                    "first_day": str(row[7] or ""),
+                    "last_day": str(row[8] or ""),
+                }
             return {
                 "ts": str(row[0]) if row[0] is not None else "",
                 "build_id": str(row[1] or ""),
@@ -346,9 +388,10 @@ def get_latest_feature_build(
                 "factors": str(row[3] or ""),
                 "schema_hash": str(row[4] or ""),
                 "schedule_hash": str(row[5] or ""),
-                "rows_total": int(row[6]) if row[6] is not None else None,
-                "first_day": str(row[7] or ""),
-                "last_day": str(row[8] or ""),
+                "row_hash_algo": str(row[6] or row_hash_algorithm_version()),
+                "rows_total": int(row[7]) if row[7] is not None else None,
+                "first_day": str(row[8] or ""),
+                "last_day": str(row[9] or ""),
             }
 
 
@@ -362,17 +405,44 @@ def get_latest_label_build(
     connect_timeout_s: int = 2,
 ) -> dict[str, Any] | None:
     bt = _ident(str(builds_table).strip() or LABEL_BUILDS_TABLE_V2)
-    sql = (
+    sql_new = (
+        f"SELECT ts, build_id, horizons, threshold_k, price_tick, schedule_hash, row_hash_algo, rows_total, first_day, last_day "
+        f"FROM {bt} WHERE symbol=%s AND ticks_kind=%s AND dataset_version=%s "
+        "ORDER BY ts DESC LIMIT 1"
+    )
+    sql_legacy = (
         f"SELECT ts, build_id, horizons, threshold_k, price_tick, schedule_hash, rows_total, first_day, last_day "
         f"FROM {bt} WHERE symbol=%s AND ticks_kind=%s AND dataset_version=%s "
         "ORDER BY ts DESC LIMIT 1"
     )
     with _connect(cfg, connect_timeout_s=connect_timeout_s) as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, [str(symbol), str(ticks_kind), str(dataset_version)])
-            row = cur.fetchone()
+            row = None
+            legacy_shape = False
+            try:
+                cur.execute(sql_new, [str(symbol), str(ticks_kind), str(dataset_version)])
+                row = cur.fetchone()
+            except Exception as e:
+                if "row_hash_algo" not in str(e).lower():
+                    raise
+                legacy_shape = True
+                cur.execute(sql_legacy, [str(symbol), str(ticks_kind), str(dataset_version)])
+                row = cur.fetchone()
             if not row:
                 return None
+            if legacy_shape:
+                return {
+                    "ts": str(row[0]) if row[0] is not None else "",
+                    "build_id": str(row[1] or ""),
+                    "horizons": str(row[2] or ""),
+                    "threshold_k": int(row[3]) if row[3] is not None else None,
+                    "price_tick": float(row[4]) if row[4] is not None else None,
+                    "schedule_hash": str(row[5] or ""),
+                    "row_hash_algo": row_hash_algorithm_version(),
+                    "rows_total": int(row[6]) if row[6] is not None else None,
+                    "first_day": str(row[7] or ""),
+                    "last_day": str(row[8] or ""),
+                }
             return {
                 "ts": str(row[0]) if row[0] is not None else "",
                 "build_id": str(row[1] or ""),
@@ -380,9 +450,10 @@ def get_latest_label_build(
                 "threshold_k": int(row[3]) if row[3] is not None else None,
                 "price_tick": float(row[4]) if row[4] is not None else None,
                 "schedule_hash": str(row[5] or ""),
-                "rows_total": int(row[6]) if row[6] is not None else None,
-                "first_day": str(row[7] or ""),
-                "last_day": str(row[8] or ""),
+                "row_hash_algo": str(row[6] or row_hash_algorithm_version()),
+                "rows_total": int(row[7]) if row[7] is not None else None,
+                "first_day": str(row[8] or ""),
+                "last_day": str(row[9] or ""),
             }
 
 

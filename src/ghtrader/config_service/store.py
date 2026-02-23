@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ghtrader.config_service.schema import extract_managed_env, normalize_to_string
+from ghtrader.config_service.schema import extract_managed_env, key_is_env_only, key_is_managed, normalize_to_string
 
 
 def _now_iso() -> str:
@@ -187,6 +187,9 @@ class ConfigStore:
             k = str(key or "").strip()
             if not k:
                 continue
+            if not key_is_managed(k):
+                reason = "env_only" if key_is_env_only(k) else "unmanaged"
+                raise ValueError(f"config_key_not_writable:{k}:{reason}")
             if val is None:
                 incoming[k] = None
             else:
