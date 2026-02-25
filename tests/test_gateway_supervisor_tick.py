@@ -33,8 +33,9 @@ def test_gateway_supervisor_tick_starts_one_job(tmp_path: Path) -> None:
     runs_dir = tmp_path / "runs"
     write_gateway_desired(runs_dir=runs_dir, profile="alt", desired=GatewayDesired(mode="paper", symbols=["SHFE.cu2602"]))
 
-    app_mod = importlib.import_module("ghtrader.control.app")
-    tick = getattr(app_mod, "_gateway_supervisor_tick")
+    bootstrap_mod = importlib.import_module("ghtrader.control.bootstrap")
+    tick = getattr(bootstrap_mod, "gateway_supervisor_tick")
+    assert getattr(tick, "__module__", "") == "ghtrader.control.bootstrap"
 
     store = _FakeStore(active=[])
     jm = _FakeJM()
@@ -47,6 +48,9 @@ def test_gateway_supervisor_tick_starts_one_job(tmp_path: Path) -> None:
     assert "gateway" in argv
     assert "run" in argv
     assert "--account" in argv
+    meta = jm.started[0].metadata if isinstance(jm.started[0].metadata, dict) else {}
+    assert str(meta.get("supervisor") or "") == "gateway"
+    assert str(meta.get("restart_reason") or "") == "desired_non_idle_no_active_job"
 
 
 def test_gateway_supervisor_tick_cancels_when_desired_idle(tmp_path: Path) -> None:
@@ -66,8 +70,8 @@ def test_gateway_supervisor_tick_cancels_when_desired_idle(tmp_path: Path) -> No
         pid=123,
     )
 
-    app_mod = importlib.import_module("ghtrader.control.app")
-    tick = getattr(app_mod, "_gateway_supervisor_tick")
+    bootstrap_mod = importlib.import_module("ghtrader.control.bootstrap")
+    tick = getattr(bootstrap_mod, "gateway_supervisor_tick")
 
     store = _FakeStore(active=[job])
     jm = _FakeJM()

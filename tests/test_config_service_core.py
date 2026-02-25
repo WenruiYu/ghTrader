@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -118,4 +120,48 @@ def test_config_store_rejects_unmanaged_keys(tmp_path: Path):
             actor="test",
             reason="should_fail",
         )
+
+
+def test_config_store_auto_sanitizes_legacy_illegal_keys(tmp_path: Path):
+    runs_dir = tmp_path / "runs"
+    resolver = ConfigResolver(runs_dir=runs_dir)
+    rev = resolver.set_values(
+        values={"GHTRADER_PROGRESS_EVERY_N": 19},
+        actor="test",
+        reason="seed",
+    )
+    db_path = runs_dir / "control" / "config.db"
+
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT id, snapshot_json FROM config_revisions WHERE id=?",
+            (int(rev.revision),),
+        ).fetchone()
+        assert row is not None
+        snap = json.loads(str(row["snapshot_json"]))
+        snap["GHTRADER_DASHBOARD_TOKEN"] = "legacy_secret"
+        snap["NOT_MANAGED_KEY"] = "legacy_value"
+        con.execute(
+            "UPDATE config_revisions SET snapshot_json=?, snapshot_hash=? WHERE id=?",
+            (json.dumps(snap, ensure_ascii=False, sort_keys=True), "legacy", int(rev.revision)),
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO config_current(key, value, updated_at, revision_id) VALUES (?, ?, ?, ?)",
+            ("GHTRADER_DASHBOARD_TOKEN", "legacy_secret", "legacy", int(rev.revision)),
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO config_current(key, value, updated_at, revision_id) VALUES (?, ?, ?, ?)",
+            ("NOT_MANAGED_KEY", "legacy_value", "legacy", int(rev.revision)),
+        )
+        con.commit()
+
+    resolver2 = ConfigResolver(runs_dir=runs_dir)
+    snap2 = resolver2.snapshot()
+    assert "GHTRADER_DASHBOARD_TOKEN" not in snap2
+    assert "NOT_MANAGED_KEY" not in snap2
+    assert resolver2.revision > int(rev.revision)
+
+    latest = resolver2.list_revisions(limit=1)[0]
+    assert latest.reason == "sanitize_illegal_keys"
 

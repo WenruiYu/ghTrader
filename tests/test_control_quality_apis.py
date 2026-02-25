@@ -16,6 +16,20 @@ def _boot_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     return TestClient(mod.app)
 
 
+def test_create_app_is_provided_by_dedicated_factory_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+
+    app_mod = importlib.import_module("ghtrader.control.app")
+    importlib.reload(app_mod)
+    factory_mod = importlib.import_module("ghtrader.control.app_factory")
+
+    create_app = getattr(app_mod, "create_app")
+    assert getattr(create_app, "__module__", "") == "ghtrader.control.app_factory"
+    assert create_app is getattr(factory_mod, "create_app")
+
+
 def test_quality_readiness_api_returns_layered_states(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     client = _boot_client(tmp_path, monkeypatch)
     import ghtrader.data.main_l5_validation as validation
@@ -104,3 +118,195 @@ def test_quality_profiles_api_returns_effective_profile(tmp_path: Path, monkeypa
     assert body["ok"] is True
     assert body["profile"]["gap_threshold_s"] == 8.0
     assert "policy_sources" in body["profile"]
+
+
+def test_quality_routes_are_mounted_from_dedicated_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+
+    app_mod = importlib.import_module("ghtrader.control.app")
+    importlib.reload(app_mod)
+
+    expected_paths = {
+        "/api/data/quality/readiness",
+        "/api/data/quality/anomalies",
+        "/api/data/quality/profiles",
+    }
+    route_modules: dict[str, str] = {}
+    for route in app_mod.app.routes:
+        if getattr(route, "path", "") not in expected_paths:
+            continue
+        methods = set(getattr(route, "methods", set()) or set())
+        if "GET" not in methods:
+            continue
+        route_modules[str(route.path)] = str(getattr(getattr(route, "endpoint", None), "__module__", ""))
+
+    assert set(route_modules.keys()) == expected_paths
+    assert all(mod == "ghtrader.control.routes.quality" for mod in route_modules.values())
+
+
+def test_quality_data_query_routes_are_mounted_from_dedicated_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+
+    app_mod = importlib.import_module("ghtrader.control.app")
+    importlib.reload(app_mod)
+
+    expected_paths = {
+        "/api/data/quality-summary",
+        "/api/data/main-l5-validate",
+        "/api/data/main-l5-validate-summary",
+        "/api/data/main-l5-validate-gaps",
+    }
+    route_modules: dict[str, str] = {}
+    for route in app_mod.app.routes:
+        if getattr(route, "path", "") not in expected_paths:
+            continue
+        methods = set(getattr(route, "methods", set()) or set())
+        if "GET" not in methods:
+            continue
+        route_modules[str(route.path)] = str(getattr(getattr(route, "endpoint", None), "__module__", ""))
+
+    assert set(route_modules.keys()) == expected_paths
+    assert all(mod == "ghtrader.control.routes.quality_data" for mod in route_modules.values())
+
+
+def test_data_report_routes_are_mounted_from_dedicated_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+
+    app_mod = importlib.import_module("ghtrader.control.app")
+    importlib.reload(app_mod)
+
+    expected_paths = {
+        "/api/data/reports",
+        "/api/data/l5-start",
+    }
+    route_modules: dict[str, str] = {}
+    for route in app_mod.app.routes:
+        if getattr(route, "path", "") not in expected_paths:
+            continue
+        methods = set(getattr(route, "methods", set()) or set())
+        if "GET" not in methods:
+            continue
+        route_modules[str(route.path)] = str(getattr(getattr(route, "endpoint", None), "__module__", ""))
+
+    assert set(route_modules.keys()) == expected_paths
+    assert all(mod == "ghtrader.control.routes.data_reports" for mod in route_modules.values())
+
+
+def test_data_enqueue_routes_are_mounted_from_dedicated_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+
+    app_mod = importlib.import_module("ghtrader.control.app")
+    importlib.reload(app_mod)
+
+    expected_paths = {
+        "/api/data/enqueue-l5-start",
+        "/api/data/enqueue-main-l5-validate",
+    }
+    route_modules: dict[str, str] = {}
+    for route in app_mod.app.routes:
+        if getattr(route, "path", "") not in expected_paths:
+            continue
+        methods = set(getattr(route, "methods", set()) or set())
+        if "POST" not in methods:
+            continue
+        route_modules[str(route.path)] = str(getattr(getattr(route, "endpoint", None), "__module__", ""))
+
+    assert set(route_modules.keys()) == expected_paths
+    assert all(mod == "ghtrader.control.routes.data_jobs" for mod in route_modules.values())
+
+
+def test_questdb_query_route_is_mounted_from_dedicated_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+
+    app_mod = importlib.import_module("ghtrader.control.app")
+    importlib.reload(app_mod)
+
+    route_modules: dict[str, str] = {}
+    for route in app_mod.app.routes:
+        if getattr(route, "path", "") != "/api/questdb/query":
+            continue
+        methods = set(getattr(route, "methods", set()) or set())
+        if "POST" not in methods:
+            continue
+        route_modules[str(route.path)] = str(getattr(getattr(route, "endpoint", None), "__module__", ""))
+
+    assert set(route_modules.keys()) == {"/api/questdb/query"}
+    assert route_modules["/api/questdb/query"] == "ghtrader.control.routes.questdb_query"
+
+
+def test_dashboard_status_routes_are_mounted_from_dedicated_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+
+    app_mod = importlib.import_module("ghtrader.control.app")
+    importlib.reload(app_mod)
+
+    expected_paths = {
+        "/api/dashboard/summary",
+        "/api/ui/status",
+    }
+    route_modules: dict[str, str] = {}
+    for route in app_mod.app.routes:
+        if getattr(route, "path", "") not in expected_paths:
+            continue
+        methods = set(getattr(route, "methods", set()) or set())
+        if "GET" not in methods:
+            continue
+        route_modules[str(route.path)] = str(getattr(getattr(route, "endpoint", None), "__module__", ""))
+
+    assert set(route_modules.keys()) == expected_paths
+    assert all(mod == "ghtrader.control.routes.dashboard_status" for mod in route_modules.values())
+
+
+def test_trading_runtime_routes_are_mounted_from_dedicated_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GHTRADER_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("GHTRADER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("GHTRADER_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+
+    app_mod = importlib.import_module("ghtrader.control.app")
+    importlib.reload(app_mod)
+
+    expected_paths = {
+        "/api/strategy/status",
+        "/api/strategy/desired",
+        "/api/gateway/start",
+        "/api/gateway/stop",
+        "/api/strategy/start",
+        "/api/strategy/stop",
+        "/api/strategy/runs",
+        "/api/trading/console/status",
+    }
+    route_modules: dict[str, str] = {}
+    for route in app_mod.app.routes:
+        if getattr(route, "path", "") not in expected_paths:
+            continue
+        methods = set(getattr(route, "methods", set()) or set())
+        if not ({"GET", "POST"} & methods):
+            continue
+        route_modules[str(route.path)] = str(getattr(getattr(route, "endpoint", None), "__module__", ""))
+
+    assert set(route_modules.keys()) == expected_paths
+    assert all(mod == "ghtrader.control.routes.trading_runtime" for mod in route_modules.values())

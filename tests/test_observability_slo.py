@@ -31,6 +31,7 @@ def test_observability_slo_endpoint_ok_shape(tmp_path: Path, monkeypatch: pytest
     assert "data_plane" in payload
     assert "training_plane" in payload
     assert "control_plane" in payload
+    assert "supervisors" in payload["control_plane"]
 
 
 def test_observability_slo_queue_threshold_warn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

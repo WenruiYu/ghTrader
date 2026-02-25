@@ -262,6 +262,92 @@ def register(main: click.Group) -> None:
                 f"report={str(out_path or '')}"
             )
 
+    @data_group.command("contract-check")
+    @click.option(
+        "--input-path",
+        default="",
+        show_default=False,
+        help="Optional CSV/Parquet/JSON tick file for contract validation",
+    )
+    @click.option(
+        "--rows",
+        "synthetic_rows",
+        default=64,
+        type=int,
+        show_default=True,
+        help="Synthetic rows when --input-path is omitted",
+    )
+    @click.option(
+        "--min-rows",
+        default=32,
+        type=int,
+        show_default=True,
+        help="Minimum required rows for contract pass",
+    )
+    @click.option(
+        "--max-core-null-rate",
+        default=0.01,
+        type=float,
+        show_default=True,
+        help="Max null rate for core columns",
+    )
+    @click.option(
+        "--max-l5-null-rate",
+        default=0.05,
+        type=float,
+        show_default=True,
+        help="Max mean null rate across L5 columns",
+    )
+    @click.option("--json", "as_json", is_flag=True, help="Print full JSON payload")
+    @click.pass_context
+    def data_contract_check(
+        ctx: click.Context,
+        input_path: str,
+        synthetic_rows: int,
+        min_rows: int,
+        max_core_null_rate: float,
+        max_l5_null_rate: float,
+        as_json: bool,
+    ) -> None:
+        import json
+
+        from ghtrader.data.contract_checks import (
+            DataContractThresholds,
+            evaluate_tick_data_contract,
+            load_tick_frame_for_contract_check,
+        )
+
+        _ = ctx
+        try:
+            df, source = load_tick_frame_for_contract_check(
+                path=(input_path or None),
+                synthetic_rows=int(synthetic_rows),
+            )
+        except Exception as e:
+            raise click.ClickException(f"failed to load tick input: {e}") from e
+
+        report = evaluate_tick_data_contract(
+            df=df,
+            thresholds=DataContractThresholds(
+                min_rows=int(min_rows),
+                max_core_null_rate=float(max_core_null_rate),
+                max_l5_null_rate=float(max_l5_null_rate),
+            ),
+        )
+        report = dict(report)
+        report["source"] = str(source)
+
+        if as_json:
+            click.echo(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+        else:
+            click.echo(
+                f"data contract source={source} ok={bool(report.get('ok'))} "
+                f"rows={int(report.get('rows_total') or 0)} "
+                f"violations={int(len(report.get('violations') or []))}"
+            )
+        if not bool(report.get("ok")):
+            raise click.ClickException("data contract check failed")
+
     @data_group.command("field-quality")
     @click.option("--exchange", default="SHFE", show_default=True, help="Exchange (e.g. SHFE)")
     @click.option("--var", "variety", default="cu", show_default=True, help="Variety code (e.g. cu)")

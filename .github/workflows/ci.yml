@@ -30,3 +30,62 @@ jobs:
             --cov-report=term-missing \
             --cov-fail-under=50
 
+  data-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,control,questdb]"
+
+      - name: Run contract/governance tests
+        run: |
+          pytest -q tests/test_data_contract_checks.py tests/test_coverage_governance.py
+
+      - name: Run CLI data contract preflight
+        run: |
+          ghtrader data contract-check --rows 96 --json
+
+  e2e-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,control,questdb]"
+
+      - name: Run deterministic e2e pipeline coverage
+        run: |
+          pytest -q tests/test_e2e_data_pipeline.py -m "not integration"
+
+      - name: Optional live e2e pipeline smoke
+        env:
+          TQSDK_USER: ${{ secrets.TQSDK_USER }}
+          TQSDK_PASSWORD: ${{ secrets.TQSDK_PASSWORD }}
+          GHTRADER_RUN_E2E_PIPELINE_LIVE: ${{ vars.GHTRADER_RUN_E2E_PIPELINE_LIVE }}
+        run: |
+          if [ -n "${TQSDK_USER}" ] && [ -n "${TQSDK_PASSWORD}" ] && [ "${GHTRADER_RUN_E2E_PIPELINE_LIVE}" = "true" ]; then
+            pip install tqsdk
+            pytest -q tests/test_e2e_data_pipeline.py -m "integration"
+          else
+            echo "Skipping live e2e pipeline smoke (missing creds or feature flag disabled)."
+          fi
+

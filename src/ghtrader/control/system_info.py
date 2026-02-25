@@ -7,7 +7,6 @@ import threading
 import time
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,8 +39,7 @@ def disk_usage(path: Path) -> DiskUsage:
         return DiskUsage(total_gb=nan, used_gb=nan, free_gb=nan)
 
 
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from ghtrader.util.time import now_iso as _now_utc_iso
 
 
 def _human_bytes(n: int | None) -> str:

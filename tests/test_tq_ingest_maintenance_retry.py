@@ -22,7 +22,7 @@ def _sample_tick_df() -> pd.DataFrame:
     return pd.DataFrame(row)
 
 
-def test_download_main_l5_maintenance_retry_exhausted(monkeypatch, tmp_path) -> None:
+def test_download_main_l5_maintenance_retry_exhausted_records_skip_and_continues(monkeypatch, tmp_path) -> None:
     import ghtrader.tq.ingest as ingest
 
     class _Backend:
@@ -47,21 +47,112 @@ def test_download_main_l5_maintenance_retry_exhausted(monkeypatch, tmp_path) -> 
     monkeypatch.setattr(ingest, "get_tqsdk_auth", lambda: object())
     monkeypatch.setattr(ingest.time, "sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setitem(sys.modules, "tqsdk", SimpleNamespace(TqApi=_FakeTqApi))
-    monkeypatch.setenv("GHTRADER_INGEST_WORKERS", "1")
-    monkeypatch.setenv("GHTRADER_TQ_RETRY_MAX", "0")
-    monkeypatch.setenv("GHTRADER_TQ_MAINTENANCE_WAIT_S", "1")
-    monkeypatch.setenv("GHTRADER_TQ_MAINTENANCE_MAX_RETRIES", "1")
+    int_cfg = {
+        "GHTRADER_TQ_RETRY_MAX": 0,
+        "GHTRADER_TQ_MAINTENANCE_MAX_RETRIES": 1,
+        "GHTRADER_TQ_TIMEOUT_RESET_AFTER": 2,
+        "GHTRADER_PROGRESS_EVERY_N": 25,
+    }
+    float_cfg = {
+        "GHTRADER_TQ_RETRY_BASE_S": 0.0,
+        "GHTRADER_TQ_RETRY_MAX_S": 0.0,
+        "GHTRADER_TQ_MAINTENANCE_WAIT_S": 1.0,
+        "GHTRADER_TQ_MAINTENANCE_MAX_TOTAL_WAIT_S": 10.0,
+        "GHTRADER_PROGRESS_EVERY_S": 15.0,
+        "GHTRADER_TQ_MAINTENANCE_CIRCUIT_COOLDOWN_S": 60.0,
+    }
+    bool_cfg = {"GHTRADER_TQ_MAINTENANCE_CIRCUIT_ENABLED": True}
+    monkeypatch.setattr(ingest, "env_int", lambda key, default: int(int_cfg.get(key, default)))
+    monkeypatch.setattr(ingest, "env_float", lambda key, default: float(float_cfg.get(key, default)))
+    monkeypatch.setattr(ingest, "env_bool", lambda key, default: bool(bool_cfg.get(key, default)))
 
-    with pytest.raises(RuntimeError, match="maintenance retry exhausted"):
-        ingest.download_main_l5_for_days(
-            underlying_symbol="SHFE.cu2501",
-            derived_symbol="KQ.m@SHFE.cu",
-            trading_days=[date(2025, 1, 2)],
-            segment_id=0,
-            schedule_hash="hash-x",
-            data_dir=tmp_path,
-            dataset_version="v2",
-        )
+    res = ingest.download_main_l5_for_days(
+        underlying_symbol="SHFE.cu2501",
+        derived_symbol="KQ.m@SHFE.cu",
+        trading_days=[date(2025, 1, 2)],
+        segment_id=0,
+        schedule_hash="hash-x",
+        data_dir=tmp_path,
+        dataset_version="v2",
+        workers=1,
+    )
+    assert int(res.get("rows_total") or 0) == 0
+    assert dict(res.get("row_counts") or {}) == {date(2025, 1, 2).isoformat(): 0}
+    skips = list(res.get("skip_ledger") or [])
+    assert len(skips) == 1
+    assert str(skips[0].get("reason") or "") == "maintenance_retry_exhausted"
+    assert str(skips[0].get("day") or "") == date(2025, 1, 2).isoformat()
+
+
+def test_download_main_l5_maintenance_circuit_breaker_skips_following_days(monkeypatch, tmp_path) -> None:
+    import ghtrader.tq.ingest as ingest
+
+    class _Backend:
+        def ensure_table(self, *, table: str, include_segment_metadata: bool) -> None:
+            _ = (table, include_segment_metadata)
+
+        def ingest_df(self, *, table: str, df) -> None:
+            _ = (table, df)
+
+    class _FakeTqApi:
+        calls = 0
+
+        def __init__(self, auth=None) -> None:
+            self.auth = auth
+
+        def get_tick_data_series(self, *, symbol: str, start_dt: date, end_dt: date):
+            _ = (symbol, start_dt, end_dt)
+            type(self).calls += 1
+            raise RuntimeError("maintenance window")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(ingest, "_make_questdb_backend_required", lambda: _Backend())
+    monkeypatch.setattr(ingest, "get_tqsdk_auth", lambda: object())
+    monkeypatch.setattr(ingest.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(sys.modules, "tqsdk", SimpleNamespace(TqApi=_FakeTqApi))
+    int_cfg = {
+        "GHTRADER_TQ_RETRY_MAX": 0,
+        "GHTRADER_TQ_MAINTENANCE_MAX_RETRIES": 0,
+        "GHTRADER_TQ_MAINTENANCE_CIRCUIT_THRESHOLD": 1,
+        "GHTRADER_TQ_TIMEOUT_RESET_AFTER": 2,
+        "GHTRADER_PROGRESS_EVERY_N": 25,
+    }
+    float_cfg = {
+        "GHTRADER_TQ_RETRY_BASE_S": 0.0,
+        "GHTRADER_TQ_RETRY_MAX_S": 0.0,
+        "GHTRADER_TQ_MAINTENANCE_WAIT_S": 1.0,
+        "GHTRADER_TQ_MAINTENANCE_MAX_TOTAL_WAIT_S": 10.0,
+        "GHTRADER_PROGRESS_EVERY_S": 15.0,
+        "GHTRADER_TQ_MAINTENANCE_CIRCUIT_COOLDOWN_S": 600.0,
+    }
+    bool_cfg = {"GHTRADER_TQ_MAINTENANCE_CIRCUIT_ENABLED": True}
+    monkeypatch.setattr(ingest, "env_int", lambda key, default: int(int_cfg.get(key, default)))
+    monkeypatch.setattr(ingest, "env_float", lambda key, default: float(float_cfg.get(key, default)))
+    monkeypatch.setattr(ingest, "env_bool", lambda key, default: bool(bool_cfg.get(key, default)))
+
+    days = [date(2025, 1, 2), date(2025, 1, 3)]
+    res = ingest.download_main_l5_for_days(
+        underlying_symbol="SHFE.cu2501",
+        derived_symbol="KQ.m@SHFE.cu",
+        trading_days=days,
+        segment_id=0,
+        schedule_hash="hash-x",
+        data_dir=tmp_path,
+        dataset_version="v2",
+        workers=1,
+    )
+
+    assert _FakeTqApi.calls == 1
+    assert int(res.get("rows_total") or 0) == 0
+    assert dict(res.get("row_counts") or {}) == {
+        date(2025, 1, 2).isoformat(): 0,
+        date(2025, 1, 3).isoformat(): 0,
+    }
+    reasons = [str(x.get("reason") or "") for x in (res.get("skip_ledger") or [])]
+    assert "maintenance_retry_exhausted" in reasons
+    assert "maintenance_circuit_open" in reasons
 
 
 def test_download_main_l5_reuses_tqapi_per_worker(monkeypatch, tmp_path) -> None:

@@ -94,6 +94,13 @@ MANAGED_FIELDS: dict[str, ConfigField] = {
         domain="data.main_l5",
         description="Provider-missing-day tolerance for main_l5 health gate.",
     ),
+    "GHTRADER_MAIN_L5_STRICT_PROVENANCE": ConfigField(
+        key="GHTRADER_MAIN_L5_STRICT_PROVENANCE",
+        value_type="bool",
+        default=True,
+        domain="data.main_l5",
+        description="Require segment_id + schedule_hash provenance for main_l5 feature/label builds.",
+    ),
     "GHTRADER_WORKERS_GLOBAL_MAX": ConfigField(
         key="GHTRADER_WORKERS_GLOBAL_MAX",
         value_type="int",

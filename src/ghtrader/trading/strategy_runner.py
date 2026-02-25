@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -28,6 +29,7 @@ log = structlog.get_logger()
 _obs_store = get_store("trading.strategy_runner")
 
 ModelType = Literal["logistic", "xgboost", "lightgbm", "deeplob", "transformer", "tcn", "tlob", "ssm"]
+HotPathState = Literal["starting", "healthy", "suspect", "degraded"]
 
 
 from ghtrader.util.time import now_iso as _now_iso
@@ -95,6 +97,70 @@ def _read_enabled_factors(*, model_dir: Path, horizon: int) -> list[str]:
     if isinstance(ef, list) and ef and all(isinstance(x, str) and x.strip() for x in ef):
         return [str(x).strip() for x in ef if str(x).strip()]
     raise RuntimeError(f"Missing enabled_factors in model metadata: {model_dir}/model_h{int(horizon)}.meta.json")
+
+
+def _ts_to_iso(ts: float | None) -> str:
+    if ts is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return ""
+
+
+@dataclass
+class _ZmqConnectionHealthFsm:
+    """
+    Stabilize ZMQ hot-path health transitions to avoid one-tick flapping.
+    """
+
+    enter_degraded_after_failures: int = 3
+    recover_after_successes: int = 2
+    state: HotPathState = "starting"
+    consecutive_failures: int = 0
+    consecutive_successes: int = 0
+    last_success_at: float | None = None
+    last_failure_at: float | None = None
+    last_reason: str = ""
+
+    def __post_init__(self) -> None:
+        self.enter_degraded_after_failures = max(1, int(self.enter_degraded_after_failures))
+        self.recover_after_successes = max(1, int(self.recover_after_successes))
+        s = str(self.state or "starting").strip().lower()
+        if s not in {"starting", "healthy", "suspect", "degraded"}:
+            s = "starting"
+        self.state = s  # type: ignore[assignment]
+
+    def record_failure(self, *, reason: str, now_ts: float | None = None) -> bool:
+        prev = self.state
+        now_s = float(time.time() if now_ts is None else now_ts)
+        self.last_failure_at = now_s
+        self.last_reason = str(reason or "")
+        self.consecutive_failures = int(self.consecutive_failures) + 1
+        self.consecutive_successes = 0
+        if prev == "degraded":
+            # Stay degraded until recover_after_successes is satisfied.
+            self.state = "degraded"
+        elif int(self.consecutive_failures) >= int(self.enter_degraded_after_failures):
+            self.state = "degraded"
+        else:
+            self.state = "suspect"
+        return self.state != prev
+
+    def record_success(self, *, now_ts: float | None = None) -> bool:
+        prev = self.state
+        now_s = float(time.time() if now_ts is None else now_ts)
+        self.last_success_at = now_s
+        self.consecutive_successes = int(self.consecutive_successes) + 1
+        self.consecutive_failures = 0
+        if self.state == "degraded":
+            if int(self.consecutive_successes) >= int(self.recover_after_successes):
+                self.state = "healthy"
+        else:
+            self.state = "healthy"
+        if self.state == "healthy":
+            self.last_reason = ""
+        return self.state != prev
 
 
 class StrategyWriter:
@@ -207,6 +273,7 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
         }
     )
     writer.event({"type": "strategy_start"})
+    hot_path_fsm = _ZmqConnectionHealthFsm()
     statew.set_health(ok=True, running=True, error="", last_loop_at=_now_iso())
     statew.set_effective(
         run_id=writer.run_id,
@@ -222,8 +289,48 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
         poll_interval_sec=float(cfg.poll_interval_sec),
         warm_path_degraded=bool(warm_path_degraded),
         warm_path_reason=str(warm_path_reason),
+        hot_path_state=str(hot_path_fsm.state),
+        hot_path_consecutive_failures=0,
+        hot_path_consecutive_successes=0,
+        hot_path_last_success_at="",
+        hot_path_last_failure_at="",
+        no_new_targets=False,
+        halt_reason="",
     )
     statew.append_event({"type": "strategy_start", "run_id": writer.run_id})
+
+    def _sync_hot_path_state(*, prev_state: HotPathState, reason: str) -> None:
+        halt_active = str(hot_path_fsm.state) == "degraded"
+        halt_reason = str(hot_path_fsm.last_reason or reason or "") if halt_active else ""
+        statew.set_effective(
+            hot_path_state=str(hot_path_fsm.state),
+            hot_path_consecutive_failures=int(hot_path_fsm.consecutive_failures),
+            hot_path_consecutive_successes=int(hot_path_fsm.consecutive_successes),
+            hot_path_last_success_at=_ts_to_iso(hot_path_fsm.last_success_at),
+            hot_path_last_failure_at=_ts_to_iso(hot_path_fsm.last_failure_at),
+            no_new_targets=bool(halt_active),
+            halt_reason=str(halt_reason),
+        )
+        if prev_state == hot_path_fsm.state:
+            return
+        evt = {
+            "type": "hot_path_state_changed",
+            "from": str(prev_state),
+            "to": str(hot_path_fsm.state),
+            "reason": str(reason or hot_path_fsm.last_reason or ""),
+            "consecutive_failures": int(hot_path_fsm.consecutive_failures),
+            "consecutive_successes": int(hot_path_fsm.consecutive_successes),
+        }
+        writer.event(evt)
+        statew.append_event(evt)
+        if prev_state != "degraded" and hot_path_fsm.state == "degraded":
+            halt_evt = {"type": "safe_halt_entered", "reason": str(halt_reason or "gateway_hot_path_degraded")}
+            writer.event(halt_evt)
+            statew.append_event(halt_evt)
+        elif prev_state == "degraded" and hot_path_fsm.state != "degraded":
+            clear_evt = {"type": "safe_halt_cleared", "reason": "gateway_stream_restored"}
+            writer.event(clear_evt)
+            statew.append_event(clear_evt)
 
     def _set_warm_path_state(*, degraded: bool, reason: str = "") -> None:
         nonlocal warm_path_degraded, warm_path_reason
@@ -291,7 +398,6 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
     last_symbol_mapping: dict[str, str] = {}  # requested_symbol -> execution_symbol
 
     last_zmq_timeout_event_at = 0.0
-    safe_halt_active = False
     while True:
         loop_started = time.perf_counter()
         _ensure_redis_connection()
@@ -300,12 +406,9 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
             if not sub_socket.poll(timeout=1000):
                 now_ts = time.time()
                 statew.set_health(ok=False, running=True, error="gateway_zmq_timeout", last_loop_at=_now_iso())
-                if not safe_halt_active:
-                    safe_halt_active = True
-                    statew.set_effective(no_new_targets=True, halt_reason="gateway_zmq_timeout")
-                    halt_evt = {"type": "safe_halt_entered", "reason": "gateway_zmq_timeout"}
-                    writer.event(halt_evt)
-                    statew.append_event(halt_evt)
+                prev_state: HotPathState = hot_path_fsm.state
+                hot_path_fsm.record_failure(reason="gateway_zmq_timeout", now_ts=now_ts)
+                _sync_hot_path_state(prev_state=prev_state, reason="gateway_zmq_timeout")
                 if (now_ts - last_zmq_timeout_event_at) >= 5.0:
                     evt = {"type": "gateway_state_timeout", "channel": "zmq_hot_path"}
                     writer.event(evt)
@@ -318,12 +421,9 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
             msg = sub_socket.recv_json()
             st = msg.get("payload", {})
             statew.set_health(ok=True, running=True, error="", last_loop_at=_now_iso())
-            if safe_halt_active:
-                safe_halt_active = False
-                statew.set_effective(no_new_targets=False, halt_reason="")
-                clear_evt = {"type": "safe_halt_cleared", "reason": "gateway_stream_restored"}
-                writer.event(clear_evt)
-                statew.append_event(clear_evt)
+            prev_state = hot_path_fsm.state
+            hot_path_fsm.record_success(now_ts=time.time())
+            _sync_hot_path_state(prev_state=prev_state, reason="gateway_stream_restored")
             market = st.get("market") if isinstance(st.get("market"), dict) else {}
             ticks = market.get("ticks") if isinstance(market.get("ticks"), dict) else {}
             effective = st.get("effective") if isinstance(st.get("effective"), dict) else {}
@@ -333,12 +433,9 @@ def run_strategy_runner(cfg: StrategyConfig) -> None:
             symbol_mapping = {}
             _obs_store.observe(metric="gateway_state_read", ok=False)
             statew.set_health(ok=False, running=True, error=str(e), last_loop_at=_now_iso())
-            if not safe_halt_active:
-                safe_halt_active = True
-                statew.set_effective(no_new_targets=True, halt_reason="gateway_state_read_failed")
-                halt_evt = {"type": "safe_halt_entered", "reason": "gateway_state_read_failed"}
-                writer.event(halt_evt)
-                statew.append_event(halt_evt)
+            prev_state = hot_path_fsm.state
+            hot_path_fsm.record_failure(reason="gateway_state_read_failed", now_ts=time.time())
+            _sync_hot_path_state(prev_state=prev_state, reason="gateway_state_read_failed")
             statew.append_event({"type": "gateway_state_read_failed", "error": str(e)})
 
         # Detect roll: if execution symbol changed for any requested symbol, reset engines

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,75 +13,20 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ghtrader.config import get_artifacts_dir, get_runs_dir
+from ghtrader.control.app_helpers import (
+    normalize_variety_for_api as _normalize_variety_for_api,
+    scan_model_files as _scan_model_files,
+)
 from ghtrader.control import auth
 from ghtrader.control.cache import TTLCacheSlot
-from ghtrader.control.variety_context import (
-    allowed_varieties as _allowed_varieties,
-    symbol_matches_variety as _symbol_matches_variety,
-)
+from ghtrader.control.routes.query_budget import bounded_limit
+from ghtrader.control.variety_context import symbol_matches_variety as _symbol_matches_variety
 
 log = structlog.get_logger()
 router = APIRouter(tags=["models-api"])
 
 _BENCHMARKS_TTL_S = 10.0
 _benchmarks_cache = TTLCacheSlot()
-
-
-def _normalize_variety_for_api(raw: str | None) -> str:
-    v = str(raw or "").strip().lower()
-    if not v:
-        raise HTTPException(status_code=400, detail="var is required")
-    if v not in _allowed_varieties():
-        allowed = ",".join(_allowed_varieties())
-        raise HTTPException(status_code=400, detail=f"invalid var '{v}', allowed: {allowed}")
-    return v
-
-
-def _scan_model_files(artifacts_dir: Path) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    if not artifacts_dir.exists():
-        return out
-    try:
-        pat = re.compile(r"^model_h(?P<h>\d+)\.[a-zA-Z0-9]+$")
-        allowed_ext = {".json", ".pt", ".pkl"}
-        for f in artifacts_dir.rglob("model_h*.*"):
-            try:
-                if not f.is_file():
-                    continue
-                if f.suffix.lower() not in allowed_ext:
-                    continue
-                m = pat.match(f.name)
-                if not m:
-                    continue
-                rel = f.relative_to(artifacts_dir).parts
-                if len(rel) < 3:
-                    continue
-                namespace = None
-                if rel[0] in {"production", "candidates", "temp"} and len(rel) >= 4:
-                    namespace = rel[0]
-                    symbol = rel[1]
-                    model_type = rel[2]
-                else:
-                    symbol = rel[0]
-                    model_type = rel[1]
-                horizon = int(m.group("h"))
-                st = f.stat()
-                out.append(
-                    {
-                        "symbol": str(symbol),
-                        "model_type": str(model_type),
-                        "horizon": int(horizon),
-                        "namespace": str(namespace) if namespace else "",
-                        "path": str(f),
-                        "size_bytes": int(st.st_size),
-                        "mtime": float(st.st_mtime),
-                    }
-                )
-            except Exception:
-                continue
-    except Exception:
-        return []
-    return out
 
 
 def _human_size(size_bytes: int) -> str:
@@ -101,11 +45,12 @@ def api_models_inventory(
     max_rows: int = 500,
     var: str = "",
 ) -> dict[str, Any]:
-    _ = (include_temp, max_rows)
+    _ = include_temp
     if not auth.is_authorized(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     artifacts_dir = get_artifacts_dir()
+    rows_limit = bounded_limit(max_rows, default=500, max_limit=2000)
     models: list[dict[str, Any]] = []
     var_filter = _normalize_variety_for_api(var) if str(var or "").strip() else ""
 
@@ -143,6 +88,7 @@ def api_models_inventory(
 
     if var_filter:
         models = [m for m in models if _symbol_matches_variety(str(m.get("symbol") or ""), var_filter)]
+    models = models[:rows_limit]
     return {"ok": True, "models": models, "var": (var_filter or None)}
 
 
@@ -152,7 +98,7 @@ def api_models_benchmarks(request: Request, limit: int = 20, var: str = "") -> d
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     var_filter = _normalize_variety_for_api(var) if str(var or "").strip() else ""
-    lim = max(1, min(int(limit or 20), 200))
+    lim = bounded_limit(limit, default=20, max_limit=200)
     runs_dir = get_runs_dir()
     root = runs_dir / "benchmarks"
     cache_root = str(root.resolve()) if root.exists() else str(root)

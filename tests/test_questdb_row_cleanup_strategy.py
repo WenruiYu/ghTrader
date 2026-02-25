@@ -156,7 +156,7 @@ def test_main_schedule_trim_delegates_to_row_cleanup(monkeypatch) -> None:
     assert len(calls) == 1
     call = calls[0]
     assert call["table"] == "ghtrader_main_schedule_v2"
-    assert "cast(trading_day as string) < %s" in str(call["delete_where_sql"])
+    assert "trading_day < %s" in str(call["delete_where_sql"])
     assert call["delete_params"] == ["SHFE", "cu", "2025-01-02"]
 
 

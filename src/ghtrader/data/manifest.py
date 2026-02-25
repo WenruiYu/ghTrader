@@ -53,8 +53,7 @@ def manifests_dir(data_dir: Path) -> Path:
     return data_dir / "manifests"
 
 
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from ghtrader.util.time import now_iso as _now_utc_iso
 
 
 def _get_git_hash() -> str:

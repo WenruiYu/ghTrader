@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from ghtrader.questdb.serving_db import QuestDBBackend, ServingDBConfig
 
@@ -221,3 +222,72 @@ def test_questdb_backend_ingest_retries_when_flush_reports_closed_sender(monkeyp
     backend.ingest_df(table="ticks_test", df=df)
     assert FakeSender.flush_failures == 1
     assert FakeSender.created == 2
+
+
+def test_ticks_partition_by_env_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ghtrader.questdb.serving_db as sdb
+
+    monkeypatch.setenv("GHTRADER_QDB_TICKS_PARTITION_BY", "month")
+    assert sdb._ticks_partition_by(default="DAY") == "MONTH"
+
+    monkeypatch.setenv("GHTRADER_QDB_TICKS_PARTITION_BY", "invalid-partition")
+    assert sdb._ticks_partition_by(default="DAY") == "DAY"
+
+    monkeypatch.delenv("GHTRADER_QDB_TICKS_PARTITION_BY", raising=False)
+    assert sdb._ticks_partition_by(default="YEAR") == "YEAR"
+
+
+def test_questdb_backend_ensure_table_uses_partition_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ghtrader.questdb.migrate as migrate
+    from ghtrader.data.ticks_schema import TICK_COLUMN_NAMES
+
+    executed_sql: list[str] = []
+
+    class FakeCursor:
+        def execute(self, sql: str) -> None:
+            executed_sql.append(str(sql))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeConn:
+        def __init__(self) -> None:
+            self.autocommit = False
+
+        def cursor(self) -> FakeCursor:
+            return FakeCursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakePsycopg:
+        @staticmethod
+        def connect(**_kwargs):
+            return FakeConn()
+
+    tick_numeric_cols = [c for c in TICK_COLUMN_NAMES if c not in {"symbol", "datetime"}]
+    existing_cols = ["trading_day", "row_hash", *tick_numeric_cols, "dataset_version", "ticks_kind"]
+
+    monkeypatch.setenv("GHTRADER_QDB_TICKS_PARTITION_BY", "MONTH")
+    monkeypatch.setattr(migrate, "ensure_schema_migration_ledger", lambda cur: None)
+    monkeypatch.setattr(migrate, "best_effort_rename_provenance_columns_v2", lambda cur, table: None)
+    monkeypatch.setattr(
+        migrate,
+        "append_schema_migration_ledger",
+        lambda cur, migration_id, table_name, action, status, detail: None,
+    )
+    monkeypatch.setattr(migrate, "list_table_columns_with_cursor", lambda cur, table: list(existing_cols))
+
+    cfg = ServingDBConfig(backend="questdb", host="127.0.0.1", questdb_pg_port=8812)
+    backend = QuestDBBackend(config=cfg)
+    monkeypatch.setattr(backend, "_psycopg", lambda: FakePsycopg())
+
+    backend.ensure_table(table="ghtrader_ticks_main_l5_v2", include_segment_metadata=False)
+
+    assert any("PARTITION BY MONTH WAL" in sql for sql in executed_sql)

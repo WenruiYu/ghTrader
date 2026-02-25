@@ -272,6 +272,55 @@ def register(main: click.Group) -> None:
         if not bool(out.get("ok", False)):
             raise SystemExit(1)
 
+    @db_group.command("refresh-main-l5-daily-agg")
+    @click.option("--start", type=click.DateTime(formats=["%Y-%m-%d"]), required=False, help="Start date (YYYY-MM-DD)")
+    @click.option("--end", type=click.DateTime(formats=["%Y-%m-%d"]), required=False, help="End date (YYYY-MM-DD)")
+    @click.option("--symbol", default="", help="Optional symbol filter (e.g. KQ.m@SHFE.cu)")
+    @click.option("--ticks-kind", default="main_l5", show_default=True, help="Ticks kind filter")
+    @click.option("--dataset-version", default="v2", show_default=True, help="Dataset version filter")
+    @click.option("--json", "as_json", is_flag=True, help="Print JSON output")
+    def db_refresh_main_l5_daily_agg(
+        start: datetime | None,
+        end: datetime | None,
+        symbol: str,
+        ticks_kind: str,
+        dataset_version: str,
+        as_json: bool,
+    ) -> None:
+        """Refresh QuestDB main_l5 daily aggregate table for coverage queries."""
+        import json
+
+        from ghtrader.questdb.client import make_questdb_query_config_from_env
+        from ghtrader.questdb.main_l5_daily_agg import rebuild_main_l5_daily_agg
+
+        d0 = start.date() if start is not None else None
+        d1 = end.date() if end is not None else None
+        if d0 is not None and d1 is not None and d1 < d0:
+            raise click.ClickException("end must be >= start")
+
+        cfg = make_questdb_query_config_from_env()
+        out = rebuild_main_l5_daily_agg(
+            cfg=cfg,
+            start_day=d0,
+            end_day=d1,
+            symbol=(str(symbol).strip() or None),
+            ticks_kind=str(ticks_kind).strip() or "main_l5",
+            dataset_version=str(dataset_version).strip() or "v2",
+        )
+        if as_json:
+            click.echo(json.dumps(out, ensure_ascii=False, indent=2))
+            return
+        click.echo(
+            "ok={ok} source_groups={source_groups} upserted_rows={upserted_rows} "
+            "invalid_rows={invalid_rows} distinct_symbols={distinct_symbols}".format(
+                ok=bool(out.get("ok", False)),
+                source_groups=int(out.get("source_groups", 0) or 0),
+                upserted_rows=int(out.get("upserted_rows", 0) or 0),
+                invalid_rows=int(out.get("invalid_rows", 0) or 0),
+                distinct_symbols=int(out.get("distinct_symbols", 0) or 0),
+            )
+        )
+
     @db_group.command("benchmark")
     @click.option("--symbol", required=True, help="Symbol to benchmark (e.g. SHFE.cu2602 or KQ.m@SHFE.cu)")
     @click.option("--start", required=True, type=click.DateTime(formats=["%Y-%m-%d"]), help="Start date (YYYY-MM-DD)")
@@ -564,10 +613,10 @@ def register(main: click.Group) -> None:
             where.append("symbol = %s")
             params.append(sym)
         if start is not None:
-            where.append("cast(trading_day as string) >= %s")
+            where.append("trading_day >= %s")
             params.append(start.date().isoformat())
         if end is not None:
-            where.append("cast(trading_day as string) <= %s")
+            where.append("trading_day <= %s")
             params.append(end.date().isoformat())
 
         where_sql = " AND ".join(where)
@@ -670,6 +719,7 @@ def register(main: click.Group) -> None:
         keep = {
             "ghtrader_main_schedule_v2",
             "ghtrader_ticks_main_l5_v2",
+            "ghtrader_main_l5_daily_agg_v2",
             "ghtrader_features_v2",
             "ghtrader_labels_v2",
             "ghtrader_feature_builds_v2",

@@ -43,7 +43,7 @@ def list_tick_gap_ledger(
         "max_interval_ms, abnormal_gaps_count, critical_gaps_count, largest_gap_duration_ms, updated_at "
         f"FROM {tbl} "
         "WHERE symbol=%s AND ticks_kind=%s AND dataset_version=%s "
-        "ORDER BY cast(trading_day as string) DESC "
+        "ORDER BY trading_day DESC "
         "LIMIT %s"
     )
     out: list[TickGapLedgerRow] = []

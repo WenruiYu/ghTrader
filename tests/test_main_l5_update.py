@@ -73,6 +73,189 @@ def test_main_l5_update_backfills_missing_days(monkeypatch, tmp_path) -> None:
     assert "config_hash" in payload["config_snapshot"]
 
 
+def test_main_l5_update_report_contains_skip_ledger(monkeypatch, tmp_path) -> None:
+    from ghtrader.data import main_l5 as ml5
+    import ghtrader.questdb.client as qclient
+    import ghtrader.questdb.main_schedule as qms
+    import ghtrader.questdb.queries as qqueries
+    import ghtrader.tq.ingest as ingest
+    import ghtrader.config as cfg
+
+    schedule_hash = "hash-skip-ledger"
+    schedule = pd.DataFrame(
+        {
+            "trading_day": [date(2025, 1, 2)],
+            "main_contract": ["SHFE.cu2501"],
+            "segment_id": [0],
+            "schedule_hash": [schedule_hash],
+        }
+    )
+
+    monkeypatch.setattr(qclient, "make_questdb_query_config_from_env", lambda: object())
+    monkeypatch.setattr(qms, "fetch_schedule", lambda **kwargs: schedule)
+    monkeypatch.setattr(qqueries, "list_schedule_hashes_for_symbol", lambda **kwargs: {schedule_hash})
+    monkeypatch.setattr(qqueries, "list_trading_days_for_symbol", lambda **kwargs: [])
+    monkeypatch.setattr(qqueries, "query_symbol_day_bounds", lambda **kwargs: {})
+    monkeypatch.setattr(cfg, "get_runs_dir", lambda: tmp_path)
+    monkeypatch.setattr(ml5, "_clear_main_l5_symbol", lambda **kwargs: 0)
+    monkeypatch.setattr(ml5, "_purge_main_l5_l1", lambda **kwargs: 0)
+
+    def _fake_download(**kwargs):
+        days = sorted(kwargs["trading_days"])
+        day_iso = days[0].isoformat()
+        return {
+            "rows_total": 0,
+            "row_counts": {day_iso: 0},
+            "skip_ledger": [
+                {
+                    "day": day_iso,
+                    "reason": "maintenance_retry_exhausted",
+                    "error": "maintenance window",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(ingest, "download_main_l5_for_days", _fake_download)
+
+    ml5.build_main_l5(
+        var="cu",
+        derived_symbol="KQ.m@SHFE.cu",
+        exchange="SHFE",
+        data_dir=str(tmp_path),
+        update_mode=False,
+    )
+
+    report_dir = tmp_path / "control" / "reports" / "main_l5_update"
+    reports = sorted(report_dir.glob("*.json"))
+    assert reports
+    payload = json.loads(reports[-1].read_text(encoding="utf-8"))
+    assert int(payload.get("skip_ledger_total") or 0) == 1
+    assert dict(payload.get("skip_ledger_by_reason") or {}).get("maintenance_retry_exhausted") == 1
+    skips = list(payload.get("skip_ledger") or [])
+    assert len(skips) == 1
+    assert str(skips[0].get("day") or "") == date(2025, 1, 2).isoformat()
+
+
+def test_main_l5_auto_refresh_daily_agg_on_success(monkeypatch, tmp_path) -> None:
+    from ghtrader.data import main_l5 as ml5
+    import ghtrader.config as cfg
+    import ghtrader.questdb.client as qclient
+    import ghtrader.questdb.main_l5_daily_agg as qagg
+    import ghtrader.questdb.main_schedule as qms
+    import ghtrader.questdb.queries as qqueries
+    import ghtrader.tq.ingest as ingest
+
+    schedule_hash = "hash-agg-refresh"
+    schedule = _schedule_df(schedule_hash)
+    schedule_days = [d for d in schedule["trading_day"].tolist() if isinstance(d, date)]
+
+    monkeypatch.setattr(qclient, "make_questdb_query_config_from_env", lambda: object())
+    monkeypatch.setattr(qms, "fetch_schedule", lambda **kwargs: schedule)
+    monkeypatch.setattr(qqueries, "query_symbol_day_bounds", lambda **kwargs: {})
+    monkeypatch.setattr(qqueries, "list_schedule_hashes_for_symbol", lambda **kwargs: {schedule_hash})
+    monkeypatch.setattr(qqueries, "list_trading_days_for_symbol", lambda **kwargs: schedule_days)
+    monkeypatch.setattr(cfg, "get_runs_dir", lambda: tmp_path)
+    monkeypatch.setattr(ml5, "_clear_main_l5_symbol", lambda **kwargs: 0)
+    monkeypatch.setattr(ml5, "_purge_main_l5_l1", lambda **kwargs: 0)
+    monkeypatch.setattr(
+        ingest,
+        "download_main_l5_for_days",
+        lambda **kwargs: {
+            "rows_total": len(kwargs["trading_days"]),
+            "row_counts": {d.isoformat(): 1 for d in kwargs["trading_days"]},
+        },
+    )
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_refresh(**kwargs):
+        calls.append(dict(kwargs))
+        return {"ok": True, "upserted_rows": 3}
+
+    monkeypatch.setattr(qagg, "rebuild_main_l5_daily_agg", _fake_refresh)
+
+    ml5.build_main_l5(
+        var="cu",
+        derived_symbol="KQ.m@SHFE.cu",
+        exchange="SHFE",
+        data_dir=str(tmp_path),
+        update_mode=False,
+    )
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["symbol"] == "KQ.m@SHFE.cu"
+    assert call["start_day"] == date(2025, 1, 2)
+    assert call["end_day"] == date(2025, 1, 4)
+    assert call["dataset_version"] == "v2"
+    assert call["ticks_kind"] == "main_l5"
+
+    report_dir = tmp_path / "control" / "reports" / "main_l5_update"
+    reports = sorted(report_dir.glob("*.json"))
+    assert reports
+    payload = json.loads(reports[-1].read_text(encoding="utf-8"))
+    agg = dict(payload.get("daily_agg_refresh") or {})
+    assert agg.get("attempted") is True
+    assert agg.get("ok") is True
+    assert int(agg.get("upserted_rows") or 0) == 3
+
+
+def test_main_l5_auto_refresh_daily_agg_can_be_disabled(monkeypatch, tmp_path) -> None:
+    from ghtrader.data import main_l5 as ml5
+    import ghtrader.config as cfg
+    import ghtrader.questdb.client as qclient
+    import ghtrader.questdb.main_l5_daily_agg as qagg
+    import ghtrader.questdb.main_schedule as qms
+    import ghtrader.questdb.queries as qqueries
+    import ghtrader.tq.ingest as ingest
+
+    monkeypatch.setenv("GHTRADER_MAIN_L5_DAILY_AGG_AUTO_REFRESH", "0")
+    schedule_hash = "hash-agg-refresh-off"
+    schedule = _schedule_df(schedule_hash)
+    schedule_days = [d for d in schedule["trading_day"].tolist() if isinstance(d, date)]
+
+    monkeypatch.setattr(qclient, "make_questdb_query_config_from_env", lambda: object())
+    monkeypatch.setattr(qms, "fetch_schedule", lambda **kwargs: schedule)
+    monkeypatch.setattr(qqueries, "query_symbol_day_bounds", lambda **kwargs: {})
+    monkeypatch.setattr(qqueries, "list_schedule_hashes_for_symbol", lambda **kwargs: {schedule_hash})
+    monkeypatch.setattr(qqueries, "list_trading_days_for_symbol", lambda **kwargs: schedule_days)
+    monkeypatch.setattr(cfg, "get_runs_dir", lambda: tmp_path)
+    monkeypatch.setattr(ml5, "_clear_main_l5_symbol", lambda **kwargs: 0)
+    monkeypatch.setattr(ml5, "_purge_main_l5_l1", lambda **kwargs: 0)
+    monkeypatch.setattr(
+        ingest,
+        "download_main_l5_for_days",
+        lambda **kwargs: {
+            "rows_total": len(kwargs["trading_days"]),
+            "row_counts": {d.isoformat(): 1 for d in kwargs["trading_days"]},
+        },
+    )
+
+    called = {"n": 0}
+    monkeypatch.setattr(
+        qagg,
+        "rebuild_main_l5_daily_agg",
+        lambda **kwargs: called.__setitem__("n", int(called["n"]) + 1) or {"ok": True},
+    )
+
+    ml5.build_main_l5(
+        var="cu",
+        derived_symbol="KQ.m@SHFE.cu",
+        exchange="SHFE",
+        data_dir=str(tmp_path),
+        update_mode=False,
+    )
+
+    assert called["n"] == 0
+    report_dir = tmp_path / "control" / "reports" / "main_l5_update"
+    reports = sorted(report_dir.glob("*.json"))
+    assert reports
+    payload = json.loads(reports[-1].read_text(encoding="utf-8"))
+    agg = dict(payload.get("daily_agg_refresh") or {})
+    assert agg.get("enabled") is False
+    assert agg.get("attempted") is False
+
+
 def test_main_l5_update_hash_mismatch_forces_rebuild(monkeypatch, tmp_path) -> None:
     from ghtrader.data import main_l5 as ml5
     import ghtrader.questdb.client as qclient
@@ -323,6 +506,7 @@ def test_main_l5_enforce_health_raises_on_missing_coverage(monkeypatch, tmp_path
 
 def test_main_l5_enforce_health_tolerates_provider_missing_days(monkeypatch, tmp_path) -> None:
     from ghtrader.data import main_l5 as ml5
+    import ghtrader.data.main_l5_validation as validation
     import ghtrader.questdb.client as qclient
     import ghtrader.questdb.main_schedule as qms
     import ghtrader.questdb.queries as qqueries
@@ -354,6 +538,19 @@ def test_main_l5_enforce_health_tolerates_provider_missing_days(monkeypatch, tmp
                 date(2025, 1, 4).isoformat(): 0,  # provider anomaly style missing day
             },
         },
+    )
+    monkeypatch.setattr(
+        validation,
+        "validate_main_l5",
+        lambda **kwargs: (
+            {
+                "state": "ok",
+                "overall_state": "ok",
+                "reason_code": "quality_ok",
+                "action_hint": "No action needed.",
+            },
+            None,
+        ),
     )
 
     res = ml5.build_main_l5(
@@ -405,6 +602,60 @@ def test_main_l5_enforce_health_blocks_engineering_missing_days_even_with_tolera
         ml5.build_main_l5(
             var="au",
             derived_symbol="KQ.m@SHFE.au",
+            exchange="SHFE",
+            data_dir=str(tmp_path),
+            update_mode=False,
+            enforce_health=True,
+        )
+
+
+def test_main_l5_enforce_health_blocks_on_validation_gate_error(monkeypatch, tmp_path) -> None:
+    from ghtrader.data import main_l5 as ml5
+    import ghtrader.data.main_l5_validation as validation
+    import ghtrader.questdb.client as qclient
+    import ghtrader.questdb.main_schedule as qms
+    import ghtrader.questdb.queries as qqueries
+    import ghtrader.tq.ingest as ingest
+    import ghtrader.config as cfg
+
+    schedule_hash = "hash-health-validation-gate"
+    schedule = _schedule_df(schedule_hash)
+    schedule_days = [d for d in schedule["trading_day"].tolist() if isinstance(d, date)]
+
+    monkeypatch.setattr(qclient, "make_questdb_query_config_from_env", lambda: object())
+    monkeypatch.setattr(qms, "fetch_schedule", lambda **kwargs: schedule)
+    monkeypatch.setattr(cfg, "get_runs_dir", lambda: tmp_path)
+    monkeypatch.setattr(ml5, "_clear_main_l5_symbol", lambda **kwargs: 0)
+    monkeypatch.setattr(ml5, "_purge_main_l5_l1", lambda **kwargs: 0)
+    monkeypatch.setattr(qqueries, "query_symbol_day_bounds", lambda **kwargs: {})
+    monkeypatch.setattr(qqueries, "list_schedule_hashes_for_symbol", lambda **kwargs: {schedule_hash})
+    monkeypatch.setattr(qqueries, "list_trading_days_for_symbol", lambda **kwargs: schedule_days)
+    monkeypatch.setattr(
+        ingest,
+        "download_main_l5_for_days",
+        lambda **kwargs: {
+            "rows_total": len(kwargs["trading_days"]),
+            "row_counts": {d.isoformat(): 1 for d in kwargs["trading_days"]},
+        },
+    )
+    monkeypatch.setattr(
+        validation,
+        "validate_main_l5",
+        lambda **kwargs: (
+            {
+                "state": "error",
+                "overall_state": "error",
+                "reason_code": "gap_gt30_block",
+                "action_hint": "Review top gap days and adjust gap policy.",
+            },
+            tmp_path / "validate_report.json",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="gap_gt30_block"):
+        ml5.build_main_l5(
+            var="cu",
+            derived_symbol="KQ.m@SHFE.cu",
             exchange="SHFE",
             data_dir=str(tmp_path),
             update_mode=False,

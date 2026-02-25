@@ -5,56 +5,26 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from ghtrader.config import get_runs_dir
+from ghtrader.control.app_helpers import job_matches_variety as _job_matches_variety
 from ghtrader.control import auth
 from ghtrader.control.job_command import infer_job_kind
 from ghtrader.control.jobs import JobSpec
-from ghtrader.control.variety_context import (
-    allowed_varieties as _allowed_varieties,
-    symbol_matches_variety as _symbol_matches_variety,
+from ghtrader.control.routes.query_budget import (
+    bounded_pagination,
+    bounded_scan_limit,
+    bounded_int,
 )
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _job_matches_variety(job: Any, variety: str) -> bool:
-    v = str(variety or "").strip().lower()
-    if not v or v not in set(_allowed_varieties()):
-        return True
-
-    meta = getattr(job, "metadata", None)
-    if isinstance(meta, dict):
-        mv = str(meta.get("variety") or "").strip().lower()
-        if mv in set(_allowed_varieties()):
-            return mv == v
-        ms = str(meta.get("symbol") or "").strip()
-        if ms:
-            return _symbol_matches_variety(ms, v)
-        mss = meta.get("symbols")
-        if isinstance(mss, list) and mss:
-            return any(_symbol_matches_variety(str(x or ""), v) for x in mss)
-
-    cmd = [str(x or "").lower() for x in (getattr(job, "command", None) or [])]
-    for i, tok in enumerate(cmd[:-1]):
-        if tok == "--var" and cmd[i + 1] == v:
-            return True
-    if any(_symbol_matches_variety(tok, v) for tok in cmd):
-        return True
-
-    title = str(getattr(job, "title", "") or "").lower()
-    if _symbol_matches_variety(title, v):
-        return True
-    return bool(re.search(rf"(^|\s){re.escape(v)}(\s|$)", title))
+from ghtrader.util.time import now_iso as _now_iso
 
 
 def _job_kind(job: Any) -> str:
@@ -103,15 +73,20 @@ def api_list_jobs(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     store = request.app.state.job_store
-    lim = max(1, min(int(limit or 200), 1000))
-    off = max(0, int(offset or 0))
+    lim, off = bounded_pagination(
+        limit=limit,
+        offset=offset,
+        default_limit=200,
+        max_limit=1000,
+        max_offset=5000,
+    )
     status_filter = str(status or "").strip().lower()
     kind_filter = str(kind or "").strip().lower()
     var_filter = str(var or "").strip().lower()
     query = str(q or "").strip().lower()
 
     # Pull a bounded window large enough for common filtering/pagination use-cases.
-    jobs_all = store.list_jobs(limit=max(2000, lim + off + 200))
+    jobs_all = store.list_jobs(limit=bounded_scan_limit(limit=lim, offset=off, floor=2000, headroom=200, max_scan=6200))
     filtered: list[Any] = []
     for job in jobs_all:
         st = str(getattr(job, "status", "") or "").strip().lower()
@@ -262,7 +237,8 @@ def api_job_log(request: Request, job_id: str, max_bytes: int = 64000) -> str:
     if not auth.is_authorized(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     jm = request.app.state.job_manager
-    return jm.read_log_tail(job_id, max_bytes=int(max_bytes))
+    bounded_max_bytes = bounded_int(max_bytes, default=64000, min_value=1024, max_value=1_048_576)
+    return jm.read_log_tail(job_id, max_bytes=int(bounded_max_bytes))
 
 
 @router.get("/{job_id}/log/download")

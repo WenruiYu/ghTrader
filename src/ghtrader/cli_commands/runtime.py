@@ -236,7 +236,7 @@ def register(main: click.Group) -> None:
 
         _ = ctx
         prof = canonical_account_profile(account_profile)
-        _acquire_locks([f"trade:account={prof}", f"trade:strategy:account={prof}"])
+        _acquire_locks([f"trade:strategy:account={prof}"])
         cfg = StrategyConfig(
             account_profile=prof,
             symbols=[str(s).strip() for s in symbols if str(s).strip()],

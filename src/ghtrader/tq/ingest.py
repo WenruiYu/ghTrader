@@ -14,7 +14,7 @@ from typing import Any
 import pandas as pd
 import structlog
 
-from ghtrader.config import env_float, env_int, get_tqsdk_auth
+from ghtrader.config import env_bool, env_float, env_int, get_tqsdk_auth
 from ghtrader.data.manifest import write_manifest
 from ghtrader.data.ticks_schema import DatasetVersion, TICK_COLUMN_NAMES, row_hash_from_ticks_df
 
@@ -431,8 +431,20 @@ def download_main_l5_for_days(
     maintenance_max_total_wait_s = max(0.0, float(maintenance_max_total_wait_s))
     timeout_reset_after = env_int("GHTRADER_TQ_TIMEOUT_RESET_AFTER", 2)
     timeout_reset_after = max(1, int(timeout_reset_after))
+    maintenance_circuit_enabled = env_bool("GHTRADER_TQ_MAINTENANCE_CIRCUIT_ENABLED", True)
+    maintenance_circuit_threshold = env_int("GHTRADER_TQ_MAINTENANCE_CIRCUIT_THRESHOLD", 3)
+    maintenance_circuit_threshold = max(1, int(maintenance_circuit_threshold))
+    maintenance_circuit_cooldown_s = env_float(
+        "GHTRADER_TQ_MAINTENANCE_CIRCUIT_COOLDOWN_S",
+        max(60.0, float(maintenance_wait_s)),
+    )
+    maintenance_circuit_cooldown_s = max(0.0, float(maintenance_circuit_cooldown_s))
+    maintenance_circuit_open_until = 0.0
+    maintenance_circuit_failures = 0
+    maintenance_circuit_lock = threading.Lock()
 
     row_counts: dict[str, int] = {}
+    skip_ledger: list[dict[str, Any]] = []
     unique_days = sorted(set(trading_days))
     session_windows_by_day = _build_session_windows_by_day(
         trading_days=unique_days,
@@ -534,6 +546,40 @@ def download_main_l5_for_days(
                 except Exception:
                     pass
 
+        def _maintenance_circuit_state(*, now_ts: float) -> tuple[bool, float, int]:
+            nonlocal maintenance_circuit_open_until
+            with maintenance_circuit_lock:
+                if maintenance_circuit_open_until > 0 and float(now_ts) >= float(maintenance_circuit_open_until):
+                    maintenance_circuit_open_until = 0.0
+                open_until = float(maintenance_circuit_open_until)
+                failures = int(maintenance_circuit_failures)
+            return bool(open_until > float(now_ts)), float(open_until), int(failures)
+
+        def _maintenance_circuit_note_failure(*, now_ts: float) -> tuple[bool, float, int]:
+            nonlocal maintenance_circuit_open_until, maintenance_circuit_failures
+            with maintenance_circuit_lock:
+                maintenance_circuit_failures = int(maintenance_circuit_failures) + 1
+                if (
+                    bool(maintenance_circuit_enabled)
+                    and float(maintenance_circuit_cooldown_s) > 0
+                    and int(maintenance_circuit_failures) >= int(maintenance_circuit_threshold)
+                ):
+                    maintenance_circuit_open_until = max(
+                        float(maintenance_circuit_open_until),
+                        float(now_ts) + float(maintenance_circuit_cooldown_s),
+                    )
+                open_until = float(maintenance_circuit_open_until)
+                failures = int(maintenance_circuit_failures)
+            return bool(open_until > float(now_ts)), float(open_until), int(failures)
+
+        def _maintenance_circuit_note_success() -> None:
+            nonlocal maintenance_circuit_open_until, maintenance_circuit_failures
+            now_ts = time.time()
+            with maintenance_circuit_lock:
+                maintenance_circuit_failures = 0
+                if maintenance_circuit_open_until > 0 and float(now_ts) >= float(maintenance_circuit_open_until):
+                    maintenance_circuit_open_until = 0.0
+
         def _download_day_worker(
             idx: int,
             day: date,
@@ -551,54 +597,135 @@ def download_main_l5_for_days(
             maintenance_max_retries: int,
             maintenance_max_total_wait_s: float,
             day_session_windows: list[dict[str, Any]] | None,
-        ) -> tuple[str, int]:
+        ) -> tuple[str, int, dict[str, Any] | None]:
             """Worker function for downloading a single day."""
-            api = _get_thread_api()
+            api: Any | None = None
             attempts = 0
             maintenance_attempts = 0
             maintenance_wait_total = 0.0
+
+            def _skip_day(
+                *,
+                reason: str,
+                err_text: str,
+                circuit_open_until: float | None = None,
+                circuit_failures: int | None = None,
+            ) -> dict[str, Any]:
+                payload: dict[str, Any] = {
+                    "day": day.isoformat(),
+                    "symbol": str(underlying_symbol),
+                    "segment_id": int(segment_id),
+                    "schedule_hash": str(schedule_hash),
+                    "reason": str(reason),
+                    "error": str(err_text or ""),
+                    "attempts": int(maintenance_attempts),
+                    "wait_total_s": float(maintenance_wait_total),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if circuit_open_until is not None and float(circuit_open_until) > 0:
+                    payload["circuit_open_until"] = datetime.fromtimestamp(
+                        float(circuit_open_until),
+                        tz=timezone.utc,
+                    ).isoformat()
+                if circuit_failures is not None:
+                    payload["circuit_failures"] = int(circuit_failures)
+                return payload
+
             while True:
+                now_ts = time.time()
+                circuit_open, open_until_ts, circuit_failures = _maintenance_circuit_state(now_ts=now_ts)
+                if bool(maintenance_circuit_enabled) and circuit_open:
+                    skip = _skip_day(
+                        reason="maintenance_circuit_open",
+                        err_text="maintenance circuit breaker open",
+                        circuit_open_until=float(open_until_ts),
+                        circuit_failures=int(circuit_failures),
+                    )
+                    log.warning(
+                        "tq_main_l5.maintenance_skip",
+                        symbol=underlying_symbol,
+                        day=day.isoformat(),
+                        reason="maintenance_circuit_open",
+                        attempts=int(maintenance_attempts),
+                        wait_total_s=float(maintenance_wait_total),
+                        circuit_failures=int(circuit_failures),
+                        circuit_open_until=skip.get("circuit_open_until"),
+                    )
+                    return day.isoformat(), 0, skip
+                if api is None:
+                    api = _get_thread_api()
                 try:
                     df = api.get_tick_data_series(
                         symbol=underlying_symbol,
                         start_dt=day,
                         end_dt=day + timedelta(days=1),
                     )
+                    _maintenance_circuit_note_success()
                     break
                 except Exception as e:
                     err = str(e)
                     if maintenance_wait_s > 0 and _is_maintenance_error(err):
                         if maintenance_attempts >= maintenance_max_retries:
-                            log.error(
-                                "tq_main_l5.maintenance_exhausted",
+                            opened, open_until_ts, circuit_failures = _maintenance_circuit_note_failure(
+                                now_ts=time.time()
+                            )
+                            log.warning(
+                                "tq_main_l5.maintenance_skip",
                                 symbol=underlying_symbol,
                                 day=day.isoformat(),
+                                reason="maintenance_retry_exhausted",
                                 attempts=int(maintenance_attempts),
                                 max_attempts=int(maintenance_max_retries),
                                 wait_total_s=float(maintenance_wait_total),
                                 max_total_wait_s=float(maintenance_max_total_wait_s),
+                                circuit_opened=bool(opened),
+                                circuit_failures=int(circuit_failures),
+                                circuit_open_until=(
+                                    datetime.fromtimestamp(float(open_until_ts), tz=timezone.utc).isoformat()
+                                    if float(open_until_ts) > 0
+                                    else ""
+                                ),
                                 error=err,
                             )
-                            raise RuntimeError(
-                                f"TqSdk maintenance retry exhausted for {underlying_symbol} {day.isoformat()}: {err}"
+                            skip = _skip_day(
+                                reason="maintenance_retry_exhausted",
+                                err_text=err,
+                                circuit_open_until=float(open_until_ts),
+                                circuit_failures=int(circuit_failures),
                             )
+                            return day.isoformat(), 0, skip
                         wait_s = float(maintenance_wait_s)
                         if maintenance_max_total_wait_s > 0:
                             remaining_wait = float(maintenance_max_total_wait_s) - float(maintenance_wait_total)
                             if remaining_wait <= 0:
-                                log.error(
-                                    "tq_main_l5.maintenance_wait_budget_exhausted",
+                                opened, open_until_ts, circuit_failures = _maintenance_circuit_note_failure(
+                                    now_ts=time.time()
+                                )
+                                log.warning(
+                                    "tq_main_l5.maintenance_skip",
                                     symbol=underlying_symbol,
                                     day=day.isoformat(),
+                                    reason="maintenance_wait_budget_exhausted",
                                     attempts=int(maintenance_attempts),
                                     max_attempts=int(maintenance_max_retries),
                                     wait_total_s=float(maintenance_wait_total),
                                     max_total_wait_s=float(maintenance_max_total_wait_s),
+                                    circuit_opened=bool(opened),
+                                    circuit_failures=int(circuit_failures),
+                                    circuit_open_until=(
+                                        datetime.fromtimestamp(float(open_until_ts), tz=timezone.utc).isoformat()
+                                        if float(open_until_ts) > 0
+                                        else ""
+                                    ),
                                     error=err,
                                 )
-                                raise RuntimeError(
-                                    f"TqSdk maintenance wait budget exhausted for {underlying_symbol} {day.isoformat()}: {err}"
+                                skip = _skip_day(
+                                    reason="maintenance_wait_budget_exhausted",
+                                    err_text=err,
+                                    circuit_open_until=float(open_until_ts),
+                                    circuit_failures=int(circuit_failures),
                                 )
+                                return day.isoformat(), 0, skip
                             wait_s = min(wait_s, float(remaining_wait))
                         maintenance_attempts += 1
                         maintenance_wait_total += float(wait_s)
@@ -647,7 +774,7 @@ def download_main_l5_for_days(
                     day_index=int(idx),
                     days_total=int(days_total),
                 )
-                return day.isoformat(), 0
+                return day.isoformat(), 0, None
 
             df = df.rename(columns={"id": "_tq_id"})
             df["symbol"] = underlying_symbol
@@ -674,7 +801,7 @@ def download_main_l5_for_days(
                         days_total=int(days_total),
                         rows_total=0, # Worker doesn't know global total
                     )
-                    return day.isoformat(), 0
+                    return day.isoformat(), 0, None
                 df = df.loc[mask].copy()
                 log.debug(
                     "tq_main_l5.download_day_filtered",
@@ -696,7 +823,7 @@ def download_main_l5_for_days(
                         days_total=int(days_total),
                         dropped_rows=int(before_trim),
                     )
-                    return day.isoformat(), 0
+                    return day.isoformat(), 0, None
                 if dropped_outside > 0:
                     log.info(
                         "tq_main_l5.download_day_trimmed_outside_sessions",
@@ -716,7 +843,7 @@ def download_main_l5_for_days(
                         days_total=int(days_total),
                         dropped_rows=int(rows_before),
                     )
-                    return day.isoformat(), 0
+                    return day.isoformat(), 0, None
                 if dropped_cross_day > 0:
                     log.info(
                         "tq_main_l5.download_day_trimmed_cross_day_rows",
@@ -748,7 +875,7 @@ def download_main_l5_for_days(
                 days_total=int(days_total),
                 rows=count,
             )
-            return day.isoformat(), count
+            return day.isoformat(), count, None
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -775,9 +902,11 @@ def download_main_l5_for_days(
             }
             
             for future in as_completed(futures):
-                day_iso, count = future.result()
+                day_iso, count, skip = future.result()
                 row_counts[day_iso] = count
                 total_rows += count
+                if isinstance(skip, dict):
+                    skip_ledger.append(dict(skip))
                 
                 if (time.time() - last_progress_ts) >= progress_every_s:
                     log.info(
@@ -805,6 +934,13 @@ def download_main_l5_for_days(
             source="tq_main_l5",
             row_counts=row_counts,
         )
-
-    return {"rows_total": int(total_rows), "row_counts": row_counts}
+    if skip_ledger:
+        log.warning(
+            "tq_main_l5.download_skips",
+            symbol=underlying_symbol,
+            skipped_days=int(len(skip_ledger)),
+            reasons=sorted({str(item.get("reason") or "") for item in skip_ledger}),
+        )
+    skip_ledger = sorted(skip_ledger, key=lambda item: str(item.get("day") or ""))
+    return {"rows_total": int(total_rows), "row_counts": row_counts, "skip_ledger": skip_ledger}
 

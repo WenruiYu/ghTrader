@@ -580,10 +580,10 @@ def clear_main_l5_validate_gap_rows(
     where = ["symbol=%s"]
     params: list[Any] = [sym]
     if start_day is not None:
-        where.append("cast(trading_day as string) >= %s")
+        where.append("trading_day >= %s")
         params.append(start_day.isoformat())
     if end_day is not None:
-        where.append("cast(trading_day as string) <= %s")
+        where.append("trading_day <= %s")
         params.append(end_day.isoformat())
     where_sql = " AND ".join(where)
     cols = ["ts", "symbol", "trading_day", "session", "start_ts", "end_ts", "duration_s", "tqsdk_status", "schedule_hash", "updated_at"]
@@ -622,7 +622,7 @@ def fetch_latest_main_l5_validate_summary(
         "gap_bucket_gt_30, gap_count_gt_30, missing_half_seconds, last_tick_ts, session_end_lag_s, "
         "max_gap_s, gap_threshold_s, schedule_hash, updated_at "
         f"FROM {tbl} WHERE {' AND '.join(where)} "
-        "ORDER BY cast(trading_day as string) DESC LIMIT %s"
+        "ORDER BY trading_day DESC LIMIT %s"
     )
     params.append(lim)
     out: list[dict[str, Any]] = []
@@ -680,7 +680,7 @@ def fetch_main_l5_validate_top_gap_days(
     sql = (
         "SELECT trading_day, cadence_mode, missing_segments, missing_half_seconds, max_gap_s, schedule_hash "
         f"FROM {tbl} WHERE {' AND '.join(where)} "
-        "ORDER BY max_gap_s DESC, missing_segments DESC, cast(trading_day as string) DESC LIMIT %s"
+        "ORDER BY max_gap_s DESC, missing_segments DESC, trading_day DESC LIMIT %s"
     )
     params.append(lim)
     out: list[dict[str, Any]] = []
@@ -719,7 +719,7 @@ def fetch_main_l5_validate_top_lag_days(
     sql = (
         "SELECT trading_day, session_end_lag_s, last_tick_ts, cadence_mode, max_gap_s, schedule_hash "
         f"FROM {tbl} WHERE {' AND '.join(where)} "
-        "ORDER BY session_end_lag_s DESC, cast(trading_day as string) DESC LIMIT %s"
+        "ORDER BY session_end_lag_s DESC, trading_day DESC LIMIT %s"
     )
     params.append(lim)
     out: list[dict[str, Any]] = []
@@ -760,13 +760,13 @@ def list_main_l5_validate_gaps(
     params: list[Any] = [sym]
     _append_schedule_hash_filter(where=where, params=params, schedule_hash=schedule_hash)
     if trading_day is not None:
-        where.append("cast(trading_day as string) = %s")
+        where.append("trading_day = %s")
         params.append(trading_day.isoformat())
     if start_day is not None:
-        where.append("cast(trading_day as string) >= %s")
+        where.append("trading_day >= %s")
         params.append(start_day.isoformat())
     if end_day is not None:
-        where.append("cast(trading_day as string) <= %s")
+        where.append("trading_day <= %s")
         params.append(end_day.isoformat())
     if min_duration_s is not None:
         where.append("duration_s >= %s")
@@ -828,7 +828,7 @@ def fetch_main_l5_validate_overview(
         "max(max_gap_s) AS max_gap_s, "
         "max(session_end_lag_s) AS max_lag_s, "
         "max(gap_threshold_s) AS gap_threshold_s, "
-        "max(cast(trading_day as string)) AS last_day "
+        "max(trading_day) AS last_day "
         f"FROM {tbl} WHERE {' AND '.join(where)}"
     )
     out: dict[str, Any] = {

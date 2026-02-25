@@ -51,6 +51,16 @@ def ticks_schema_hash() -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
+def null_rate(series: pd.Series, total: int, *, default_on_error: float = 0.0) -> float:
+    """Fraction of null/NaN values in *series* relative to *total* rows."""
+    if total <= 0:
+        return 0.0
+    try:
+        return float(series.isna().sum()) / float(total)
+    except Exception:
+        return float(default_on_error)
+
+
 def row_hash_from_ticks_df(df: pd.DataFrame) -> pd.Series:
     """
     Deterministic row identity hash used by QuestDB ingest (LONG).

@@ -28,7 +28,7 @@
             <option value="" selected>(select)</option>
             <option value="SELECT count() AS n_ticks FROM ghtrader_ticks_main_l5_v2">Count main_l5 rows</option>
             <option value="SELECT symbol, count() AS n_rows FROM ghtrader_ticks_main_l5_v2 GROUP BY symbol ORDER BY n_rows DESC LIMIT 20">Top symbols by rows (main_l5)</option>
-            <option value="SELECT symbol, min(cast(trading_day as string)) AS first_day, max(cast(trading_day as string)) AS last_day, count(DISTINCT cast(trading_day as string)) AS n_days FROM ghtrader_ticks_main_l5_v2 GROUP BY symbol ORDER BY n_days DESC LIMIT 20">Coverage bounds by symbol (main_l5)</option>
+            <option value="SELECT symbol, min(trading_day) AS first_day, max(trading_day) AS last_day, count(DISTINCT trading_day) AS n_days FROM ghtrader_ticks_main_l5_v2 GROUP BY symbol ORDER BY n_days DESC LIMIT 20">Coverage bounds by symbol (main_l5)</option>
             <option value="SELECT ts, symbol, last_price FROM ghtrader_ticks_main_l5_v2 WHERE symbol='{{ default_symbol }}' ORDER BY ts DESC LIMIT 50">Latest ticks for {{ default_symbol }}</option>
           </select>
         </div>

@@ -11,6 +11,7 @@ Tick ingestion writes directly to QuestDB via tq_ingest.py.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import threading
 import time
 from typing import Literal
@@ -33,6 +34,24 @@ def _env_int(key: str, default: int) -> int:
 
 def _env_bool(key: str, default: bool) -> bool:
     return env_bool(key, default)
+
+
+def _ticks_partition_by(default: str = "DAY") -> str:
+    """Resolve QuestDB partition strategy for tick tables."""
+    allowed = {"DAY", "MONTH", "YEAR"}
+    raw = str(os.getenv("GHTRADER_QDB_TICKS_PARTITION_BY", default) or default).strip().upper()
+    if raw in allowed:
+        return raw
+    try:
+        log.warning(
+            "serving_db.invalid_partition_by",
+            env_key="GHTRADER_QDB_TICKS_PARTITION_BY",
+            value=raw,
+            fallback=default,
+        )
+    except Exception:
+        pass
+    return str(default).upper().strip()
 
 
 def _is_recoverable_sender_error(exc: Exception) -> bool:
@@ -181,10 +200,11 @@ class QuestDBBackend(ServingDBBackend):
         # DEDUP UPSERT KEYS makes ingest idempotent:
         # - include ts + symbol + provenance tags + row_hash so re-ingest replaces identical rows
         # - row_hash prevents collapsing legitimate same-timestamp distinct rows
+        partition_by = _ticks_partition_by(default="DAY")
         ddl = f"""
         CREATE TABLE IF NOT EXISTS {table} (
           {", ".join(cols)}
-        ) TIMESTAMP(ts) PARTITION BY DAY WAL
+        ) TIMESTAMP(ts) PARTITION BY {partition_by} WAL
           DEDUP UPSERT KEYS(ts, symbol, ticks_kind, dataset_version, row_hash)
         """
         conn_params = {

@@ -24,6 +24,7 @@ def test_api_trading_console_status_minimal(tmp_path: Path, monkeypatch: pytest.
     assert j["account_profile"] == "alt"
     required_keys = {"ok", "account_profile", "live_enabled", "gateway", "strategy", "gateway_job", "strategy_job", "generated_at"}
     assert required_keys.issubset(set(j))
+    assert "supervisor_telemetry" in j
     assert j["state"] in {"ok", "warn", "error"}
     assert isinstance(j["text"], str)
     assert isinstance(j["updated_at"], str)

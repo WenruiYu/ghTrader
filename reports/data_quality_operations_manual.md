@@ -78,18 +78,34 @@ API:
 
 These are intended for operational dashboards and alert routing.
 
-## 5) SLO Metrics (Recommended)
+## 5) SLO Metrics and Alert Thresholds
 
-Track:
+Track these SLIs and route incidents by threshold:
 
-- `provider_missing_day_rate`
-- `outside_session_seconds`
-- `gap_count_gt_30`
-- `validation_runtime_p95`
-- `main_l5_build_success_rate`
+| Metric | SLO target (7d rolling) | Warn threshold | Page/block threshold |
+|---|---|---|---|
+| `main_l5_build_success_rate` | >= 99% | < 99% | < 97% |
+| `validation_runtime_p95` | <= 600s | > 600s | > 1200s |
+| `provider_missing_day_rate` | <= 1% | > 1% | > 3% |
+| `outside_session_seconds` | 0 | > 0 | > 60 |
+| `gap_count_gt_30` | 0 | > 0 | > 3 |
 
-Use severity routing aligned with layered states:
+Layered severity routing:
 
-- Engineering: page/block
-- Source: warn/page by tolerance profile
-- Policy: strategy-owner review
+- Engineering: page/block on `outside_session_seconds` or hard schedule/write integrity breaks.
+- Source: warn/page by `provider_missing_day_rate` and tolerance profile.
+- Policy: strategy-owner review by gap/half-second policy limits.
+
+## 6) Dry-Run Drill Checklist
+
+Run this checklist monthly (or before major release):
+
+1. Simulate a failed `main-l5-validate` report by injecting controlled missing segments in a staging symbol.
+2. Verify dashboard/API signal consistency:
+   - `/data` readiness cards
+   - `GET /api/data/quality/readiness`
+   - `GET /api/data/quality/anomalies`
+3. Confirm alert routes by severity:
+   - warn -> owner triage queue
+   - error -> on-call page
+4. Record MTTA/MTTR and update thresholds if repeated false-positive/false-negative patterns appear.

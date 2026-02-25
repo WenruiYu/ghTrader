@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +12,7 @@ from ghtrader.util.json_io import read_json, write_json_atomic
 log = structlog.get_logger()
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from ghtrader.util.time import now_iso as _now_iso
 
 
 def trading_sessions_cache_path(*, data_dir: Path, exchange: str, variety: str) -> Path:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from ghtrader.config import env_bool, env_int, get_qdb_redis_config
@@ -13,8 +12,7 @@ def _env_bool(key: str, default: bool) -> bool:
     return env_bool(key, default)
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from ghtrader.util.time import now_iso as _now_iso
 
 
 def _gpu_count() -> int:
@@ -57,10 +55,65 @@ def _redis_status() -> dict[str, Any]:
         return {"enabled": True, "ok": False, "host": host, "port": port, "db": db, "error": str(e)}
 
 
-def collect_slo_snapshot(*, store: Any | None = None) -> dict[str, Any]:
+def _supervisor_plane(telemetry: dict[str, Any] | None, *, tick_fail_crit: int) -> dict[str, Any]:
+    root = telemetry if isinstance(telemetry, dict) else {}
+    supervisors = root.get("supervisors") if isinstance(root.get("supervisors"), dict) else {}
+
+    def _bucket(name: str) -> dict[str, Any]:
+        raw = supervisors.get(name)
+        if not isinstance(raw, dict):
+            return {
+                "ticks_total": 0,
+                "tick_failures_total": 0,
+                "started_total": 0,
+                "stopped_total": 0,
+                "last_tick_at": "",
+                "last_tick_error": "",
+                "restart_reasons_total": {},
+                "stop_reasons_total": {},
+            }
+        return {
+            "ticks_total": int(raw.get("ticks_total") or 0),
+            "tick_failures_total": int(raw.get("tick_failures_total") or 0),
+            "started_total": int(raw.get("started_total") or 0),
+            "stopped_total": int(raw.get("stopped_total") or 0),
+            "last_tick_at": str(raw.get("last_tick_at") or ""),
+            "last_tick_error": str(raw.get("last_tick_error") or ""),
+            "restart_reasons_total": dict(raw.get("restart_reasons_total") or {}),
+            "stop_reasons_total": dict(raw.get("stop_reasons_total") or {}),
+        }
+
+    strategy = _bucket("strategy")
+    gateway = _bucket("gateway")
+    scheduler = _bucket("scheduler")
+    tick_failures_total = (
+        int(strategy.get("tick_failures_total") or 0)
+        + int(gateway.get("tick_failures_total") or 0)
+        + int(scheduler.get("tick_failures_total") or 0)
+    )
+    restarts_total = int(strategy.get("started_total") or 0) + int(gateway.get("started_total") or 0)
+    if int(tick_failures_total) >= int(max(1, int(tick_fail_crit))):
+        state = "error"
+    elif int(tick_failures_total) > 0:
+        state = "warn"
+    else:
+        state = "ok"
+    return {
+        "state": str(state),
+        "tick_failures_total": int(tick_failures_total),
+        "restarts_total": int(restarts_total),
+        "generated_at": str(root.get("generated_at") or ""),
+        "strategy": strategy,
+        "gateway": gateway,
+        "scheduler": scheduler,
+    }
+
+
+def collect_slo_snapshot(*, store: Any | None = None, supervisor_telemetry: dict[str, Any] | None = None) -> dict[str, Any]:
     queue_warn = max(1, _env_int("GHTRADER_SLO_QUEUE_WARN", 64))
     queue_crit = max(queue_warn, _env_int("GHTRADER_SLO_QUEUE_CRIT", 128))
     gpu_min = max(0, _env_int("GHTRADER_SLO_GPU_MIN", 8))
+    supervisor_tick_fail_crit = max(1, _env_int("GHTRADER_SLO_SUPERVISOR_TICK_FAIL_CRIT", 10))
     require_questdb = _env_bool("GHTRADER_SLO_REQUIRE_QUESTDB", True)
     require_redis = _env_bool("GHTRADER_SLO_REQUIRE_REDIS", False)
 
@@ -85,6 +138,7 @@ def collect_slo_snapshot(*, store: Any | None = None) -> dict[str, Any]:
     questdb = _questdb_status()
     redis_state = _redis_status()
     gpus = _gpu_count()
+    supervisor_plane = _supervisor_plane(supervisor_telemetry, tick_fail_crit=supervisor_tick_fail_crit)
 
     data_state = "ok"
     if require_questdb and not bool(questdb.get("ok")):
@@ -95,7 +149,12 @@ def collect_slo_snapshot(*, store: Any | None = None) -> dict[str, Any]:
         data_state = "warn"
 
     train_state = "ok" if gpus >= gpu_min else ("warn" if gpus > 0 else "error")
-    control_state = queue_state
+    control_state = str(queue_state)
+    if control_state != "error":
+        if str(supervisor_plane.get("state") or "") == "error":
+            control_state = "error"
+        elif str(supervisor_plane.get("state") or "") == "warn" and control_state == "ok":
+            control_state = "warn"
 
     overall = "ok"
     if "error" in {data_state, train_state, control_state}:
@@ -111,6 +170,7 @@ def collect_slo_snapshot(*, store: Any | None = None) -> dict[str, Any]:
             "queue_warn": queue_warn,
             "queue_crit": queue_crit,
             "gpu_min": gpu_min,
+            "supervisor_tick_fail_crit": int(supervisor_tick_fail_crit),
             "require_questdb": require_questdb,
             "require_redis": require_redis,
         },
@@ -129,5 +189,6 @@ def collect_slo_snapshot(*, store: Any | None = None) -> dict[str, Any]:
             "running_jobs": int(running),
             "queued_jobs": int(queued),
             "queue_depth": int(queue_depth),
+            "supervisors": supervisor_plane,
         },
     }

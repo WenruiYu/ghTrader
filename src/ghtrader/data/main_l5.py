@@ -14,7 +14,7 @@ import json
 import pandas as pd
 import structlog
 
-from ghtrader.config import get_env
+from ghtrader.config import env_bool
 from ghtrader.config_service import get_config_resolver
 
 log = structlog.get_logger()
@@ -29,36 +29,11 @@ class MainL5BuildResult:
     segments: list[dict[str, Any]]
 
 
-def _job_progress_from_env(*, runs_dir: Path, total_phases: int, message: str) -> Any | None:
-    job_id = str(get_env("GHTRADER_JOB_ID", "") or "").strip()
-    if not job_id:
-        return None
-    try:
-        from ghtrader.control.progress import JobProgress
-
-        progress = JobProgress(job_id=job_id, runs_dir=Path(runs_dir))
-        progress.start(total_phases=max(1, int(total_phases)), message=str(message))
-        return progress
-    except Exception:
-        return None
-
-
-def _progress_update(progress: Any | None, **kwargs: Any) -> None:
-    if progress is None:
-        return
-    try:
-        progress.update(**kwargs)
-    except Exception:
-        pass
-
-
-def _progress_finish(progress: Any | None, *, message: str) -> None:
-    if progress is None:
-        return
-    try:
-        progress.finish(message=str(message))
-    except Exception:
-        pass
+from ghtrader.data.progress_helpers import (
+    job_progress_from_env as _job_progress_from_env,
+    progress_update as _progress_update,
+    progress_finish as _progress_finish,
+)
 
 
 def _schedule_hash_from_rows(schedule: pd.DataFrame) -> str:
@@ -121,6 +96,9 @@ def _write_main_l5_update_report(
     covered_days: set[date],
     coverage_bounds: dict[str, Any] | None,
     row_counts: dict[str, int] | None = None,
+    skip_ledger: list[dict[str, Any]] | None = None,
+    validation_gate: dict[str, Any] | None = None,
+    daily_agg_refresh: dict[str, Any] | None = None,
     missing_days_tolerance: int = 0,
     missing_days_tolerance_source: str = "default",
     config_snapshot: dict[str, Any] | None = None,
@@ -154,6 +132,11 @@ def _write_main_l5_update_report(
         missing_by_segment = []
 
     bounds = coverage_bounds or {}
+    skip_rows: list[dict[str, Any]] = [dict(item) for item in (skip_ledger or []) if isinstance(item, dict)]
+    skip_by_reason: dict[str, int] = {}
+    for item in skip_rows:
+        reason = str(item.get("reason") or "unknown")
+        skip_by_reason[reason] = int(skip_by_reason.get(reason, 0)) + 1
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "exchange": str(exchange),
@@ -178,6 +161,11 @@ def _write_main_l5_update_report(
         "covered_last_ts": bounds.get("last_ts"),
         "config_snapshot": dict(config_snapshot or {}),
         "missing_by_segment": missing_by_segment,
+        "skip_ledger_total": int(len(skip_rows)),
+        "skip_ledger_by_reason": skip_by_reason,
+        "skip_ledger": skip_rows,
+        "validation_gate": dict(validation_gate or {}),
+        "daily_agg_refresh": dict(daily_agg_refresh or {}),
     }
 
     try:
@@ -542,12 +530,15 @@ def build_main_l5(
         )
         out_row_counts = res.get("row_counts")
         row_counts = out_row_counts if isinstance(out_row_counts, dict) else {}
+        out_skip_ledger = res.get("skip_ledger")
+        skip_ledger = [dict(item) for item in (out_skip_ledger or []) if isinstance(item, dict)]
         return {
             "segment_id": int(seg_id),
             "underlying_contract": contract,
             "days": int(len(days)),
             "rows_total": int(res.get("rows_total") or 0),
             "row_counts": row_counts,
+            "skip_ledger": skip_ledger,
         }
 
     segment_results: list[dict[str, Any]] = []
@@ -646,6 +637,7 @@ def build_main_l5(
 
     segment_results = sorted(segment_results, key=lambda x: int(x.get("segment_id") or 0))
     row_counts_agg: dict[str, int] = {}
+    skip_ledger_agg: list[dict[str, Any]] = []
     for seg in segment_results:
         rows_total += int(seg.get("rows_total") or 0)
         days_total += int(seg.get("days") or 0)
@@ -665,6 +657,25 @@ def build_main_l5(
                     row_counts_agg[day_key] = int(row_counts_agg.get(day_key, 0)) + int(cnt or 0)
                 except Exception:
                     row_counts_agg[day_key] = int(row_counts_agg.get(day_key, 0))
+        seg_skip_ledger = seg.get("skip_ledger")
+        if isinstance(seg_skip_ledger, list):
+            for item in seg_skip_ledger:
+                if not isinstance(item, dict):
+                    continue
+                entry = dict(item)
+                if not entry.get("segment_id"):
+                    entry["segment_id"] = int(seg.get("segment_id") or 0)
+                if not entry.get("underlying_contract"):
+                    entry["underlying_contract"] = str(seg.get("underlying_contract") or "")
+                skip_ledger_agg.append(entry)
+
+    if skip_ledger_agg:
+        log.warning(
+            "main_l5.download_skips",
+            derived_symbol=ds,
+            skipped_days=int(len(skip_ledger_agg)),
+            reasons=sorted({str(item.get("reason") or "") for item in skip_ledger_agg}),
+        )
 
     # Keep one manifest per main_l5 build run so downstream validation reads a consistent day map.
     _progress_update(
@@ -799,34 +810,20 @@ def build_main_l5(
     tolerated_provider_missing_days = min(int(missing_days_tolerance), int(len(provider_missing_days)))
     provider_missing_days_excess = max(0, int(len(provider_missing_days)) - int(tolerated_provider_missing_days))
 
-    report_path = _write_main_l5_update_report(
-        runs_dir=get_runs_dir(),
-        derived_symbol=ds,
-        schedule_hash=str(schedule_hash),
-        exchange=ex,
-        variety=var_l,
-        update_mode=bool(update_mode),
-        full_rebuild=bool(full_rebuild),
-        schedule=schedule,
-        covered_days=covered_days,
-        coverage_bounds=coverage_bounds,
-        row_counts=row_counts_agg,
-        missing_days_tolerance=int(missing_days_tolerance),
-        missing_days_tolerance_source=str(missing_days_tolerance_source),
-        config_snapshot=get_config_resolver().export_snapshot_payload(),
-    )
-    if coverage_bounds:
-        log.info(
-            "main_l5.coverage",
-            derived_symbol=ds,
-            covered_first_day=coverage_bounds.get("first_day"),
-            covered_last_day=coverage_bounds.get("last_day"),
-            covered_days=int(len(covered_days)),
-            covered_last_ts=coverage_bounds.get("last_ts"),
-        )
-
     hashes_after: set[str] = set()
     health_errors: list[str] = []
+    validation_gate_summary: dict[str, Any] = {
+        "enabled": bool(enforce_health),
+        "checked": False,
+        "state": "disabled" if not bool(enforce_health) else "pending",
+    }
+    daily_agg_refresh_enabled = bool(env_bool("GHTRADER_MAIN_L5_DAILY_AGG_AUTO_REFRESH", True))
+    daily_agg_refresh_summary: dict[str, Any] = {
+        "enabled": bool(daily_agg_refresh_enabled),
+        "attempted": False,
+        "ok": False,
+        "state": ("pending" if daily_agg_refresh_enabled else "disabled"),
+    }
     try:
         hashes_after = set(
             list_schedule_hashes_for_symbol(
@@ -861,6 +858,168 @@ def build_main_l5(
         health_errors.append(
             f"persisted_hashes={sorted(hashes_after)} expected={[str(schedule_hash)]}"
         )
+
+    if bool(enforce_health):
+        if health_errors:
+            validation_gate_summary.update(
+                state="skipped",
+                reason_code="preexisting_health_errors",
+                action_hint="Skipped validate gate because base coverage/hash health checks already failed.",
+            )
+        else:
+            try:
+                from ghtrader.data.main_l5_validation import validate_main_l5
+
+                val_report, val_report_path = validate_main_l5(
+                    exchange=ex,
+                    variety=var_l,
+                    derived_symbol=ds,
+                    data_dir=Path(str(data_dir)),
+                    runs_dir=Path(get_runs_dir()),
+                    start_day=schedule_start,
+                    end_day=schedule_end,
+                    tqsdk_check=False,
+                    incremental=bool(update_mode),
+                )
+                val_report = dict(val_report or {})
+                val_state = str(val_report.get("overall_state") or val_report.get("state") or "").strip().lower()
+                val_reason_code = str(val_report.get("reason_code") or "").strip()
+                val_action_hint = str(val_report.get("action_hint") or "").strip()
+                validation_gate_summary.update(
+                    checked=True,
+                    state=(val_state or "unknown"),
+                    reason_code=val_reason_code,
+                    action_hint=val_action_hint,
+                    report_path=(str(val_report_path) if val_report_path else ""),
+                )
+                if val_state == "error":
+                    detail_parts = ["validation_state=error"]
+                    if val_reason_code:
+                        detail_parts.append(f"reason_code={val_reason_code}")
+                    if val_action_hint:
+                        detail_parts.append(f"action_hint={val_action_hint}")
+                    if val_report_path:
+                        detail_parts.append(f"report_path={val_report_path}")
+                    health_errors.append(" ".join(detail_parts))
+            except Exception as e:
+                validation_gate_summary.update(
+                    checked=True,
+                    state="error",
+                    reason_code="validation_runtime_error",
+                    action_hint="Fix main_l5 validate runtime error and rerun main-l5.",
+                    error=str(e),
+                )
+                health_errors.append(f"validation_runtime_error={e}")
+
+    if not daily_agg_refresh_enabled:
+        daily_agg_refresh_summary.update(
+            state="disabled",
+            reason_code="disabled_by_config",
+            action_hint="Enable GHTRADER_MAIN_L5_DAILY_AGG_AUTO_REFRESH=1 to auto-refresh daily aggregates.",
+        )
+    elif bool(enforce_health) and health_errors:
+        daily_agg_refresh_summary.update(
+            state="skipped",
+            reason_code="blocked_by_health_errors",
+            action_hint="Skipped aggregate refresh because enforce_health would fail this build.",
+        )
+    else:
+        all_job_days = sorted({d for _, _, days in segment_jobs for d in days if isinstance(d, date)})
+        if not all_job_days:
+            daily_agg_refresh_summary.update(
+                state="skipped",
+                reason_code="no_segments_downloaded",
+                action_hint="No downloaded segment days in this run; aggregate refresh skipped.",
+            )
+        else:
+            try:
+                from ghtrader.questdb.main_l5_daily_agg import rebuild_main_l5_daily_agg
+
+                refresh_start = min(all_job_days)
+                refresh_end = max(all_job_days)
+                daily_agg_refresh_summary.update(
+                    attempted=True,
+                    start_day=refresh_start.isoformat(),
+                    end_day=refresh_end.isoformat(),
+                )
+                refresh_out = rebuild_main_l5_daily_agg(
+                    cfg=cfg,
+                    start_day=refresh_start,
+                    end_day=refresh_end,
+                    symbol=ds,
+                    dataset_version="v2",
+                    ticks_kind="main_l5",
+                    connect_timeout_s=2,
+                )
+                refresh_ok = bool((refresh_out or {}).get("ok", True))
+                daily_agg_refresh_summary.update(dict(refresh_out or {}))
+                daily_agg_refresh_summary.update(
+                    attempted=True,
+                    ok=bool(refresh_ok),
+                    state=("ok" if refresh_ok else "error"),
+                )
+                log.info(
+                    "main_l5.daily_agg_refresh",
+                    derived_symbol=ds,
+                    start_day=refresh_start.isoformat(),
+                    end_day=refresh_end.isoformat(),
+                    ok=bool(refresh_ok),
+                    upserted_rows=int((refresh_out or {}).get("upserted_rows", 0) or 0),
+                )
+            except Exception as e:
+                daily_agg_refresh_summary.update(
+                    attempted=True,
+                    ok=False,
+                    state="error",
+                    reason_code="refresh_runtime_error",
+                    error=str(e),
+                    action_hint="Run `ghtrader db refresh-main-l5-daily-agg --symbol <derived_symbol>` manually.",
+                )
+                log.warning(
+                    "main_l5.daily_agg_refresh_failed",
+                    derived_symbol=ds,
+                    error=str(e),
+                )
+
+    report_path = _write_main_l5_update_report(
+        runs_dir=get_runs_dir(),
+        derived_symbol=ds,
+        schedule_hash=str(schedule_hash),
+        exchange=ex,
+        variety=var_l,
+        update_mode=bool(update_mode),
+        full_rebuild=bool(full_rebuild),
+        schedule=schedule,
+        covered_days=covered_days,
+        coverage_bounds=coverage_bounds,
+        row_counts=row_counts_agg,
+        skip_ledger=skip_ledger_agg,
+        validation_gate=validation_gate_summary,
+        daily_agg_refresh=daily_agg_refresh_summary,
+        missing_days_tolerance=int(missing_days_tolerance),
+        missing_days_tolerance_source=str(missing_days_tolerance_source),
+        config_snapshot=get_config_resolver().export_snapshot_payload(),
+    )
+    if coverage_bounds:
+        log.info(
+            "main_l5.coverage",
+            derived_symbol=ds,
+            covered_first_day=coverage_bounds.get("first_day"),
+            covered_last_day=coverage_bounds.get("last_day"),
+            covered_days=int(len(covered_days)),
+            covered_last_ts=coverage_bounds.get("last_ts"),
+        )
+
+    if validation_gate_summary.get("checked") or validation_gate_summary.get("state") == "skipped":
+        log.info(
+            "main_l5.validation_gate",
+            derived_symbol=ds,
+            enabled=bool(validation_gate_summary.get("enabled")),
+            checked=bool(validation_gate_summary.get("checked")),
+            state=str(validation_gate_summary.get("state") or ""),
+            reason_code=str(validation_gate_summary.get("reason_code") or ""),
+            report_path=str(validation_gate_summary.get("report_path") or ""),
+        )
     log.info(
         "main_l5.health",
         derived_symbol=ds,
@@ -873,6 +1032,7 @@ def build_main_l5(
         missing_days_tolerance_source=str(missing_days_tolerance_source),
         provider_missing_days_excess=int(provider_missing_days_excess),
         persisted_hashes=sorted(hashes_after),
+        validation_gate_state=str(validation_gate_summary.get("state") or ""),
         ok=bool(len(health_errors) == 0),
     )
     if bool(enforce_health) and health_errors:

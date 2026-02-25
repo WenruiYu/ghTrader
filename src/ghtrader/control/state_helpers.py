@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,78 @@ def read_redis_json(key: str) -> dict[str, Any] | None:
         return obj if isinstance(obj, dict) else None
     except Exception:
         return None
+
+
+def state_revision(state: Any) -> int | None:
+    try:
+        if isinstance(state, dict):
+            v = int(state.get("state_revision"))
+            return int(v) if int(v) >= 0 else None
+    except Exception:
+        return None
+    return None
+
+
+def _updated_at_ts(state: Any) -> float | None:
+    try:
+        if not isinstance(state, dict):
+            return None
+        s = str(state.get("updated_at") or "").strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return float(datetime.fromisoformat(s).timestamp())
+    except Exception:
+        return None
+
+
+def choose_latest_state(redis_state: Any, file_state: Any) -> tuple[dict[str, Any] | None, str]:
+    """
+    Choose the freshest state snapshot using revision first, then updated_at.
+    """
+    rs = redis_state if isinstance(redis_state, dict) else None
+    fs = file_state if isinstance(file_state, dict) else None
+    if rs is None and fs is None:
+        return None, "none"
+    if rs is None:
+        return fs, "file"
+    if fs is None:
+        return rs, "redis"
+
+    rr = state_revision(rs)
+    fr = state_revision(fs)
+    if rr is not None or fr is not None:
+        if rr is None:
+            return fs, "file"
+        if fr is None:
+            return rs, "redis"
+        if int(rr) > int(fr):
+            return rs, "redis"
+        if int(fr) > int(rr):
+            return fs, "file"
+
+    rt = _updated_at_ts(rs)
+    ft = _updated_at_ts(fs)
+    if rt is not None or ft is not None:
+        if rt is None:
+            return fs, "file"
+        if ft is None:
+            return rs, "redis"
+        if float(rt) >= float(ft):
+            return rs, "redis"
+        return fs, "file"
+
+    return rs, "redis"
+
+
+def read_state_with_revision(*, redis_key: str, file_path: Path) -> tuple[dict[str, Any] | None, str]:
+    """
+    Read state from Redis and file mirror, then choose freshest snapshot.
+    """
+    rs = read_redis_json(redis_key)
+    fs = read_json(file_path) if file_path.exists() else None
+    return choose_latest_state(rs, fs)
 
 
 def read_jsonl_tail(path: Path, *, max_lines: int, max_bytes: int = 256 * 1024) -> list[dict[str, Any]]:
@@ -108,6 +181,9 @@ def status_from_desired_and_state(*, root_exists: bool, desired_mode: str, state
 __all__ = [
     "read_json_file",
     "read_redis_json",
+    "state_revision",
+    "choose_latest_state",
+    "read_state_with_revision",
     "read_jsonl_tail",
     "read_last_jsonl_obj",
     "artifact_age_sec",

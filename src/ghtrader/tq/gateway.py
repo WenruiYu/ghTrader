@@ -25,11 +25,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+import redis
 import structlog
 import zmq
-import redis
 
-from ghtrader.config import env_bool, get_tqsdk_auth, is_live_enabled, load_config
+from ghtrader.config import env_bool, env_int, get_tqsdk_auth, is_live_enabled, load_config
 from ghtrader.util.json_io import read_json, write_json_atomic
 from ghtrader.util.observability import get_store
 
@@ -310,6 +310,22 @@ class GatewayWriter:
         self._health: dict[str, Any] = {"ok": False}
         self._effective: dict[str, Any] = {"mode": "idle"}
         self._market: dict[str, Any] = {}
+        self._state_revision = self._load_last_state_revision()
+        self._redis_publish_failures_total = 0
+        self._redis_set_failures_total = 0
+        self._redis_write_fail_streak = 0
+        self._redis_last_write_error = ""
+        self._redis_last_write_failed_at = ""
+
+    def _load_last_state_revision(self) -> int:
+        try:
+            obj = read_json(self._state_path)
+            if isinstance(obj, dict):
+                rev = int(obj.get("state_revision") or 0)
+                return int(rev) if int(rev) >= 0 else 0
+        except Exception:
+            pass
+        return 0
 
     def set_health(self, **fields: Any) -> None:
         self._health.update(fields)
@@ -325,8 +341,10 @@ class GatewayWriter:
         self._write_state()
 
     def _write_state(self) -> None:
+        self._state_revision = int(self._state_revision) + 1
         payload = {
             "schema_version": int(STATE_SCHEMA_VERSION),
+            "state_revision": int(self._state_revision),
             "updated_at": _now_iso(),
             "account_profile": self.profile,
             "health": _jsonable(self._health),
@@ -342,19 +360,45 @@ class GatewayWriter:
             except Exception:
                 pass
         
+        redis_publish_failed = False
+        redis_set_failed = False
+        redis_last_error = ""
         if self.redis_client:
             try:
                 # Publish to Redis channel for WebSocket
                 self.redis_client.publish(f"ghtrader:gateway:updates:{self.profile}", json.dumps(payload, default=str))
+            except Exception as e:
+                redis_publish_failed = True
+                redis_last_error = str(e)
+                self._redis_publish_failures_total = int(self._redis_publish_failures_total) + 1
+            try:
                 # Set hot state key
                 self.redis_client.set(f"ghtrader:gateway:state:{self.profile}", json.dumps(payload, default=str))
-            except Exception:
-                pass
+            except Exception as e:
+                redis_set_failed = True
+                redis_last_error = str(e)
+                self._redis_set_failures_total = int(self._redis_set_failures_total) + 1
+            if redis_publish_failed or redis_set_failed:
+                self._redis_write_fail_streak = int(self._redis_write_fail_streak) + 1
+                self._redis_last_write_error = str(redis_last_error or "redis_state_write_failed")
+                self._redis_last_write_failed_at = _now_iso()
+            else:
+                self._redis_write_fail_streak = 0
+                self._redis_last_write_error = ""
 
         try:
             write_json_atomic(self._state_path, payload)
         except Exception:
             return None
+
+    def redis_write_status(self) -> dict[str, Any]:
+        return {
+            "publish_failures_total": int(self._redis_publish_failures_total),
+            "set_failures_total": int(self._redis_set_failures_total),
+            "fail_streak": int(self._redis_write_fail_streak),
+            "last_error": str(self._redis_last_write_error),
+            "last_failed_at": str(self._redis_last_write_failed_at),
+        }
 
     def append_event(self, evt: dict[str, Any]) -> None:
         try:
@@ -457,6 +501,49 @@ def _connect_local_redis() -> redis.Redis | None:
         return None
 
 
+class _CommandIdDeduper:
+    """Bounded duplicate-command filter with TTL + capacity limits."""
+
+    def __init__(self, *, max_ids: int, ttl_s: float) -> None:
+        self.max_ids = max(1, int(max_ids))
+        self.ttl_s = max(1.0, float(ttl_s))
+        self._ts_by_id: dict[str, float] = {}
+        self._fifo: deque[tuple[float, str]] = deque()
+
+    def _prune(self, *, now_ts: float) -> None:
+        cutoff = float(now_ts) - float(self.ttl_s)
+        while self._fifo and (self._fifo[0][0] < cutoff or len(self._ts_by_id) > self.max_ids):
+            ts0, cid0 = self._fifo.popleft()
+            cur = self._ts_by_id.get(cid0)
+            if cur is None:
+                continue
+            # Remove only if this FIFO entry still represents the latest stamp for cid0.
+            if float(cur) == float(ts0):
+                del self._ts_by_id[cid0]
+
+    def is_duplicate_and_remember(self, cid: str, *, now_ts: float | None = None) -> bool:
+        cc = str(cid or "").strip()
+        if not cc:
+            return True
+        now_s = float(time.time() if now_ts is None else now_ts)
+        self._prune(now_ts=now_s)
+        prev = self._ts_by_id.get(cc)
+        if prev is not None and (now_s - float(prev)) <= float(self.ttl_s):
+            return True
+        self._ts_by_id[cc] = now_s
+        self._fifo.append((now_s, cc))
+        self._prune(now_ts=now_s)
+        return False
+
+
+def _should_emit_hot_path_heartbeat(*, now_ts: float, last_emit_at: float, interval_s: float) -> bool:
+    try:
+        interval = max(0.1, float(interval_s))
+        return (float(now_ts) - float(last_emit_at)) >= interval
+    except Exception:
+        return True
+
+
 def _close_api(api: Any) -> None:
     try:
         api.close()
@@ -519,6 +606,7 @@ def run_gateway(
     risk_kill_active = bool(risk_kill_state.get("active"))
     risk_kill_reason = str(risk_kill_state.get("reason") or "")
     risk_kill_updated_at = str(risk_kill_state.get("updated_at") or "")
+    risk_kill_pending_enforce = bool(risk_kill_active)
     warm_path_degraded = redis_client is None
     warm_path_reason = "redis_unavailable" if warm_path_degraded else ""
     redis_retry_interval_s = 3.0
@@ -531,6 +619,8 @@ def run_gateway(
     symbol_mapping: dict[str, str] = {}  # requested_symbol -> execution_symbol
     last_resolution_at = 0.0
     resolution_interval_sec = 60.0  # Re-resolve periodically to catch trading day changes
+    hot_path_heartbeat_interval_s = float(env_int("GHTRADER_GATEWAY_HOT_PATH_HEARTBEAT_S", 1))
+    last_hot_path_heartbeat_at = 0.0
 
     # Get data_dir for symbol resolution
     from ghtrader.config import get_data_dir
@@ -554,7 +644,13 @@ def run_gateway(
     cmd_offset = _read_commands_cursor(runs_dir=runs_dir, profile=prof)
     redis_cmd_stream = f"ghtrader:commands:{prof}"
     redis_cmd_id = "$"
-    seen_command_ids: set[str] = set()
+    cmd_dedupe_max_ids = int(env_int("GHTRADER_GATEWAY_CMD_DEDUPE_MAX_IDS", 20000))
+    cmd_dedupe_ttl_s = float(env_int("GHTRADER_GATEWAY_CMD_DEDUPE_TTL_S", 24 * 3600))
+    command_deduper = _CommandIdDeduper(max_ids=cmd_dedupe_max_ids, ttl_s=cmd_dedupe_ttl_s)
+    redis_state_write_fail_streak_degrade = max(
+        1,
+        int(env_int("GHTRADER_GATEWAY_REDIS_WRITE_FAIL_STREAK_DEGRADE", 3)),
+    )
 
     def _set_warm_path_state(*, degraded: bool, reason: str = "") -> None:
         nonlocal warm_path_degraded, warm_path_reason
@@ -573,9 +669,6 @@ def run_gateway(
                 }
             )
 
-    def _sync_warm_path_redis_client(rc: redis.Redis | None) -> None:
-        writer.redis_client = rc
-
     def _ensure_redis_connection() -> None:
         nonlocal redis_client, last_redis_retry_at
         if redis_client is not None:
@@ -589,9 +682,31 @@ def run_gateway(
             _set_warm_path_state(degraded=True, reason="redis_unavailable")
             return
         redis_client = rc
-        _sync_warm_path_redis_client(redis_client)
+        writer.redis_client = redis_client
         _set_warm_path_state(degraded=False, reason="")
         writer.append_event({"type": "warm_path_recovered", "component": "redis"})
+
+    def _sync_redis_state_write_health() -> None:
+        stats = writer.redis_write_status()
+        fail_streak = int(stats.get("fail_streak") or 0)
+        writer.set_effective(
+            redis_state_publish_failures_total=int(stats.get("publish_failures_total") or 0),
+            redis_state_set_failures_total=int(stats.get("set_failures_total") or 0),
+            redis_state_write_fail_streak=int(fail_streak),
+            redis_state_last_error=str(stats.get("last_error") or ""),
+            redis_state_last_failed_at=str(stats.get("last_failed_at") or ""),
+        )
+        if redis_client is not None and fail_streak >= int(redis_state_write_fail_streak_degrade):
+            if not (bool(warm_path_degraded) and str(warm_path_reason) == "redis_state_write_failed"):
+                _set_warm_path_state(degraded=True, reason="redis_state_write_failed")
+            return
+        if (
+            redis_client is not None
+            and fail_streak == 0
+            and bool(warm_path_degraded)
+            and str(warm_path_reason) == "redis_state_write_failed"
+        ):
+            _set_warm_path_state(degraded=False, reason="")
 
     def _enforce_risk_kill_actions() -> None:
         try:
@@ -613,10 +728,11 @@ def run_gateway(
             pass
 
     def _activate_risk_kill(*, reason: str, details: dict[str, Any] | None = None) -> None:
-        nonlocal risk_kill_active, risk_kill_reason, risk_kill_updated_at
+        nonlocal risk_kill_active, risk_kill_reason, risk_kill_updated_at, risk_kill_pending_enforce
         if risk_kill_active:
             return
         risk_kill_active = True
+        risk_kill_pending_enforce = True
         risk_kill_reason = str(reason or "")
         st = _write_risk_kill_state(
             runs_dir=runs_dir,
@@ -637,9 +753,10 @@ def run_gateway(
         _enforce_risk_kill_actions()
 
     def _reset_risk_kill(*, reason: str) -> None:
-        nonlocal risk_kill_active, risk_kill_reason, risk_kill_updated_at
+        nonlocal risk_kill_active, risk_kill_reason, risk_kill_updated_at, risk_kill_pending_enforce
         was_active = bool(risk_kill_active)
         risk_kill_active = False
+        risk_kill_pending_enforce = False
         risk_kill_reason = ""
         risk_kill_updated_at = _now_iso()
         _clear_risk_kill_state(runs_dir=runs_dir, profile=prof)
@@ -656,9 +773,21 @@ def run_gateway(
             }
         )
 
+    if risk_kill_active:
+        _enforce_risk_kill_actions()
+
     while True:
         loop_started = time.perf_counter()
         loop_ok = True
+        now_ts = time.time()
+        _sync_redis_state_write_health()
+        if _should_emit_hot_path_heartbeat(
+            now_ts=now_ts,
+            last_emit_at=last_hot_path_heartbeat_at,
+            interval_s=hot_path_heartbeat_interval_s,
+        ):
+            writer.flush_state()
+            last_hot_path_heartbeat_at = now_ts
         _ensure_redis_connection()
         desired = read_gateway_desired(runs_dir=runs_dir, profile=prof, redis_client=redis_client)
         desired_mode = desired.mode
@@ -695,6 +824,8 @@ def run_gateway(
             last_targets = {}
             zmq_targets = {}
             start_balance = None
+            if risk_kill_active:
+                risk_kill_pending_enforce = True
             current_mode = effective_mode
             current_symbols = []
 
@@ -830,6 +961,11 @@ def run_gateway(
                 except Exception:
                     exec_targetpos = None
 
+            if risk_kill_active and risk_kill_pending_enforce:
+                _enforce_risk_kill_actions()
+                risk_kill_pending_enforce = False
+                writer.append_event({"type": "risk_kill_enforced", "reason": str(risk_kill_reason or "persisted_state")})
+
             # ZMQ Hot Path: Check for incoming targets/commands
             try:
                 while True:
@@ -959,7 +1095,7 @@ def run_gateway(
                     except Exception as e:
                         writer.append_event({"type": "gateway_commands_stream_failed", "error": str(e)})
                         redis_client = None
-                        _sync_warm_path_redis_client(None)
+                        writer.redis_client = None
                         _set_warm_path_state(degraded=True, reason="redis_stream_failed")
 
                 # Fallback/audit mirror: append-only file.
@@ -986,9 +1122,10 @@ def run_gateway(
                 for obj in incoming_commands:
                     ctype = str(obj.get("type") or "").strip()
                     cid = str(obj.get("command_id") or "").strip()
-                    if not ctype or not cid or cid in seen_command_ids:
+                    if not ctype or not cid:
                         continue
-                    seen_command_ids.add(cid)
+                    if command_deduper.is_duplicate_and_remember(cid):
+                        continue
 
                     writer.append_event({"type": "gateway_command", "command_type": ctype, "command_id": cid})
 

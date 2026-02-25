@@ -48,8 +48,8 @@ def fetch_main_schedule_state(
     state: dict[str, Any] = {"first_day": None, "last_day": None, "n_days": 0, "schedule_hashes": set()}
 
     sql_bounds = (
-        f"SELECT min(cast(trading_day as string)) AS first_day, "
-        f"max(cast(trading_day as string)) AS last_day, "
+        f"SELECT min(trading_day) AS first_day, "
+        f"max(trading_day) AS last_day, "
         f"count() AS n_days "
         f"FROM {tbl} WHERE exchange=%s AND variety=%s"
     )
@@ -198,7 +198,7 @@ def trim_main_schedule_before(
     from .row_cleanup import replace_table_delete_where
 
     cutoff = start_day.isoformat()
-    where = "exchange=%s AND variety=%s AND cast(trading_day as string) < %s"
+    where = "exchange=%s AND variety=%s AND trading_day < %s"
     cols = ["ts", "exchange", "variety", "trading_day", "main_contract", "segment_id", "schedule_hash", "updated_at"]
     return int(
         replace_table_delete_where(
@@ -290,14 +290,14 @@ def fetch_schedule(
     where = ["exchange=%s", "variety=%s"]
     params: list[Any] = [ex, var]
     if start_day is not None:
-        where.append("cast(trading_day as string) >= %s")
+        where.append("trading_day >= %s")
         params.append(start_day.isoformat())
     if end_day is not None:
-        where.append("cast(trading_day as string) <= %s")
+        where.append("trading_day <= %s")
         params.append(end_day.isoformat())
 
     sql = (
-        "SELECT cast(trading_day as string) AS trading_day, main_contract, segment_id, schedule_hash "
+        "SELECT trading_day AS trading_day, main_contract, segment_id, schedule_hash "
         f"FROM {tbl} WHERE {' AND '.join(where)} ORDER BY trading_day ASC"
     )
     with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:
@@ -336,7 +336,7 @@ def resolve_main_contract(
     sql = (
         "SELECT main_contract, segment_id, schedule_hash "
         f"FROM {tbl} "
-        "WHERE exchange=%s AND variety=%s AND cast(trading_day as string) <= %s "
+        "WHERE exchange=%s AND variety=%s AND trading_day <= %s "
         "ORDER BY trading_day DESC LIMIT 1"
     )
     with connect_pg(cfg, connect_timeout_s=connect_timeout_s) as conn:

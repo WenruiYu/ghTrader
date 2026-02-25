@@ -7,8 +7,7 @@ from pathlib import Path
 from typing import Any
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from ghtrader.util.time import now_iso as _now_iso
 
 
 def capacity_matrix_template() -> list[dict[str, Any]]:

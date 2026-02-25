@@ -37,8 +37,9 @@ def test_strategy_supervisor_tick_starts_one_job(tmp_path: Path) -> None:
         desired=StrategyDesired(mode="run", symbols=["SHFE.cu2602"], model_name="xgboost", horizon=50),
     )
 
-    app_mod = importlib.import_module("ghtrader.control.app")
-    tick = getattr(app_mod, "_strategy_supervisor_tick")
+    bootstrap_mod = importlib.import_module("ghtrader.control.bootstrap")
+    tick = getattr(bootstrap_mod, "strategy_supervisor_tick")
+    assert getattr(tick, "__module__", "") == "ghtrader.control.bootstrap"
 
     store = _FakeStore(active=[])
     jm = _FakeJM()
@@ -52,6 +53,9 @@ def test_strategy_supervisor_tick_starts_one_job(tmp_path: Path) -> None:
     assert "run" in argv
     assert "--account" in argv
     assert "--symbols" in argv
+    meta = jm.started[0].metadata if isinstance(jm.started[0].metadata, dict) else {}
+    assert str(meta.get("supervisor") or "") == "strategy"
+    assert str(meta.get("restart_reason") or "") == "desired_run_no_active_job"
 
 
 def test_strategy_supervisor_tick_cancels_when_desired_idle(tmp_path: Path) -> None:
@@ -71,8 +75,8 @@ def test_strategy_supervisor_tick_cancels_when_desired_idle(tmp_path: Path) -> N
         pid=123,
     )
 
-    app_mod = importlib.import_module("ghtrader.control.app")
-    tick = getattr(app_mod, "_strategy_supervisor_tick")
+    bootstrap_mod = importlib.import_module("ghtrader.control.bootstrap")
+    tick = getattr(bootstrap_mod, "strategy_supervisor_tick")
 
     store = _FakeStore(active=[job])
     jm = _FakeJM()

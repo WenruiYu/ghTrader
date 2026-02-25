@@ -71,11 +71,9 @@ markers = [
 
 [tool.coverage.run]
 omit = [
-  # Deferred / optional modules kept out of Phase-0 quality gate.
+  # Governed exclusions (see reports/coverage_governance_review.md).
   "src/ghtrader/data_provider.py",
   "src/ghtrader/questdb/bench.py",
-  "src/ghtrader/questdb/features_labels.py",
-  "src/ghtrader/questdb/migrate.py",
   "src/ghtrader/regime.py",
   "src/ghtrader/research/eval.py",
   "src/ghtrader/tq/catalog.py",

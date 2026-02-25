@@ -11,8 +11,7 @@ from typing import Any
 from ghtrader.config_service.schema import extract_managed_env, key_is_env_only, key_is_managed, normalize_to_string
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from ghtrader.util.time import now_iso as _now_iso
 
 
 def _snapshot_hash(snapshot: dict[str, str]) -> str:
@@ -36,6 +35,7 @@ class ConfigStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
         self._ensure_baseline()
+        self._sanitize_illegal_snapshot_keys()
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(str(self.db_path))
@@ -116,6 +116,19 @@ class ConfigStore:
             )
             con.commit()
 
+    def _sanitize_illegal_snapshot_keys(self) -> None:
+        _, snapshot, _ = self.get_latest_snapshot()
+        remove_keys = sorted([k for k in snapshot.keys() if not key_is_managed(k)])
+        if not remove_keys:
+            return
+        self.set_values(
+            values={k: None for k in remove_keys},
+            actor="system",
+            reason="sanitize_illegal_keys",
+            action="sanitize",
+            metadata={"removed_keys": list(remove_keys)},
+        )
+
     def _latest_row(self, con: sqlite3.Connection) -> sqlite3.Row:
         row = con.execute(
             "SELECT id, created_at, actor, reason, snapshot_json, snapshot_hash, changed_keys_json "
@@ -187,13 +200,13 @@ class ConfigStore:
             k = str(key or "").strip()
             if not k:
                 continue
+            if val is None:
+                incoming[k] = None
+                continue
             if not key_is_managed(k):
                 reason = "env_only" if key_is_env_only(k) else "unmanaged"
                 raise ValueError(f"config_key_not_writable:{k}:{reason}")
-            if val is None:
-                incoming[k] = None
-            else:
-                incoming[k] = normalize_to_string(k, val)
+            incoming[k] = normalize_to_string(k, val)
 
         with self._connect() as con:
             latest = self._latest_row(con)

@@ -17,6 +17,7 @@ from ghtrader.config_service.schema import (
 )
 from ghtrader.config import get_artifacts_dir, get_data_dir, get_runs_dir
 from ghtrader.control import auth
+from ghtrader.control.routes.query_budget import bounded_limit
 from ghtrader.control.slo import collect_slo_snapshot
 from ghtrader.util.observability import snapshot_all
 
@@ -54,7 +55,14 @@ def api_observability_slo(request: Request) -> dict[str, Any]:
     if not auth.is_authorized(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     store = getattr(request.app.state, "job_store", None)
-    return collect_slo_snapshot(store=store)
+    telemetry_getter = getattr(request.app.state, "supervisor_telemetry_getter", None)
+    telemetry = None
+    if callable(telemetry_getter):
+        try:
+            telemetry = telemetry_getter()
+        except Exception:
+            telemetry = None
+    return collect_slo_snapshot(store=store, supervisor_telemetry=telemetry)
 
 
 @router.get("/api/observability/runtime", response_class=JSONResponse)
@@ -161,7 +169,7 @@ def api_config_history(request: Request, limit: int = 50) -> dict[str, Any]:
     if not auth.is_authorized(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     resolver = get_config_resolver()
-    rows = resolver.list_revisions(limit=max(1, min(int(limit), 500)))
+    rows = resolver.list_revisions(limit=bounded_limit(limit, default=50, max_limit=500))
     return {
         "ok": True,
         "items": [

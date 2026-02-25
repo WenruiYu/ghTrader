@@ -305,7 +305,7 @@ def query_symbol_day_bounds(
 
     Notes:
     - Uses `trading_day` column (ISO YYYY-MM-DD strings, stored as SYMBOL).
-    - Uses `cast(trading_day as string)` for compatibility with min/max.
+    - Uses cast only for aggregation compatibility (min/max/distinct display).
     - `l5_only=True` restricts to rows that appear to have true L5 values.
     """
     if not symbols:
@@ -326,47 +326,80 @@ def query_symbol_day_bounds(
     except Exception:
         pass
 
-    # Safe placeholders for IN (...)
-    placeholders = ", ".join(["%s"] * len(symbols))
-    where = [f"symbol IN ({placeholders})", "ticks_kind = %s", "dataset_version = %s"]
-    params: list[Any] = list(symbols) + [tk, dv]
-    if l5_only:
-        where.append(_l5_condition_sql())
+    def _run_raw_bounds(query_symbols: list[str]) -> dict[str, dict[str, Any]]:
+        if not query_symbols:
+            return {}
+        placeholders = ", ".join(["%s"] * len(query_symbols))
+        where = [f"symbol IN ({placeholders})", "ticks_kind = %s", "dataset_version = %s"]
+        params: list[Any] = list(query_symbols) + [tk, dv]
+        if l5_only:
+            where.append(_l5_condition_sql())
 
-    sql = (
-        "SELECT symbol, "
-        "min(cast(trading_day as string)) AS first_day, "
-        "max(cast(trading_day as string)) AS last_day, "
-        "count(DISTINCT cast(trading_day as string)) AS n_days, "
-        "min(datetime_ns) AS first_ns, "
-        "max(datetime_ns) AS last_ns "
-        f"FROM {table} "
-        f"WHERE {' AND '.join(where)} "
-        "GROUP BY symbol"
-    )
+        sql = (
+            "SELECT symbol, "
+            "min(cast(trading_day as string)) AS first_day, "
+            "max(cast(trading_day as string)) AS last_day, "
+            "count(DISTINCT cast(trading_day as string)) AS n_days, "
+            "min(datetime_ns) AS first_ns, "
+            "max(datetime_ns) AS last_ns "
+            f"FROM {table} "
+            f"WHERE {' AND '.join(where)} "
+            "GROUP BY symbol"
+        )
 
+        raw_out: dict[str, dict[str, Any]] = {}
+        timeout_s = int(connect_timeout_s) if connect_timeout_s is not None else _query_connect_timeout()
+        with _connect(cfg, connect_timeout_s=timeout_s) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                for row in cur.fetchall():
+                    try:
+                        sym = str(row[0])
+                        first_ns = row[4]
+                        last_ns = row[5]
+                        raw_out[sym] = {
+                            "first_day": row[1],
+                            "last_day": row[2],
+                            "n_days": row[3],
+                            "first_ns": int(first_ns) if first_ns is not None else None,
+                            "last_ns": int(last_ns) if last_ns is not None else None,
+                            "first_ts": _ns_to_iso(first_ns),
+                            "last_ts": _ns_to_iso(last_ns),
+                        }
+                    except Exception:
+                        continue
+        return raw_out
+
+    use_daily_agg = False
     out: dict[str, dict[str, Any]] = {}
+    try:
+        from .main_l5_daily_agg import MAIN_L5_SOURCE_TABLE_V2, query_main_l5_day_bounds_from_agg
 
-    timeout_s = int(connect_timeout_s) if connect_timeout_s is not None else _query_connect_timeout()
-    with _connect(cfg, connect_timeout_s=timeout_s) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            for row in cur.fetchall():
-                try:
-                    sym = str(row[0])
-                    first_ns = row[4]
-                    last_ns = row[5]
-                    out[sym] = {
-                        "first_day": row[1],
-                        "last_day": row[2],
-                        "n_days": row[3],
-                        "first_ns": int(first_ns) if first_ns is not None else None,
-                        "last_ns": int(last_ns) if last_ns is not None else None,
-                        "first_ts": _ns_to_iso(first_ns),
-                        "last_ts": _ns_to_iso(last_ns),
-                    }
-                except Exception:
-                    continue
+        use_daily_agg = bool(
+            _env_bool("GHTRADER_QDB_USE_MAIN_L5_DAILY_AGG", True)
+            and str(table).strip().lower() == str(MAIN_L5_SOURCE_TABLE_V2).lower()
+            and str(tk) == "main_l5"
+            and not bool(l5_only)
+        )
+        if use_daily_agg:
+            timeout_s = int(connect_timeout_s) if connect_timeout_s is not None else _query_connect_timeout()
+            out = query_main_l5_day_bounds_from_agg(
+                cfg=cfg,
+                symbols=list(symbols),
+                dataset_version=str(dv),
+                ticks_kind=str(tk),
+                connect_timeout_s=int(timeout_s),
+            )
+    except Exception:
+        out = {}
+
+    if use_daily_agg:
+        missing_symbols = [s for s in symbols if s not in out]
+        if missing_symbols:
+            out.update(_run_raw_bounds(missing_symbols))
+    else:
+        out = _run_raw_bounds(list(symbols))
+
     try:
         log.debug(
             "questdb.query_symbol_day_bounds.done",
@@ -374,6 +407,7 @@ def query_symbol_day_bounds(
             dataset_version=str(dv),
             ticks_kind=str(tk),
             l5_only=bool(l5_only),
+            used_daily_agg=bool(use_daily_agg),
             n_symbols=int(len(symbols)),
             n_rows=int(len(out)),
             ms=int((time.time() - t0) * 1000),
@@ -412,7 +446,7 @@ def fetch_ticks_for_day(
         "symbol = %s",
         "ticks_kind = %s",
         "dataset_version = %s",
-        "cast(trading_day as string) = %s",
+        "trading_day = %s",
     ]
     params: list[Any] = [sym, str(ticks_kind), str(dataset_version), trading_day.isoformat()]
     sql = f"SELECT {cols_sql} FROM {tbl} WHERE {' AND '.join(where)} ORDER BY datetime_ns"
@@ -461,11 +495,11 @@ def list_trading_days_for_symbol(
     params: list[Any] = [sym, tk, dv]
     if l5_only:
         where.append(_l5_condition_sql())
-    where.append("cast(trading_day as string) >= %s")
-    where.append("cast(trading_day as string) <= %s")
+    where.append("trading_day >= %s")
+    where.append("trading_day <= %s")
     params += [d0, d1]
     sql = (
-        "SELECT DISTINCT cast(trading_day as string) AS trading_day "
+        "SELECT DISTINCT trading_day "
         f"FROM {tbl} "
         f"WHERE {' AND '.join(where)} "
         "ORDER BY trading_day ASC"
@@ -535,17 +569,35 @@ def query_symbol_latest(
     dv = str(dataset_version).lower().strip()
     tk = str(ticks_kind).lower().strip()
 
-    # Safe placeholders for IN (...)
-    placeholders = ", ".join(["%s"] * len(symbols))
-    where = [f"symbol IN ({placeholders})", "ticks_kind = %s", "dataset_version = %s"]
-    params: list[Any] = list(symbols) + [tk, dv]
-
-    sql_latest_on = (
-        "SELECT symbol, cast(trading_day as string) AS last_day, datetime_ns AS last_ns "
-        f"FROM {table} "
-        f"WHERE {' AND '.join(where)} "
-        "LATEST ON ts PARTITION BY symbol"
-    )
+    def _run_raw_latest(query_symbols: list[str]) -> dict[str, dict[str, Any]]:
+        if not query_symbols:
+            return {}
+        placeholders = ", ".join(["%s"] * len(query_symbols))
+        where = [f"symbol IN ({placeholders})", "ticks_kind = %s", "dataset_version = %s"]
+        params: list[Any] = list(query_symbols) + [tk, dv]
+        sql_latest_on = (
+            "SELECT symbol, trading_day AS last_day, datetime_ns AS last_ns "
+            f"FROM {table} "
+            f"WHERE {' AND '.join(where)} "
+            "LATEST ON ts PARTITION BY symbol"
+        )
+        raw_out: dict[str, dict[str, Any]] = {}
+        timeout_s = int(connect_timeout_s) if connect_timeout_s is not None else _query_connect_timeout()
+        with _connect(cfg, connect_timeout_s=timeout_s) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_latest_on, params)
+                for row in cur.fetchall():
+                    try:
+                        sym = str(row[0])
+                        last_ns = row[2]
+                        raw_out[sym] = {
+                            "last_day": row[1],
+                            "last_ns": int(last_ns) if last_ns is not None else None,
+                            "last_ts": _ns_to_iso(last_ns),
+                        }
+                    except Exception:
+                        continue
+        return raw_out
 
     t0 = time.time()
     try:
@@ -559,22 +611,34 @@ def query_symbol_latest(
     except Exception:
         pass
 
+    use_daily_agg = False
     out: dict[str, dict[str, Any]] = {}
-    timeout_s = int(connect_timeout_s) if connect_timeout_s is not None else _query_connect_timeout()
-    with _connect(cfg, connect_timeout_s=timeout_s) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql_latest_on, params)
-            for row in cur.fetchall():
-                try:
-                    sym = str(row[0])
-                    last_ns = row[2]
-                    out[sym] = {
-                        "last_day": row[1],
-                        "last_ns": int(last_ns) if last_ns is not None else None,
-                        "last_ts": _ns_to_iso(last_ns),
-                    }
-                except Exception:
-                    continue
+    try:
+        from .main_l5_daily_agg import MAIN_L5_SOURCE_TABLE_V2, query_main_l5_latest_from_agg
+
+        use_daily_agg = bool(
+            _env_bool("GHTRADER_QDB_USE_MAIN_L5_DAILY_AGG", True)
+            and str(table).strip().lower() == str(MAIN_L5_SOURCE_TABLE_V2).lower()
+            and str(tk) == "main_l5"
+        )
+        if use_daily_agg:
+            timeout_s = int(connect_timeout_s) if connect_timeout_s is not None else _query_connect_timeout()
+            out = query_main_l5_latest_from_agg(
+                cfg=cfg,
+                symbols=list(symbols),
+                dataset_version=str(dv),
+                ticks_kind=str(tk),
+                connect_timeout_s=int(timeout_s),
+            )
+    except Exception:
+        out = {}
+
+    if use_daily_agg:
+        missing_symbols = [s for s in symbols if s not in out]
+        if missing_symbols:
+            out.update(_run_raw_latest(missing_symbols))
+    else:
+        out = _run_raw_latest(list(symbols))
 
     try:
         log.debug(
@@ -582,6 +646,7 @@ def query_symbol_latest(
             table=str(table),
             dataset_version=str(dv),
             ticks_kind=str(tk),
+            used_daily_agg=bool(use_daily_agg),
             n_symbols=int(len(symbols)),
             n_rows=int(len(out)),
             ms=int((time.time() - t0) * 1000),
@@ -637,10 +702,14 @@ def fetch_ticks_for_symbol_day(
     if not tbl or not sym or not td:
         return pd.DataFrame(columns=list(TICK_COLUMN_NAMES) + ["row_hash"])
 
+    lim = int(limit) if limit is not None else None
+    if lim is not None:
+        lim = max(1, min(lim, 2_000_000))
+
     tick_numeric_cols = [c for c in TICK_COLUMN_NAMES if c not in {"symbol", "datetime"}]
     prov_cols = ["underlying_contract", "segment_id", "schedule_hash"] if bool(include_provenance) else []
 
-    def _run_query(*, include_row_hash: bool, include_prov: bool) -> pd.DataFrame:
+    def _run_query(*, include_row_hash: bool, include_prov: bool, limit_rows: int | None) -> pd.DataFrame:
         sel = ["datetime_ns AS datetime"]
         if include_row_hash:
             sel.append("row_hash")
@@ -657,9 +726,9 @@ def fetch_ticks_for_symbol_day(
         )
         q_params: list[Any] = [sym, tk, dv, td]
         q_sql = base_sql
-        if lim is not None:
+        if limit_rows is not None:
             q_sql = base_sql + " LIMIT %s"
-            q_params.append(int(lim))
+            q_params.append(int(limit_rows))
         rows: list[Any] = []
 
         def _fetch_rows() -> list[Any]:
@@ -706,13 +775,8 @@ def fetch_ticks_for_symbol_day(
         df0.insert(0, "symbol", sym)
         return df0
 
-    _ = "ASC" if str(order).lower().strip() != "desc" else "DESC"
-    lim = int(limit) if limit is not None else None
-    if lim is not None:
-        lim = max(1, min(lim, 2_000_000))
-
     try:
-        df = _run_query(include_row_hash=True, include_prov=bool(include_provenance))
+        df = _run_query(include_row_hash=True, include_prov=bool(include_provenance), limit_rows=lim)
         # Ensure dtypes are sane for downstream compute.
         df["datetime"] = pd.to_numeric(df["datetime"], errors="coerce").fillna(0).astype("int64")
         df["row_hash"] = pd.to_numeric(df.get("row_hash"), errors="coerce").fillna(0).astype("int64")
@@ -725,9 +789,9 @@ def fetch_ticks_for_symbol_day(
     except Exception:
         # Backward compat: older tick tables may not have `row_hash` and/or provenance columns.
         try:
-            df2 = _run_query(include_row_hash=False, include_prov=bool(include_provenance))
+            df2 = _run_query(include_row_hash=False, include_prov=bool(include_provenance), limit_rows=lim)
         except Exception:
-            df2 = _run_query(include_row_hash=False, include_prov=False)
+            df2 = _run_query(include_row_hash=False, include_prov=False, limit_rows=lim)
         df2["datetime"] = pd.to_numeric(df2["datetime"], errors="coerce").fillna(0).astype("int64")
         for c in tick_numeric_cols:
             if c in df2.columns:
@@ -760,25 +824,47 @@ def query_symbol_recent_last(
 
     dv = str(dataset_version).lower().strip()
     tk = str(ticks_kind).lower().strip()
+    day_values = [str(d).strip() for d in trading_days if str(d).strip()]
+    if not day_values:
+        return {}
 
-    placeholders_syms = ", ".join(["%s"] * len(symbols))
-    placeholders_days = ", ".join(["%s"] * len(trading_days))
-    where = [
-        f"symbol IN ({placeholders_syms})",
-        "ticks_kind = %s",
-        "dataset_version = %s",
-        f"cast(trading_day as string) IN ({placeholders_days})",
-    ]
-    params: list[Any] = list(symbols) + [tk, dv] + [str(d).strip() for d in trading_days if str(d).strip()]
-
-    sql = (
-        "SELECT symbol, "
-        "max(cast(trading_day as string)) AS last_day, "
-        "max(datetime_ns) AS last_ns "
-        f"FROM {table} "
-        f"WHERE {' AND '.join(where)} "
-        "GROUP BY symbol"
-    )
+    def _run_raw_recent_last(query_symbols: list[str]) -> dict[str, dict[str, Any]]:
+        if not query_symbols:
+            return {}
+        placeholders_syms = ", ".join(["%s"] * len(query_symbols))
+        placeholders_days = ", ".join(["%s"] * len(day_values))
+        where = [
+            f"symbol IN ({placeholders_syms})",
+            "ticks_kind = %s",
+            "dataset_version = %s",
+            f"trading_day IN ({placeholders_days})",
+        ]
+        params: list[Any] = list(query_symbols) + [tk, dv] + day_values
+        sql = (
+            "SELECT symbol, "
+            "max(trading_day) AS last_day, "
+            "max(datetime_ns) AS last_ns "
+            f"FROM {table} "
+            f"WHERE {' AND '.join(where)} "
+            "GROUP BY symbol"
+        )
+        raw_out: dict[str, dict[str, Any]] = {}
+        timeout_s = int(connect_timeout_s) if connect_timeout_s is not None else _query_connect_timeout()
+        with _connect(cfg, connect_timeout_s=timeout_s) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                for row in cur.fetchall():
+                    try:
+                        sym = str(row[0])
+                        last_ns = row[2]
+                        raw_out[sym] = {
+                            "last_day": row[1],
+                            "last_ns": int(last_ns) if last_ns is not None else None,
+                            "last_ts": _ns_to_iso(last_ns),
+                        }
+                    except Exception:
+                        continue
+        return raw_out
 
     t0 = time.time()
     try:
@@ -788,27 +874,40 @@ def query_symbol_recent_last(
             dataset_version=str(dv),
             ticks_kind=str(tk),
             n_symbols=int(len(symbols)),
-            n_days=int(len(trading_days)),
+            n_days=int(len(day_values)),
         )
     except Exception:
         pass
 
+    use_daily_agg = False
     out: dict[str, dict[str, Any]] = {}
-    timeout_s = int(connect_timeout_s) if connect_timeout_s is not None else _query_connect_timeout()
-    with _connect(cfg, connect_timeout_s=timeout_s) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            for row in cur.fetchall():
-                try:
-                    sym = str(row[0])
-                    last_ns = row[2]
-                    out[sym] = {
-                        "last_day": row[1],
-                        "last_ns": int(last_ns) if last_ns is not None else None,
-                        "last_ts": _ns_to_iso(last_ns),
-                    }
-                except Exception:
-                    continue
+    try:
+        from .main_l5_daily_agg import MAIN_L5_SOURCE_TABLE_V2, query_main_l5_recent_last_from_agg
+
+        use_daily_agg = bool(
+            _env_bool("GHTRADER_QDB_USE_MAIN_L5_DAILY_AGG", True)
+            and str(table).strip().lower() == str(MAIN_L5_SOURCE_TABLE_V2).lower()
+            and str(tk) == "main_l5"
+        )
+        if use_daily_agg:
+            timeout_s = int(connect_timeout_s) if connect_timeout_s is not None else _query_connect_timeout()
+            out = query_main_l5_recent_last_from_agg(
+                cfg=cfg,
+                symbols=list(symbols),
+                trading_days=list(day_values),
+                dataset_version=str(dv),
+                ticks_kind=str(tk),
+                connect_timeout_s=int(timeout_s),
+            )
+    except Exception:
+        out = {}
+
+    if use_daily_agg:
+        missing_symbols = [s for s in symbols if s not in out]
+        if missing_symbols:
+            out.update(_run_raw_recent_last(missing_symbols))
+    else:
+        out = _run_raw_recent_last(list(symbols))
 
     try:
         log.debug(
@@ -816,8 +915,9 @@ def query_symbol_recent_last(
             table=str(table),
             dataset_version=str(dv),
             ticks_kind=str(tk),
+            used_daily_agg=bool(use_daily_agg),
             n_symbols=int(len(symbols)),
-            n_days=int(len(trading_days)),
+            n_days=int(len(day_values)),
             n_rows=int(len(out)),
             ms=int((time.time() - t0) * 1000),
         )

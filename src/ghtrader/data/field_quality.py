@@ -6,7 +6,7 @@ from typing import Any
 
 import pandas as pd
 
-from ghtrader.data.ticks_schema import L5_BOOK_COLS
+from ghtrader.data.ticks_schema import L5_BOOK_COLS, null_rate as _null_rate
 from ghtrader.questdb.field_quality import FieldQualityRow
 from ghtrader.questdb.queries import fetch_ticks_for_day
 
@@ -15,15 +15,6 @@ from ghtrader.questdb.queries import fetch_ticks_for_day
 class FieldQualityResult:
     row: FieldQualityRow
     details: dict[str, Any]
-
-
-def _null_rate(series: pd.Series, total: int) -> float:
-    if total <= 0:
-        return 0.0
-    try:
-        return float(series.isna().sum()) / float(total)
-    except Exception:
-        return 0.0
 
 
 def _positive_mask(series: pd.Series) -> pd.Series:
@@ -207,14 +198,14 @@ def list_symbol_trading_days(
     where = ["symbol=%s", "ticks_kind=%s", "dataset_version=%s"]
     params: list[Any] = [str(symbol), str(ticks_kind), str(dataset_version)]
     if start_day is not None:
-        where.append("cast(trading_day as string) >= %s")
+        where.append("trading_day >= %s")
         params.append(start_day.isoformat())
     if end_day is not None:
-        where.append("cast(trading_day as string) <= %s")
+        where.append("trading_day <= %s")
         params.append(end_day.isoformat())
     sql = (
-        f"SELECT DISTINCT cast(trading_day as string) FROM {table} "
-        f"WHERE {' AND '.join(where)} ORDER BY cast(trading_day as string)"
+        f"SELECT DISTINCT trading_day FROM {table} "
+        f"WHERE {' AND '.join(where)} ORDER BY trading_day"
     )
     out: list[date] = []
     with connect_pg(cfg, connect_timeout_s=2) as conn:

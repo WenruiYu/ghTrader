@@ -19,12 +19,12 @@ def fetch_day_second_stats(
     l5_where = f" AND {l5_cond} " if l5_cond else " "
     sql = (
         "WITH per_sec AS ("
-        "  SELECT cast(trading_day as string) AS trading_day, "
+        "  SELECT trading_day AS trading_day, "
         "         cast(datetime_ns/1000000000 as long) AS sec, "
         "         count() AS n "
         "  FROM ghtrader_ticks_main_l5_v2 "
         f"  WHERE symbol=%s AND ticks_kind='main_l5' AND dataset_version='v2'{l5_where}"
-        "    AND cast(trading_day as string) >= %s AND cast(trading_day as string) <= %s "
+        "    AND trading_day >= %s AND trading_day <= %s "
         "  GROUP BY trading_day, sec"
         ") "
         "SELECT trading_day, "
@@ -95,7 +95,7 @@ def fetch_per_second_counts_batch(
             chunk = trading_days[i : i + chunk_size]
             placeholders = ",".join(["%s"] * len(chunk))
             sql = (
-                "SELECT cast(trading_day as string) AS td, "
+                "SELECT trading_day AS td, "
                 "       cast(datetime_ns/1000000000 as long) AS sec, count() AS n "
                 "FROM ghtrader_ticks_main_l5_v2 "
                 f"WHERE symbol=%s AND ticks_kind='main_l5' AND dataset_version='v2'{l5_where}"
@@ -132,7 +132,7 @@ def get_last_validated_day(
     if sh:
         where.append("schedule_hash=%s")
         params.append(sh)
-    sql = f"SELECT max(cast(trading_day as string)) FROM {table} WHERE {' AND '.join(where)}"
+    sql = f"SELECT max(trading_day) FROM {table} WHERE {' AND '.join(where)}"
     with connect_pg(cfg, connect_timeout_s=2) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)

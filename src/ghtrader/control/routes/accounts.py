@@ -23,6 +23,7 @@ from ghtrader.control.brokers import get_supported_brokers as _get_supported_bro
 from ghtrader.control.jobs import JobSpec, python_module_argv
 from ghtrader.control.state_helpers import (
     artifact_age_sec as _artifact_age_sec,
+    read_state_with_revision as _read_state_with_revision,
     read_json_file as _read_json_file,
     read_redis_json as _read_redis_json,
     status_from_desired_and_state as _status_from_desired_and_state,
@@ -201,15 +202,21 @@ def api_account_gateway_strategy_status(request: Request, profile: str) -> dict[
     gw_root = runs_dir / "gateway" / f"account={p}"
     st_root = runs_dir / "strategy" / f"account={p}"
 
-    gw_state = _read_redis_json(f"ghtrader:gateway:state:{p}") or _read_json_file(gw_root / "state.json")
-    st_state = _read_redis_json(f"ghtrader:strategy:state:{p}") or _read_json_file(st_root / "state.json")
+    gw_state, gw_state_source = _read_state_with_revision(
+        redis_key=f"ghtrader:gateway:state:{p}",
+        file_path=(gw_root / "state.json"),
+    )
+    st_state, st_state_source = _read_state_with_revision(
+        redis_key=f"ghtrader:strategy:state:{p}",
+        file_path=(st_root / "state.json"),
+    )
     gw_desired = _read_redis_json(f"ghtrader:gateway:desired:{p}") or _read_json_file(gw_root / "desired.json")
     st_desired = _read_redis_json(f"ghtrader:strategy:desired:{p}") or _read_json_file(st_root / "desired.json")
 
     return {
         "ok": True,
         "profile": p,
-        "gateway": {"root": str(gw_root), "state": gw_state, "desired": gw_desired},
-        "strategy": {"root": str(st_root), "state": st_state, "desired": st_desired},
+        "gateway": {"root": str(gw_root), "state": gw_state, "state_source": gw_state_source, "desired": gw_desired},
+        "strategy": {"root": str(st_root), "state": st_state, "state_source": st_state_source, "desired": st_desired},
         "generated_at": _now_iso(),
     }

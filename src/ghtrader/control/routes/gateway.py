@@ -13,9 +13,11 @@ from fastapi.responses import JSONResponse
 
 from ghtrader.config import get_runs_dir
 from ghtrader.control import auth
+from ghtrader.control.routes.query_budget import bounded_limit
 from ghtrader.control.state_helpers import (
     read_json_file as _read_json_file,
     read_redis_json as _read_redis_json,
+    read_state_with_revision as _read_state_with_revision,
 )
 from ghtrader.util.time import now_iso as _now_iso
 
@@ -35,7 +37,10 @@ def gateway_status_payload(*, account_profile: str) -> dict[str, Any]:
     runs_dir = get_runs_dir()
     prof = _canonical_account_profile(account_profile)
     root = runs_dir / "gateway" / f"account={prof}"
-    st = _read_redis_json(f"ghtrader:gateway:state:{prof}") or (_read_json_file(root / "state.json") if root.exists() else None)
+    st, st_source = _read_state_with_revision(
+        redis_key=f"ghtrader:gateway:state:{prof}",
+        file_path=(root / "state.json"),
+    )
     desired = _read_redis_json(f"ghtrader:gateway:desired:{prof}") or (_read_json_file(root / "desired.json") if root.exists() else None)
     targets = _read_json_file(root / "targets.json") if root.exists() else None
     return {
@@ -44,6 +49,7 @@ def gateway_status_payload(*, account_profile: str) -> dict[str, Any]:
         "root": str(root),
         "exists": bool(root.exists()),
         "state": st,
+        "state_source": st_source,
         "desired": desired,
         "targets": targets,
         "generated_at": _now_iso(),
@@ -53,13 +59,16 @@ def gateway_status_payload(*, account_profile: str) -> dict[str, Any]:
 def gateway_list_payload(*, limit: int) -> dict[str, Any]:
     runs_dir = get_runs_dir()
     root = runs_dir / "gateway"
-    lim = max(1, min(int(limit or 200), 500))
+    lim = bounded_limit(limit, default=200, max_limit=500)
     rows: list[dict[str, Any]] = []
     try:
         if root.exists():
             for d in sorted([p for p in root.iterdir() if p.is_dir() and p.name.startswith("account=")], key=lambda x: x.name)[:lim]:
                 prof = d.name.split("=", 1)[-1] if "=" in d.name else d.name
-                st = _read_redis_json(f"ghtrader:gateway:state:{prof}") or (_read_json_file(d / "state.json") if (d / "state.json").exists() else None)
+                st, st_source = _read_state_with_revision(
+                    redis_key=f"ghtrader:gateway:state:{prof}",
+                    file_path=(d / "state.json"),
+                )
                 desired = _read_redis_json(f"ghtrader:gateway:desired:{prof}") or (_read_json_file(d / "desired.json") if (d / "desired.json").exists() else None)
                 health = st.get("health") if isinstance(st, dict) and isinstance(st.get("health"), dict) else {}
                 effective = st.get("effective") if isinstance(st, dict) and isinstance(st.get("effective"), dict) else {}
@@ -69,6 +78,7 @@ def gateway_list_payload(*, limit: int) -> dict[str, Any]:
                         "root": str(d),
                         "health": health,
                         "effective": effective,
+                        "state_source": st_source,
                         "desired": desired.get("desired") if isinstance(desired, dict) else desired,
                         "updated_at": (st or {}).get("updated_at") if isinstance(st, dict) else None,
                     }

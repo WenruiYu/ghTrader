@@ -41,36 +41,11 @@ class MainScheduleResult:
     questdb_table: str
 
 
-def _job_progress_from_env(*, runs_dir: Path, total_phases: int, message: str) -> Any | None:
-    job_id = str(get_env("GHTRADER_JOB_ID", "") or "").strip()
-    if not job_id:
-        return None
-    try:
-        from ghtrader.control.progress import JobProgress
-
-        progress = JobProgress(job_id=job_id, runs_dir=Path(runs_dir))
-        progress.start(total_phases=max(1, int(total_phases)), message=str(message))
-        return progress
-    except Exception:
-        return None
-
-
-def _progress_update(progress: Any | None, **kwargs: Any) -> None:
-    if progress is None:
-        return
-    try:
-        progress.update(**kwargs)
-    except Exception:
-        pass
-
-
-def _progress_finish(progress: Any | None, *, message: str) -> None:
-    if progress is None:
-        return
-    try:
-        progress.finish(message=str(message))
-    except Exception:
-        pass
+from ghtrader.data.progress_helpers import (
+    job_progress_from_env as _job_progress_from_env,
+    progress_update as _progress_update,
+    progress_finish as _progress_finish,
+)
 
 
 def _stable_hash_df(df: pd.DataFrame) -> str:
